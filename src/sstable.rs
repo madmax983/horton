@@ -572,6 +572,7 @@ fn index_lookup<E>(payload: &[u8], key: &[u8], index_id: u64) -> Result<Option<u
 struct ParsedEntry<'a> {
     key: &'a [u8],
     val: &'a [u8],
+    seq: u64,
     op: Op,
 }
 
@@ -591,7 +592,7 @@ fn data_entry_parse(payload: &[u8], off: usize) -> Result<(ParsedEntry<'_>, usiz
         slice_at(payload, off + 2, 2)?.try_into().map_err(|_| ())?,
     ));
     let seq_bytes = slice_at(payload, off + 4, 8)?;
-    let _seq = u64::from_le_bytes(seq_bytes.try_into().map_err(|_| ())?);
+    let seq = u64::from_le_bytes(seq_bytes.try_into().map_err(|_| ())?);
     let op = Op::from_u8(slice_at(payload, off + 12, 1)?[0]).ok_or(())?;
     let key = slice_at(payload, off + ENTRY_HEADER, kl)?;
     let val = slice_at(payload, off + ENTRY_HEADER + kl, vl)?;
@@ -605,13 +606,15 @@ fn data_entry_parse(payload: &[u8], off: usize) -> Result<(ParsedEntry<'_>, usiz
     if next > payload.len() {
         return Err(());
     }
-    Ok((ParsedEntry { key, val, op }, next))
+    Ok((ParsedEntry { key, val, seq, op }, next))
 }
 
-/// What a data-block search found.
+/// What a data-block search found, with the entry's sequence number.
 enum DataHit {
-    Value(usize),
-    Tombstone,
+    /// Live value: byte length and sequence number.
+    Value(usize, u64),
+    /// Deletion marker: sequence number.
+    Tombstone(u64),
 }
 
 /// Searches one data block: restart-point binary search, then a linear scan.
@@ -678,7 +681,7 @@ fn data_lookup<E>(
             core::cmp::Ordering::Less => off = next,
             core::cmp::Ordering::Equal => {
                 if entry.op == Op::Delete {
-                    return Ok(Some(DataHit::Tombstone));
+                    return Ok(Some(DataHit::Tombstone(entry.seq)));
                 }
                 if entry.val.len() > val_buf.len() {
                     return Err(Error::BufferTooSmall {
@@ -686,7 +689,7 @@ fn data_lookup<E>(
                     });
                 }
                 val_buf[..entry.val.len()].copy_from_slice(entry.val);
-                return Ok(Some(DataHit::Value(entry.val.len())));
+                return Ok(Some(DataHit::Value(entry.val.len(), entry.seq)));
             }
             core::cmp::Ordering::Greater => return Ok(None),
         }
@@ -694,14 +697,26 @@ fn data_lookup<E>(
     Ok(None)
 }
 
-/// Result of a point lookup in one table. [`TableReader::lookup`] reports
-/// all three; [`TableReader::get`] folds tombstones and misses into `None`.
+/// Result of a point lookup in one table, carrying the entry's sequence
+/// number. [`TableReader::lookup`] reports all three; [`TableReader::get`]
+/// folds tombstones and misses into `None`. `seq` is 0 for [`Lookup::Missing`].
+///
+/// The sequence number is what lets [`crate::Db`] implement "highest seq
+/// wins" across levels: the entry's own seq, not just its table's max.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lookup {
-    /// Live value; holds the byte length written to the caller's buffer.
-    Value(usize),
+    /// Live value.
+    Value {
+        /// Byte length written to the caller's buffer.
+        len: usize,
+        /// The entry's sequence number.
+        seq: u64,
+    },
     /// Deletion marker: shadows the same key in older tables.
-    Tombstone,
+    Tombstone {
+        /// The tombstone's sequence number.
+        seq: u64,
+    },
     /// Key not present in this table.
     Missing,
 }
@@ -780,8 +795,8 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         val_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<D::Error>> {
         Ok(match self.lookup(scratch, key, val_buf).await? {
-            Lookup::Value(n) => Some(n),
-            Lookup::Tombstone | Lookup::Missing => None,
+            Lookup::Value { len, .. } => Some(len),
+            Lookup::Tombstone { .. } | Lookup::Missing => None,
         })
     }
 
@@ -831,8 +846,8 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         }
         Ok(
             match data_lookup::<D::Error>(&scratch[..payload_end], key, val_buf, block_id)? {
-                Some(DataHit::Value(n)) => Lookup::Value(n),
-                Some(DataHit::Tombstone) => Lookup::Tombstone,
+                Some(DataHit::Value(n, seq)) => Lookup::Value { len: n, seq },
+                Some(DataHit::Tombstone(seq)) => Lookup::Tombstone { seq },
                 None => Lookup::Missing,
             },
         )

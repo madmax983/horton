@@ -4,10 +4,12 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.2 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.3 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
-//! [`manifest`] crash-safe root pointer, and the [`Db`] database
-//! (WAL + memtable + flush into `L0` `SSTables`).
+//! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
+//! (bump pointer plus free list), and the [`Db`] database (WAL + memtable +
+//! flush into `SSTables`, multi-level bloom-gated reads with key-range
+//! pruning and highest-sequence-wins).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -27,7 +29,7 @@ pub mod memtable;
 pub mod sstable;
 pub mod wal;
 
-pub use alloc::Bump;
+pub use alloc::{Bump, FreeList};
 pub use crc::crc32;
 pub use db::{Config, Db, OpenReport};
 pub use device::BlockDevice;

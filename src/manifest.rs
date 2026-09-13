@@ -107,6 +107,16 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
     pub const fn end_block(&self) -> u64 {
         self.first_block + self.block_count as u64
     }
+
+    /// True when `key` lies within the table's key bounds (inclusive).
+    ///
+    /// Exact: every key stored in the table is within
+    /// `[first_key, last_key]`, so a key outside the bounds is definitely
+    /// absent and the table can be skipped without any I/O.
+    #[must_use]
+    pub fn covers(&self, key: &[u8]) -> bool {
+        self.first_key.as_slice() <= key && key <= self.last_key.as_slice()
+    }
 }
 
 /// One LSM level: a fixed array of table refs with a live count.
@@ -220,6 +230,52 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     #[must_use]
     pub fn l0(&self) -> &[TableRef<KEY_MAX>] {
         &self.levels[0].tables[..self.levels[0].len]
+    }
+
+    /// Live table refs of level `idx`, oldest first, or `None` when `idx`
+    /// is out of range. Level 0 holds overlapping flush output (newest
+    /// last); deeper levels hold disjoint sorted runs once compaction
+    /// (v0.4) populates them.
+    #[must_use]
+    pub fn level(&self, idx: usize) -> Option<&[TableRef<KEY_MAX>]> {
+        self.levels.get(idx).map(|l| &l.tables[..l.len])
+    }
+
+    /// Appends a table ref to level `level` (flush and compaction output;
+    /// oldest first).
+    ///
+    /// Only capacity is checked here. For levels ≥ 1 the caller (compaction,
+    /// v0.4) is responsible for keeping the level's key ranges sorted and
+    /// non-overlapping.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when `level` is out of range or already holds
+    /// `TABLES` tables.
+    pub fn add_table_to_level<E>(
+        &mut self,
+        level: usize,
+        tref: TableRef<KEY_MAX>,
+    ) -> Result<(), Error<E>> {
+        let l = self.levels.get_mut(level).ok_or(Error::NoSpace)?;
+        if l.len >= TABLES {
+            return Err(Error::NoSpace);
+        }
+        l.tables[l.len] = tref;
+        l.len += 1;
+        Ok(())
+    }
+
+    /// True when block `id` is referenced by some table in some level
+    /// (the open-time sweep's liveness query).
+    #[must_use]
+    pub fn is_table_block_referenced(&self, id: u64) -> bool {
+        self.levels.iter().any(|l| {
+            l.tables[..l.len].iter().any(|t| {
+                id.checked_sub(t.first_block)
+                    .is_some_and(|d| d < u64::from(t.block_count))
+            })
+        })
     }
 
     /// Highest sequence number across all tables (0 when empty).

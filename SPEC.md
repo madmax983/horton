@@ -282,7 +282,10 @@ deferred to v0.3; the sweep makes it correct, just not space-optimal yet.
 
 - v0.1 — MemTable + WAL + recovery. In-memory `BlockDevice` in tests.
   Gate: crash-injector green over 3-op scripts.
-- v0.2 — SSTable writer/reader + `flush()` + manifest commit protocol.
+- ~~v0.2 — SSTable writer/reader + `flush()` + manifest commit protocol.~~
+  DONE 2026-09-13 (commit 963f5f1): plus bump-pointer block allocation and
+  L0-newest-first point reads in `get()`. 61 tests green, clippy
+  pedantic+nursery clean, fmt clean.
 - v0.3 — Full read path (levels, bloom, ranges) + block allocator sweep.
 - v0.4 — Leveled `compact_step` with bounded work + tombstone rule.
 - v0.5 — `scan` iterator + snapshot reads + Verus models for the two

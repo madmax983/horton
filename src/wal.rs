@@ -235,6 +235,18 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.next_block
     }
 
+    /// Repositions the append pointer to `block` (the WAL wrap).
+    ///
+    /// The caller must guarantee no live records exist: every record below
+    /// the old position is flushed into `SSTables` (see [`crate::Db::flush`]),
+    /// and the staging buffer is empty. Stale blocks left behind are skipped
+    /// at recovery by the sequence floor; the manifest's `wal_head` move is
+    /// committed atomically with the flush that wraps.
+    pub fn reset_to(&mut self, block: u64) {
+        debug_assert_eq!(self.stage_len, 0, "reset with staged records");
+        self.next_block = block;
+    }
+
     /// Highest sequence number appended or recovered so far.
     #[must_use]
     pub const fn max_seq(&self) -> u64 {
@@ -340,7 +352,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         &mut self,
         table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
     ) -> Result<RecoverState, Error<D::Error>> {
-        self.recover_from(table, self.wal_start).await
+        self.recover_from(table, self.wal_start, 0).await
     }
 
     /// Replays the WAL from block `from` into `table`, stopping at the first
@@ -349,6 +361,14 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     ///
     /// `Db` passes the manifest's `wal_head`: blocks before it were flushed
     /// into `SSTables` and are no longer needed for recovery.
+    ///
+    /// Records with `seq <= seq_floor` are skipped, not replayed: after a WAL
+    /// wrap (`wal_head` moved back to `wal_start` by a flush) the scan passes
+    /// over stale pre-wrap blocks, and every mutation they hold is already
+    /// in a table — replaying them would resurrect superseded versions that
+    /// shadow newer table data via the memtable. `Db` passes the manifest's
+    /// `max_seq`; it is always a no-op when the WAL never wrapped, because
+    /// live records all have `seq > max_seq`.
     ///
     /// A torn tail is the expected crash boundary, not an error.
     ///
@@ -366,6 +386,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         &mut self,
         table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
         from: u64,
+        seq_floor: u64,
     ) -> Result<RecoverState, Error<D::Error>> {
         let mut state = RecoverState {
             records: 0,
@@ -388,13 +409,17 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
                 match scan_record(&block[off..]) {
                     Scan::Record(rec) => {
                         let tombstone = rec.op == Op::Delete;
-                        table
-                            .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
-                            .map_err(|_| Error::CorruptWal { offset: id })?;
                         if rec.seq > state.max_seq {
                             state.max_seq = rec.seq;
                         }
-                        state.records += 1;
+                        // Stale pre-wrap records: already in a table, never
+                        // replayed (see the `seq_floor` docs above).
+                        if rec.seq > seq_floor {
+                            table
+                                .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
+                                .map_err(|_| Error::CorruptWal { offset: id })?;
+                            state.records += 1;
+                        }
                         off += rec.total_len;
                     }
                     // Clean zero padding: this block is done; the log may
