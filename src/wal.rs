@@ -217,6 +217,24 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.device
     }
 
+    /// The underlying device (shared: block reads only need `&`).
+    #[must_use]
+    pub const fn device(&self) -> &D {
+        &self.device
+    }
+
+    /// The underlying device, mutably.
+    pub const fn device_mut(&mut self) -> &mut D {
+        &mut self.device
+    }
+
+    /// Next block id that will be written: the WAL append position, and the
+    /// value flush stores as the manifest's `wal_head`.
+    #[must_use]
+    pub const fn next_block(&self) -> u64 {
+        self.next_block
+    }
+
     /// Highest sequence number appended or recovered so far.
     #[must_use]
     pub const fn max_seq(&self) -> u64 {
@@ -307,17 +325,12 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         Ok(())
     }
 
-    /// Replays the WAL from `wal_start` into `table`, stopping at the first
-    /// corrupt/truncated record. Positions the writer to continue appending
-    /// after the last consumed block and resets the staging buffer.
-    ///
-    /// A torn tail is the expected crash boundary, not an error.
+    /// Replays the WAL from `wal_start` into `table`. See
+    /// [`recover_from`](WalWriter::recover_from).
     ///
     /// # Errors
     ///
-    /// [`Error::CorruptWal`] if a structurally valid record does not fit the
-    /// table (practically unreachable through [`crate::Db`]), or
-    /// [`Error::Device`] on I/O failure.
+    /// Same as [`recover_from`](WalWriter::recover_from).
     pub async fn recover<
         const CAP: usize,
         const ARENA: usize,
@@ -327,13 +340,40 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         &mut self,
         table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
     ) -> Result<RecoverState, Error<D::Error>> {
+        self.recover_from(table, self.wal_start).await
+    }
+
+    /// Replays the WAL from block `from` into `table`, stopping at the first
+    /// corrupt/truncated record. Positions the writer to continue appending
+    /// after the last consumed block and resets the staging buffer.
+    ///
+    /// `Db` passes the manifest's `wal_head`: blocks before it were flushed
+    /// into `SSTables` and are no longer needed for recovery.
+    ///
+    /// A torn tail is the expected crash boundary, not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptWal`] if a structurally valid record does not fit the
+    /// table (practically unreachable through [`crate::Db`]), or
+    /// [`Error::Device`] on I/O failure.
+    pub async fn recover_from<
+        const CAP: usize,
+        const ARENA: usize,
+        const KEY_MAX: usize,
+        const VAL_MAX: usize,
+    >(
+        &mut self,
+        table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        from: u64,
+    ) -> Result<RecoverState, Error<D::Error>> {
         let mut state = RecoverState {
             records: 0,
             max_seq: 0,
             blocks_used: 0,
         };
         loop {
-            let id = self.wal_start + state.blocks_used;
+            let id = from + state.blocks_used;
             if id >= self.wal_end {
                 break; // Region exhausted: nothing beyond wal_end was written.
             }
@@ -376,7 +416,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
                 break; // Torn tail: expected crash boundary, not an error.
             }
         }
-        self.next_block = self.wal_start + state.blocks_used;
+        self.next_block = from + state.blocks_used;
         self.stage_len = 0;
         self.max_seq = state.max_seq;
         Ok(state)

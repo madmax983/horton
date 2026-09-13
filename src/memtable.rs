@@ -43,6 +43,66 @@ pub struct Lookup<'a> {
     pub tombstone: bool,
 }
 
+/// One live memtable entry, borrowed. Yielded by [`MemTable::iter`] in
+/// key-ascending order (dead slots are skipped).
+#[derive(Debug, Clone, Copy)]
+pub struct Entry<
+    'a,
+    const CAP: usize,
+    const ARENA: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+> {
+    /// Key bytes.
+    pub key: &'a [u8],
+    /// Value bytes (empty for tombstones).
+    pub val: &'a [u8],
+    /// Sequence number of the mutation that wrote this entry.
+    pub seq: u64,
+    /// True when this entry is a deletion marker.
+    pub tombstone: bool,
+}
+
+/// Key-ascending iterator over live memtable entries.
+#[derive(Debug, Clone)]
+pub struct Iter<
+    'a,
+    const CAP: usize,
+    const ARENA: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+> {
+    table: &'a MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+    idx: usize,
+}
+
+impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize> Iterator
+    for Iter<'a, CAP, ARENA, KEY_MAX, VAL_MAX>
+{
+    type Item = Entry<'a, CAP, ARENA, KEY_MAX, VAL_MAX>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.idx < self.table.len {
+            let slot = &self.table.slots[self.idx];
+            self.idx += 1;
+            if slot.dead {
+                continue;
+            }
+            let koff = slot.key_off as usize;
+            let kl = usize::from(slot.key_len);
+            let voff = slot.val_off as usize;
+            let vl = usize::from(slot.val_len);
+            return Some(Entry {
+                key: &self.table.arena[koff..koff + kl],
+                val: &self.table.arena[voff..voff + vl],
+                seq: slot.seq,
+                tombstone: slot.tombstone,
+            });
+        }
+        None
+    }
+}
+
 /// Sorted in-memory table. Only the newest entry per key is retained.
 #[derive(Debug, Clone)]
 pub struct MemTable<
@@ -378,5 +438,26 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             seq: slot.seq,
             tombstone: slot.tombstone,
         })
+    }
+
+    /// Iterates live entries in key-ascending order (dead slots skipped).
+    /// Used by flush to drain the table into an `SSTable`.
+    #[must_use]
+    pub const fn iter(&self) -> Iter<'_, CAP, ARENA, KEY_MAX, VAL_MAX> {
+        Iter {
+            table: self,
+            idx: 0,
+        }
+    }
+}
+
+impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize>
+    IntoIterator for &'a MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>
+{
+    type Item = Entry<'a, CAP, ARENA, KEY_MAX, VAL_MAX>;
+    type IntoIter = Iter<'a, CAP, ARENA, KEY_MAX, VAL_MAX>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }

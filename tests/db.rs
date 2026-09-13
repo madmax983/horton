@@ -5,10 +5,8 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{block_on, CrashDevice, Lcg, MemDevice, TestDb};
-use horton::{Config, Error};
-
-const WAL_BLOCKS: u64 = 128;
+use common::{block_on, test_config, CrashDevice, Lcg, MemDevice, TestDb};
+use horton::Error;
 
 fn open<D: horton::BlockDevice>(db: &mut TestDb<D>)
 where
@@ -29,7 +27,7 @@ where
 
 #[test]
 fn put_get_delete() {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), Config::new(0, WAL_BLOCKS));
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
 
     let s1 = block_on(db.put(b"name", b"horton")).unwrap();
@@ -52,7 +50,7 @@ fn put_get_delete() {
 
 #[test]
 fn seq_numbers_increase() {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), Config::new(0, WAL_BLOCKS));
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
     let mut last = 0;
     for i in 0..10u8 {
@@ -64,7 +62,7 @@ fn seq_numbers_increase() {
 
 #[test]
 fn get_buffer_too_small() {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), Config::new(0, WAL_BLOCKS));
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
     block_on(db.put(b"k", b"12345678")).unwrap();
     let mut tiny = [0u8; 3];
@@ -79,7 +77,7 @@ fn get_buffer_too_small() {
 #[test]
 fn reopen_recovers_state() {
     let dev = MemDevice::<4096>::new();
-    let mut db = TestDb::new(dev, Config::new(0, WAL_BLOCKS));
+    let mut db = TestDb::new(dev, test_config());
     let rep = block_on(db.open()).unwrap();
     assert_eq!(rep.recovered_records, 0);
     block_on(db.put(b"a", b"1")).unwrap();
@@ -87,7 +85,7 @@ fn reopen_recovers_state() {
     block_on(db.delete(b"a")).unwrap();
 
     let dev = db.into_device();
-    let mut db2 = TestDb::new(dev, Config::new(0, WAL_BLOCKS));
+    let mut db2 = TestDb::new(dev, test_config());
     let rep = block_on(db2.open()).unwrap();
     assert_eq!(rep.recovered_records, 3);
     assert_eq!(rep.max_seq, 3);
@@ -106,7 +104,7 @@ fn oracle_random() {
     let mut rng = Lcg::new(0xC10C_A8A7);
     let key_pool: [&[u8]; 6] = [b"a", b"b", b"c", b"dd", b"eee", b"f"];
     for round in 0..200 {
-        let mut db = TestDb::new(MemDevice::<4096>::new(), Config::new(0, WAL_BLOCKS));
+        let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
         open(&mut db);
         let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         let n = 1 + rng.next() % 20;
@@ -138,7 +136,7 @@ fn oracle_random() {
         }
         // Reopen and verify the recovered state matches the oracle too.
         let dev = db.into_device();
-        let mut db2 = TestDb::new(dev, Config::new(0, WAL_BLOCKS));
+        let mut db2 = TestDb::new(dev, test_config());
         let rep = block_on(db2.open()).unwrap();
         assert_eq!(rep.recovered_records, n, "round {round}");
         for (k, v) in &oracle {
@@ -185,7 +183,7 @@ fn apply_script(ops: &[ScriptOp], crash_at: usize) -> MemDevice<4096> {
     let keys: [&[u8]; 2] = [b"a", b"b"];
     let dev: CrashDevice<MemDevice<4096>, 4096> =
         CrashDevice::new(MemDevice::<4096>::new(), crash_at);
-    let mut db = TestDb::new(dev, Config::new(0, WAL_BLOCKS));
+    let mut db = TestDb::new(dev, test_config());
     open(&mut db);
     for op in ops {
         match op {
@@ -227,7 +225,7 @@ fn crash_injector() {
     for (si, script) in all_scripts().iter().enumerate() {
         for crash_at in 0..=3 {
             let dev = apply_script(script, crash_at);
-            let mut db = TestDb::new(dev, Config::new(0, WAL_BLOCKS));
+            let mut db = TestDb::new(dev, test_config());
             let rep = block_on(db.open()).unwrap();
             assert_eq!(
                 rep.recovered_records, crash_at as u64,

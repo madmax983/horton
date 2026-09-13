@@ -4,8 +4,10 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.1 surface: [`MemTable`], the [`wal`] write-ahead log, the async
-//! [`BlockDevice`] trait, and the minimal [`Db`] (WAL + memtable).
+//! v0.2 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
+//! [`manifest`] crash-safe root pointer, and the [`Db`] database
+//! (WAL + memtable + flush into `L0` `SSTables`).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -15,16 +17,25 @@
 // requiring the device (or the futures) to be `Send`.
 #![allow(clippy::future_not_send)]
 
+pub mod alloc;
 pub mod crc;
 pub mod db;
 pub mod device;
 pub mod error;
+pub mod manifest;
 pub mod memtable;
+pub mod sstable;
 pub mod wal;
 
+pub use alloc::Bump;
 pub use crc::crc32;
 pub use db::{Config, Db, OpenReport};
 pub use device::BlockDevice;
 pub use error::Error;
-pub use memtable::MemTable;
+pub use manifest::{KeyBound, Level, Manifest, TableRef, MANIFEST_MAGIC};
+pub use memtable::{Entry as MemTableEntry, MemTable};
+pub use sstable::{
+    bloom_k, bloom_maybe_contains, plan_table, write_table, Lookup as SstLookup, SstEntry,
+    TablePlan, TableReader, SSTABLE_MAGIC,
+};
 pub use wal::{Op, RecoverState, WalWriter};

@@ -160,8 +160,15 @@ impl<D: BlockDevice, const BLOCK: usize> BlockDevice for CrashDevice<D, BLOCK> {
 }
 
 /// `Db` with the standard test geometry: 4 KiB blocks, 256 B keys,
-/// 1 KiB values, 64 slots, 4 KiB arena.
-pub type TestDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096>;
+/// 1 KiB values, 64 slots, 4 KiB arena, 7 levels, 4 L0 tables, 1024-byte
+/// bloom filters.
+pub type TestDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024>;
+
+/// Standard region layout: manifest slots 0/1, WAL `[8, 136)`, tables
+/// `[136, 4224)`. The regions are disjoint by construction.
+pub const fn test_config() -> horton::Config {
+    horton::Config::new(8, 136, 136, 4224, 0, 1)
+}
 
 /// Tiny deterministic PRNG (LCG) — no `rand` dependency, even for tests.
 pub struct Lcg(u64);
