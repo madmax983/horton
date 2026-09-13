@@ -11,11 +11,8 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use horton::BlockDevice;
 
-/// Drives a future to completion on the current thread with a no-op waker.
-///
-/// Our test devices always return `Poll::Ready`, so this never spins in
-/// practice; the `yield_now` is just good manners for `Pending`.
-pub fn block_on<F: Future>(future: F) -> F::Output {
+/// A waker that does nothing. Good for hand-polling a future in a test.
+pub fn noop_waker() -> Waker {
     // SAFETY: all callbacks are no-ops that never touch the null data pointer.
     const unsafe fn waker_clone(data: *const ()) -> RawWaker {
         RawWaker::new(data, &WAKER_VTABLE)
@@ -25,7 +22,15 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     static WAKER_VTABLE: RawWakerVTable =
         RawWakerVTable::new(waker_clone, waker_noop, waker_noop, waker_noop);
     // SAFETY: the vtable above is valid and its callbacks never dereference data.
-    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &WAKER_VTABLE)) };
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &WAKER_VTABLE)) }
+}
+
+/// Drives a future to completion on the current thread with a no-op waker.
+///
+/// Our test devices always return `Poll::Ready`, so this never spins in
+/// practice; the `yield_now` is just good manners for `Pending`.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = noop_waker();
     let mut cx = Context::from_waker(&waker);
     let mut future = future;
     // SAFETY: `future` is never moved after pinning and is polled to

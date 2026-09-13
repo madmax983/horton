@@ -7,11 +7,13 @@
 
 mod common;
 
+use core::future::Future;
+use core::pin::pin;
 use core::task::{Context, Poll};
 use std::cell::Cell;
 use std::rc::Rc;
 
-use common::{block_on, test_config, MemDevice};
+use common::{block_on, noop_waker, test_config, MemDevice};
 use horton::{bloom_k, plan_table, write_table, BlockDevice, Config, Manifest, SstEntry, TableRef};
 
 type DevError = core::convert::Infallible;
@@ -215,6 +217,105 @@ fn range_prune_skips_out_of_range_tables() {
     // "m" is covered by neither table: zero table I/O, still a miss.
     assert_eq!(block_on(db.get(b"m", &mut buf)).expect("get"), None);
     assert_eq!(reads.get(), 8);
+}
+
+/// Returns `Poll::Pending` once, on the first table-region read
+/// (`id >= 136`). Every read before or after that returns `Ready`.
+/// Reads below 136 are manifest and WAL reads, for example the reads in
+/// `Db::open`. They always return `Ready`. This forces a real suspend
+/// point inside `Db::get`. A test can then poll two `get` futures at once.
+struct PendingOnceDevice {
+    inner: MemDevice<4096>,
+    yielded: Cell<bool>,
+}
+
+impl BlockDevice for PendingOnceDevice {
+    type Error = DevError;
+    const BLOCK: usize = 4096;
+
+    fn poll_read_block(
+        &self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        if id >= 136 && !self.yielded.replace(true) {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.inner.poll_read_block(cx, id, buf)
+    }
+
+    fn poll_write_block(
+        &mut self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &[u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_write_block(cx, id, buf)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+}
+
+#[test]
+fn concurrent_gets_do_not_panic_when_interleaved() {
+    // `get` takes `&self`. An executor can run two calls at once.
+    // It can interleave their polls.
+    // `PendingOnceDevice` forces the first `get` to suspend. This
+    // happens right after it claims the shared scratch buffer.
+    // The first `get` is still suspended. The second `get` is polled
+    // during this time. It must fall back to its own buffer instead of
+    // panicking. Both calls must still return the right value.
+    let mut dev = MemDevice::new();
+    let t0 = write_single(&mut dev, 136, b"alpha", b"AAAA", 1, false, 0);
+    commit_tables(&mut dev, &[(0, t0)]);
+    let dev = PendingOnceDevice {
+        inner: dev,
+        yielded: Cell::new(false),
+    };
+    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
+    let mut db = PendingDb::new(dev, test_config());
+    block_on(db.open()).expect("open");
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut buf_a = [0u8; 1024];
+    let mut buf_b = [0u8; 1024];
+    let mut done_a = None;
+    let mut done_b = None;
+    {
+        let mut fut_a = pin!(db.get(b"alpha", &mut buf_a));
+        let mut fut_b = pin!(db.get(b"alpha", &mut buf_b));
+        for _ in 0..64 {
+            if done_a.is_none() {
+                if let Poll::Ready(r) = fut_a.as_mut().poll(&mut cx) {
+                    done_a = Some(r);
+                }
+            }
+            if done_b.is_none() {
+                if let Poll::Ready(r) = fut_b.as_mut().poll(&mut cx) {
+                    done_b = Some(r);
+                }
+            }
+            if done_a.is_some() && done_b.is_some() {
+                break;
+            }
+        }
+    }
+
+    let n_a = done_a
+        .expect("fut_a completed")
+        .expect("get ok")
+        .expect("present");
+    let n_b = done_b
+        .expect("fut_b completed")
+        .expect("get ok")
+        .expect("present");
+    assert_eq!(&buf_a[..n_a], b"AAAA");
+    assert_eq!(&buf_b[..n_b], b"AAAA");
 }
 
 #[test]

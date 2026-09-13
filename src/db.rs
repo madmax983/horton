@@ -10,6 +10,8 @@
 //! first), then deeper levels in order; every table is key-range pruned and
 //! bloom-gated, and the hit with the highest sequence number wins.
 
+use core::cell::RefCell;
+
 use crate::alloc::{Bump, FreeList};
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -104,6 +106,19 @@ pub struct Db<
     tbl_free: FreeList<FREELIST>,
     cfg: Config,
     next_seq: u64,
+    /// Block-read buffer for [`Db::get`]. A read fills every byte before
+    /// `get` reads it. A zeroed buffer on each call would waste work.
+    /// Calls reuse this buffer instead.
+    ///
+    /// The buffer sits in a `RefCell`. This lets `get` write to it
+    /// through `&self`. Two `get` calls can run at once (interleaved
+    /// awaits on one executor). The second call then uses its own local
+    /// buffer, not this one.
+    ///
+    /// This buffer used to live on `get`'s stack, for one call only. It
+    /// now lives here, for the life of the `Db`. Count `BLOCK` bytes of
+    /// permanent RAM for this field against SPEC.md's RAM budget.
+    get_scratch: RefCell<[u8; BLOCK]>,
 }
 
 impl<
@@ -152,6 +167,7 @@ impl<
             tbl_free: FreeList::new(),
             cfg: config,
             next_seq: 0,
+            get_scratch: RefCell::new([0u8; BLOCK]),
         }
     }
 
@@ -280,6 +296,10 @@ impl<
     /// value, [`Error::CorruptManifest`] when a table's block range is
     /// malformed, [`Error::CorruptBlock`] when a table's index or footer
     /// fails verification, or [`Error::Device`] on I/O failure.
+    // This call holds `get_scratch`'s borrow across its own awaits.
+    // `try_borrow_mut` stops two calls from holding this borrow at once.
+    // So the lint does not apply here.
+    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn get(
         &self,
         key: &[u8],
@@ -303,19 +323,25 @@ impl<
             }
         }
 
-        let mut scratch = [0u8; BLOCK];
+        // Use the shared buffer when it is free (see `get_scratch`). Fall
+        // back to a local buffer when another `get` call already holds it.
+        let mut shared_scratch;
+        let mut owned_scratch;
+        let scratch: &mut [u8; BLOCK] = match self.get_scratch.try_borrow_mut() {
+            Ok(guard) => {
+                shared_scratch = guard;
+                &mut shared_scratch
+            }
+            Err(_) => {
+                owned_scratch = [0u8; BLOCK];
+                &mut owned_scratch
+            }
+        };
         // Level 0, newest table first: its tables overlap, and newer tables
         // hold higher sequence numbers.
         for tref in self.manifest.l0().iter().rev() {
-            self.consider_table(
-                tref,
-                key,
-                &mut scratch,
-                &mut stage,
-                &mut best,
-                &mut best_seq,
-            )
-            .await?;
+            self.consider_table(tref, key, scratch, &mut stage, &mut best, &mut best_seq)
+                .await?;
         }
         // Deeper levels in order. Highest-seq-wins keeps the result exact
         // regardless of how tables are placed; v0.4 compaction will keep
@@ -324,15 +350,8 @@ impl<
             // `li < LEVELS` by construction; the fallback is unreachable.
             let tables = self.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
-                self.consider_table(
-                    tref,
-                    key,
-                    &mut scratch,
-                    &mut stage,
-                    &mut best,
-                    &mut best_seq,
-                )
-                .await?;
+                self.consider_table(tref, key, scratch, &mut stage, &mut best, &mut best_seq)
+                    .await?;
             }
         }
 
