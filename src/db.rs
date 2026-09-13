@@ -107,13 +107,17 @@ pub struct Db<
     cfg: Config,
     next_seq: u64,
     /// Block-read buffer for [`Db::get`]. A read fills every byte before
-    /// `get` reads it. So a fresh, zeroed buffer on each call would waste
-    /// work; calls reuse this one instead.
+    /// `get` reads it. A zeroed buffer on each call would waste work.
+    /// Calls reuse this buffer instead.
     ///
-    /// The buffer sits in a `RefCell`, so `get` can write to it through
-    /// `&self`. Two `get` calls can run at once (interleaved awaits on
-    /// one executor). The second call then uses its own local buffer, not
-    /// this one.
+    /// The buffer sits in a `RefCell`. This lets `get` write to it
+    /// through `&self`. Two `get` calls can run at once (interleaved
+    /// awaits on one executor). The second call then uses its own local
+    /// buffer, not this one.
+    ///
+    /// This buffer used to live on `get`'s stack, for one call only. It
+    /// now lives here, for the life of the `Db`. Count `BLOCK` bytes of
+    /// permanent RAM for this field against SPEC.md's RAM budget.
     get_scratch: RefCell<[u8; BLOCK]>,
 }
 
@@ -293,8 +297,8 @@ impl<
     /// malformed, [`Error::CorruptBlock`] when a table's index or footer
     /// fails verification, or [`Error::Device`] on I/O failure.
     // This call holds `get_scratch`'s borrow across its own awaits.
-    // `try_borrow_mut` below stops it from doing so across another
-    // call's awaits, so the lint does not apply here.
+    // `try_borrow_mut` stops two calls from holding this borrow at once.
+    // So the lint does not apply here.
     #[allow(clippy::await_holding_refcell_ref)]
     pub async fn get(
         &self,
