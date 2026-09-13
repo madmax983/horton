@@ -698,8 +698,10 @@ fn data_lookup<E>(
 }
 
 /// Result of a point lookup in one table, carrying the entry's sequence
-/// number. [`TableReader::lookup`] reports all three; [`TableReader::get`]
-/// folds tombstones and misses into `None`. `seq` is 0 for [`Lookup::Missing`].
+/// number.
+///
+/// [`TableReader::lookup`] reports all three; [`TableReader::get`] folds
+/// tombstones and misses into `None`. `seq` is 0 for [`Lookup::Missing`].
 ///
 /// The sequence number is what lets [`crate::Db`] implement "highest seq
 /// wins" across levels: the entry's own seq, not just its table's max.

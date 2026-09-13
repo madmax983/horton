@@ -113,7 +113,6 @@ impl<const CAP: usize> FreeList<CAP> {
             len: 0,
         }
     }
-
     /// Number of free block ids held.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -194,9 +193,8 @@ impl<const CAP: usize> FreeList<CAP> {
         };
         let mut k = 0usize;
         while k < count {
-            let want = match u64::try_from(k).ok().and_then(|kk| base.checked_add(kk)) {
-                Some(w) => w,
-                None => return false,
+            let Some(want) = u64::try_from(k).ok().and_then(|kk| base.checked_add(kk)) else {
+                return false;
             };
             // `k` only grows while the gets succeed, so `i + k <= self.len`
             // and the addition cannot overflow.
@@ -208,5 +206,11 @@ impl<const CAP: usize> FreeList<CAP> {
         self.ids.copy_within(i + count..self.len, i);
         self.len -= count;
         true
+    }
+}
+
+impl<const CAP: usize> Default for FreeList<CAP> {
+    fn default() -> Self {
+        Self::new()
     }
 }

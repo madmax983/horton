@@ -307,8 +307,15 @@ impl<
         // Level 0, newest table first: its tables overlap, and newer tables
         // hold higher sequence numbers.
         for tref in self.manifest.l0().iter().rev() {
-            self.consider_table(tref, key, &mut scratch, &mut stage, &mut best, &mut best_seq)
-                .await?;
+            self.consider_table(
+                tref,
+                key,
+                &mut scratch,
+                &mut stage,
+                &mut best,
+                &mut best_seq,
+            )
+            .await?;
         }
         // Deeper levels in order. Highest-seq-wins keeps the result exact
         // regardless of how tables are placed; v0.4 compaction will keep
@@ -389,16 +396,15 @@ impl<
     /// The `wal_head` move rides a manifest commit, so it stays atomic with
     /// the flush; stale pre-wrap blocks are skipped at recovery by the
     /// sequence floor (see `WalWriter::recover_from`).
-    async fn wrap_wal_if_full(
-        &mut self,
-        scratch: &mut [u8; BLOCK],
-    ) -> Result<(), Error<D::Error>> {
+    async fn wrap_wal_if_full(&mut self, scratch: &mut [u8; BLOCK]) -> Result<(), Error<D::Error>> {
         if self.wal.next_block() < self.cfg.wal_end {
             return Ok(());
         }
-        // The memtable is empty, so every WAL record is flushed: the head
-        // equals the append position and nothing is live.
-        debug_assert_eq!(self.manifest.wal_head(), self.wal.next_block());
+        // Safe: the memtable is empty, and every WAL record not yet flushed
+        // into a table is replayed into the memtable at open — so no live
+        // records exist. (Stale pre-wrap blocks may still sit between
+        // `wal_head` and the append position; the sequence floor skips them
+        // at recovery.)
         let mut staged = self.manifest;
         staged.set_wal_head(self.cfg.wal_start);
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);

@@ -261,8 +261,18 @@ returned, never panicked.
 v0.1: simplest thing that works — three fixed regions from `Config`
 (wal: `[wal_start, wal_end)`, tables: `[tbl_start, tbl_end)`,
 manifest: two fixed block ids). A bump pointer per region; the open-time
-garbage sweep rebuilds "free" as "not referenced." True free-list reuse is
-deferred to v0.3; the sweep makes it correct, just not space-optimal yet.
+garbage sweep rebuilds "free" as "not referenced."
+
+v0.3: true free-list reuse. Each region gets a bump pointer plus a
+`FreeList<CAP>` (sorted, `no_std`, no allocation). Allocation is
+free-list-first (first-fit contiguous run), then the bump; the run is only
+*reserved* until the manifest commit lands, then claimed — a failed flush
+changes nothing. The open-time sweep reclaims unreferenced blocks below the
+bump's resume point into the free list. Compaction (v0.4) will free whole
+input tables into it. The WAL wraps instead of exhausting: the flush that
+fills the region restarts `wal_head` at `wal_start` in the same atomic
+manifest commit, and recovery skips stale pre-wrap blocks via a sequence
+floor (`seq <= manifest.max_seq`).
 
 ## 8. Testing strategy
 
@@ -286,7 +296,17 @@ deferred to v0.3; the sweep makes it correct, just not space-optimal yet.
   DONE 2026-09-13 (commit 963f5f1): plus bump-pointer block allocation and
   L0-newest-first point reads in `get()`. 61 tests green, clippy
   pedantic+nursery clean, fmt clean.
-- v0.3 — Full read path (levels, bloom, ranges) + block allocator sweep.
+- ~~v0.3 — Full read path (levels, bloom, ranges) + block allocator sweep.~~
+  DONE 2026-09-13: `get()` scans memtable → L0 newest-first → deeper levels
+  with key-range pruning, bloom gating, and sequence pruning; entry seqs are
+  threaded through the SSTable lookup so highest-seq wins across levels and
+  the highest-seq tombstone hides older values. `FreeList` with first-fit
+  run allocation (free-list-first, claim-after-commit); open-time sweep
+  reclaims orphaned table blocks. WAL wraps atomically with the filling
+  flush; recovery skips stale pre-wrap blocks via a sequence floor. 74 tests
+  green (13 new: 6 read-path, 5 free-list, WAL wrap, orphan reclaim),
+  clippy pedantic+nursery clean, fmt clean. v0.4+ exclusions held: no
+  compaction, no scan/snapshots.
 - v0.4 — Leveled `compact_step` with bounded work + tombstone rule.
 - v0.5 — `scan` iterator + snapshot reads + Verus models for the two
   core invariants.
