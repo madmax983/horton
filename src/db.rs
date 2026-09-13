@@ -541,7 +541,13 @@ impl<
         match free_base {
             Some(b) => {
                 debug_assert_eq!(b, base);
-                debug_assert!(self.tbl_free.claim_run(b, total_usize));
+                // Must run unconditionally: `claim_run` removes the run from
+                // the free list, and `debug_assert!` does not evaluate its
+                // argument in release builds. Wrapping the call itself in
+                // `debug_assert!` would silently skip that removal in
+                // release, leaving claimed blocks marked free forever.
+                let claimed = self.tbl_free.claim_run(b, total_usize);
+                debug_assert!(claimed, "find_run's own result must still claim");
             }
             None => {
                 self.tbl_bump
