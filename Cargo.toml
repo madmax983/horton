@@ -15,3 +15,12 @@ license = "MIT OR Apache-2.0"
 # compaction; v0.2 does not implement it. It must never be required, never be
 # global, and never pull in `alloc`.
 scratch-bump = []
+
+[[bench]]
+name = "write_path"
+harness = false
+
+# Keep debug symbols in release builds so instruction-count profiles
+# (valgrind --tool=callgrind / cachegrind) can attribute cost to functions.
+[profile.release]
+debug = true
