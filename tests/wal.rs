@@ -4,7 +4,7 @@ mod common;
 
 use core::task::{Context, Poll};
 
-use common::{block_on, MemDevice};
+use common::{block_on, noop_waker, MemDevice};
 use horton::memtable::MemTable;
 use horton::wal::{Op, WalWriter};
 use horton::BlockDevice;
@@ -152,6 +152,51 @@ fn crc_failure_drops_block() {
     let st = block_on(w2.recover(&mut t)).unwrap();
     assert_eq!(st.records, 0);
     assert!(t.is_empty());
+}
+
+/// A commit whose staged bytes are shorter than the previous commit's must
+/// still zero-pad its own block correctly: `stage` is a buffer reused
+/// across commits, not zeroed fresh each time, so a shorter batch leaves a
+/// gap of the previous batch's leftover bytes that only the shrink itself
+/// needs to clear.
+#[test]
+fn shrinking_commit_zero_pads_correctly() {
+    // BLOCK = 512; record_len = 23 + 2 + 32 = 57 (VAL_MAX for T16 is 32):
+    // block-0 commit.
+    let mut w = writer();
+    block_on(w.append(1, Op::Put, b"k1", &[b'a'; 32])).unwrap();
+    block_on(w.commit()).unwrap();
+    // record_len = 23 + 1 + 1 = 25: a smaller block-1 commit. Without
+    // re-zeroing the shrunk gap, bytes [25..57) of the reused stage buffer
+    // would still hold block 0's tail instead of the zero padding recovery
+    // relies on to find the clean end of the log.
+    block_on(w.append(2, Op::Put, b"z", b"v")).unwrap();
+    block_on(w.commit()).unwrap();
+
+    // Read block 1 back directly: a stray nonzero byte past the record
+    // would still get silently classified as an (expected, non-error) torn
+    // tail by `recover` below, so check the raw padding itself rather than
+    // relying on recovery to notice.
+    let dev = w.into_device();
+    let mut buf = [0xFFu8; 512]; // poisoned: a no-op read would be caught too
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    assert_eq!(
+        dev.poll_read_block(&mut cx, 1, &mut buf),
+        Poll::Ready(Ok(()))
+    );
+    assert!(
+        buf[25..].iter().all(|&b| b == 0),
+        "stale bytes from the longer previous commit leaked past the record"
+    );
+
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(dev, 0, 16);
+    let mut t = T16::new();
+    let st = block_on(w.recover(&mut t)).unwrap();
+    assert_eq!(st.records, 2);
+    assert_eq!(st.blocks_used, 2);
+    assert_eq!(t.get(b"k1").unwrap().val, &[b'a'; 32][..]);
+    assert_eq!(t.get(b"z").unwrap().val, b"v");
 }
 
 /// Records that do not fit in one block are rejected, not split (v0.1).
