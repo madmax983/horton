@@ -183,6 +183,11 @@ pub struct WalWriter<D: BlockDevice, const BLOCK: usize> {
     wal_end: u64,
     stage: [u8; BLOCK],
     stage_len: usize,
+    /// High-water mark: `stage[dirty_to..]` is guaranteed already zero (from
+    /// the last block written, or the initial `[0u8; BLOCK]`). Lets
+    /// [`write_stage`](WalWriter::write_stage) skip re-zeroing bytes that
+    /// are already zero; see its doc comment.
+    dirty_to: usize,
     next_block: u64,
     max_seq: u64,
 }
@@ -206,6 +211,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             wal_end,
             stage: [0u8; BLOCK],
             stage_len: 0,
+            dirty_to: 0,
             next_block: wal_start,
             max_seq: 0,
         }
@@ -321,11 +327,25 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     }
 
     /// Writes the current staging buffer as one zero-padded block.
+    ///
+    /// `stage` is a persistent buffer reused across every commit, not a
+    /// fresh one per call. `dirty_to` (the previous commit's `stage_len`)
+    /// marks how far its old content could still be nonzero: everything
+    /// from there to `BLOCK` was zeroed by that commit's own fill and
+    /// nothing has written past it since. So there is live garbage to clear
+    /// only where this record set is shorter than the last one
+    /// (`stage_len < dirty_to`) — zeroing the shrunk gap is enough to
+    /// restore "everything past `stage_len` is zero" for the write below;
+    /// re-zeroing out to `BLOCK` every time (the previous approach) redid
+    /// that work even when this batch is the same size or grew.
     async fn write_stage(&mut self) -> Result<(), Error<D::Error>> {
         if self.next_block >= self.wal_end {
             return Err(Error::NoSpace);
         }
-        self.stage[self.stage_len..].fill(0);
+        if self.stage_len < self.dirty_to {
+            self.stage[self.stage_len..self.dirty_to].fill(0);
+        }
+        self.dirty_to = self.stage_len;
         let id = self.next_block;
         let device = &mut self.device;
         let stage = &self.stage;
