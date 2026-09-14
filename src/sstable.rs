@@ -494,6 +494,18 @@ fn check_block_crc<E, const BLOCK: usize>(block: &[u8; BLOCK], id: u64) -> Resul
     Ok(())
 }
 
+/// Checks whether every byte in `bytes` is zero, 8 at a time.
+///
+/// Equivalent to `bytes.iter().all(|&b| b == 0)`, which LLVM compiles to a
+/// scalar byte-at-a-time loop here (confirmed via `objdump`) rather than a
+/// vectorized comparison. Chunking into `u64` words cuts the loop trip count
+/// by 8x for the same result.
+fn all_zero(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(8);
+    chunks.all(|c| u64::from_ne_bytes(c.try_into().unwrap_or([0; 8])) == 0)
+        && chunks.remainder().iter().all(|&b| b == 0)
+}
+
 /// Bounds-checked slice read.
 fn slice_at(payload: &[u8], off: usize, len: usize) -> Result<&[u8], ()> {
     let end = off.checked_add(len).ok_or(())?;
@@ -536,7 +548,7 @@ fn index_lookup<E>(payload: &[u8], key: &[u8], index_id: u64) -> Result<Option<u
         if let Ok((_, _, next)) = index_entry_parse(payload, off) {
             off = next;
             count += 1;
-        } else if payload[off..].iter().all(|&b| b == 0) {
+        } else if all_zero(&payload[off..]) {
             break;
         } else {
             return Err(corrupt());
@@ -671,7 +683,7 @@ fn data_lookup<E>(
         // up to the restart tail) means the key is absent from this block;
         // any other unparseable structure is corruption, not padding.
         let Ok((entry, next)) = data_entry_parse(payload, off) else {
-            return if payload[off..rstart].iter().all(|&b| b == 0) {
+            return if all_zero(&payload[off..rstart]) {
                 Ok(None)
             } else {
                 Err(corrupt())
