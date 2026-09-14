@@ -340,3 +340,97 @@ fn bloom_false_positive_rate_is_low() {
         "measured bloom FPR {fpr:.4} (hits {hits}/{probes})"
     );
 }
+
+/// Point lookup with a `max_seq` watermark.
+fn get_at(
+    dev: &MemDevice<BLOCK>,
+    footer: u64,
+    key: &[u8],
+    max_seq: u64,
+) -> Result<Option<Vec<u8>>, Error<core::convert::Infallible>> {
+    let mut scratch = [0u8; BLOCK];
+    let mut buf = [0u8; 2048];
+    let reader = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, BLOOM_BYTES>::open(
+        dev,
+        &mut scratch,
+        footer,
+    ))?;
+    let n = block_on(reader.get_at(&mut scratch, key, &mut buf, max_seq))?;
+    Ok(n.map(|n| buf[..n].to_vec()))
+}
+
+/// RED (v0.5 audit): a key's version run straddling data blocks. The index
+/// must resolve to the FIRST block of the run (which holds the newest
+/// versions), and a `max_seq` hiding every version in the first block must
+/// continue the run into the next block — not report the key missing.
+#[test]
+fn version_run_crossing_blocks() {
+    const VERSIONS: u64 = 500;
+    let mut dev = MemDevice::<BLOCK>::new();
+    // `a` (3 versions) then `k` (500 versions, seqs 1..=500) then `z`:
+    // key-ascending, seq-descending within each key. All value bytes are
+    // built first so the entries can borrow them immutably.
+    let mut vals: Vec<Vec<u8>> = Vec::new();
+    for s in (2000..=2002).rev() {
+        vals.push(format!("a{s}").into_bytes());
+    }
+    for v in (1..=VERSIONS).rev() {
+        vals.push(format!("k{v:03}").into_bytes());
+    }
+    vals.push(b"z1".to_vec());
+    let mut items: Vec<SstEntry<'_>> = Vec::new();
+    for (i, s) in (2000..=2002).rev().enumerate() {
+        items.push(SstEntry {
+            key: b"a",
+            val: &vals[i],
+            seq: s,
+            tombstone: false,
+        });
+    }
+    for (i, v) in (1..=VERSIONS).rev().enumerate() {
+        items.push(SstEntry {
+            key: b"k",
+            val: &vals[3 + i],
+            seq: v,
+            tombstone: false,
+        });
+    }
+    items.push(SstEntry {
+        key: b"z",
+        val: &vals[3 + 500], // 3 `a` values + 500 `k` versions precede `z`
+        seq: 3000,
+        tombstone: false,
+    });
+    let (n, data_blocks) = write(&items, &mut dev);
+    assert!(
+        data_blocks >= 2,
+        "the run must straddle data blocks for this test to mean anything"
+    );
+    let footer = BASE + n - 1;
+    let want = |v: u64| Some(format!("k{v:03}").into_bytes());
+
+    // Live view: the newest version, which lives in the run's FIRST block.
+    assert_eq!(
+        get_at(&dev, footer, b"k", u64::MAX).unwrap(),
+        want(VERSIONS)
+    );
+    // Watermarks hiding the first block's versions must continue the run
+    // into later blocks.
+    for s in [1u64, 7, 63, 120, 250, 499] {
+        assert_eq!(
+            get_at(&dev, footer, b"k", s).unwrap(),
+            want(s),
+            "max_seq={s}"
+        );
+    }
+    // Neighbors are unaffected.
+    assert_eq!(
+        get_at(&dev, footer, b"a", u64::MAX).unwrap(),
+        Some(b"a2002".to_vec())
+    );
+    assert_eq!(
+        get_at(&dev, footer, b"z", u64::MAX).unwrap(),
+        Some(b"z1".to_vec())
+    );
+    assert_eq!(get_at(&dev, footer, b"m", u64::MAX).unwrap(), None);
+}

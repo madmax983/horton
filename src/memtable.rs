@@ -1,10 +1,13 @@
 //! Fixed-capacity sorted memtable over a bump arena.
 //!
-//! Slots are kept sorted by key bytes; key/value bytes live in a single
-//! bump-allocated arena. Duplicate keys supersede in place when the new
-//! value fits the old entry's arena region, otherwise the old slot is
-//! marked dead and a fresh slot is appended (at most one dead slot per
-//! key; dead slots are skipped by lookups and reclaimed on flush).
+//! Slots are kept sorted by key bytes, with sequence numbers descending
+//! within each key's run. Key/value bytes live in a single bump-allocated
+//! arena. Every mutation appends a fresh slot — nothing is ever replaced
+//! in place — so a key's run holds its full version history newest-first.
+//! Snapshot reads need those older versions; the live view simply takes
+//! the run's first entry. Flush drains the runs into an `SSTable` in
+//! order, preserving the per-key sequence ordering the read paths rely
+//! on.
 
 use crate::error::Error;
 
@@ -17,7 +20,6 @@ struct Slot {
     val_len: u16,
     seq: u64,
     tombstone: bool,
-    dead: bool,
 }
 
 impl Slot {
@@ -28,11 +30,10 @@ impl Slot {
         val_len: 0,
         seq: 0,
         tombstone: false,
-        dead: false,
     };
 }
 
-/// What [`MemTable::get`] returns for a live slot.
+/// What [`MemTable::get`] returns for a slot.
 #[derive(Debug, Clone, Copy)]
 pub struct Lookup<'a> {
     /// The stored value bytes (empty for tombstones).
@@ -43,8 +44,8 @@ pub struct Lookup<'a> {
     pub tombstone: bool,
 }
 
-/// One live memtable entry, borrowed. Yielded by [`MemTable::iter`] in
-/// key-ascending order (dead slots are skipped).
+/// One memtable entry, borrowed. Yielded by [`MemTable::iter`] in
+/// key-ascending, sequence-descending order.
 #[derive(Debug, Clone, Copy)]
 pub struct Entry<
     'a,
@@ -63,7 +64,7 @@ pub struct Entry<
     pub tombstone: bool,
 }
 
-/// Key-ascending iterator over live memtable entries.
+/// Key-ascending, sequence-descending iterator over memtable entries.
 #[derive(Debug, Clone)]
 pub struct Iter<
     'a,
@@ -82,28 +83,26 @@ impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_M
     type Item = Entry<'a, CAP, ARENA, KEY_MAX, VAL_MAX>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.idx < self.table.len {
-            let slot = &self.table.slots[self.idx];
-            self.idx += 1;
-            if slot.dead {
-                continue;
-            }
-            let koff = slot.key_off as usize;
-            let kl = usize::from(slot.key_len);
-            let voff = slot.val_off as usize;
-            let vl = usize::from(slot.val_len);
-            return Some(Entry {
-                key: &self.table.arena[koff..koff + kl],
-                val: &self.table.arena[voff..voff + vl],
-                seq: slot.seq,
-                tombstone: slot.tombstone,
-            });
-        }
-        None
+        let slot = self.table.slots[..self.table.len].get(self.idx)?;
+        self.idx += 1;
+        let koff = slot.key_off as usize;
+        let kl = usize::from(slot.key_len);
+        let voff = slot.val_off as usize;
+        let vl = usize::from(slot.val_len);
+        Some(Entry {
+            key: &self.table.arena[koff..koff + kl],
+            val: &self.table.arena[voff..voff + vl],
+            seq: slot.seq,
+            tombstone: slot.tombstone,
+        })
     }
 }
 
-/// Sorted in-memory table. Only the newest entry per key is retained.
+/// Sorted in-memory table. Every mutation appends a new slot at its key's
+/// run start, so each key's versions are ordered newest-first.
+///
+/// Sequence numbers are assigned in increasing order by the owner, which
+/// is what keeps the runs descending.
 #[derive(Debug, Clone)]
 pub struct MemTable<
     const CAP: usize,
@@ -120,27 +119,14 @@ pub struct MemTable<
 
 /// Insertion plan computed by [`MemTable::plan`].
 #[derive(Debug, Clone, Copy)]
-enum Plan {
-    /// Overwrite the value region of `idx` (same key, fits).
-    InPlace { idx: usize, val_len: u16 },
-    /// Mark `kill` dead and store the new bytes in reused slot `dead`.
-    ReuseDead {
-        dead: usize,
-        kill: usize,
-        key_off: u32,
-        key_len: u16,
-        val_off: u32,
-        val_len: u16,
-    },
-    /// Shift slots and insert a brand-new slot at `pos`, marking `kill` dead.
-    NewSlot {
-        pos: usize,
-        kill: Option<usize>,
-        key_off: u32,
-        key_len: u16,
-        val_off: u32,
-        val_len: u16,
-    },
+struct Plan {
+    /// Sorted insertion position: the key's run start, or the lower bound
+    /// for a new key.
+    pos: usize,
+    key_off: u32,
+    key_len: u16,
+    val_off: u32,
+    val_len: u16,
 }
 
 impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize> Default
@@ -182,7 +168,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         }
     }
 
-    /// Number of slots in use (live + dead).
+    /// Number of slots in use.
     #[must_use]
     pub const fn len(&self) -> usize {
         self.len
@@ -213,41 +199,21 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         &self.arena[off..off + len]
     }
 
-    fn find(&self, key: &[u8]) -> Result<usize, usize> {
-        self.slots[..self.len].binary_search_by(|slot| self.slot_key(slot).cmp(key))
+    /// Locates `key`'s run: `Ok(start)` with the run's first slot when the
+    /// key is present, `Err(pos)` with the sorted insertion point when it
+    /// is absent.
+    fn find_run(&self, key: &[u8]) -> Result<usize, usize> {
+        let mut pos =
+            self.slots[..self.len].binary_search_by(|slot| self.slot_key(slot).cmp(key))?;
+        while pos > 0 && self.slot_key(&self.slots[pos - 1]) == key {
+            pos -= 1;
+        }
+        Ok(pos)
     }
 
-    /// Scans the equal-key run containing `any_idx`.
-    ///
-    /// Returns `(live, dead, insert_pos)`: the live slot if any, the first
-    /// dead slot if any, and the position just past the run (a valid sorted
-    /// insertion point for this key).
-    fn scan_run(&self, any_idx: usize, key: &[u8]) -> (Option<usize>, Option<usize>, usize) {
-        let mut start = any_idx;
-        while start > 0 && self.slot_key(&self.slots[start - 1]) == key {
-            start -= 1;
-        }
-        let mut end = any_idx;
-        while end + 1 < self.len && self.slot_key(&self.slots[end + 1]) == key {
-            end += 1;
-        }
-        let mut live = None;
-        let mut dead = None;
-        let mut i = start;
-        while i <= end {
-            if self.slots[i].dead {
-                if dead.is_none() {
-                    dead = Some(i);
-                }
-            } else if live.is_none() {
-                live = Some(i);
-            }
-            i += 1;
-        }
-        (live, dead, end + 1)
-    }
-
-    /// Decides how an insert would proceed, without mutating anything.
+    /// Decides how an insert would proceed, without mutating anything. The
+    /// new version always goes at the key's run start, keeping versions
+    /// newest-first (the owner assigns increasing sequence numbers).
     fn plan<E>(&self, key: &[u8], val: &[u8], tombstone: bool) -> Result<Plan, Error<E>> {
         if key.is_empty() {
             return Err(Error::EmptyKey);
@@ -274,21 +240,13 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             });
         }
 
-        let (live, dead, insert_pos) = match self.find(key) {
-            Ok(any) => self.scan_run(any, key),
-            Err(pos) => (None, None, pos),
+        let pos = match self.find_run(key) {
+            Ok(start) => start,
+            Err(pos) => pos,
         };
-
-        // Duplicate key whose new bytes fit the old region: overwrite in place.
-        if let Some(li) = live {
-            let old = &self.slots[li];
-            let old_total = usize::from(old.key_len) + usize::from(old.val_len);
-            if key.len() + vlen <= old_total {
-                return Ok(Plan::InPlace { idx: li, val_len });
-            }
+        if self.len >= CAP {
+            return Err(Error::TableFull);
         }
-
-        // Otherwise fresh arena space is required.
         let need = key.len() + vlen;
         if self.arena_len + need > ARENA {
             return Err(Error::ArenaFull);
@@ -297,23 +255,8 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         let val_off = key_off
             .checked_add(u32::from(key_len))
             .ok_or(Error::ArenaFull)?;
-
-        if let Some(di) = dead {
-            return Ok(Plan::ReuseDead {
-                dead: di,
-                kill: live.unwrap_or(di),
-                key_off,
-                key_len,
-                val_off,
-                val_len,
-            });
-        }
-        if self.len >= CAP {
-            return Err(Error::TableFull);
-        }
-        Ok(Plan::NewSlot {
-            pos: insert_pos,
-            kill: live,
+        Ok(Plan {
+            pos,
             key_off,
             key_len,
             val_off,
@@ -322,75 +265,30 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     }
 
     fn apply(&mut self, plan: Plan, key: &[u8], val: &[u8], seq: u64, tombstone: bool) {
-        match plan {
-            Plan::InPlace { idx, val_len } => {
-                // Duplicate key: key bytes are identical, so only the value
-                // region is overwritten.
-                let vl = usize::from(val_len);
-                let slot = &mut self.slots[idx];
-                let voff = slot.val_off as usize;
-                self.arena[voff..voff + vl].copy_from_slice(&val[..vl]);
-                slot.val_len = val_len;
-                slot.seq = seq;
-                slot.tombstone = tombstone;
-            }
-            Plan::ReuseDead {
-                dead,
-                kill,
-                key_off,
-                key_len,
-                val_off,
-                val_len,
-            } => {
-                self.slots[kill].dead = true;
-                let kl = usize::from(key_len);
-                let vl = usize::from(val_len);
-                let koff = key_off as usize;
-                let voff = val_off as usize;
-                self.arena[koff..koff + kl].copy_from_slice(&key[..kl]);
-                self.arena[voff..voff + vl].copy_from_slice(&val[..vl]);
-                self.arena_len = voff + vl;
-                self.slots[dead] = Slot {
-                    key_off,
-                    key_len,
-                    val_off,
-                    val_len,
-                    seq,
-                    tombstone,
-                    dead: false,
-                };
-            }
-            Plan::NewSlot {
-                pos,
-                kill,
-                key_off,
-                key_len,
-                val_off,
-                val_len,
-            } => {
-                if let Some(k) = kill {
-                    self.slots[k].dead = true;
-                }
-                let kl = usize::from(key_len);
-                let vl = usize::from(val_len);
-                let koff = key_off as usize;
-                let voff = val_off as usize;
-                self.arena[koff..koff + kl].copy_from_slice(&key[..kl]);
-                self.arena[voff..voff + vl].copy_from_slice(&val[..vl]);
-                self.arena_len = voff + vl;
-                self.slots.copy_within(pos..self.len, pos + 1);
-                self.slots[pos] = Slot {
-                    key_off,
-                    key_len,
-                    val_off,
-                    val_len,
-                    seq,
-                    tombstone,
-                    dead: false,
-                };
-                self.len += 1;
-            }
-        }
+        let Plan {
+            pos,
+            key_off,
+            key_len,
+            val_off,
+            val_len,
+        } = plan;
+        let kl = usize::from(key_len);
+        let vl = usize::from(val_len);
+        let koff = key_off as usize;
+        let voff = val_off as usize;
+        self.arena[koff..koff + kl].copy_from_slice(&key[..kl]);
+        self.arena[voff..voff + vl].copy_from_slice(&val[..vl]);
+        self.arena_len = voff + vl;
+        self.slots.copy_within(pos..self.len, pos + 1);
+        self.slots[pos] = Slot {
+            key_off,
+            key_len,
+            val_off,
+            val_len,
+            seq,
+            tombstone,
+        };
+        self.len += 1;
         if seq > self.max_seq {
             self.max_seq = seq;
         }
@@ -407,7 +305,9 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         Ok(())
     }
 
-    /// Inserts or supersedes `key`. Tombstone entries store no value bytes.
+    /// Appends `key`'s new version. Tombstone entries store no value bytes.
+    /// The caller must assign increasing sequence numbers; the run stays
+    /// newest-first only then.
     ///
     /// # Errors
     ///
@@ -425,23 +325,38 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         Ok(())
     }
 
-    /// Looks up `key`, returning the newest live entry, if any.
+    /// Looks up `key`, returning the newest entry, if any.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<Lookup<'_>> {
-        let any = self.find(key).ok()?;
-        let (live, _, _) = self.scan_run(any, key);
-        let slot = &self.slots[live?];
-        let voff = slot.val_off as usize;
-        let vl = usize::from(slot.val_len);
-        Some(Lookup {
-            val: &self.arena[voff..voff + vl],
-            seq: slot.seq,
-            tombstone: slot.tombstone,
-        })
+        self.get_at(key, u64::MAX)
     }
 
-    /// Iterates live entries in key-ascending order (dead slots skipped).
-    /// Used by flush to drain the table into an `SSTable`.
+    /// Looks up `key` as of `max_seq`: the newest version with
+    /// `seq <= max_seq`, if any. `u64::MAX` is the live view.
+    #[must_use]
+    pub fn get_at(&self, key: &[u8], max_seq: u64) -> Option<Lookup<'_>> {
+        let mut idx = self.find_run(key).ok()?;
+        while idx < self.len {
+            let slot = &self.slots[idx];
+            if self.slot_key(slot) != key {
+                break;
+            }
+            if slot.seq <= max_seq {
+                let voff = slot.val_off as usize;
+                let vl = usize::from(slot.val_len);
+                return Some(Lookup {
+                    val: &self.arena[voff..voff + vl],
+                    seq: slot.seq,
+                    tombstone: slot.tombstone,
+                });
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    /// Iterates entries in key-ascending, sequence-descending order. Used
+    /// by flush to drain the table into an `SSTable`.
     #[must_use]
     pub const fn iter(&self) -> Iter<'_, CAP, ARENA, KEY_MAX, VAL_MAX> {
         Iter {
@@ -449,6 +364,53 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             idx: 0,
         }
     }
+
+    /// Number of slots. The scan iterator walks slots by index; the borrow
+    /// on the database (not documentation) is what keeps those indices
+    /// valid for the scan's lifetime.
+    #[must_use]
+    pub(crate) const fn slot_len(&self) -> usize {
+        self.len
+    }
+
+    /// The entry at `idx`, or `None` for out-of-range indices.
+    #[must_use]
+    pub(crate) fn slot_view(&self, idx: usize) -> Option<SlotView<'_>> {
+        let slot = self.slots[..self.len].get(idx)?;
+        let koff = slot.key_off as usize;
+        let kl = usize::from(slot.key_len);
+        let voff = slot.val_off as usize;
+        let vl = usize::from(slot.val_len);
+        Some(SlotView {
+            key: &self.arena[koff..koff + kl],
+            val: &self.arena[voff..voff + vl],
+            seq: slot.seq,
+            tombstone: slot.tombstone,
+        })
+    }
+
+    /// First slot index whose key is `>= key`: a key's run start when the
+    /// key is present, the sorted insertion point when it is absent.
+    #[must_use]
+    pub(crate) fn lower_bound(&self, key: &[u8]) -> usize {
+        match self.find_run(key) {
+            Ok(start) => start,
+            Err(pos) => pos,
+        }
+    }
+}
+
+/// Crate-internal view of one memtable slot, for the scan iterator.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlotView<'a> {
+    /// Key bytes.
+    pub key: &'a [u8],
+    /// Value bytes (empty for tombstones).
+    pub val: &'a [u8],
+    /// Sequence number of the mutation that wrote this entry.
+    pub seq: u64,
+    /// True when this entry is a deletion marker.
+    pub tombstone: bool,
 }
 
 impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize>

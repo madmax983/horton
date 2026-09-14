@@ -87,6 +87,31 @@ enum Best {
     Value(usize),
 }
 
+/// Accumulator for [`Db::get_at`]'s multi-table read: the winning staged
+/// value bytes plus the sequence that won them. Bundled into one struct so
+/// `consider_table` stays under the argument-count lint; table lookups
+/// copy into a per-table buffer first, and only a winning hit is promoted
+/// into `stage`, so a losing hit can never clobber the winner.
+struct ReadAcc<const VAL_MAX: usize> {
+    stage: [u8; VAL_MAX],
+    best: Best,
+    best_seq: u64,
+}
+
+impl<const VAL_MAX: usize> ReadAcc<VAL_MAX> {
+    const fn new() -> Self {
+        Self {
+            stage: [0u8; VAL_MAX],
+            best: Best::Missing,
+            best_seq: 0,
+        }
+    }
+}
+
+/// Maximum live snapshots. Snapshot slots are plain `u64`s in the `Db`;
+/// the bound keeps that state tiny and the exhaustion error explicit.
+pub(crate) const MAX_SNAPSHOTS: usize = 8;
+
 /// The database handle. Owns the WAL writer (and through it, the device),
 /// the memtable, the manifest, and the table-region allocator (bump pointer
 /// plus free list of reclaimed blocks).
@@ -109,6 +134,14 @@ pub struct Db<
     tbl_free: FreeList<FREELIST>,
     cfg: Config,
     next_seq: u64,
+    /// Live snapshot watermarks (sequence numbers). A snapshot pins reads
+    /// to mutations with `seq <= watermark`; while any snapshot is live,
+    /// compaction must not drop a tombstone at or above the oldest
+    /// watermark. Bounded: [`MAX_SNAPSHOTS`] live snapshots, then
+    /// [`Error::NoSpace`]. Snapshots are in-memory only — they do not
+    /// survive `open()`.
+    snapshots: [u64; MAX_SNAPSHOTS],
+    n_snapshots: usize,
     /// Block-read buffer for [`Db::get`]. A read fills every byte before
     /// `get` reads it. A zeroed buffer on each call would waste work.
     /// Calls reuse this buffer instead.
@@ -170,6 +203,8 @@ impl<
             tbl_free: FreeList::new(),
             cfg: config,
             next_seq: 0,
+            snapshots: [0u64; MAX_SNAPSHOTS],
+            n_snapshots: 0,
             get_scratch: RefCell::new([0u8; BLOCK]),
         }
     }
@@ -178,6 +213,71 @@ impl<
     #[must_use]
     pub fn into_device(self) -> D {
         self.wal.into_device()
+    }
+
+    /// Takes a snapshot: registers the current sequence watermark and
+    /// returns it. Reads pinned to the watermark (`get_at`, `Scan::seek`
+    /// with `max_seq`) see exactly the mutations with `seq <= watermark`,
+    /// however much is written afterwards. While the snapshot is live,
+    /// compaction retains any tombstone a read at the watermark could
+    /// observe. Release with [`release_snapshot`](Db::release_snapshot);
+    /// snapshots are in-memory only and do not survive `open()`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when [`MAX_SNAPSHOTS`] snapshots are already live.
+    pub const fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
+        if self.n_snapshots >= MAX_SNAPSHOTS {
+            return Err(Error::NoSpace);
+        }
+        let snap = self.next_seq;
+        self.snapshots[self.n_snapshots] = snap;
+        self.n_snapshots += 1;
+        Ok(snap)
+    }
+
+    /// Releases a snapshot taken by [`snapshot`](Db::snapshot), freeing its
+    /// slot so compaction may drop tombstones again. Releasing an unknown
+    /// watermark is a no-op.
+    pub const fn release_snapshot(&mut self, snap: u64) {
+        let mut i = 0;
+        while i < self.n_snapshots {
+            if self.snapshots[i] == snap {
+                self.n_snapshots -= 1;
+                self.snapshots[i] = self.snapshots[self.n_snapshots];
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Oldest live snapshot watermark, or `u64::MAX` when none is live.
+    /// Compaction captures this at select time as the tombstone-drop floor.
+    pub(crate) const fn oldest_snapshot_seq(&self) -> u64 {
+        let mut min = u64::MAX;
+        let mut i = 0;
+        while i < self.n_snapshots {
+            if self.snapshots[i] < min {
+                min = self.snapshots[i];
+            }
+            i += 1;
+        }
+        min
+    }
+
+    /// The device, for the scan iterator's block reads.
+    pub(crate) const fn device(&self) -> &D {
+        self.wal.device()
+    }
+
+    /// The memtable, for the scan iterator's memtable cursor.
+    pub(crate) const fn memtable(&self) -> &MemTable<CAP, ARENA, KEY_MAX, VAL_MAX> {
+        &self.table
+    }
+
+    /// The manifest, for the scan iterator's table cursors.
+    pub(crate) const fn manifest_ref(&self) -> &Manifest<LEVELS, TABLES, KEY_MAX> {
+        &self.manifest
     }
 
     /// Opens the database: recovers the manifest, rebuilds the table-region
@@ -282,11 +382,8 @@ impl<
     }
 
     /// Reads `key` into `val_buf`: memtable first, then level 0 newest table
-    /// first, then deeper levels in order. Every table is key-range pruned
-    /// (no I/O when the key falls outside its bounds), bloom-gated, and
-    /// sequence-pruned (no I/O when its `max_seq` cannot beat the best hit
-    /// so far). The hit with the highest sequence number wins; a tombstone
-    /// there hides every older version.
+    /// first, then deeper levels in order. This is
+    /// [`get_at`](Db::get_at) with `max_seq = u64::MAX`: the latest view.
     ///
     /// Returns `Ok(None)` for missing keys and tombstones. Never truncates:
     /// an undersized buffer yields [`Error::BufferTooSmall`] with the
@@ -308,21 +405,52 @@ impl<
         key: &[u8],
         val_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<D::Error>> {
+        self.get_at(key, val_buf, u64::MAX).await
+    }
+
+    /// Reads `key` into `val_buf` as of a snapshot: like [`get`](Db::get),
+    /// but only mutations with `seq <= max_seq` are visible. Newer versions
+    /// (including newer tombstones) are invisible, so an older value — or
+    /// a missing key — can correctly win. Pass a watermark from
+    /// [`snapshot`](Db::snapshot) for a pinned read, or `u64::MAX` for the
+    /// latest view.
+    ///
+    /// Returns `Ok(None)` for missing keys and tombstones. Never truncates:
+    /// an undersized buffer yields [`Error::BufferTooSmall`] with the
+    /// required length — the length of the *winning* value, even when an
+    /// older shadowed version would have fit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the winning
+    /// value, [`Error::CorruptManifest`] when a table's block range is
+    /// malformed, [`Error::CorruptBlock`] when a table's index or footer
+    /// fails verification, or [`Error::Device`] on I/O failure.
+    // This call holds `get_scratch`'s borrow across its own awaits.
+    // `try_borrow_mut` stops two calls from holding this borrow at once.
+    // So the lint does not apply here.
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub async fn get_at(
+        &self,
+        key: &[u8],
+        val_buf: &mut [u8],
+        max_seq: u64,
+    ) -> Result<Option<usize>, Error<D::Error>> {
         // The winning value's bytes are staged here; table lookups copy
         // into a per-table buffer first so a losing hit can never clobber
         // the winner. Values are at most VAL_MAX bytes (enforced on the
         // write path), so the staging always fits.
-        let mut stage = [0u8; VAL_MAX];
-        let mut best = Best::Missing;
-        let mut best_seq = 0u64;
+        let mut acc = ReadAcc::<VAL_MAX>::new();
 
-        if let Some(entry) = self.table.get(key) {
-            best_seq = entry.seq;
+        if let Some(entry) = self.table.get_at(key, max_seq) {
+            // The memtable holds the newest mutations; `get_at` already
+            // selected the newest version at or below the snapshot.
+            acc.best_seq = entry.seq;
             if entry.tombstone {
-                best = Best::Tombstone;
+                acc.best = Best::Tombstone;
             } else {
-                stage[..entry.val.len()].copy_from_slice(entry.val);
-                best = Best::Value(entry.val.len());
+                acc.stage[..entry.val.len()].copy_from_slice(entry.val);
+                acc.best = Best::Value(entry.val.len());
             }
         }
 
@@ -339,7 +467,7 @@ impl<
         // Level 0, newest table first: its tables overlap, and newer tables
         // hold higher sequence numbers.
         for tref in self.manifest.l0().iter().rev() {
-            self.consider_table(tref, key, scratch, &mut stage, &mut best, &mut best_seq)
+            self.consider_table(tref, key, max_seq, scratch, &mut acc)
                 .await?;
         }
         // Deeper levels in order. Highest-seq-wins keeps the result exact
@@ -349,38 +477,37 @@ impl<
             // `li < LEVELS` by construction; the fallback is unreachable.
             let tables = self.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
-                self.consider_table(tref, key, scratch, &mut stage, &mut best, &mut best_seq)
+                self.consider_table(tref, key, max_seq, scratch, &mut acc)
                     .await?;
             }
         }
 
-        match best {
+        match acc.best {
             Best::Missing | Best::Tombstone => Ok(None),
             Best::Value(len) => {
                 if len > val_buf.len() {
                     return Err(Error::BufferTooSmall { need: len });
                 }
-                val_buf[..len].copy_from_slice(&stage[..len]);
+                val_buf[..len].copy_from_slice(&acc.stage[..len]);
                 Ok(Some(len))
             }
         }
     }
 
-    /// Considers one table for [`Db::get`]: key-range prune, sequence prune,
+    /// Considers one table for [`Db::get_at`]: key-range prune, sequence prune,
     /// then a bloom-gated lookup. A hit with a higher sequence number than
-    /// the best so far is promoted into `stage`/`best`/`best_seq`.
+    /// the best so far — and visible at `max_seq` — is promoted into `acc`.
     async fn consider_table(
         &self,
         tref: &TableRef<KEY_MAX>,
         key: &[u8],
+        max_seq: u64,
         scratch: &mut [u8; BLOCK],
-        stage: &mut [u8; VAL_MAX],
-        best: &mut Best,
-        best_seq: &mut u64,
+        acc: &mut ReadAcc<VAL_MAX>,
     ) -> Result<(), Error<D::Error>> {
         // Both prunes are exact: the table's keys all lie within its bounds,
         // and no entry here can carry a seq above the table's max.
-        if !tref.covers(key) || tref.max_seq <= *best_seq {
+        if !tref.covers(key) || tref.max_seq <= acc.best_seq {
             return Ok(());
         }
         let footer = tref
@@ -391,18 +518,18 @@ impl<
         let reader =
             sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open(self.wal.device(), scratch, footer)
                 .await?;
-        // `tmp` (not `stage`) receives the value: only a winning hit is
+        // `tmp` (not `acc.stage`) receives the value: only a winning hit is
         // promoted, so a losing hit cannot clobber the staged winner.
         let mut tmp = [0u8; VAL_MAX];
-        match reader.lookup(scratch, key, &mut tmp).await? {
-            sstable::Lookup::Value { len, seq } if seq > *best_seq => {
-                *best_seq = seq;
-                stage[..len].copy_from_slice(&tmp[..len]);
-                *best = Best::Value(len);
+        match reader.lookup_at(scratch, key, &mut tmp, max_seq).await? {
+            sstable::Lookup::Value { len, seq } if seq > acc.best_seq && seq <= max_seq => {
+                acc.best_seq = seq;
+                acc.stage[..len].copy_from_slice(&tmp[..len]);
+                acc.best = Best::Value(len);
             }
-            sstable::Lookup::Tombstone { seq } if seq > *best_seq => {
-                *best_seq = seq;
-                *best = Best::Tombstone;
+            sstable::Lookup::Tombstone { seq } if seq > acc.best_seq && seq <= max_seq => {
+                acc.best_seq = seq;
+                acc.best = Best::Tombstone;
             }
             _ => {}
         }
@@ -618,6 +745,26 @@ impl<
         }
     }
 
+    /// Live snapshot watermarks, sorted descending. At most
+    /// [`MAX_SNAPSHOTS`] items, so insertion sort is trivially bounded.
+    const fn sorted_snapshot_watermarks(&self) -> ([u64; MAX_SNAPSHOTS], usize) {
+        let mut n = 0usize;
+        let mut sorted = [0u64; MAX_SNAPSHOTS];
+        let mut j = 0usize;
+        while j < self.n_snapshots {
+            let s = self.snapshots[j];
+            let mut i = n;
+            while i > 0 && sorted[i - 1] < s {
+                sorted[i] = sorted[i - 1];
+                i -= 1;
+            }
+            sorted[i] = s;
+            n += 1;
+            j += 1;
+        }
+        (sorted, n)
+    }
+
     /// Selects the next compaction job into `scratch`: all of L0 plus the
     /// L1 tables overlapping the merged key range. Returns `false` when L0
     /// is not full and there is no work.
@@ -717,6 +864,16 @@ impl<
         c.from_free = from_free;
         c.target_level = 1;
         c.bottommost = bottommost;
+        // The version-retention set: snapshots live at select time pin this
+        // compaction's keep-set. Watermarks are stored descending so the
+        // merge can walk its thresholds (live view, then each snapshot) in
+        // order. A snapshot taken mid-compaction always has a seq above
+        // every version being merged, so the select-time set is exactly the
+        // history that needs protection.
+        let (sorted, n) = self.sorted_snapshot_watermarks();
+        c.snapshots = sorted;
+        c.n_snapshots = n;
+        c.oldest_snapshot = self.oldest_snapshot_seq();
         c.n_inputs = n_inputs;
         c.writer =
             sstable::TableWriter::new(out_base, sstable::bloom_k(BLOOM_BYTES * 8, total_entries));

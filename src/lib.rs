@@ -27,6 +27,8 @@ pub mod device;
 pub mod error;
 pub mod manifest;
 pub mod memtable;
+pub mod model;
+pub mod scan;
 pub mod sstable;
 pub mod wal;
 
@@ -38,6 +40,7 @@ pub use device::BlockDevice;
 pub use error::Error;
 pub use manifest::{KeyBound, Level, Manifest, TableRef, MANIFEST_MAGIC};
 pub use memtable::{Entry as MemTableEntry, MemTable};
+pub use scan::Scan;
 pub use sstable::{
     bloom_k, bloom_maybe_contains, plan_table, write_table, Lookup as SstLookup, SstEntry,
     TablePlan, TableReader, SSTABLE_MAGIC,

@@ -15,14 +15,16 @@
 //! `open()` sweep, while the input tables stay referenced; a fresh scratch
 //! simply selects the job again.
 //!
-//! Compaction preserves the read path's highest-sequence-wins rule: when
-//! several inputs hold the same key, the entry with the highest sequence
-//! number survives. Tombstones drop the key, and a tombstone itself is
-//! dropped only when the output reaches the bottommost level holding the
-//! merged key range — nothing below can hide an older version there.
+//! Compaction preserves the read path's visibility rule: each key keeps
+//! the newest version (the live view) plus the newest version at or below
+//! each live snapshot's watermark — older versions are dead to every reader
+//! and are not emitted. A bottommost tombstone older than every live
+//! snapshot drops the whole key: nothing below can hide an older version,
+//! and deletion is observationally identical to absence there.
 
 use core::future::poll_fn;
 
+use crate::db::MAX_SNAPSHOTS;
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, TableRef};
@@ -38,6 +40,21 @@ pub enum Progress {
     Done,
     /// The job made bounded progress (one output block sealed); call again.
     More,
+}
+
+/// Merge state of the key currently being compacted. A sealed output block
+/// may interrupt a key mid-versions; [`KeyState`] plus the `served` flags
+/// resume it exactly. `Dropping` implies the key is active: the whole key
+/// is being discarded (bottommost tombstone older than every live
+/// snapshot), so the two booleans it replaces could never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyState {
+    /// No key is being merged (between keys, or the job just started).
+    Idle,
+    /// Merging versions of `key`; thresholds in `served` are being filled.
+    Merging,
+    /// The active key's versions are all dropped.
+    Dropping,
 }
 
 /// Caller-owned scratch driving one compaction job at a time.
@@ -57,13 +74,42 @@ pub struct Compaction<
     pub(crate) inputs: [Input<KEY_MAX>; COMPACTION_KMAX],
     pub(crate) n_inputs: usize,
     pub(crate) target_level: usize,
+    /// True when the output level is the bottommost one holding the merged
+    /// key range: a tombstone there shadows nothing below and may be
+    /// dropped — unless a live snapshot could still observe it (see
+    /// `oldest_snapshot`).
     pub(crate) bottommost: bool,
+    /// Live snapshot watermarks at select time, sorted descending. The
+    /// merge's per-key keep-set is the newest version (the live view) plus
+    /// the newest version at or below each watermark; older versions are
+    /// dead to every reader and are not emitted.
+    pub(crate) snapshots: [u64; MAX_SNAPSHOTS],
+    /// How many entries of [`snapshots`](Self::snapshots) are live.
+    pub(crate) n_snapshots: usize,
+    /// Oldest live snapshot sequence at select time (`u64::MAX` when no
+    /// snapshot is live). A bottommost tombstone is dropped only when its
+    /// seq is below this floor: then every snapshot's visible version of
+    /// the key is the tombstone itself, so the keep-set is just it, and
+    /// deletion is observationally identical to absence. Captured at
+    /// `compact_select`; a snapshot taken mid-compaction always has
+    /// `seq >=` every version being merged, so it can never observe the
+    /// difference.
+    pub(crate) oldest_snapshot: u64,
     pub(crate) out_base: u64,
     pub(crate) out_blocks: u64,
     pub(crate) out_len: usize,
     pub(crate) from_free: bool,
     pub(crate) writer: TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>,
     pub(crate) cursors: [Cursor<BLOCK, KEY_MAX, VAL_MAX>; COMPACTION_KMAX],
+    /// The key currently being merged: a sealed output block may interrupt
+    /// a key mid-versions, and matching on these bytes resumes it exactly
+    /// (thresholds already served are not served twice).
+    key: [u8; KEY_MAX],
+    key_len: usize,
+    key_state: KeyState,
+    /// Thresholds served for [`key`](Self::key): index 0 is the live view
+    /// (`u64::MAX`), indices `1..=n_snapshots` are the snapshots.
+    served: [bool; MAX_SNAPSHOTS + 1],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,12 +204,19 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             n_inputs: 0,
             target_level: 0,
             bottommost: false,
+            snapshots: [0u64; MAX_SNAPSHOTS],
+            n_snapshots: 0,
+            oldest_snapshot: u64::MAX,
             out_base: 0,
             out_blocks: 0,
             out_len: 0,
             from_free: false,
             writer: TableWriter::new(0, 0),
             cursors: [Cursor::EMPTY; COMPACTION_KMAX],
+            key: [0u8; KEY_MAX],
+            key_len: 0,
+            key_state: KeyState::Idle,
+            served: [false; MAX_SNAPSHOTS + 1],
         }
     }
 
@@ -173,10 +226,20 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
     pub(crate) const fn reset(&mut self) {
         self.state = State::Idle;
         self.n_inputs = 0;
+        self.key_state = KeyState::Idle;
     }
 
     /// One bounded merge quantum: pushes merged entries into the output
     /// table until one output block seals, or every input is exhausted.
+    ///
+    /// Each key's versions surface newest-first, one per loop iteration:
+    /// the iteration's head (highest sequence among the cursors tied on
+    /// the minimum key) is emitted exactly when an unserved threshold —
+    /// the live view, then each snapshot, descending — covers it. That
+    /// emission then serves every threshold the version satisfies, which
+    /// is precisely the keep-set: the newest version plus the newest
+    /// version at or below each snapshot. A sealed block may interrupt a
+    /// key mid-versions; the per-key state resumes it exactly.
     ///
     /// # Errors
     ///
@@ -188,72 +251,124 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         device: &mut D,
     ) -> Result<MergeOutcome, Error<D::Error>> {
         loop {
-            // The live cursor on the minimum key; among ties the highest
-            // sequence wins. KMAX = 8, so a linear scan is trivially
-            // bounded — and unlike a heap it cannot hold stale entries for
-            // exhausted cursors.
+            // The live cursor on the minimum key. KMAX = 8, so a linear
+            // scan is trivially bounded — and unlike a heap it cannot hold
+            // stale entries for exhausted cursors.
             let mut best = COMPACTION_KMAX;
-            let mut tied = [false; COMPACTION_KMAX];
             for ci in 0..self.n_inputs {
                 if !self.cursors[ci].live {
                     continue;
                 }
                 if best == COMPACTION_KMAX {
                     best = ci;
-                    tied[ci] = true;
                     continue;
                 }
-                let ord = self.cursors[ci].key[..self.cursors[ci].key_len]
-                    .cmp(&self.cursors[best].key[..self.cursors[best].key_len]);
-                match ord {
-                    core::cmp::Ordering::Less => {
-                        best = ci;
-                        tied = [false; COMPACTION_KMAX];
-                        tied[ci] = true;
-                    }
-                    core::cmp::Ordering::Equal => {
-                        tied[ci] = true;
-                        if self.cursors[ci].seq > self.cursors[best].seq {
-                            best = ci;
-                        }
-                    }
-                    core::cmp::Ordering::Greater => {}
+                if self.cursors[ci].key[..self.cursors[ci].key_len]
+                    < self.cursors[best].key[..self.cursors[best].key_len]
+                {
+                    best = ci;
                 }
             }
             if best == COMPACTION_KMAX {
+                self.key_state = KeyState::Idle;
                 return Ok(MergeOutcome::Exhausted);
             }
-            // Advance every tied loser past the consumed key. The winner
-            // stays parked until its entry is safely in the output.
+            // This iteration's head: the highest sequence among the cursors
+            // tied on the minimum key. Each cursor sits at its table's
+            // version-run start and runs are newest-first, so the head is
+            // the newest version not yet processed for this key.
+            let mut head = best;
             for ci in 0..self.n_inputs {
-                if tied[ci] && ci != best {
-                    advance_cursor(&*device, &mut self.cursors[ci]).await?;
+                if !self.cursors[ci].live || ci == best {
+                    continue;
+                }
+                let tied = self.cursors[ci].key[..self.cursors[ci].key_len]
+                    == self.cursors[best].key[..self.cursors[best].key_len];
+                if tied && self.cursors[ci].seq > self.cursors[head].seq {
+                    head = ci;
                 }
             }
-            // The winner survives — unless it is a tombstone whose key
-            // range reached the bottommost level, where nothing below can
-            // hold an older version of the key.
-            let (tombstone, seq, key_len, val_len) = {
-                let c = &self.cursors[best];
-                (c.tombstone, c.seq, c.key_len, c.val_len)
-            };
-            if tombstone && self.bottommost {
-                advance_cursor(&*device, &mut self.cursors[best]).await?;
-                continue;
+            // New key: (re)start the per-key threshold state. After a
+            // mid-key seal the bytes match and the served flags resume the
+            // key exactly where it stopped.
+            let hkey_len = self.cursors[best].key_len;
+            if self.key_state == KeyState::Idle
+                || self.key_len != hkey_len
+                || self.key[..hkey_len] != self.cursors[best].key[..hkey_len]
+            {
+                self.key[..hkey_len].copy_from_slice(&self.cursors[best].key[..hkey_len]);
+                self.key_len = hkey_len;
+                self.key_state = KeyState::Merging;
+                self.served = [false; MAX_SNAPSHOTS + 1];
+                // Bottommost tombstone drop: the head is the key's newest
+                // version. Dropping the whole key is safe exactly when the
+                // tombstone predates every live snapshot — then each
+                // snapshot's visible version is the tombstone itself, the
+                // keep-set is just it, and deletion is observationally
+                // identical to absence.
+                let c = &self.cursors[head];
+                if self.bottommost && c.tombstone && c.seq < self.oldest_snapshot {
+                    self.key_state = KeyState::Dropping;
+                }
             }
-            let sealed = {
-                let c = &self.cursors[best];
-                let e = SstEntry {
-                    key: &c.key[..key_len],
-                    val: &c.val[..val_len],
-                    seq,
-                    tombstone,
-                };
-                self.writer.push(device, e).await?
+            let (seq, tombstone, val_len) = {
+                let c = &self.cursors[head];
+                (c.seq, c.tombstone, c.val_len)
             };
-            advance_cursor(&*device, &mut self.cursors[best]).await?;
-            if sealed == PushOutcome::BlockSealed {
-                return Ok(MergeOutcome::More);
+            // The head is emitted when some unserved threshold covers it:
+            // threshold 0 is the live view, the rest are the snapshots.
+            let mut emit = false;
+            if self.key_state != KeyState::Dropping {
+                let mut ti = 0;
+                while ti < 1 + self.n_snapshots {
+                    let th = if ti == 0 {
+                        u64::MAX
+                    } else {
+                        self.snapshots[ti - 1]
+                    };
+                    if !self.served[ti] && seq <= th {
+                        emit = true;
+                        break;
+                    }
+                    ti += 1;
+                }
+            }
+            if emit {
+                let sealed = {
+                    let c = &self.cursors[head];
+                    let e = SstEntry {
+                        key: &c.key[..c.key_len],
+                        val: &c.val[..val_len],
+                        seq,
+                        tombstone,
+                    };
+                    self.writer.push(device, e).await?
+                };
+                // The emitted version is the newest at or below every
+                // threshold it satisfies (versions surface newest-first),
+                // so it serves all of them at once.
+                let mut ti = 0;
+                while ti < 1 + self.n_snapshots {
+                    let th = if ti == 0 {
+                        u64::MAX
+                    } else {
+                        self.snapshots[ti - 1]
+                    };
+                    if seq <= th {
+                        self.served[ti] = true;
+                    }
+                    ti += 1;
+                }
+                advance_cursor(&*device, &mut self.cursors[head]).await?;
+                if sealed == PushOutcome::BlockSealed {
+                    return Ok(MergeOutcome::More);
+                }
+            } else {
+                // Skipped (or the key is dropped): this version serves no
+                // threshold. Only the head advances — a tied cursor parked
+                // on an older version may still serve a smaller threshold
+                // on a later iteration.
+                advance_cursor(&*device, &mut self.cursors[head]).await?;
             }
         }
     }

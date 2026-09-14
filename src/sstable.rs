@@ -93,7 +93,7 @@ const RESTART_INTERVAL: u64 = 16;
 /// Restart offsets live in a fixed array: the per-block entry cap.
 const MAX_ENTRIES_PER_BLOCK: u64 = 128 * RESTART_INTERVAL;
 /// CRC32 bytes trailing every block.
-const CRC_LEN: usize = 4;
+pub(crate) const CRC_LEN: usize = 4;
 
 /// Validated entry sizes: `(total_len, key_len, val_len)`.
 ///
@@ -791,9 +791,27 @@ fn index_entry_parse(payload: &[u8], off: usize) -> Result<(&[u8], u64, usize), 
     Ok((key, block_id, next))
 }
 
-/// Binary-searches the index for the last data block with
-/// `first_key <= key`. Returns `None` when `key` sorts before every block.
-fn index_lookup<E>(payload: &[u8], key: &[u8], index_id: u64) -> Result<Option<u64>, Error<E>> {
+/// Binary-searches the index for the first data block that may hold `key`.
+/// Returns the block id and the maximum number of data blocks a point
+/// lookup may walk forward from it (the index entry count minus the
+/// resolved position: the walk stays inside the table), or `None` when
+/// `key` sorts before every block.
+/// `pub(crate)` for the scan iterator's seek positioning and the point
+/// lookup's cross-block run walk.
+///
+/// A key's version run can straddle data blocks: every block the run
+/// touches carries the key as its restart (first) key, and worse, a block
+/// can seal *inside* the run — so the block before the first duplicate
+/// restart can hold the run's newest versions. The search therefore lands
+/// on the last restart with `first_key <= key` and then walks back over
+/// every duplicate of `key`, ending at the last restart strictly below
+/// `key` (entry 0 stays put): the first block whose key range can contain
+/// `key`. Starting any later would miss the run's newest versions.
+pub(crate) fn index_lookup<E>(
+    payload: &[u8],
+    key: &[u8],
+    index_id: u64,
+) -> Result<Option<(u64, usize)>, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: index_id };
     // Count entries with one linear pass; the binary search below then
     // re-parses on demand (O(n log n) byte scans, no allocation). The
@@ -834,8 +852,56 @@ fn index_lookup<E>(payload: &[u8], key: &[u8], index_id: u64) -> Result<Option<u
     if lo == 0 {
         return Ok(None);
     }
-    let (_, block_id, _) = entry_at(lo - 1).map_err(|()| corrupt())?;
-    Ok(Some(block_id))
+    // `lo - 1`: last restart with `first_key <= key`. Walk back over
+    // duplicates of `key` — the run's newest versions live in the first
+    // block it touches, which can be the block *before* the first
+    // duplicate restart when a block seals mid-run.
+    let mut pos = lo - 1;
+    while pos > 0 {
+        let (fkey, _, _) = entry_at(pos).map_err(|()| corrupt())?;
+        if fkey != key {
+            break;
+        }
+        pos -= 1;
+    }
+    let (_, block_id, _) = entry_at(pos).map_err(|()| corrupt())?;
+    // The walk may visit every data block from `pos` onward — never past
+    // the table's last data block (whose readers must not stray into the
+    // bloom/index/footer blocks).
+    Ok(Some((block_id, count - pos)))
+}
+
+/// Reads and verifies a table footer, returning its index block id.
+/// Used by the scan iterator to position cursors via the block index
+/// without opening a full [`TableReader`].
+///
+/// # Errors
+///
+/// [`Error::CorruptBlock`] when the footer is missing or fails
+/// verification, or [`Error::Device`] on I/O failure.
+pub(crate) async fn footer_index_block<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    scratch: &mut [u8; BLOCK],
+    footer_block: u64,
+) -> Result<u64, Error<D::Error>> {
+    poll_fn(|cx| device.poll_read_block(cx, footer_block, scratch))
+        .await
+        .map_err(Error::Device)?;
+    check_block_crc::<D::Error, BLOCK>(scratch, footer_block)?;
+    let magic = u64::from_le_bytes(
+        scratch[0..8]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id: footer_block })?,
+    );
+    if magic != SSTABLE_MAGIC {
+        return Err(Error::CorruptBlock { id: footer_block });
+    }
+    let index_block = u64::from_le_bytes(
+        scratch[8..16]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id: footer_block })?,
+    );
+    Ok(index_block)
 }
 
 /// One parsed data-block entry, borrowing the block.
@@ -887,13 +953,31 @@ enum DataHit {
     Tombstone(u64),
 }
 
+/// What one data block contributed to a point lookup. A key's version run
+/// can straddle data blocks, so "not in this block" is not "not in the
+/// table": the caller walks forward while a block ends inside the run.
+enum BlockOutcome {
+    /// The newest version with `seq <= max_seq` was found in this block.
+    Hit(DataHit),
+    /// An entry larger than the key was seen: the key is absent from the
+    /// table — later blocks only hold larger keys.
+    Absent,
+    /// The block ended (or zero padding began) with no larger key seen:
+    /// the key was not found in this block, but its version run may
+    /// continue in the next data block.
+    Truncated,
+}
+
 /// Searches one data block: restart-point binary search, then a linear scan.
+/// Selects the newest version with `seq <= max_seq`, reporting [`BlockOutcome`]
+/// so the caller can continue a version run into the next data block.
 fn data_lookup<E>(
     payload: &[u8],
     key: &[u8],
     val_buf: &mut [u8],
     block_id: u64,
-) -> Result<Option<DataHit>, Error<E>> {
+    max_seq: u64,
+) -> Result<BlockOutcome, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: block_id };
     if payload.len() < 6 {
         return Err(corrupt());
@@ -917,15 +1001,17 @@ fn data_lookup<E>(
             Some(roff)
         }
     };
-    // Binary search over restart points: the last restart whose entry key
-    // does not sort after `key`.
+    // Binary search over restart points: the first restart whose entry key
+    // sorts at or after `key`. A key's version run is contiguous and newest
+    // first, so the run starts at or after the previous restart — stepping
+    // back one (saturating) can never skip the run's first entry.
     let mut lo = 0usize;
     let mut hi = rcount;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let roff = restart_at(mid).ok_or_else(corrupt)?;
         let (entry, _) = data_entry_parse(payload, roff).map_err(|()| corrupt())?;
-        if entry.key <= key {
+        if entry.key < key {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -938,11 +1024,13 @@ fn data_lookup<E>(
     };
     while off < rstart {
         // The block's CRC already passed. Genuine zero padding (all zeros
-        // up to the restart tail) means the key is absent from this block;
-        // any other unparseable structure is corruption, not padding.
+        // up to the restart tail) means the block's entries end here — the
+        // key may still continue in the next data block, so this is
+        // `Truncated`, not `Absent`. Any other unparseable structure is
+        // corruption, not padding.
         let Ok((entry, next)) = data_entry_parse(payload, off) else {
             return if all_zero(&payload[off..rstart]) {
-                Ok(None)
+                Ok(BlockOutcome::Truncated)
             } else {
                 Err(corrupt())
             };
@@ -950,21 +1038,50 @@ fn data_lookup<E>(
         match entry.key.cmp(key) {
             core::cmp::Ordering::Less => off = next,
             core::cmp::Ordering::Equal => {
-                if entry.op == Op::Delete {
-                    return Ok(Some(DataHit::Tombstone(entry.seq)));
+                // Version run, newest first: this read observes the first
+                // entry with `seq <= max_seq`. Entries are contiguous, so a
+                // parse failure inside the run is corruption — except for
+                // genuine zero padding at the entries end, which means the
+                // run may continue in the next data block (`Truncated`).
+                // Reaching a larger key ends the run: `Absent`.
+                let (mut entry, mut next) = (entry, next);
+                loop {
+                    if entry.seq <= max_seq {
+                        if entry.op == Op::Delete {
+                            return Ok(BlockOutcome::Hit(DataHit::Tombstone(entry.seq)));
+                        }
+                        if entry.val.len() > val_buf.len() {
+                            return Err(Error::BufferTooSmall {
+                                need: entry.val.len(),
+                            });
+                        }
+                        val_buf[..entry.val.len()].copy_from_slice(entry.val);
+                        return Ok(BlockOutcome::Hit(DataHit::Value(
+                            entry.val.len(),
+                            entry.seq,
+                        )));
+                    }
+                    off = next;
+                    if off >= rstart {
+                        return Ok(BlockOutcome::Truncated);
+                    }
+                    let Ok((e, n)) = data_entry_parse(payload, off) else {
+                        return if all_zero(&payload[off..rstart]) {
+                            Ok(BlockOutcome::Truncated)
+                        } else {
+                            Err(corrupt())
+                        };
+                    };
+                    if e.key != key {
+                        return Ok(BlockOutcome::Absent);
+                    }
+                    (entry, next) = (e, n);
                 }
-                if entry.val.len() > val_buf.len() {
-                    return Err(Error::BufferTooSmall {
-                        need: entry.val.len(),
-                    });
-                }
-                val_buf[..entry.val.len()].copy_from_slice(entry.val);
-                return Ok(Some(DataHit::Value(entry.val.len(), entry.seq)));
             }
-            core::cmp::Ordering::Greater => return Ok(None),
+            core::cmp::Ordering::Greater => return Ok(BlockOutcome::Absent),
         }
     }
-    Ok(None)
+    Ok(BlockOutcome::Truncated)
 }
 
 /// Result of a point lookup in one table, carrying the entry's sequence
@@ -1052,8 +1169,10 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     }
 
     /// Looks `key` up: bloom gate → index binary search → data block
-    /// restart-point search. Tombstones and misses both yield `Ok(None)`;
-    /// use [`lookup`](TableReader::lookup) when the distinction matters.
+    /// restart-point search, selecting the newest version. Tombstones and
+    /// misses both yield `Ok(None)`; use [`lookup`](TableReader::lookup)
+    /// when the distinction matters. This is the live view — it is
+    /// [`get_at`](TableReader::get_at) with `max_seq = u64::MAX`.
     ///
     /// # Errors
     ///
@@ -1066,14 +1185,36 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         key: &[u8],
         val_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<D::Error>> {
-        Ok(match self.lookup(scratch, key, val_buf).await? {
-            Lookup::Value { len, .. } => Some(len),
-            Lookup::Tombstone { .. } | Lookup::Missing => None,
-        })
+        self.get_at(scratch, key, val_buf, u64::MAX).await
+    }
+
+    /// Snapshot read: like [`get`](TableReader::get), but observes only
+    /// versions with `seq <= max_seq`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the value,
+    /// [`Error::CorruptBlock`] when the index block fails verification, or
+    /// [`Error::Device`] on I/O failure.
+    pub async fn get_at(
+        &self,
+        scratch: &mut [u8; BLOCK],
+        key: &[u8],
+        val_buf: &mut [u8],
+        max_seq: u64,
+    ) -> Result<Option<usize>, Error<D::Error>> {
+        Ok(
+            match self.lookup_at(scratch, key, val_buf, max_seq).await? {
+                Lookup::Value { len, .. } => Some(len),
+                Lookup::Tombstone { .. } | Lookup::Missing => None,
+            },
+        )
     }
 
     /// Looks `key` up, distinguishing a live value from a deletion marker:
-    /// bloom gate → index binary search → data block restart-point search.
+    /// bloom gate → index binary search → data block restart-point search,
+    /// selecting the newest version. This is the live view — it is
+    /// [`lookup_at`](TableReader::lookup_at) with `max_seq = u64::MAX`.
     /// A corrupt bloom block only disables the gate, never the lookup.
     ///
     /// # Errors
@@ -1086,6 +1227,28 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         scratch: &mut [u8; BLOCK],
         key: &[u8],
         val_buf: &mut [u8],
+    ) -> Result<Lookup, Error<D::Error>> {
+        self.lookup_at(scratch, key, val_buf, u64::MAX).await
+    }
+
+    /// Snapshot read: like [`lookup`](TableReader::lookup), but observes
+    /// only versions with `seq <= max_seq` (`u64::MAX` is the live view).
+    /// A key's version run can straddle data blocks, and a `max_seq` can
+    /// hide every version in the run's first block, so the search walks
+    /// forward across data blocks while a block ends inside the run.
+    /// A corrupt bloom block only disables the gate, never the lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the value,
+    /// [`Error::CorruptBlock`] when the index block fails verification, or
+    /// [`Error::Device`] on I/O failure.
+    pub async fn lookup_at(
+        &self,
+        scratch: &mut [u8; BLOCK],
+        key: &[u8],
+        val_buf: &mut [u8],
+        max_seq: u64,
     ) -> Result<Lookup, Error<D::Error>> {
         let device = self.device;
         // Bloom gate (advisory: corruption just disables the optimization,
@@ -1104,24 +1267,41 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             .map_err(Error::Device)?;
         check_block_crc::<D::Error, BLOCK>(scratch, self.index_block)?;
         let payload_end = BLOCK - CRC_LEN;
-        let Some(block_id) =
+        let Some((mut block_id, mut remaining)) =
             index_lookup::<D::Error>(&scratch[..payload_end], key, self.index_block)?
         else {
             return Ok(Lookup::Missing);
         };
-        // Data: a torn block is treated as absent.
-        poll_fn(|cx| device.poll_read_block(cx, block_id, scratch))
-            .await
-            .map_err(Error::Device)?;
-        if check_block_crc::<D::Error, BLOCK>(scratch, block_id).is_err() {
-            return Ok(Lookup::Missing);
+        // Data blocks are contiguous, so the run walk below only moves
+        // forward, and `remaining` keeps it inside the table's data blocks.
+        loop {
+            // Data: a torn block is treated as absent.
+            poll_fn(|cx| device.poll_read_block(cx, block_id, scratch))
+                .await
+                .map_err(Error::Device)?;
+            if check_block_crc::<D::Error, BLOCK>(scratch, block_id).is_err() {
+                return Ok(Lookup::Missing);
+            }
+            match data_lookup::<D::Error>(&scratch[..payload_end], key, val_buf, block_id, max_seq)?
+            {
+                BlockOutcome::Hit(DataHit::Value(n, seq)) => {
+                    return Ok(Lookup::Value { len: n, seq })
+                }
+                BlockOutcome::Hit(DataHit::Tombstone(seq)) => return Ok(Lookup::Tombstone { seq }),
+                // A larger key was seen: later blocks only hold larger keys.
+                BlockOutcome::Absent => return Ok(Lookup::Missing),
+                // The block ended inside (or before) the key's run: the next
+                // data block may continue it.
+                BlockOutcome::Truncated => {
+                    remaining = remaining.saturating_sub(1);
+                    if remaining == 0 {
+                        return Ok(Lookup::Missing);
+                    }
+                    block_id = block_id
+                        .checked_add(1)
+                        .ok_or(Error::CorruptBlock { id: block_id })?;
+                }
+            }
         }
-        Ok(
-            match data_lookup::<D::Error>(&scratch[..payload_end], key, val_buf, block_id)? {
-                Some(DataHit::Value(n, seq)) => Lookup::Value { len: n, seq },
-                Some(DataHit::Tombstone(seq)) => Lookup::Tombstone { seq },
-                None => Lookup::Missing,
-            },
-        )
     }
 }

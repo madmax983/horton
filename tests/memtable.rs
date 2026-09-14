@@ -1,4 +1,8 @@
-//! `MemTable` unit tests: ordering, supersede paths, tombstones, capacity.
+//! `MemTable` unit tests: ordering, versioning, tombstones, capacity.
+//!
+//! Every mutation appends a fresh slot — updates never overwrite — so each
+//! key's versions accumulate newest-first. Snapshots and flush both rely
+//! on that history surviving in the table.
 
 use core::convert::Infallible;
 
@@ -27,34 +31,66 @@ fn sorted_order_and_lookup() {
 }
 
 #[test]
-fn supersede_in_place() {
+fn updates_append_versions_newest_first() {
     let mut t = Small::new();
-    insert(&mut t, b"k", b"longvalue", 1);
-    // Shorter value fits the old region: overwritten in place, same slot count.
-    insert(&mut t, b"k", b"v", 2);
-    assert_eq!(t.len(), 1);
+    insert(&mut t, b"k", b"v1", 1);
+    insert(&mut t, b"k", b"v2", 2);
+    insert(&mut t, b"k", b"v3", 3);
+    // One slot per mutation: no overwriting, no dead slots.
+    assert_eq!(t.len(), 3);
+    // The live view sees the newest version.
     let e = t.get(b"k").unwrap();
-    assert_eq!(e.val, b"v");
-    assert_eq!(e.seq, 2);
+    assert_eq!(e.val, b"v3");
+    assert_eq!(e.seq, 3);
+    // Iterating yields the key's whole run, newest first.
+    let got: Vec<(u64, &[u8])> = t.iter().map(|e| (e.seq, e.val)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (3, b"v3".as_slice()),
+            (2, b"v2".as_slice()),
+            (1, b"v1".as_slice())
+        ]
+    );
 }
 
 #[test]
-fn supersede_via_dead_slot() {
+fn get_at_selects_visible_version() {
     let mut t = Small::new();
-    insert(&mut t, b"k", b"v", 1);
-    // Longer value does not fit: old slot dies, new slot takes over.
-    insert(&mut t, b"k", b"a-much-longer-value", 2);
-    let e = t.get(b"k").unwrap();
-    assert_eq!(e.val, b"a-much-longer-value");
-    assert_eq!(e.seq, 2);
-    // At most one dead slot per key: slot count grows by exactly one.
-    assert_eq!(t.len(), 2);
-    // A third, even longer value reuses the dead slot instead of growing.
-    insert(&mut t, b"k", b"an-even-much-longer-value!!", 3);
-    assert_eq!(t.len(), 2);
-    let e = t.get(b"k").unwrap();
-    assert_eq!(e.val, b"an-even-much-longer-value!!");
-    assert_eq!(e.seq, 3);
+    insert(&mut t, b"k", b"v1", 1);
+    insert(&mut t, b"k", b"v2", 2);
+    insert(&mut t, b"k", b"v3", 3);
+    // Each watermark sees the newest version at or below it.
+    assert_eq!(t.get_at(b"k", 1).unwrap().val, b"v1");
+    assert_eq!(t.get_at(b"k", 2).unwrap().val, b"v2");
+    assert_eq!(t.get_at(b"k", u64::MAX).unwrap().val, b"v3");
+    // Nothing is visible below the first version.
+    assert!(t.get_at(b"k", 0).is_none());
+    // A tombstone version is visible as a tombstone, not skipped.
+    t.insert::<Infallible>(b"k", b"", 4, true).unwrap();
+    let e = t.get_at(b"k", 4).unwrap();
+    assert!(e.tombstone);
+    assert_eq!(t.get_at(b"k", 3).unwrap().val, b"v3");
+}
+
+#[test]
+fn versions_sort_within_key_order() {
+    let mut t = Small::new();
+    insert(&mut t, b"b", b"b1", 1);
+    insert(&mut t, b"a", b"a1", 2);
+    insert(&mut t, b"b", b"b2", 3);
+    insert(&mut t, b"a", b"a2", 4);
+    // Key-ascending, and each key's versions newest-first.
+    let got: Vec<(&[u8], u64)> = t.iter().map(|e| (e.key, e.seq)).collect();
+    assert_eq!(
+        got,
+        vec![
+            (b"a".as_slice(), 4),
+            (b"a".as_slice(), 2),
+            (b"b".as_slice(), 3),
+            (b"b".as_slice(), 1),
+        ]
+    );
 }
 
 #[test]
@@ -99,14 +135,13 @@ fn table_full() {
         t.insert::<Infallible>(b"z", b"v", 9, false),
         Err(Error::TableFull)
     );
-    // Superseding an existing key in place still works when full.
-    insert(&mut t, b"a", b"w", 10);
-    assert_eq!(t.get(b"a").unwrap().val, b"w");
-    // But a growing supersede needs a new slot, so it reports TableFull.
+    // Every mutation consumes a slot — even a same-key update, since old
+    // versions are retained for snapshots. A full table rejects those too.
     assert_eq!(
-        t.insert::<Infallible>(b"a", b"vv", 11, false),
+        t.insert::<Infallible>(b"a", b"w", 10, false),
         Err(Error::TableFull)
     );
+    assert_eq!(t.get(b"a").unwrap().val, b"v");
 }
 
 #[test]

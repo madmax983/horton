@@ -443,3 +443,240 @@ fn compact_reclaims_inputs_when_output_is_empty() {
         "flushed table must reuse the reclaimed input run"
     );
 }
+
+/// Differential: the compaction keep-set must preserve exactly what the
+/// model predicts. Builds known version chains, pins snapshots at chosen
+/// watermarks, compacts with the snapshots live, then checks every
+/// snapshot's (and the live view's) visible value per key against
+/// [`model_winner`](horton::model::model_winner) — the model's analogue of
+/// `get_at`. Any version the merge wrongly drops (or keeps wrongly visible)
+/// diverges here.
+#[test]
+#[allow(clippy::similar_names)] // s_a1/s_a2/... are intentionally parallel: seq of key X put N.
+fn compact_keep_set_matches_model() {
+    use horton::model::{model_keep_set, model_winner, Version};
+
+    type Chain<'a> = (&'a [u8], &'a [(u64, bool, &'a [u8])]);
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // Key "a": three values. Key "b": a value then a tombstone. Key "c":
+    // a single value after the first snapshot.
+    let s_a1 = block_on(db.put(b"a", b"a1")).unwrap();
+    let s_a2 = block_on(db.put(b"a", b"a2")).unwrap();
+    let snap1 = db.snapshot().unwrap(); // observes a = a2, b and c absent
+    let s_a3 = block_on(db.put(b"a", b"a3")).unwrap();
+    let s_b1 = block_on(db.put(b"b", b"b1")).unwrap();
+    let s_b2 = block_on(db.delete(b"b")).unwrap();
+    let s_c1 = block_on(db.put(b"c", b"c1")).unwrap();
+    let snap2 = db.snapshot().unwrap(); // observes a = a3, b deleted, c = c1
+                                        // Spread the versions across four L0 tables so the merge actually runs.
+    block_on(db.flush()).unwrap();
+    for t in 0..3u8 {
+        block_on(db.put(&[b'x', t], &[t])).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    // L0 is full: this drive compacts with both snapshots live.
+    drive(&mut db);
+
+    // The model's version chains, newest-first, with their values.
+    let chains: &[Chain<'_>] = &[
+        (
+            b"a",
+            &[
+                (s_a3, false, b"a3".as_slice()),
+                (s_a2, false, b"a2".as_slice()),
+                (s_a1, false, b"a1".as_slice()),
+            ],
+        ),
+        (
+            b"b",
+            &[
+                (s_b2, true, b"".as_slice()),
+                (s_b1, false, b"b1".as_slice()),
+            ],
+        ),
+        (b"c", &[(s_c1, false, b"c1".as_slice())]),
+    ];
+    let mut buf = [0u8; 1024];
+    // Full-sequence sweep against the MODEL'S KEEP-SET chains: every
+    // `max_seq` from 0 through the last write must agree with
+    // `model_winner` over exactly the versions `model_keep_set` retains.
+    // (Versions below the oldest live snapshot are droppable by design, so
+    // the oracle is the keep-set — not the full pre-compaction history.
+    // The live view is `u64::MAX`, so every KEPT version is observable at
+    // some watermark; a merge that keeps too much or too little shows up
+    // as a divergence at that version's own seq.)
+    let max_th = s_c1;
+    // Watermarks descending, as the merge holds them; both snapshots are
+    // live, so L1 is bottommost and the oldest watermark is `snap1`.
+    let snaps = [snap2, snap1];
+    for (key, chain) in chains {
+        let vs: [Version; 3] = {
+            let mut vs = [Version {
+                seq: 0,
+                tombstone: false,
+            }; 3];
+            for (i, (seq, tombstone, _)) in chain.iter().enumerate() {
+                vs[i] = Version {
+                    seq: *seq,
+                    tombstone: *tombstone,
+                };
+            }
+            vs
+        };
+        let vs = &vs[..chain.len()];
+        let (kept_idx, n) = model_keep_set(vs, &snaps, true, snap1);
+        let kept: Vec<(Version, &[u8])> =
+            kept_idx[..n].iter().map(|&i| (vs[i], chain[i].2)).collect();
+        let kept_vs: Vec<Version> = kept.iter().map(|k| k.0).collect();
+        // The keep-set always covers the protected thresholds: each live
+        // view/snapshot sees exactly what it saw before the merge.
+        for th in [u64::MAX, snap2, snap1] {
+            let before = model_winner(vs, th);
+            let after = model_winner(&kept_vs, th);
+            assert_eq!(
+                before.map(|i| vs[i].seq),
+                after.map(|i| kept_vs[i].seq),
+                "key {key:?}: keep-set must cover protected threshold {th}"
+            );
+        }
+        let mut th = 0u64;
+        loop {
+            let want = model_winner(&kept_vs, th).and_then(|i| {
+                if kept[i].0.tombstone {
+                    None
+                } else {
+                    Some(kept[i].1)
+                }
+            });
+            let got = block_on(db.get_at(key, &mut buf, th)).unwrap();
+            match want {
+                None => assert_eq!(got, None, "key {key:?} at max_seq {th}: model says absent"),
+                Some(v) => {
+                    let n = got
+                        .unwrap_or_else(|| panic!("key {key:?} at max_seq {th}: model says {v:?}"));
+                    assert_eq!(
+                        &buf[..n],
+                        v,
+                        "key {key:?} at max_seq {th} diverged from model"
+                    );
+                }
+            }
+            if th >= max_th {
+                break;
+            }
+            th += 1;
+        }
+    }
+    db.release_snapshot(snap1);
+    db.release_snapshot(snap2);
+}
+
+/// Differential keep-set, part 2: no live snapshots, plus duplicate
+/// watermarks (two snapshots with no writes between them share one
+/// watermark). With no snapshots the merge keeps only the newest version
+/// per key, and a bottommost tombstone drops its whole key.
+#[test]
+#[allow(clippy::similar_names)] // s_d1/s_d2/... are intentionally parallel: seq of key X put N.
+fn compact_keep_set_no_snapshots_and_duplicate_watermarks() {
+    use horton::model::{model_keep_set, model_winner, Version};
+
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // Key "d": value, value, tombstone — newest is a bottommost tombstone
+    // with no live snapshots: the whole key must vanish.
+    let s_d1 = block_on(db.put(b"d", b"d1")).unwrap();
+    let s_d2 = block_on(db.put(b"d", b"d2")).unwrap();
+    let s_d3 = block_on(db.delete(b"d")).unwrap();
+    // Key "e": two values around a duplicated watermark pair.
+    let s_e1 = block_on(db.put(b"e", b"e1")).unwrap();
+    let snap_a = db.snapshot().unwrap();
+    let snap_b = db.snapshot().unwrap(); // no writes between: same watermark
+    assert_eq!(snap_a, snap_b, "back-to-back snapshots share a watermark");
+    let s_e2 = block_on(db.put(b"e", b"e2")).unwrap();
+    // Flush d/e into L0, then fill L0 with three more tables so `drive`
+    // actually compacts.
+    block_on(db.flush()).unwrap();
+    for t in 0..3u8 {
+        block_on(db.put(&[b'x', t], &[t])).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    db.release_snapshot(snap_a);
+    db.release_snapshot(snap_b);
+    // No live snapshots during the compaction.
+    drive(&mut db);
+
+    // The model agrees: no snapshots, bottommost, tombstone predates the
+    // (empty) snapshot set → the keep-set is empty. The snapshots were
+    // released before the merge, so their watermarks protect nothing: even
+    // `get_at` at the dropped versions' own seqs must stay absent.
+    let d_vs = [
+        Version {
+            seq: s_d3,
+            tombstone: true,
+        },
+        Version {
+            seq: s_d2,
+            tombstone: false,
+        },
+        Version {
+            seq: s_d1,
+            tombstone: false,
+        },
+    ];
+    let (kept_idx, n) = model_keep_set(&d_vs, &[], true, u64::MAX);
+    assert_eq!(n, 0, "model must drop the whole key");
+    assert_eq!(kept_idx[..n], []);
+    let mut buf = [0u8; 1024];
+    assert_eq!(block_on(db.get(b"d", &mut buf)).unwrap(), None);
+    for th in [0u64, s_d1, s_d2, s_d3] {
+        assert_eq!(
+            block_on(db.get_at(b"d", &mut buf, th)).unwrap(),
+            None,
+            "d at {th}: dropped tombstone must stay dropped"
+        );
+    }
+
+    // Key "e": newest-only retention — the keep-set oracle, not the full
+    // chain: `s_e1` is unobservable to every retained view (no live
+    // snapshots) and the merge drops it.
+    let e_vs = [
+        Version {
+            seq: s_e2,
+            tombstone: false,
+        },
+        Version {
+            seq: s_e1,
+            tombstone: false,
+        },
+    ];
+    let (kept_idx, n) = model_keep_set(&e_vs, &[], true, u64::MAX);
+    assert_eq!(&kept_idx[..n], &[0], "only the newest version survives");
+    let kept_vs = [e_vs[kept_idx[0]]];
+    let mut th = 0u64;
+    loop {
+        let want = model_winner(&kept_vs, th).map(|i| {
+            assert!(!kept_vs[i].tombstone);
+            b"e2".as_slice()
+        });
+        let got = block_on(db.get_at(b"e", &mut buf, th)).unwrap();
+        match want {
+            None => assert_eq!(got, None, "e at {th}: model says absent"),
+            Some(v) => {
+                let n = got.unwrap_or_else(|| panic!("e at {th}: model says {v:?}"));
+                assert_eq!(&buf[..n], v, "e at {th} diverged from model");
+            }
+        }
+        if th >= s_e2 {
+            break;
+        }
+        th += 1;
+    }
+    // The live view agrees with the model.
+    assert_eq!(
+        block_on(db.get(b"e", &mut buf))
+            .unwrap()
+            .map(|n| buf[..n].to_vec()),
+        Some(b"e2".to_vec())
+    );
+}

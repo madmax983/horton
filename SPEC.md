@@ -78,15 +78,17 @@ pub struct MemTable<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, 
 struct Slot { hash: u32, key_off: u32, key_len: u16, val_off: u32, val_len: u16, seq: u64, tombstone: bool }
 ```
 
-- Insert: binary search `slots[..len]` by `(key, seq)`; on duplicate key,
-  supersede in place if the arena has room, else append new bytes and mark the
-  old slot dead (dead slots are skipped, reclaimed on flush — no compaction
-  inside the memtable, bounded waste: at most one dead slot per key).
+- Insert: binary search `slots[..len]` by `(key, seq)`; every mutation —
+  including a same-key update — allocates one fresh slot and bumps the
+  arena. There are no superseded or dead slots: the memtable keeps the
+  key's complete version chain, newest-first within the key, because
+  snapshots (v0.5) can observe any older version. A full table rejects
+  same-key updates — `Error::TableFull` (slots) or `Error::ArenaFull`
+  (bytes); the caller flushes on either. Full-version retention costs
+  nothing extra at flush: the writer already walks `slots[..len]`.
 - New key bytes are bump-appended to `arena`; the slot is `copy_within`-shifted
   into sorted position. O(n) insert, O(log n) lookup; `CAP = 4096` keeps the
   shift cost trivial against flash write costs.
-- Full conditions are explicit errors: `Error::TableFull` (slots) and
-  `Error::ArenaFull` (bytes). The caller flushes on either.
 
 Why not a skiplist: pointer chasing without allocation means fixed node pools
 and worse cache behavior for zero benefit at these capacities.
@@ -219,10 +221,23 @@ db.compact_step(&mut scratch) -> Result<Progress, Error>
   so firmware can interleave compaction with real-time work. The call that
   exhausts the merge seals the table and commits the manifest atomically
   (`Progress::Done`).
-- Tombstone drop rule: a tombstone may be dropped only when the merge output
-  goes to the bottommost level containing that key's range — i.e. no table
-  at any level ≥ 2 overlaps the output key span (checked against the
-  manifest's level key ranges before dropping).
+- Tombstone drop rule (v0.5): a bottommost tombstone may be dropped only
+  when it predates every live snapshot. The merge keeps, per key, the
+  **keep-set**: the live view's newest version plus the newest version at
+  or below each live snapshot's watermark (threshold `u64::MAX` for the
+  live view, then the snapshot watermarks sorted descending; each
+  threshold is served by the first version at or below it, so at most
+  1 + 8 versions survive per key). A bottommost newest tombstone with
+  `seq < oldest_live_snapshot` (no live snapshots → `u64::MAX`, i.e. the
+  v0.4 behavior) drops the whole key: in that case every reader — live
+  and snapshot — would observe the tombstone, so deletion is
+  observationally identical to absence. Dropping a tombstone a live
+  snapshot could still observe would resurrect the shadowed value. The
+  watermarks are copied at `compact_select`; a snapshot taken
+  mid-compaction always has `seq >=` every version being compacted (seqs
+  are monotonic), so it can never need older history the merge already
+  discarded. Executable model: `model_keep_set` in `src/model.rs`,
+  differentially tested against the real merge in `tests/compact.rs`.
 - Crash during compaction is harmless: inputs are untouched until the new
   manifest slot commits; partial outputs are orphaned blocks, reclaimed by
   the next open's garbage sweep (any block not referenced by the manifest or
@@ -238,24 +253,55 @@ db.compact_step(&mut scratch) -> Result<Progress, Error>
 
 ### 4.7 Read path
 
-`get(key, val_buf) -> Result<Option<usize>, Error>`:
+`get(key, val_buf) -> Result<Option<usize>, Error>` is `get_at(key, val_buf,
+u64::MAX)`:
 
-1. MemTable lookup (binary search). Newest seq wins; tombstone = `Ok(None)`.
-2. L0, newest table first, bloom-gated, then block index → data block.
+1. MemTable lookup (binary search over version chains). The newest version
+   with `seq <= max_seq` wins; a tombstone there is `Ok(None)`.
+2. L0, newest table first, bloom-gated, then block index → data block;
+   the key's version run is scanned newest-first for the first version at
+   or below `max_seq`. A run can straddle data blocks (many versions of
+   one key): the index resolves to the run's first block and the lookup
+   walks forward across contiguous data blocks while the run continues,
+   bounded by the table's data-block count so it never strays into the
+   bloom/index/footer blocks.
 3. L1..Ln in order, key-range pruned, bloom-gated.
-4. First hit at the highest seq wins; older versions and tombstones below it
-   are invisible. Copies value bytes into the caller buffer; `Error::BufferTooSmall`
-   if it doesn't fit (returns required length — no hidden truncation, ever).
+4. First hit wins; older versions and tombstones below the visible version
+   are invisible. Copies value bytes into the caller buffer;
+   `Error::BufferTooSmall` if it doesn't fit (returns required length —
+   no hidden truncation, ever).
 
-`scan` (v0.5): a borrowed merge iterator over one block-iterator per level,
-all state in `Scan<const K: usize>` owned by the caller. Prefix scans via
-seek.
+`scan` (v0.5): a borrowed merge iterator over one cursor per table plus the
+memtable, all state in caller-owned `Scan<'d, ...>` (it borrows `&'d Db`,
+so the compiler — not documentation — forbids `put`/`flush`/`compact`
+mid-scan). One shared `[u8; BLOCK]` buffer; each cursor caches only its
+head key (`[u8; KEY_MAX]`), seq, tombstone flag, and value length. Winner
+selection mirrors the compaction merge: minimum key across live cursors,
+highest seq wins ties, tombstone winners are skipped silently, and each
+source is advanced past every version of the yielded key so an older
+version is never yielded as a duplicate. Key/value bytes are copied into
+caller buffers (`BufferTooSmall { need }` is returned *before* any cursor
+advances, so a retry with a larger buffer sees the same entry — never
+silent truncation, never a skipped entry). Prefix scans via
+`seek(prefix, Some(prefix_end))`.
+
+Snapshot reads (v0.5): `snapshot() -> Result<u64, Error>` registers the
+current `next_seq` as a live snapshot (bounded: 8 live snapshots,
+`NoSpace` when exhausted) and `release_snapshot(u64)` unregisters it.
+`get_at(key, val_buf, max_seq)` and `Scan::seek(..., max_seq)` expose only
+mutations with `seq <= max_seq`. The memtable and every SSTable keep full
+version chains so older snapshots keep seeing their values; compaction's
+per-key keep-set (§4.6) is what bounds the retention. Executable models:
+`model_winner` / `model_visible` / `model_keep_set` in `src/model.rs`,
+property- and differentially-tested against the read path and the merge.
 
 ## 5. Public API (v0.1 surface; v0.2+ additive)
 
 ```rust
-pub struct Db<D: BlockDevice, const KEY_MAX: usize, const VAL_MAX: usize,
-              const CAP: usize, const ARENA: usize>;
+pub struct Db<D: BlockDevice, const BLOCK: usize, const KEY_MAX: usize,
+              const VAL_MAX: usize, const CAP: usize, const ARENA: usize,
+              const LEVELS: usize, const TABLES: usize,
+              const BLOOM_BYTES: usize, const FREELIST: usize>;
 
 impl<D: BlockDevice, ...> Db<D, ...> {
     pub const fn new(device: D, config: Config) -> Self;
@@ -264,9 +310,45 @@ impl<D: BlockDevice, ...> Db<D, ...> {
     pub async fn delete(&mut self, key: &[u8]) -> Result<u64, Error<D::Error>>;
     pub async fn get(&self, key: &[u8], val_buf: &mut [u8]) -> Result<Option<usize>, Error<D::Error>>;
     pub async fn flush(&mut self) -> Result<(), Error<D::Error>>;
-    pub async fn compact_step(&mut self, scratch: &mut [u8]) -> Result<Progress, Error<D::Error>>;
+    pub async fn compact_step(&mut self, scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>)
+        -> Result<Progress, Error<D::Error>>;
+    // v0.5 additions:
+    pub async fn get_at(&self, key: &[u8], val_buf: &mut [u8], max_seq: u64)
+        -> Result<Option<usize>, Error<D::Error>>; // get() is get_at(.., u64::MAX)
+    pub const fn snapshot(&mut self) -> Result<u64, Error<D::Error>>; // -> watermark (max 8 live)
+    pub const fn release_snapshot(&mut self, snap: u64); // unknown watermark is a no-op
+}
+
+pub struct Scan<'d, D: BlockDevice, ...>; // borrows &'d Db; caller-owned state
+impl Scan<'_, ...> {
+    pub const fn new(db: &Db<...>) -> Self; // unpositioned; seek() before next()
+    pub async fn seek(&mut self, start: &[u8], end: Option<&[u8]>, max_seq: u64)
+        -> Result<(), Error<D::Error>>; // empty start scans from first key; end exclusive
+    pub async fn next(&mut self, key_buf: &mut [u8], val_buf: &mut [u8])
+        -> Result<Option<(usize, usize)>, Error<D::Error>>; // BufferTooSmall never consumes an entry
+}
+
+impl<D: BlockDevice, ...> TableReader<D, ...> {
+    pub async fn get(&self, scratch: &mut [u8; BLOCK], key: &[u8], val_buf: &mut [u8])
+        -> Result<Option<usize>, Error<D::Error>>;
+    pub async fn get_at(&self, scratch: &mut [u8; BLOCK], key: &[u8], val_buf: &mut [u8],
+                        max_seq: u64) -> Result<Option<usize>, Error<D::Error>>;
+    pub async fn lookup(&self, scratch: &mut [u8; BLOCK], key: &[u8], val_buf: &mut [u8])
+        -> Result<Lookup, Error<D::Error>>; // distinguishes tombstones
+    pub async fn lookup_at(&self, scratch: &mut [u8; BLOCK], key: &[u8], val_buf: &mut [u8],
+                           max_seq: u64) -> Result<Lookup, Error<D::Error>>;
 }
 ```
+
+`get` is `get_at(.., u64::MAX)` and `lookup` is `lookup_at(.., u64::MAX)` —
+v0.5 added the `_at` snapshot variants without changing the existing
+signatures. `snapshot()` registers the current `next_seq` as a live
+watermark (at most 8; `NoSpace` beyond that); `release_snapshot` frees it.
+`get_at`/`seek(.., max_seq)` observe only versions with `seq <= max_seq` —
+pass a live snapshot's watermark for a pinned read. Unregistered watermarks
+are best-effort: compaction retains exactly the live view plus the newest
+version at or below each *live* snapshot's watermark (§4.6), so a watermark
+below the oldest live snapshot may observe dropped history as absent.
 
 `Config` is a plain struct of const-compatible tunables (block id ranges for
 WAL/table/manifest regions, or a `BlockAllocator` policy — see open questions).
@@ -364,8 +446,15 @@ floor (`seq <= manifest.max_seq`).
   `hrtman02` for the v0.4 key-bound encoding change; pre-1.0 policy is no
   format compat across minor versions — a foreign magic is
   `CorruptManifest`, never a misparse.
-- v0.5 — `scan` iterator + snapshot reads + Verus models for the two
-  core invariants.
+- v0.5 — `scan` iterator + snapshot reads + executable models of the core
+  invariants (seq-ordered visibility, per-key keep-set) with property and
+  differential tests. Machine-checked proofs are deferred: the Verus
+  toolchain is not installed on the dev host (confirmed 2026-09-14), so
+  the models are pure total `no_alloc` functions written to lift into
+  Verus `spec` fns later. Full version chains are retained in the memtable
+  and SSTables; compaction emits the per-key keep-set (live view plus the
+  newest version at or below each live snapshot watermark) and drops a
+  bottommost newest tombstone only when it predates every live snapshot.
 - v0.6 (roadmap) — ESP32-S3 / Tallow port: SPI-flash `BlockDevice`,
   budget re-tune.
 
