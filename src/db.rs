@@ -13,6 +13,9 @@
 use core::cell::RefCell;
 
 use crate::alloc::{Bump, FreeList};
+use crate::compact::{
+    init_cursor, ranges_overlap, Compaction, Input, MergeOutcome, Progress, State, COMPACTION_KMAX,
+};
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{Manifest, TableRef};
@@ -325,17 +328,13 @@ impl<
 
         // Use the shared buffer when it is free (see `get_scratch`). Fall
         // back to a local buffer when another `get` call already holds it.
-        let mut shared_scratch;
+        let mut shared_scratch = self.get_scratch.try_borrow_mut().ok();
         let mut owned_scratch;
-        let scratch: &mut [u8; BLOCK] = match self.get_scratch.try_borrow_mut() {
-            Ok(guard) => {
-                shared_scratch = guard;
-                &mut shared_scratch
-            }
-            Err(_) => {
-                owned_scratch = [0u8; BLOCK];
-                &mut owned_scratch
-            }
+        let scratch: &mut [u8; BLOCK] = if let Some(guard) = shared_scratch.as_mut() {
+            guard
+        } else {
+            owned_scratch = [0u8; BLOCK];
+            &mut owned_scratch
         };
         // Level 0, newest table first: its tables overlap, and newer tables
         // hold higher sequence numbers.
@@ -492,18 +491,13 @@ impl<
             None => self.tbl_bump.peek_run::<D::Error>(total)?,
         };
         // Pass 2: stream the blocks. `data` doubles as the manifest scratch
-        // below; all three buffers are plain stack locals.
+        // below; it is a plain stack local.
         let mut data = [0u8; BLOCK];
-        let mut index = [0u8; BLOCK];
-        let mut bloom = [0u8; BLOOM_BYTES];
-        let written = sstable::write_table::<D, BLOCK, BLOOM_BYTES>(
+        let written = sstable::write_table::<D, BLOCK, BLOOM_BYTES, KEY_MAX>(
             self.wal.device_mut(),
             base,
             k,
             self.table.iter().map(sstable::SstEntry::from),
-            &mut data,
-            &mut index,
-            &mut bloom,
         )
         .await?;
         debug_assert_eq!(written, total);
@@ -559,6 +553,237 @@ impl<
         if wrap {
             self.wal.reset_to(self.cfg.wal_start);
         }
+        Ok(())
+    }
+}
+
+impl<
+        D: BlockDevice,
+        const BLOCK: usize,
+        const KEY_MAX: usize,
+        const VAL_MAX: usize,
+        const CAP: usize,
+        const ARENA: usize,
+        const LEVELS: usize,
+        const TABLES: usize,
+        const BLOOM_BYTES: usize,
+        const FREELIST: usize,
+    > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+{
+    /// Runs one bounded compaction step using the caller's `scratch`.
+    ///
+    /// When L0 is full, the first call selects all of L0 plus the
+    /// overlapping L1 tables and merges them one output block per call
+    /// ([`Progress::More`]); the call that exhausts the merge seals the
+    /// output table and commits the manifest atomically, returning
+    /// [`Progress::Done`]. With L0 not full this is a no-op returning
+    /// [`Progress::Done`]. Drive it with `while db.compact_step(&mut
+    /// scratch).await? == Progress::More {}`.
+    ///
+    /// The scratch is reusable across jobs and droppable mid-job: partial
+    /// output is invisible until the manifest commit, so abandoning it only
+    /// orphans blocks the next `open()` sweep reclaims.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when the job would exceed [`COMPACTION_KMAX`]
+    /// inputs, no output run can be reserved, or the target level is full;
+    /// [`Error::CorruptBlock`] on a torn input table (compaction never
+    /// silently drops entries); [`Error::Device`] on I/O failure. A failed
+    /// step resets the scratch; the device manifest is untouched, so the
+    /// job can be reselected later.
+    pub async fn compact_step(
+        &mut self,
+        scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<Progress, Error<D::Error>> {
+        if scratch.state == State::Idle && !self.compact_select(scratch).await? {
+            return Ok(Progress::Done);
+        }
+        let outcome = match scratch.merge_step(self.wal.device_mut()).await {
+            Ok(o) => o,
+            Err(e) => {
+                scratch.reset();
+                return Err(e);
+            }
+        };
+        match outcome {
+            MergeOutcome::More => Ok(Progress::More),
+            MergeOutcome::Exhausted => {
+                if let Err(e) = self.compact_commit(scratch).await {
+                    scratch.reset();
+                    return Err(e);
+                }
+                Ok(Progress::Done)
+            }
+        }
+    }
+
+    /// Selects the next compaction job into `scratch`: all of L0 plus the
+    /// L1 tables overlapping the merged key range. Returns `false` when L0
+    /// is not full and there is no work.
+    async fn compact_select(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<bool, Error<D::Error>> {
+        // v0.4 compacts L0 -> L1 only, triggered by a full L0.
+        if LEVELS < 2 {
+            return Ok(false);
+        }
+        let l0 = self.manifest.level(0).ok_or(Error::NoSpace)?;
+        if l0.len() < TABLES {
+            return Ok(false);
+        }
+        // Copy the refs so the manifest borrow ends before the scratch and
+        // the device are touched.
+        let mut l0_refs = [TableRef::EMPTY; TABLES];
+        let l0_take = l0.len().min(TABLES);
+        l0_refs[..l0_take].copy_from_slice(&l0[..l0_take]);
+        let l1 = self.manifest.level(1).ok_or(Error::NoSpace)?;
+        let mut l1_refs = [TableRef::EMPTY; TABLES];
+        let l1_take = l1.len().min(TABLES);
+        l1_refs[..l1_take].copy_from_slice(&l1[..l1_take]);
+
+        let mut n_inputs = 0usize;
+        let mut first = l0_refs[0].first_key;
+        let mut last = l0_refs[0].last_key;
+        let mut total_entries = 0u64;
+        let mut total_data = 0u64;
+        // Pushes one input table, widening the merged range and totals.
+        let mut push = |level: usize, t: &TableRef<KEY_MAX>| -> Result<(), Error<D::Error>> {
+            if n_inputs >= COMPACTION_KMAX {
+                return Err(Error::NoSpace);
+            }
+            c.inputs[n_inputs] = Input { level, tref: *t };
+            n_inputs += 1;
+            total_entries = total_entries
+                .checked_add(u64::from(t.entry_count))
+                .ok_or(Error::NoSpace)?;
+            let data = u64::from(t.block_count)
+                .checked_sub(3)
+                .ok_or(Error::CorruptBlock { id: t.first_block })?;
+            total_data = total_data.checked_add(data).ok_or(Error::NoSpace)?;
+            Ok(())
+        };
+        for t in l0_refs.iter().take(l0_take) {
+            push(0, t)?;
+            if t.first_key.as_slice() < first.as_slice() {
+                first = t.first_key;
+            }
+            if t.last_key.as_slice() > last.as_slice() {
+                last = t.last_key;
+            }
+        }
+        // Overlapping L1 tables join the merge (L1 runs never overlap each
+        // other, so range overlap is the exact join condition).
+        for t in l1_refs.iter().take(l1_take) {
+            if ranges_overlap(first, last, t.first_key, t.last_key) {
+                push(1, t)?;
+                if t.first_key.as_slice() < first.as_slice() {
+                    first = t.first_key;
+                }
+                if t.last_key.as_slice() > last.as_slice() {
+                    last = t.last_key;
+                }
+            }
+        }
+        // Tombstones drop only when the output reaches the bottommost level
+        // holding the merged range: nothing below can hide an older version
+        // of a dropped key.
+        let mut bottommost = true;
+        'levels: for lvl in 2..LEVELS {
+            let Some(tables) = self.manifest.level(lvl) else {
+                break 'levels;
+            };
+            for t in tables {
+                if ranges_overlap(first, last, t.first_key, t.last_key) {
+                    bottommost = false;
+                    break 'levels;
+                }
+            }
+        }
+        // Reserve the output run: the merge only shrinks the inputs (dedup
+        // plus tombstone drops), so their data blocks plus the 3 framing
+        // blocks always suffice. Free list first, then the bump — claimed
+        // only after the manifest commit, exactly like flush.
+        let out_blocks = total_data.checked_add(3).ok_or(Error::NoSpace)?;
+        let out_len = usize::try_from(out_blocks).map_err(|_| Error::NoSpace)?;
+        let (out_base, from_free) = match self.tbl_free.find_run(out_len) {
+            Some(b) => (b, true),
+            None => (self.tbl_bump.peek_run::<D::Error>(out_blocks)?, false),
+        };
+        c.out_base = out_base;
+        c.out_blocks = out_blocks;
+        c.out_len = out_len;
+        c.from_free = from_free;
+        c.target_level = 1;
+        c.bottommost = bottommost;
+        c.n_inputs = n_inputs;
+        c.writer =
+            sstable::TableWriter::new(out_base, sstable::bloom_k(BLOOM_BYTES * 8, total_entries));
+        // Position one cursor per input on its first entry.
+        let device = self.wal.device_mut();
+        for i in 0..n_inputs {
+            let tref = c.inputs[i].tref;
+            init_cursor(&*device, &tref, &mut c.cursors[i]).await?;
+        }
+        c.state = State::Merging;
+        Ok(true)
+    }
+
+    /// Commits the finished merge: seals the output table (unless the merge
+    /// produced no entries), swaps the input tables for it in a staged
+    /// manifest, and claims the output run after the commit lands.
+    async fn compact_commit(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<(), Error<D::Error>> {
+        let mut scratch = [0u8; BLOCK];
+        let mut staged = self.manifest;
+        // Seal the output table first: finish flushes, so its blocks are
+        // durable before the manifest makes them visible.
+        let out_ref = if c.writer.entry_count() > 0 {
+            let done: sstable::FinishedTable<KEY_MAX> =
+                c.writer.finish(self.wal.device_mut()).await?;
+            let total = done.data_blocks.checked_add(3).ok_or(Error::NoSpace)?;
+            let id = staged.alloc_table_id::<D::Error>()?;
+            Some(TableRef {
+                id,
+                first_block: c.out_base,
+                block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
+                first_key: done.first_key,
+                last_key: done.last_key,
+                max_seq: done.max_seq,
+                entry_count: u32::try_from(done.entry_count).map_err(|_| Error::NoSpace)?,
+            })
+        } else {
+            None
+        };
+        for input in c.inputs.iter().take(c.n_inputs) {
+            staged.remove_table_from_level::<D::Error>(input.level, input.tref.id)?;
+        }
+        if let Some(tref) = out_ref {
+            staged.add_table_to_level::<D::Error>(c.target_level, tref)?;
+        }
+        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        staged
+            .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
+            .await?;
+        // Commit point passed: publish the staged state, then claim the
+        // output run (free list or bump) exactly like flush does.
+        self.manifest = staged;
+        if out_ref.is_some() {
+            if c.from_free {
+                // Must run unconditionally: `claim_run` removes the run from
+                // the free list, and `debug_assert!` does not evaluate its
+                // argument in release builds. (Same fix as flush's claim.)
+                let claimed = self.tbl_free.claim_run(c.out_base, c.out_len);
+                debug_assert!(claimed, "merge's own reservation must still claim");
+            } else {
+                self.tbl_bump
+                    .set_next(c.out_base.checked_add(c.out_blocks).ok_or(Error::NoSpace)?);
+            }
+        }
+        c.reset();
         Ok(())
     }
 }

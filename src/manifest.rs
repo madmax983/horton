@@ -266,6 +266,27 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         Ok(())
     }
 
+    /// Removes the table with `id` from `level`, keeping the remaining refs
+    /// packed. Returns `true` when a table was removed.
+    ///
+    /// Removing a table that is not there is not an error — compaction
+    /// replays its input set against the live manifest, and a missing input
+    /// simply means there is nothing to remove.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when `level` is out of range.
+    pub fn remove_table_from_level<E>(&mut self, level: usize, id: u32) -> Result<bool, Error<E>> {
+        let l = self.levels.get_mut(level).ok_or(Error::NoSpace)?;
+        let Some(pos) = l.tables[..l.len].iter().position(|t| t.id == id) else {
+            return Ok(false);
+        };
+        l.tables.copy_within(pos + 1..l.len, pos);
+        l.tables[l.len - 1] = TableRef::EMPTY;
+        l.len -= 1;
+        Ok(true)
+    }
+
     /// True when block `id` is referenced by some table in some level
     /// (the open-time sweep's liveness query).
     #[must_use]
@@ -336,9 +357,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 enc.u64(tref.first_block)?;
                 enc.u32(tref.block_count)?;
                 enc.u16(tref.first_key.len)?;
-                enc.bytes(&tref.first_key.bytes)?;
+                enc.bytes(&tref.first_key.bytes[..usize::from(tref.first_key.len)])?;
                 enc.u16(tref.last_key.len)?;
-                enc.bytes(&tref.last_key.bytes)?;
+                enc.bytes(&tref.last_key.bytes[..usize::from(tref.last_key.len)])?;
                 enc.u64(tref.max_seq)?;
                 enc.u32(tref.entry_count)?;
             }
@@ -437,12 +458,13 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     fn decode_bound<E>(dec: &mut Decoder<'_>) -> Result<KeyBound<KEY_MAX>, Error<E>> {
         let corrupt = || Error::CorruptManifest;
         let len = dec.u16().map_err(|()| corrupt())?;
-        if usize::from(len) > KEY_MAX {
+        let n = usize::from(len);
+        if n > KEY_MAX {
             return Err(corrupt());
         }
-        let bytes_in = dec.bytes(KEY_MAX).map_err(|()| corrupt())?;
+        let bytes_in = dec.bytes(n).map_err(|()| corrupt())?;
         let mut bytes = [0u8; KEY_MAX];
-        bytes.copy_from_slice(bytes_in);
+        bytes[..n].copy_from_slice(bytes_in);
         Ok(KeyBound { len, bytes })
     }
 

@@ -1,7 +1,8 @@
-//! Hand-rolled IEEE CRC-32. Slicing-by-8, table-driven — no dependency,
-//! tables computed at compile time (spec §4.2: "256-entry table is also
-//! fine, it's `const`"; this uses eight such tables so the main loop
-//! consumes 8 bytes per iteration instead of 1).
+//! Hand-rolled IEEE CRC-32, slicing-by-8 and table-driven.
+//!
+//! No dependency; the eight tables are computed at compile time (spec §4.2:
+//! "256-entry table is also fine, it's `const`"). The main loop consumes 8
+//! bytes per iteration instead of 1.
 
 /// Builds the eight slicing-by-8 tables. `TABLES[0]` is the standard
 /// byte-indexed reflected CRC-32 table: `TABLES[0][n]` is the eight-bit-at-
@@ -10,12 +11,14 @@
 /// again to `TABLES[k - 1]`'s output (i.e. the update for a byte that sits
 /// `k` positions further back in the stream). That lets the main loop
 /// combine 8 bytes' worth of update with 8 independent table lookups —
-/// XORed together, no data dependency between them except on the previous
+/// `XOR`ed together, no data dependency between them except on the previous
 /// iteration's `crc` — instead of 8 sequential single-byte steps.
 const fn make_tables() -> [[u32; 256]; 8] {
     let mut tables = [[0u32; 256]; 8];
     let mut n = 0;
     while n < 256 {
+        // `n < 256` by the loop bound, so the cast cannot truncate.
+        #[allow(clippy::cast_possible_truncation)]
         let mut crc = n as u32;
         let mut bit = 0;
         while bit < 8 {
@@ -53,6 +56,7 @@ const TABLES: [[u32; 256]; 8] = make_tables();
 /// (517,750,659 -> 525,534,917 Ir); with it, 517,750,659 -> 340,918,564 Ir
 /// (-34.15%). See the PR for the full before/after.
 #[must_use]
+#[allow(clippy::inline_always)] // measured with callgrind (see above), not decorative
 #[inline(always)]
 pub const fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;

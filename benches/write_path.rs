@@ -43,7 +43,7 @@ struct MemDevice<const BLOCK: usize> {
 }
 
 impl<const BLOCK: usize> MemDevice<BLOCK> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self { blocks: Vec::new() }
     }
 }
@@ -97,7 +97,7 @@ impl Lcg {
         Self(seed)
     }
 
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         self.0 = self
             .0
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -106,21 +106,32 @@ impl Lcg {
     }
 
     /// Uniform in `[lo, hi]`.
-    fn range(&mut self, lo: usize, hi: usize) -> usize {
-        lo + (self.next() as usize) % (hi - lo + 1)
+    const fn range(&mut self, lo: usize, hi: usize) -> usize {
+        let span = (hi - lo + 1) as u64; // widening cast: no truncation possible
+                                         // The modulo bounds the value below `span` (a small key/value
+                                         // length), so it fits in `usize` on every bench target.
+        #[allow(clippy::cast_possible_truncation)]
+        let offset = (self.next() % span) as usize;
+        lo + offset
     }
 }
 
 fn make_key(buf: &mut [u8; 32], rng: &mut Lcg, len: usize) -> usize {
+    // `% 26` bounds the value to `[0, 26)`; the `u8` cast cannot truncate.
     for b in &mut buf[..len] {
-        *b = (rng.next() % 26) as u8 + b'a';
+        #[allow(clippy::cast_possible_truncation)]
+        let v = (rng.next() % 26) as u8;
+        *b = v + b'a';
     }
     len
 }
 
 fn make_val(buf: &mut [u8; 256], rng: &mut Lcg, len: usize) -> usize {
+    // `% 256` bounds the value to a byte; the `u8` cast cannot truncate.
     for b in &mut buf[..len] {
-        *b = (rng.next() % 256) as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        let v = (rng.next() % 256) as u8;
+        *b = v;
     }
     len
 }
@@ -138,7 +149,7 @@ const WAL_END: u64 = 8 + 4000;
 const TBL_START: u64 = WAL_END;
 const TBL_END: u64 = TBL_START + 8000;
 
-fn config() -> Config {
+const fn config() -> Config {
     Config::new(WAL_START, WAL_END, TBL_START, TBL_END, 0, 1)
 }
 
@@ -170,9 +181,14 @@ fn main() {
         for i in 0..PUT_BATCH {
             let klen = rng.range(8, 32);
             make_key(&mut kbuf, &mut rng, klen);
-            // Keep keys globally unique across batches.
-            kbuf[0] = b'a' + ((batch * PUT_BATCH + i) % 26) as u8;
-            kbuf[1] = b'a' + batch as u8;
+            // Keep keys globally unique across batches. `% 26` bounds the
+            // addend to `[0, 26)`; `batch < PUT_BATCHES = 3`. Neither `u8`
+            // cast can truncate.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                kbuf[0] = b'a' + ((batch * PUT_BATCH + i) % 26) as u8;
+                kbuf[1] = b'a' + batch as u8;
+            }
             let vlen = rng.range(16, 200);
             make_val(&mut vbuf, &mut rng, vlen);
             block_on(db.put(&kbuf[..klen], &vbuf[..vlen])).expect("put");

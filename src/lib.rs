@@ -20,6 +20,7 @@
 #![allow(clippy::future_not_send)]
 
 pub mod alloc;
+pub mod compact;
 pub mod crc;
 pub mod db;
 pub mod device;
@@ -30,6 +31,7 @@ pub mod sstable;
 pub mod wal;
 
 pub use alloc::{Bump, FreeList};
+pub use compact::{Compaction, Progress, COMPACTION_KMAX};
 pub use crc::crc32;
 pub use db::{Config, Db, OpenReport};
 pub use device::BlockDevice;

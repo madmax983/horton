@@ -26,6 +26,10 @@ per SPEC-PROOF-RED-GREEN-REFACTOR.
   (target: zero `unsafe` blocks; `copy_within` and friends are safe).
 - Default budget profile (tunable via consts): ≤ 64 KiB RAM for
   memtable + scratch, ≤ 4 KiB stack per public call. Code size tracked in CI.
+  Permanent per-`Db` RAM beyond the memtable: one `BLOCK`-byte `get` scratch
+  buffer (reused across calls instead of a per-call stack buffer) — count it
+  against this budget. The v0.4 `Compaction` scratch is caller-owned, not
+  `Db` RAM.
 
 ### Targets
 
@@ -97,7 +101,9 @@ magic: u16 = 0x6C73 ("ls") | len: u32 | seq: u64 | op: u8 (1=put, 2=del)
 ```
 
 - `crc32` covers everything after `magic`, computed with a hand-rolled
-  IEEE CRC32 (bitwise, no table — 256-entry table is also fine, it's `const`).
+  IEEE CRC32, slicing-by-8 over eight 256-entry `const` tables (8 KiB
+  `.rodata`; the tables are shared, not per-`Db` RAM). `#[inline(always)]`
+  is measured with callgrind, not decorative — see `src/crc.rs`.
 - The WAL writer owns a caller-provided `[u8; BLOCK]` staging buffer and
   appends whole blocks through the `BlockDevice` trait. `async commit()` pads
   and flushes the partial block.
@@ -180,24 +186,42 @@ pub struct TableRef {
 
 ### 4.6 Compaction — leveled, bounded, caller-driven
 
-- L0 holds ≤ 4 overlapping tables (flush outputs). When full, compact L0 → L1.
-- L1+ are non-overlapping sorted runs; level `n+1` target size is 10x level
-  `n`. Pick the table overlapping the smallest L0 key span (standard).
-- Merge is k-way (`KMAX = 8`) over per-table block iterators, with the merge
-  heap as a fixed `[HeapItem; KMAX]` array in a caller-provided scratch
-  buffer — no allocation, no recursion.
-- Output goes to new SSTable blocks streamed through a second scratch block.
-  One `compact_step(&mut scratch) -> Result<Progress, Error>` call does
-  bounded work (one input batch); the caller drives it to completion, so
-  firmware can interleave compaction with real-time work. `Progress::{Done,
-  More}` tells the caller.
+```rust
+db.compact_step(&mut scratch) -> Result<Progress, Error>
+```
+
+- `scratch` is a typed caller-owned `Compaction<BLOCK, KEY_MAX, VAL_MAX,
+  BLOOM_BYTES>` (a `Compaction::new()` value, typically a static or a
+  stack local the caller keeps across calls) — not a raw byte buffer, and
+  never stored inside `Db`. It persists across `Progress::More` calls; it
+  is droppable mid-job, because partial output is invisible until the
+  manifest commit.
+- **v0.4 scope: L0→L1 only.** When L0 is full (4 tables), one job compacts
+  all of L0 plus every L1 table overlapping the L0 key span into one new
+  L1 run. A full L1 (or more than `KMAX = 8` inputs) fails the job with
+  `Error::NoSpace` and leaves the manifest untouched; cascading L1→L2 and
+  deeper is deferred to a later version.
+- Merge is k-way (`KMAX = 8`) over per-table block cursors. Winner selection
+  is a linear scan over the ≤ 8 live cursors (minimum key; highest sequence
+  wins ties) — no heap, hence no stale entries for exhausted cursors. The
+  winner's entry is copied into the output *before* any cursor advances.
+- Cursors treat the writer's zero padding (between the last entry and the
+  restart trailer) as end-of-entries in the block, the same convention as
+  the v0.3 point-lookup scan; anything else unparseable is `CorruptBlock`.
+- Output streams through an incremental `TableWriter`: one
+  `compact_step` call seals at most one output block (`Progress::More`),
+  so firmware can interleave compaction with real-time work. The call that
+  exhausts the merge seals the table and commits the manifest atomically
+  (`Progress::Done`).
 - Tombstone drop rule: a tombstone may be dropped only when the merge output
-  goes to the bottommost level containing that key's range. Enforced by
-  checking the manifest's level key ranges before dropping.
+  goes to the bottommost level containing that key's range — i.e. no table
+  at any level ≥ 2 overlaps the output key span (checked against the
+  manifest's level key ranges before dropping).
 - Crash during compaction is harmless: inputs are untouched until the new
   manifest slot commits; partial outputs are orphaned blocks, reclaimed by
   the next open's garbage sweep (any block not referenced by the manifest or
-  the WAL range is free).
+  the WAL range is free). Crash-injector tested: the post-crash state is
+  always exactly pre- or post-compaction, never mixed.
 
 ### 4.7 Read path
 
@@ -307,7 +331,19 @@ floor (`seq <= manifest.max_seq`).
   green (13 new: 6 read-path, 5 free-list, WAL wrap, orphan reclaim),
   clippy pedantic+nursery clean, fmt clean. v0.4+ exclusions held: no
   compaction, no scan/snapshots.
-- v0.4 — Leveled `compact_step` with bounded work + tombstone rule.
+- ~~v0.4 — Leveled `compact_step` with bounded work + tombstone rule.~~
+  DONE 2026-09-14: `Db::compact_step(&mut Compaction) -> Result<Progress,
+  Error>` with caller-owned typed scratch; L0→L1 only (cascade deferred);
+  linear-scan k-way merge (KMAX = 8), highest-seq-wins dedup, tombstone drop
+  only when no level ≥ 2 overlaps the output span; one output block per call
+  (`Progress::{Done, More}`); crash-injector green (state exactly pre- or
+  post-compaction, never mixed). Also fixed a v0.3 manifest-encoding bug the
+  new tests exposed: key bounds were written as full 256-byte arrays
+  (544 bytes/table, overflowing the 4 KiB manifest block at 8 tables) and are
+  now length-prefixed variable-length. 87 tests green (9 new compaction
+  tests + merged perf work: slicing-by-8 CRC, `get` scratch reuse, release
+  free-list claim fix, word-chunked zero scans, callgrind bench harnesses),
+  clippy pedantic+nursery clean, fmt clean.
 - v0.5 — `scan` iterator + snapshot reads + Verus models for the two
   core invariants.
 - v0.6 (roadmap) — ESP32-S3 / Tallow port: SPI-flash `BlockDevice`,

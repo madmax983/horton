@@ -28,18 +28,14 @@ fn write(items: &[SstEntry<'_>], dev: &mut MemDevice<BLOCK>) -> (u64, u64) {
     let plan =
         plan_table::<core::convert::Infallible, BLOCK, KEY_MAX>(items.iter().copied()).unwrap();
     let k = bloom_k(BLOOM_BYTES * 8, plan.entry_count);
-    let mut data = [0u8; BLOCK];
-    let mut index = [0u8; BLOCK];
-    let mut bloom = [0u8; BLOOM_BYTES];
-    let n = block_on(write_table::<MemDevice<BLOCK>, BLOCK, BLOOM_BYTES>(
-        dev,
-        BASE,
-        k,
-        items.iter().copied(),
-        &mut data,
-        &mut index,
-        &mut bloom,
-    ))
+    let n = block_on(
+        write_table::<MemDevice<BLOCK>, BLOCK, BLOOM_BYTES, KEY_MAX>(
+            dev,
+            BASE,
+            k,
+            items.iter().copied(),
+        ),
+    )
     .unwrap();
     assert_eq!(n, plan.data_blocks + 3, "writer must emit plan + 3 blocks");
     (n, plan.data_blocks)

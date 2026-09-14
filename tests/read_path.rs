@@ -38,17 +38,11 @@ fn write_single(
     };
     let plan = plan_table::<DevError, 4096, 256>(core::iter::once(entry())).expect("plan table");
     let k = bloom_k(1024 * 8, plan.entry_count);
-    let mut data = [0u8; 4096];
-    let mut index = [0u8; 4096];
-    let mut bloom = [0u8; 1024];
-    let written = block_on(write_table::<MemDevice<4096>, 4096, 1024>(
+    let written = block_on(write_table::<MemDevice<4096>, 4096, 1024, 256>(
         dev,
         base,
         k,
         core::iter::once(entry()),
-        &mut data,
-        &mut index,
-        &mut bloom,
     ))
     .expect("write table");
     let total = plan.data_blocks + 3;
@@ -269,6 +263,7 @@ fn concurrent_gets_do_not_panic_when_interleaved() {
     // The first `get` is still suspended. The second `get` is polled
     // during this time. It must fall back to its own buffer instead of
     // panicking. Both calls must still return the right value.
+    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
     let mut dev = MemDevice::new();
     let t0 = write_single(&mut dev, 136, b"alpha", b"AAAA", 1, false, 0);
     commit_tables(&mut dev, &[(0, t0)]);
@@ -276,7 +271,6 @@ fn concurrent_gets_do_not_panic_when_interleaved() {
         inner: dev,
         yielded: Cell::new(false),
     };
-    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
     let mut db = PendingDb::new(dev, test_config());
     block_on(db.open()).expect("open");
 
