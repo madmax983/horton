@@ -183,6 +183,12 @@ pub struct TableRef {
   manifest slot → `flush()` → WAL blocks at/before `wal_head` are now free.
   Crash anywhere before the manifest write = old state intact; crash after =
   new state intact. No in-between.
+- **On-disk format policy (pre-1.0): no compatibility across minor
+  versions.** The manifest magic changes whenever the layout changes
+  (`hrtman01` → `hrtman02` in v0.4.1, when key bounds went from fixed
+  `KEY_MAX` arrays to length-prefixed bytes). A foreign magic decodes as
+  `CorruptManifest` — old bytes are rejected, never misparsed. WAL and
+  SSTable formats carry their own magics under the same rule.
 
 ### 4.6 Compaction — leveled, bounded, caller-driven
 
@@ -222,6 +228,13 @@ db.compact_step(&mut scratch) -> Result<Progress, Error>
   the next open's garbage sweep (any block not referenced by the manifest or
   the WAL range is free). Crash-injector tested: the post-crash state is
   always exactly pre- or post-compaction, never mixed.
+- **Reclamation (v0.4.1):** strictly *after* the manifest commit — the
+  visibility point — the input tables' block runs are returned to the free
+  list, so the live session reuses them immediately (the all-tombstone case
+  with no output table reclaims its inputs too). Reclamation is best-effort:
+  the commit already happened, so a full free list must not fail the
+  compaction; un-reclaimed blocks stay orphans and the next open's sweep
+  reclaims them.
 
 ### 4.7 Read path
 
@@ -344,6 +357,13 @@ floor (`seq <= manifest.max_seq`).
   tests + merged perf work: slicing-by-8 CRC, `get` scratch reuse, release
   free-list claim fix, word-chunked zero scans, callgrind bench harnesses),
   clippy pedantic+nursery clean, fmt clean.
+- v0.4.1 — Compaction input-run reclamation + on-disk format policy.
+  Reclaim input block runs into the free list strictly after the manifest
+  commit (best-effort: a full free list can't fail the already-committed
+  job; orphans are swept by the next open). Manifest magic `hrtman01` →
+  `hrtman02` for the v0.4 key-bound encoding change; pre-1.0 policy is no
+  format compat across minor versions — a foreign magic is
+  `CorruptManifest`, never a misparse.
 - v0.5 — `scan` iterator + snapshot reads + Verus models for the two
   core invariants.
 - v0.6 (roadmap) — ESP32-S3 / Tallow port: SPI-flash `BlockDevice`,

@@ -783,6 +783,23 @@ impl<
                     .set_next(c.out_base.checked_add(c.out_blocks).ok_or(Error::NoSpace)?);
             }
         }
+        // Reclaim the input runs strictly after the visibility point: the
+        // manifest no longer references them, so they are orphans.
+        // Best-effort — the commit already happened, so a full free list
+        // must not fail the compaction; un-reclaimed blocks stay orphans
+        // and the next open() sweep reclaims them.
+        for input in c.inputs.iter().take(c.n_inputs) {
+            let mut k = 0u64;
+            let blocks = u64::from(input.tref.block_count);
+            while k < blocks {
+                if let Some(id) = input.tref.first_block.checked_add(k) {
+                    if self.tbl_free.insert::<D::Error>(id).is_err() {
+                        break;
+                    }
+                }
+                k += 1;
+            }
+        }
         c.reset();
         Ok(())
     }

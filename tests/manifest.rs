@@ -184,3 +184,21 @@ fn encode_decode_round_trip() {
     assert_eq!(back.l0().len(), 2);
     assert_eq!(back.next_table_id(), 0);
 }
+
+#[test]
+fn old_magic_is_rejected_not_misparsed() {
+    // v0.4.0 wrote this same layout under magic "hrtman01"; v0.4.1 bumped
+    // the magic to "hrtman02" (format policy: the magic changes whenever the
+    // layout changes). Old bytes must be rejected outright, never decoded
+    // into a garbage manifest.
+    let mut m = TestManifest::new();
+    m.add_table_to_level::<DevError>(0, tref(0, 100)).unwrap();
+    let mut buf = [0u8; BLOCK];
+    m.encode::<DevError, BLOCK>(&mut buf).unwrap();
+    buf[0..8].copy_from_slice(b"hrtman01");
+    let res = TestManifest::decode::<DevError, BLOCK>(&buf);
+    assert!(
+        matches!(res, Err(Error::CorruptManifest)),
+        "old magic must be rejected, got {res:?}"
+    );
+}

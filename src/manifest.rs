@@ -7,7 +7,7 @@
 //! Layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman01" | payload_len: u32 | payload | crc32: u32
+//! magic: u64 = "hrtman02" | payload_len: u32 | payload | crc32: u32
 //! ```
 //!
 //! `payload` is variable-length (only populated levels are stored):
@@ -31,8 +31,14 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman01".
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman01");
+/// Manifest block magic: ASCII "hrtman02".
+///
+/// The magic changes whenever the layout changes (pre-1.0 format policy:
+/// no compatibility across minor versions). "hrtman01" was the v0.4.0
+/// layout with fixed `KEY_MAX` key bounds; "hrtman02" is the v0.4.1 layout
+/// with length-prefixed key bounds. A foreign magic decodes as
+/// [`Error::CorruptManifest`] — old bytes are rejected, never misparsed.
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman02");
 
 /// Fixed-size key bound: `len` significant bytes of `bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

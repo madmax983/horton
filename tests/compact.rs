@@ -373,3 +373,73 @@ fn compact_crash_never_mixes_state() {
         assert_eq!(man.level(1).unwrap().len(), 1, "crash_at={crash_at}");
     }
 }
+
+#[test]
+fn compact_reclaims_input_blocks_for_reuse() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    for t in 0..4u8 {
+        block_on(db.put(&[t], &[t])).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    // Record the L0 input runs before compaction.
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    let l0 = man.level(0).unwrap();
+    assert_eq!(l0.len(), 4);
+    let b0 = l0[0].first_block;
+    let mut db = TestDb::new(dev, test_config());
+    open(&mut db);
+    drive(&mut db);
+    // A post-compaction flush must reuse the reclaimed input blocks
+    // (free-list-first allocation), not fresh bump blocks.
+    block_on(db.put(b"new", b"v")).unwrap();
+    block_on(db.flush()).unwrap();
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    let l0 = man.level(0).unwrap();
+    assert_eq!(l0.len(), 1);
+    assert_eq!(
+        l0[0].first_block, b0,
+        "flushed table must reuse the first reclaimed input run"
+    );
+}
+
+#[test]
+fn compact_reclaims_inputs_when_output_is_empty() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // Four L0 tables of pure tombstones. L1 is the bottommost level holding
+    // the range, so every tombstone is dropped: no output table is written,
+    // but the input blocks must still be reclaimed.
+    for t in 0..4u8 {
+        block_on(db.put(&[t], &[t])).unwrap();
+        block_on(db.delete(&[t])).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    let l0 = man.level(0).unwrap();
+    assert_eq!(l0.len(), 4);
+    let b0 = l0[0].first_block;
+    let mut db = TestDb::new(dev, test_config());
+    open(&mut db);
+    drive(&mut db);
+    // No reopen in between: the live session's free list must already hold
+    // the input runs. A fresh flush must land on the reclaimed blocks.
+    block_on(db.put(b"new", b"v")).unwrap();
+    block_on(db.flush()).unwrap();
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    assert_eq!(
+        man.level(1).unwrap().len(),
+        0,
+        "no output table was written"
+    );
+    let l0 = man.level(0).unwrap();
+    assert_eq!(l0.len(), 1, "only the fresh table remains in L0");
+    assert_eq!(
+        l0[0].first_block, b0,
+        "flushed table must reuse the reclaimed input run"
+    );
+}
