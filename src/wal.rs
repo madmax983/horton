@@ -116,10 +116,23 @@ enum Scan<'a> {
 /// Classifies the data at the current block offset: a valid record, clean
 /// zero padding, or the torn tail.
 fn scan_record(buf: &[u8]) -> Scan<'_> {
-    if buf.iter().all(|&b| b == 0) {
+    if all_zero(buf) {
         return Scan::CleanEnd;
     }
     decode_record(buf).map_or(Scan::Corrupt, Scan::Record)
+}
+
+/// `true` if every byte in `bytes` is zero.
+///
+/// Word-chunked instead of a byte-at-a-time `iter().all()`: a run of live
+/// records still hits the first (non-zero) byte immediately, but the
+/// clean-padding tail — the common case this exists for, since every record
+/// scan ends by confirming the rest of the block is zero — is checked 8
+/// bytes at a time instead of one.
+fn all_zero(bytes: &[u8]) -> bool {
+    let mut chunks = bytes.chunks_exact(8);
+    chunks.all(|c| u64::from_ne_bytes(c.try_into().unwrap_or([0; 8])) == 0)
+        && chunks.remainder().iter().all(|&b| b == 0)
 }
 
 /// Decodes one record at the start of `buf`.
