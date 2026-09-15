@@ -474,19 +474,70 @@ floor (`seq <= manifest.max_seq`).
     erase-aware `BlockDevice` wrapper. Horton block writes are
     whole-sector (BLOCK = 4096 = flash sector size), so a write is
     erase-sector then program — no read-modify-write, no hidden RAM.
-    The ESP32-S3 SPI register implementation is Tallow driver work and
-    needs real hardware to verify; it is explicitly out of scope here.
+    The ESP32-S3 SPI register implementation is v0.7's
+    `src/esp32s3.rs` (below); on-silicon verification of the command
+    sequences still needs real hardware.
     The wrapper's erase discipline is property-tested on host against a
     strict mock flash (erase sets 0xFF, program only clears bits,
     programming an unerased sector is an error).
   - **Budget re-tune**: the `ESP32S3` const profile
-    (`BLOCK=4096, KEY_MAX=64, VAL_MAX=256, CAP=64, ARENA=8192, ...`)
+    (`BLOCK=4096, KEY_MAX=32, VAL_MAX=64, CAP=16, ARENA=2048, ...`)
     sizes a database at well under 64 KiB of RAM; `BUDGET.md` shows the
     accounting and the profile carries compile-time size assertions.
   - Honest limits: QEMU proves logic on the target ISA, not flash
     programming or timing; the SPI MMIO primitive and power-loss
     behavior need hardware. Throughput numbers, if any, are measured —
     never estimated.
+- v0.7 — Real ESP32-S3 SPI flash driver (`src/esp32s3.rs`).
+  - **Scope**: the `Flash` trait's ESP32-S3 implementation — the half
+    v0.6 explicitly deferred as "Tallow driver work". It lives in this
+    crate (not Tallow) because it is Horton's board seam, and it stays
+    `#![no_std]` + `#![no_alloc]` + core-only like everything else.
+  - **Design**: `SpiFlash<B: RegBus>` is generic over a tiny register
+    bus trait (`read`/`write`/`read_word` at SPI1 offsets). All of the
+    driver's logic is safe (`#![forbid(unsafe_code)]` holds for the
+    whole crate): the volatile-MMIO adapter — the half-dozen lines that
+    actually touch `0x6000_2000` — lives in the board/Tallow crate,
+    which owns the `unsafe`. Host tests plug in a mock bus backed by
+    an emulated NOR chip.
+  - **Register sequences** follow ESP-IDF v5.2's LL layer verbatim
+    (`components/hal/esp32s3/include/hal/spimem_flash_ll.h`,
+    `spi_flash_hal_iram.c`), not the TRM prose:
+    - `erase_sector`: WREN → ADDR → save CTRL / CTRL=0 → dedicated SE
+      bit → spin on CMD-bit clear → restore CTRL → RDSR, poll WIP with
+      a bounded spin cap (`Error::Timeout`).
+    - `program`: WREN, then per chunk (≤ 64 bytes — the W0–W15 buffer —
+      and never crossing a 256-byte page): ADDR = `addr | (len << 24)`,
+      words into W0.., `usr_dummy = 0`, dedicated PP bit → spin →
+      WIP poll. Chunking matches ESP-IDF's `set_buffer_data`.
+    - `read`: user-mode `0x03` transactions (CMD 8b, ADDR 24b, MISO),
+      ≤ 64 bytes each, straight from the chip. This deliberately
+      bypasses the DROM flash cache: a cached read path would need a
+      cache invalidate after every program/erase (ROM
+      `Cache_Invalidate_Addr`, unverifiable in this environment and
+      fragile to link by hand), while user-mode reads are
+      correct-by-construction and fully provable in the host mock.
+      Cost is bounded and measurable on silicon later; the cached-read
+      optimization is future work, not a v0.7 claim.
+    - Every WREN is followed by a WEL check via RDSR
+      (`Error::WriteEnableFailed`); every poll is bounded.
+  - **Proof** (this is the leg that changed vs the plan): a bare-metal
+    probe run 2026-09-15 showed QEMU's `esp32s3` machine does **not**
+    emulate the SPI_MEM user-command path — DROM CPU reads return
+    `0xDEADBEEF` regardless of flash contents, CMD bits clear
+    instantly with no observable effect, and MISO reads return `0xFF`
+    for regions known to hold other bytes. So the proof is:
+    (1) host tests against the mock NOR — exact register-write
+    sequences asserted, WEL/WIP semantics emulated, plus a full `Db`
+    on `FlashBlockDevice<SpiFlash<MockBus>>` doing puts/gets/flush/
+    overwrite/reopen; (2) the Xtensa build gate — the driver builds
+    for `xtensa-esp32s3-none-elf`; (3) QEMU runs the probe without bus
+    faults (register addresses are at least mapped), with the
+    non-emulation recorded here, not hidden.
+  - Honest limits: on-silicon verification is still pending — actual
+    command timing, WIP behavior, and power-loss during program/erase
+    cannot be proven without hardware. No timing or power-loss claims
+    are made.
 
 ## 10. Open questions for Mark
 

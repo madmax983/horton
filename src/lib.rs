@@ -25,6 +25,7 @@ pub mod crc;
 pub mod db;
 pub mod device;
 pub mod error;
+pub mod esp32s3;
 pub mod flash;
 pub mod manifest;
 pub mod memtable;
