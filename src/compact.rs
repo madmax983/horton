@@ -1,11 +1,12 @@
 //! Bounded leveled compaction: the caller-driven merge engine.
 //!
-//! When L0 fills (`TABLES` tables), [`Db::compact_step`] selects all of L0
-//! plus the L1 tables whose key ranges overlap as one compaction job. The
-//! merge is incremental: one call pushes merged entries into the output
-//! table until an output block seals (or the merge exhausts), reporting
-//! [`Progress::More`] while work remains. A final manifest commit swaps the
-//! input tables for the output table atomically.
+//! When a level fills (`TABLES` tables), [`Db::compact_step`] selects the
+//! deepest full level's job: all of L0, or the oldest table of a deeper
+//! level, plus the tables of the level below whose key ranges overlap, as
+//! one compaction job. The merge is incremental: one call pushes merged
+//! entries into the output table until an output block seals (or the merge
+//! exhausts), reporting [`Progress::More`] while work remains. A final
+//! manifest commit swaps the input tables for the output table atomically.
 //!
 //! The caller owns the [`Compaction`] scratch — the output table's staging
 //! buffers plus one read cursor per input table, at most

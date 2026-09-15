@@ -41,6 +41,9 @@ enum MockMode {
     Normal,
     /// Command bits never self-clear and WIP never clears (timeout test).
     Hang,
+    /// Only the sector-erase command bit never self-clears, so the
+    /// erase's own `spin_cmd` times out (CTRL-restore test).
+    HangSe,
     /// `WREN` does not set `WEL` (write-enable failure test).
     DenyWel,
 }
@@ -104,7 +107,10 @@ impl MockState {
             v &= !CMD_WREN;
         }
         if v & CMD_SE != 0 {
-            if self.wel {
+            if self.mode == MockMode::HangSe {
+                // Leave the bit set: the erase command never completes,
+                // so the driver's spin on it times out.
+            } else if self.wel {
                 let a = (self.reg(REG_ADDR) & 0x00FF_FFFF) as usize;
                 self.chip[a..a + SECTOR].fill(0xFF);
                 self.wel = false;
@@ -112,7 +118,9 @@ impl MockState {
             } else {
                 self.se_without_wel = true;
             }
-            v &= !CMD_SE;
+            if self.mode != MockMode::HangSe {
+                v &= !CMD_SE;
+            }
         }
         if v & CMD_PP != 0 {
             if self.wel {
@@ -333,6 +341,24 @@ fn erase_times_out_when_wip_never_clears() {
     let mut flash = driver();
     flash.bus().with_mut(|s| s.mode = MockMode::Hang);
     assert_eq!(flash.erase_sector(0), Err(SpiError::Timeout));
+}
+
+#[test]
+fn erase_timeout_restores_ctrl() {
+    let mut flash = driver();
+    // A distinctive CTRL value so restoration is observable.
+    flash.bus().with_mut(|s| {
+        s.set_reg(REG_CTRL, 0xDEAD_BEEF);
+        s.mode = MockMode::HangSe;
+    });
+    assert_eq!(flash.erase_sector(0x1000), Err(SpiError::Timeout));
+    // The erase's own command spin timed out, but the boot-configured
+    // read mode in CTRL must still be restored on the error path.
+    assert_eq!(
+        flash.bus().with(|s| s.reg(REG_CTRL)),
+        0xDEAD_BEEF,
+        "CTRL must be restored even when the erase spin times out"
+    );
 }
 
 #[test]

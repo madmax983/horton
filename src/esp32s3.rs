@@ -287,8 +287,11 @@ impl<B: RegBus> Flash for SpiFlash<B> {
         let ctrl = self.bus.read(REG_CTRL);
         self.bus.write(REG_CTRL, 0);
         self.bus.write(REG_CMD, CMD_SE);
-        self.spin_cmd(CMD_SE)?;
+        // Restore CTRL on every path: a spin timeout must not destroy the
+        // boot-configured read mode.
+        let spin = self.spin_cmd(CMD_SE);
         self.bus.write(REG_CTRL, ctrl);
+        spin?;
         self.poll_wip()
     }
 

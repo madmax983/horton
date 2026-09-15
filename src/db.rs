@@ -18,7 +18,7 @@ use crate::compact::{
 };
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::{Manifest, TableRef};
+use crate::manifest::{KeyBound, Manifest, TableRef};
 use crate::memtable::MemTable;
 use crate::sstable;
 use crate::wal::{Op, RecoverState, WalWriter};
@@ -106,6 +106,21 @@ impl<const VAL_MAX: usize> ReadAcc<VAL_MAX> {
             best_seq: 0,
         }
     }
+}
+
+/// The tables one compaction job merges, chosen by `compact_select`.
+struct JobInputs<const KEY_MAX: usize> {
+    /// Total input tables pushed into the scratch.
+    n_inputs: usize,
+    /// Of those, how many came from the target level.
+    n_tgt_inputs: usize,
+    /// Merged key-range closure over all inputs.
+    first: KeyBound<KEY_MAX>,
+    last: KeyBound<KEY_MAX>,
+    /// Summed entry counts (for the bloom filter sizing).
+    total_entries: u64,
+    /// Summed data blocks (for the output run reservation).
+    total_data: u64,
 }
 
 /// Maximum live snapshots. Snapshot slots are plain `u64`s in the `Db`;
@@ -697,15 +712,41 @@ impl<
         const FREELIST: usize,
     > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
 {
+    /// Reports whether [`compact_step`](Db::compact_step) would select a
+    /// compaction job right now: some level below the top holds `>= TABLES`
+    /// tables. Unlike [`Progress::Done`], which a finished job also
+    /// returns, this distinguishes "a job just finished, more may be
+    /// pending" from "nothing to do" — firmware idle loops and test
+    /// drivers use it to decide whether another `compact_step` is
+    /// worthwhile.
+    #[must_use]
+    pub fn compaction_pending(&self) -> bool {
+        if LEVELS < 2 || TABLES == 0 {
+            return false;
+        }
+        for lvl in (0..LEVELS - 1).rev() {
+            if let Some(tables) = self.manifest.level(lvl) {
+                if tables.len() >= TABLES {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Runs one bounded compaction step using the caller's `scratch`.
     ///
-    /// When L0 is full, the first call selects all of L0 plus the
-    /// overlapping L1 tables and merges them one output block per call
-    /// ([`Progress::More`]); the call that exhausts the merge seals the
-    /// output table and commits the manifest atomically, returning
-    /// [`Progress::Done`]. With L0 not full this is a no-op returning
-    /// [`Progress::Done`]. Drive it with `while db.compact_step(&mut
-    /// scratch).await? == Progress::More {}`.
+    /// When some level is full, the first call selects a job for the
+    /// deepest full level — all of L0, or the oldest table of a deeper
+    /// level — plus the overlapping tables of the level below, and merges
+    /// them one output block per call ([`Progress::More`]); the call that
+    /// exhausts the merge seals the output table and commits the manifest
+    /// atomically, returning [`Progress::Done`]. With no full level this
+    /// is a no-op returning [`Progress::Done`]. Note `Done` is returned in
+    /// both cases, so `while db.compact_step(&mut scratch).await? ==
+    /// Progress::More {}` drives exactly one job; loop on
+    /// [`compaction_pending`](Db::compaction_pending) to drain every
+    /// pending job.
     ///
     /// The scratch is reusable across jobs and droppable mid-job: partial
     /// output is invisible until the manifest commit, so abandoning it only
@@ -714,7 +755,9 @@ impl<
     /// # Errors
     ///
     /// [`Error::NoSpace`] when the job would exceed [`COMPACTION_KMAX`]
-    /// inputs, no output run can be reserved, or the target level is full;
+    /// inputs, no output run can be reserved, or the target level cannot
+    /// absorb the output table (a full bottommost level the merge does not
+    /// drain into — raised at select time, before any merge I/O);
     /// [`Error::CorruptBlock`] on a torn input table (compaction never
     /// silently drops entries); [`Error::Device`] on I/O failure. A failed
     /// step resets the scratch; the device manifest is untouched, so the
@@ -765,84 +808,70 @@ impl<
         (sorted, n)
     }
 
-    /// Selects the next compaction job into `scratch`: all of L0 plus the
-    /// L1 tables overlapping the merged key range. Returns `false` when L0
-    /// is not full and there is no work.
+    /// Selects the next compaction job into `scratch`: the deepest full
+    /// level's tables (all of L0, or the oldest table of a deeper level)
+    /// plus the target level's overlapping tables. Returns `false` when no
+    /// level is full and there is no work.
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<bool, Error<D::Error>> {
-        // v0.4 compacts L0 -> L1 only, triggered by a full L0.
-        if LEVELS < 2 {
+        // v0.8: every level compacts. The deepest full level is selected
+        // first, so a job's target always has room: a full non-bottom
+        // target would have been selected itself.
+        if LEVELS < 2 || TABLES == 0 {
             return Ok(false);
         }
-        let l0 = self.manifest.level(0).ok_or(Error::NoSpace)?;
-        if l0.len() < TABLES {
+        let mut src = LEVELS;
+        for lvl in (0..LEVELS - 1).rev() {
+            let tables = self.manifest.level(lvl).ok_or(Error::NoSpace)?;
+            if tables.len() >= TABLES {
+                src = lvl;
+                break;
+            }
+        }
+        if src >= LEVELS - 1 {
             return Ok(false);
         }
+        let tgt = src + 1;
         // Copy the refs so the manifest borrow ends before the scratch and
         // the device are touched.
-        let mut l0_refs = [TableRef::EMPTY; TABLES];
-        let l0_take = l0.len().min(TABLES);
-        l0_refs[..l0_take].copy_from_slice(&l0[..l0_take]);
-        let l1 = self.manifest.level(1).ok_or(Error::NoSpace)?;
-        let mut l1_refs = [TableRef::EMPTY; TABLES];
-        let l1_take = l1.len().min(TABLES);
-        l1_refs[..l1_take].copy_from_slice(&l1[..l1_take]);
-
-        let mut n_inputs = 0usize;
-        let mut first = l0_refs[0].first_key;
-        let mut last = l0_refs[0].last_key;
-        let mut total_entries = 0u64;
-        let mut total_data = 0u64;
-        // Pushes one input table, widening the merged range and totals.
-        let mut push = |level: usize, t: &TableRef<KEY_MAX>| -> Result<(), Error<D::Error>> {
-            if n_inputs >= COMPACTION_KMAX {
-                return Err(Error::NoSpace);
-            }
-            c.inputs[n_inputs] = Input { level, tref: *t };
-            n_inputs += 1;
-            total_entries = total_entries
-                .checked_add(u64::from(t.entry_count))
-                .ok_or(Error::NoSpace)?;
-            let data = u64::from(t.block_count)
-                .checked_sub(3)
-                .ok_or(Error::CorruptBlock { id: t.first_block })?;
-            total_data = total_data.checked_add(data).ok_or(Error::NoSpace)?;
-            Ok(())
+        let mut src_refs = [TableRef::EMPTY; TABLES];
+        let mut tgt_refs = [TableRef::EMPTY; TABLES];
+        let (src_take, tgt_len, tgt_take) = {
+            let manifest = &self.manifest;
+            let s = manifest.level(src).ok_or(Error::NoSpace)?;
+            let t = manifest.level(tgt).ok_or(Error::NoSpace)?;
+            let st = s.len().min(TABLES);
+            let tt = t.len().min(TABLES);
+            src_refs[..st].copy_from_slice(&s[..st]);
+            tgt_refs[..tt].copy_from_slice(&t[..tt]);
+            (st, t.len(), tt)
         };
-        for t in l0_refs.iter().take(l0_take) {
-            push(0, t)?;
-            if t.first_key.as_slice() < first.as_slice() {
-                first = t.first_key;
-            }
-            if t.last_key.as_slice() > last.as_slice() {
-                last = t.last_key;
-            }
-        }
-        // Overlapping L1 tables join the merge (L1 runs never overlap each
-        // other, so range overlap is the exact join condition).
-        for t in l1_refs.iter().take(l1_take) {
-            if ranges_overlap(first, last, t.first_key, t.last_key) {
-                push(1, t)?;
-                if t.first_key.as_slice() < first.as_slice() {
-                    first = t.first_key;
-                }
-                if t.last_key.as_slice() > last.as_slice() {
-                    last = t.last_key;
-                }
-            }
+
+        let job = Self::select_job_inputs(
+            c,
+            src,
+            &src_refs[..src_take],
+            tgt,
+            &tgt_refs[..tgt_take],
+        )?;
+        // The target absorbs the output table: it must fit once the
+        // overlapping inputs leave. Checked here — before any merge I/O —
+        // instead of failing at commit.
+        if tgt_len - job.n_tgt_inputs + 1 > TABLES {
+            return Err(Error::NoSpace);
         }
         // Tombstones drop only when the output reaches the bottommost level
         // holding the merged range: nothing below can hide an older version
         // of a dropped key.
         let mut bottommost = true;
-        'levels: for lvl in 2..LEVELS {
+        'levels: for lvl in tgt + 1..LEVELS {
             let Some(tables) = self.manifest.level(lvl) else {
                 break 'levels;
             };
             for t in tables {
-                if ranges_overlap(first, last, t.first_key, t.last_key) {
+                if ranges_overlap(job.first, job.last, t.first_key, t.last_key) {
                     bottommost = false;
                     break 'levels;
                 }
@@ -852,7 +881,7 @@ impl<
         // plus tombstone drops), so their data blocks plus the 3 framing
         // blocks always suffice. Free list first, then the bump — claimed
         // only after the manifest commit, exactly like flush.
-        let out_blocks = total_data.checked_add(3).ok_or(Error::NoSpace)?;
+        let out_blocks = job.total_data.checked_add(3).ok_or(Error::NoSpace)?;
         let out_len = usize::try_from(out_blocks).map_err(|_| Error::NoSpace)?;
         let (out_base, from_free) = match self.tbl_free.find_run(out_len) {
             Some(b) => (b, true),
@@ -862,7 +891,7 @@ impl<
         c.out_blocks = out_blocks;
         c.out_len = out_len;
         c.from_free = from_free;
-        c.target_level = 1;
+        c.target_level = tgt;
         c.bottommost = bottommost;
         // The version-retention set: snapshots live at select time pin this
         // compaction's keep-set. Watermarks are stored descending so the
@@ -874,17 +903,94 @@ impl<
         c.snapshots = sorted;
         c.n_snapshots = n;
         c.oldest_snapshot = self.oldest_snapshot_seq();
-        c.n_inputs = n_inputs;
-        c.writer =
-            sstable::TableWriter::new(out_base, sstable::bloom_k(BLOOM_BYTES * 8, total_entries));
+        c.n_inputs = job.n_inputs;
+        c.writer = sstable::TableWriter::new(
+            out_base,
+            sstable::bloom_k(BLOOM_BYTES * 8, job.total_entries),
+        );
         // Position one cursor per input on its first entry.
         let device = self.wal.device_mut();
-        for i in 0..n_inputs {
+        for i in 0..job.n_inputs {
             let tref = c.inputs[i].tref;
             init_cursor(&*device, &tref, &mut c.cursors[i]).await?;
         }
         c.state = State::Merging;
         Ok(true)
+    }
+
+    /// Pushes one compaction job's input tables into the scratch: all of a
+    /// full L0, or the oldest table of a full deeper level, plus the target
+    /// level's tables overlapping the merged range. The merged range starts
+    /// as the source span and widens as overlapping target tables join, so
+    /// the output span can never swallow a surviving target table.
+    ///
+    /// `src_tables` is never empty: the caller only selects levels holding
+    /// `>= TABLES >= 1` tables.
+    fn select_job_inputs(
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        src: usize,
+        src_tables: &[TableRef<KEY_MAX>],
+        tgt: usize,
+        tgt_tables: &[TableRef<KEY_MAX>],
+    ) -> Result<JobInputs<KEY_MAX>, Error<D::Error>> {
+        let mut job = JobInputs {
+            n_inputs: 0,
+            n_tgt_inputs: 0,
+            first: src_tables[0].first_key,
+            last: src_tables[0].last_key,
+            total_entries: 0,
+            total_data: 0,
+        };
+        // Pushes one input table, widening the merged range and totals.
+        let mut push = |level: usize, t: &TableRef<KEY_MAX>| -> Result<(), Error<D::Error>> {
+            if job.n_inputs >= COMPACTION_KMAX {
+                return Err(Error::NoSpace);
+            }
+            c.inputs[job.n_inputs] = Input { level, tref: *t };
+            job.n_inputs += 1;
+            job.total_entries = job
+                .total_entries
+                .checked_add(u64::from(t.entry_count))
+                .ok_or(Error::NoSpace)?;
+            let data = u64::from(t.block_count)
+                .checked_sub(3)
+                .ok_or(Error::CorruptBlock { id: t.first_block })?;
+            job.total_data = job.total_data.checked_add(data).ok_or(Error::NoSpace)?;
+            Ok(())
+        };
+        if src == 0 {
+            // L0 tables may overlap each other, so the whole level joins.
+            for t in src_tables {
+                push(0, t)?;
+                if t.first_key.as_slice() < job.first.as_slice() {
+                    job.first = t.first_key;
+                }
+                if t.last_key.as_slice() > job.last.as_slice() {
+                    job.last = t.last_key;
+                }
+            }
+        } else {
+            // Deeper levels never overlap within themselves: compact the
+            // oldest table. Index 0 is FIFO with no extra state, because
+            // the picked table leaves the level.
+            push(src, &src_tables[0])?;
+        }
+        // Overlapping target tables join the merge (target runs never
+        // overlap each other, so range overlap is the exact join
+        // condition).
+        for t in tgt_tables {
+            if ranges_overlap(job.first, job.last, t.first_key, t.last_key) {
+                push(tgt, t)?;
+                job.n_tgt_inputs += 1;
+                if t.first_key.as_slice() < job.first.as_slice() {
+                    job.first = t.first_key;
+                }
+                if t.last_key.as_slice() > job.last.as_slice() {
+                    job.last = t.last_key;
+                }
+            }
+        }
+        Ok(job)
     }
 
     /// Commits the finished merge: seals the output table (unless the merge

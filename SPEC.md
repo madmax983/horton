@@ -204,11 +204,24 @@ db.compact_step(&mut scratch) -> Result<Progress, Error>
   never stored inside `Db`. It persists across `Progress::More` calls; it
   is droppable mid-job, because partial output is invisible until the
   manifest commit.
-- **v0.4 scope: L0→L1 only.** When L0 is full (4 tables), one job compacts
-  all of L0 plus every L1 table overlapping the L0 key span into one new
-  L1 run. A full L1 (or more than `KMAX = 8` inputs) fails the job with
-  `Error::NoSpace` and leaves the manifest untouched; cascading L1→L2 and
-  deeper is deferred to a later version.
+- **Selection (v0.8: every level).** `compact_select` scans the candidate
+  source levels from the deepest (`LEVELS - 2`) up to L0 and takes the
+  first level holding `>= TABLES` tables. A full L0 compacts as one job
+  (all of L0, as in v0.4); a full deeper level `Ln` compacts a single
+  table — always index 0, which is oldest-first FIFO with no extra state,
+  since the picked table leaves the level — plus every `L(n+1)` table
+  overlapping the closure of its key range (seeded with the picked table's
+  full span, widened as overlapping tables join, so the output span can
+  never swallow a surviving `L(n+1)` table and levels ≥ 1 keep their
+  non-overlapping invariant). The output lands in `L(n+1)`; `bottommost`
+  is recomputed against the levels below the target. Deepest-first
+  selection guarantees the target has room — a full non-bottom target
+  would itself have been selected — so the only remaining ceiling is a
+  full bottommost level: compacting into it still succeeds when the merge
+  absorbs at least one target table, and fails with `Error::NoSpace` at
+  select time (before any merge I/O) only when the output genuinely does
+  not fit. The v0.4–v0.7 `NoSpace`-on-full-L1 behavior is retired: a full
+  L1 now drains into L2 instead of failing the job.
 - Merge is k-way (`KMAX = 8`) over per-table block cursors. Winner selection
   is a linear scan over the ≤ 8 live cursors (minimum key; highest sequence
   wins ties) — no heap, hence no stale entries for exhausted cursors. The
@@ -494,7 +507,7 @@ floor (`seq <= manifest.max_seq`).
     crate (not Tallow) because it is Horton's board seam, and it stays
     `#![no_std]` + `#![no_alloc]` + core-only like everything else.
   - **Design**: `SpiFlash<B: RegBus>` is generic over a tiny register
-    bus trait (`read`/`write`/`read_word` at SPI1 offsets). All of the
+    bus trait (`read`/`write` at SPI1 offsets). All of the
     driver's logic is safe (`#![forbid(unsafe_code)]` holds for the
     whole crate): the volatile-MMIO adapter — the half-dozen lines that
     actually touch `0x6000_2000` — lives in the board/Tallow crate,
@@ -538,6 +551,52 @@ floor (`seq <= manifest.max_seq`).
     command timing, WIP behavior, and power-loss during program/erase
     cannot be proven without hardware. No timing or power-loss claims
     are made.
+- v0.8 — Compaction down every level (`Db::compact_step` generalization).
+  - **Scope**: retire the v0.4–v0.7 L0→L1-only ceiling. `compact_select`
+    takes the deepest full level (`>= TABLES` tables, scanning
+    `LEVELS - 2` down to 0): a full L0 compacts all of L0; a full deeper
+    `Ln` compacts its oldest table (index 0 — FIFO with no extra state)
+    plus the `L(n+1)` tables overlapping the closure of its key range.
+    Output lands in `L(n+1)`; `bottommost` is recomputed against the
+    levels below the target; the merge, commit, crash-safety, and
+    snapshot keep-set logic are untouched (all already level-generic).
+  - **NoSpace moves to select time**: the target-level capacity check
+    (`len - overlapping_inputs + 1 <= TABLES`) now runs before any merge
+    I/O. Deepest-first selection means a full non-bottom target can never
+    be picked (it would have been selected itself); the only honest
+    ceiling left is a full bottommost level whose tables the merge does
+    not absorb.
+  - **Proof**: RED suite in `tests/compact.rs` — L1→L2 drain when L1 is
+    full (the old `NoSpace` test retired), deepest-first priority with L0
+    and L1 both full, version/snapshot correctness through a two-level
+    cascade, the non-overlap invariant on L2+, crash-injector for the
+    L1→L2 path (state exactly pre- or post-compaction, never mixed), and
+    `NoSpace` only for a genuinely full bottom level with disjoint ranges.
+  - **Measured**: 140 debug + 140 release tests green; `cargo fmt --check`
+    clean; clippy pedantic + nursery zero warnings on all targets;
+    `xtensa-esp32s3-none-elf` build passes; the v0.6 bare-metal QEMU
+    ESP32-S3 smoke regression still ends in `SMOKE PASS`; no
+    `unwrap`/`expect`/`panic!` in non-test source.
+  - **Driving to idle**: `compact_step` returns `Progress::Done` both when
+    a selected job finishes and when no job was selected, so a
+    `while ... == Progress::More` loop drives exactly one job. The new
+    `Db::compaction_pending()` query reports whether a job is selectable
+    right now; firmware idle loops and test drivers loop
+    `while db.compaction_pending() { drive_one_job(); }` to drain.
+  - **v0.7 audit corrections folded into this release** (audited
+    2026-09-15, before v0.8 shipped):
+      - `SpiFlash::erase_sector` now restores `CTRL` on every error path —
+        the `spin_cmd(CMD_SE)` timeout previously returned with `CTRL`
+        still cleared, destroying the boot-configured read mode. RED test
+        `erase_timeout_restores_ctrl` (new `MockMode::HangSe`), then the
+        fix: capture the spin result, restore `CTRL`, then propagate.
+      - User-address encoding verified against the ESP-IDF v5.2 reference
+        (`spimem_flash_ll_set_usr_address` writes the raw address to
+        `dev->addr`; no bit-shifting) — Horton's raw `REG_ADDR` write is
+        silicon-correct per the reference. The mock mirroring it is
+        therefore not circular on this point.
+      - SPEC claimed `RegBus` had `read`/`write`/`read_word`; the trait has
+        only `read`/`write` — the doc, not the code, was wrong (fixed).
 
 ## 10. Open questions for Mark
 

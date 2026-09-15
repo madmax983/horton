@@ -1,6 +1,8 @@
-//! Compaction (v0.4): L0 -> L1 bounded merge.
+//! Compaction (v0.8): bounded merge down every level.
 //!
-//! RED: `Compaction`, `Progress`, and `Db::compact_step` do not exist yet.
+//! v0.4 RED: `Compaction`, `Progress`, and `Db::compact_step` did not exist.
+//! v0.8 RED: `compact_select` only compacts L0 -> L1; deeper levels are not
+//! selected, so a full L1 fails the job with `Error::NoSpace`.
 
 use horton::{BlockDevice, Compaction, Error, Manifest, Progress};
 
@@ -27,13 +29,33 @@ where
         .map(|n| buf[..n].to_vec())
 }
 
-/// Drives compaction to completion.
-fn drive<D: BlockDevice>(db: &mut TestDb<D>)
+/// Drives exactly one compaction job to completion (no-op when idle).
+fn drive_one<D: BlockDevice>(db: &mut TestDb<D>)
 where
     D::Error: std::fmt::Debug,
 {
     let mut c = TestCompaction::new();
-    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    loop {
+        match block_on(db.compact_step(&mut c)) {
+            Ok(Progress::More) => {}
+            Ok(Progress::Done) => break,
+            Err(e) => panic!("unexpected compaction error: {e:?}"),
+        }
+    }
+}
+
+/// Drives compaction jobs until none is selectable. (`compact_step`
+/// reports `Done` both when a job finishes and when idle, so a single
+/// `while ... == More` loop only ever runs one job; the
+/// [`compaction_pending`](horton::Db::compaction_pending) query closes
+/// the loop honestly.)
+fn drain<D: BlockDevice>(db: &mut TestDb<D>)
+where
+    D::Error: std::fmt::Debug,
+{
+    while db.compaction_pending() {
+        drive_one(db);
+    }
 }
 
 /// Recovers the manifest straight from the device for level inspection.
@@ -70,7 +92,7 @@ fn compact_drains_l0_into_l1() {
         block_on(db.put(&[t], &[t])).unwrap();
         block_on(db.flush()).unwrap();
     }
-    drive(&mut db);
+    drain(&mut db);
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     assert_eq!(man.level(0).unwrap().len(), 0, "L0 must drain");
@@ -95,7 +117,7 @@ fn compact_dedups_highest_sequence_wins() {
         }
         block_on(db.flush()).unwrap();
     }
-    drive(&mut db);
+    drain(&mut db);
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     let l1 = man.level(1).unwrap();
@@ -122,7 +144,7 @@ fn compact_drops_tombstone_at_bottommost() {
         block_on(db.put(&[t], &[t])).unwrap();
         block_on(db.flush()).unwrap();
     }
-    drive(&mut db);
+    drain(&mut db);
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     let l1 = man.level(1).unwrap();
@@ -181,7 +203,7 @@ fn compact_merges_overlapping_l1() {
         }
         block_on(db.flush()).unwrap();
     }
-    drive(&mut db); // L0 -> L1, now one L1 table exists
+    drain(&mut db); // L0 -> L1, now one L1 table exists
                     // Four overlapping L0 tables covering [n-s], newer.
     for t in 0..4u8 {
         for k in *b"nopqrs" {
@@ -189,7 +211,7 @@ fn compact_merges_overlapping_l1() {
         }
         block_on(db.flush()).unwrap();
     }
-    drive(&mut db);
+    drain(&mut db);
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     assert_eq!(man.level(0).unwrap().len(), 0);
@@ -207,52 +229,64 @@ fn compact_merges_overlapping_l1() {
 }
 
 #[test]
-fn compact_l1_full_returns_nospace() {
+fn compact_l1_full_drains_to_l2() {
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
-    // Fill L1 to capacity with four compactions of disjoint... actually
-    // overlapping compactions merge, so seed via direct manifest-free
-    // route: four L0->L1 rounds each carrying disjoint key ranges would
-    // still merge per round. Instead fill L0, compact, repeat with
-    // disjoint ranges — each round emits one L1 table.
+    // Fill L1 to capacity: four L0->L1 rounds, each carrying one key per
+    // flush so every round emits exactly one L1 table.
     for round in 0..4u8 {
         for t in 0..4u8 {
             let base = round * 4 + t;
             block_on(db.put(&[base], b"v")).unwrap();
             block_on(db.flush()).unwrap();
         }
-        drive(&mut db);
+        // Single jobs only: let L1 accumulate to full instead of draining it.
+        drive_one(&mut db);
     }
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     assert_eq!(man.level(1).unwrap().len(), 4, "L1 is full");
     let mut db = TestDb::new(dev, test_config());
     open(&mut db);
-    // One more full L0: the L1 output has nowhere to go.
+    // One more full L0: deepest-first selection must pick L1->L2, not fail.
     for t in 0..4u8 {
         block_on(db.put(&[0x80 + t], b"v")).unwrap();
         block_on(db.flush()).unwrap();
     }
-    let mut c = TestCompaction::new();
-    // First steps merge fine; the commit fails on the full level.
-    let mut saw_nospace = false;
-    loop {
-        match block_on(db.compact_step(&mut c)) {
-            Ok(Progress::More) => {}
-            Ok(Progress::Done) => break,
-            Err(Error::NoSpace) => {
-                saw_nospace = true;
-                break;
-            }
-            Err(e) => panic!("unexpected compaction error: {e:?}"),
-        }
-    }
-    assert!(saw_nospace, "L1-full compaction must fail cleanly");
-    // Failed commit leaves the manifest untouched: L0 still full, L1 intact.
+    drive_one(&mut db);
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
-    assert_eq!(man.level(0).unwrap().len(), 4);
-    assert_eq!(man.level(1).unwrap().len(), 4);
+    assert_eq!(man.level(0).unwrap().len(), 4, "L0 untouched by L1->L2");
+    assert_eq!(man.level(1).unwrap().len(), 3, "L1 drained by one table");
+    let l2 = man.level(2).unwrap();
+    assert_eq!(l2.len(), 1, "L2 gained the merged table");
+    assert_eq!(
+        l2[0].first_key.as_slice(),
+        &[0],
+        "oldest L1 table drained first"
+    );
+    // The remaining job still works: L0->L1 lands on the drained level.
+    let mut db = TestDb::new(dev, test_config());
+    open(&mut db);
+    drain(&mut db);
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    assert_eq!(man.level(0).unwrap().len(), 0, "L0 drains");
+    // Deepest-first keeps pulling: the refilled L1 drains straight into L2.
+    assert_eq!(man.level(1).unwrap().len(), 3, "L1 drained again");
+    assert_eq!(man.level(2).unwrap().len(), 2, "L2 keeps both tables");
+    let mut db = TestDb::new(dev, test_config());
+    open(&mut db);
+    for k in 0..16u8 {
+        assert_eq!(get(&db, &[k]), Some(b"v".to_vec()), "key {k} survives");
+    }
+    for t in 0..4u8 {
+        assert_eq!(
+            get(&db, &[0x80 + t]),
+            Some(b"v".to_vec()),
+            "key {t} survives"
+        );
+    }
 }
 
 #[test]
@@ -265,7 +299,7 @@ fn compact_unblocks_flush() {
     }
     block_on(db.put(b"x", b"v")).unwrap();
     assert!(matches!(block_on(db.flush()).unwrap_err(), Error::NoSpace));
-    drive(&mut db);
+    drain(&mut db);
     block_on(db.flush()).unwrap();
     assert_eq!(get(&db, b"x"), Some(b"v".to_vec()));
     for i in 0..4u8 {
@@ -338,7 +372,7 @@ fn compact_crash_never_mixes_state() {
     // Writes of a clean setup + compaction.
     let total_writes = {
         let mut db = build();
-        drive(&mut db);
+        drain(&mut db);
         db.into_device().writes
     };
     assert!(total_writes > setup_writes);
@@ -351,7 +385,7 @@ fn compact_crash_never_mixes_state() {
         // writes that "succeed" never land, like power loss).
         let mut db = TestDb::new(CrashDevice::<_, 4096>::new(dev, crash_at), test_config());
         open(&mut db);
-        drive(&mut db);
+        drain(&mut db);
         let dev = db.into_device().into_inner();
         // Reopen on the bare device: orphans are swept, state is exactly
         // pre- or post-compaction, and a clean compaction converges.
@@ -361,7 +395,7 @@ fn compact_crash_never_mixes_state() {
             rep.l0_tables == 4 || rep.l0_tables == 0,
             "crash_at={crash_at}"
         );
-        drive(&mut db);
+        drain(&mut db);
         for t in 0..4u8 {
             for k in 0..2u8 {
                 assert_eq!(get(&db, &[t, k]), Some(vec![t, k]), "crash_at={crash_at}");
@@ -390,7 +424,7 @@ fn compact_reclaims_input_blocks_for_reuse() {
     let b0 = l0[0].first_block;
     let mut db = TestDb::new(dev, test_config());
     open(&mut db);
-    drive(&mut db);
+    drain(&mut db);
     // A post-compaction flush must reuse the reclaimed input blocks
     // (free-list-first allocation), not fresh bump blocks.
     block_on(db.put(b"new", b"v")).unwrap();
@@ -424,7 +458,7 @@ fn compact_reclaims_inputs_when_output_is_empty() {
     let b0 = l0[0].first_block;
     let mut db = TestDb::new(dev, test_config());
     open(&mut db);
-    drive(&mut db);
+    drain(&mut db);
     // No reopen in between: the live session's free list must already hold
     // the input runs. A fresh flush must land on the reclaimed blocks.
     block_on(db.put(b"new", b"v")).unwrap();
@@ -476,7 +510,7 @@ fn compact_keep_set_matches_model() {
         block_on(db.flush()).unwrap();
     }
     // L0 is full: this drive compacts with both snapshots live.
-    drive(&mut db);
+    drain(&mut db);
 
     // The model's version chains, newest-first, with their values.
     let chains: &[Chain<'_>] = &[
@@ -604,7 +638,7 @@ fn compact_keep_set_no_snapshots_and_duplicate_watermarks() {
     db.release_snapshot(snap_a);
     db.release_snapshot(snap_b);
     // No live snapshots during the compaction.
-    drive(&mut db);
+    drain(&mut db);
 
     // The model agrees: no snapshots, bottommost, tombstone predates the
     // (empty) snapshot set → the keep-set is empty. The snapshots were
@@ -679,4 +713,259 @@ fn compact_keep_set_no_snapshots_and_duplicate_watermarks() {
             .map(|n| buf[..n].to_vec()),
         Some(b"e2".to_vec())
     );
+}
+
+#[test]
+fn compact_cascades_down_every_level() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // Nine rounds; each round fills L0 with four single-key flushes and
+    // drives. Rounds 0-3 fill L1, 4-6 fill L2, 7 fills L2 fully, and round
+    // 8 forces an L2->L3 job. Every table holds exactly one key.
+    for round in 0..9u8 {
+        for _ in 0..4u8 {
+            block_on(db.put(&[round], &[round, 3])).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        drain(&mut db);
+    }
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    assert_eq!(man.level(0).unwrap().len(), 0, "L0 drains");
+    // Every level respects its table budget; deepest-first draining keeps
+    // the stack balanced rather than piled up.
+    for lvl in 0..7usize {
+        assert!(
+            man.level(lvl).unwrap().len() <= 4,
+            "level {lvl} respects TABLES"
+        );
+    }
+    let l3 = man.level(3).unwrap();
+    assert!(!l3.is_empty(), "cascade reached L3 via L2->L3");
+    assert_eq!(
+        l3[0].first_key.as_slice(),
+        &[0],
+        "oldest drains first (FIFO)"
+    );
+    assert_eq!(l3[0].entry_count, 1);
+    // Levels >= 1 never hold overlapping tables.
+    for lvl in 1..4usize {
+        let tables = man.level(lvl).unwrap();
+        for (i, a) in tables.iter().enumerate() {
+            for b in tables.iter().skip(i + 1) {
+                let overlap = a.first_key.as_slice() <= b.last_key.as_slice()
+                    && b.first_key.as_slice() <= a.last_key.as_slice();
+                assert!(!overlap, "level {lvl} tables overlap");
+            }
+        }
+    }
+    let mut db = TestDb::new(dev, test_config());
+    open(&mut db);
+    for k in 0..9u8 {
+        assert_eq!(get(&db, &[k]), Some(vec![k, 3]), "key {k} reads back");
+    }
+}
+
+#[test]
+fn compact_cascade_keeps_snapshot_versions() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // v0 of keys 0..4, then a snapshot pins them while v1 overwrites.
+    for _ in 0..4u8 {
+        for k in 0..4u8 {
+            block_on(db.put(&[k], &[k])).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    drain(&mut db);
+    let snap = db.snapshot().unwrap();
+    for _ in 0..4u8 {
+        for k in 0..4u8 {
+            block_on(db.put(&[k], &[k, 9])).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    drain(&mut db);
+    // Three filler rounds push the versioned table down: L1 fills, so the
+    // next drive must run L1->L2 on it.
+    for r in 1..4u8 {
+        for _ in 0..4u8 {
+            block_on(db.put(&[10 * r], &[r])).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        drain(&mut db);
+    }
+    let mut dev = db.into_device();
+    let man = read_manifest(&mut dev);
+    assert_eq!(man.level(1).unwrap().len(), 3, "L1 drained one table");
+    let l2 = man.level(2).unwrap();
+    assert_eq!(l2.len(), 1, "L2 holds the cascaded table");
+    assert_eq!(l2[0].entry_count, 8, "live + snapshot version per key");
+    let mut db = TestDb::new(dev, test_config());
+    open(&mut db);
+    let mut buf = [0u8; 2048];
+    for k in 0..4u8 {
+        // Live view sees the newest version.
+        assert_eq!(get(&db, &[k]), Some(vec![k, 9]), "live newest wins");
+        // The snapshot still sees the version it pinned.
+        let n = block_on(db.get_at(&[k], &mut buf, snap)).unwrap().unwrap();
+        assert_eq!(&buf[..n], &[k], "snapshot version survives L1->L2");
+    }
+}
+
+#[test]
+fn compact_l1_to_l2_crash_never_mixes_state() {
+    fn build() -> TestDb<CountDevice<MemDevice<4096>>> {
+        let mut db = TestDb::new(CountDevice::new(MemDevice::<4096>::new()), test_config());
+        open(&mut db);
+        // Four L0->L1 rounds: L1 ends full, L0 empty, 16 keys total.
+        for r in 0..4u8 {
+            for t in 0..4u8 {
+                block_on(db.put(&[r, t], &[r, t])).unwrap();
+                block_on(db.flush()).unwrap();
+            }
+            // Single jobs only: L1 must sit full for the crash campaign.
+            drive_one(&mut db);
+        }
+        db
+    }
+    // Writes of the setup alone, so the crash loop covers exactly the
+    // L1->L2 job's writes (setup crashes are the flush injector's job).
+    let setup_writes = {
+        let db = build();
+        db.into_device().writes
+    };
+    // Writes of a clean setup + the L1->L2 compaction.
+    let total_writes = {
+        let mut db = build();
+        drain(&mut db);
+        db.into_device().writes
+    };
+    assert!(total_writes > setup_writes);
+
+    for crash_at in setup_writes..total_writes {
+        // Build the pre-compaction state on a plain device.
+        let db = build();
+        let dev = db.into_device().inner;
+        // Crash at write `crash_at` of the L1->L2 job (suffix-drop model).
+        let mut db = TestDb::new(CrashDevice::<_, 4096>::new(dev, crash_at), test_config());
+        open(&mut db);
+        drain(&mut db);
+        let dev = db.into_device().into_inner();
+        // Reopen on the bare device: orphans are swept, state is exactly
+        // pre- or post-compaction, and a clean compaction converges.
+        let mut db = TestDb::new(dev, test_config());
+        block_on(db.open()).unwrap();
+        let mut dev = db.into_device();
+        let man = read_manifest(&mut dev);
+        let l1 = man.level(1).unwrap().len();
+        let l2 = man.level(2).unwrap().len();
+        assert!(
+            (l1, l2) == (4, 0) || (l1, l2) == (3, 1),
+            "crash_at={crash_at}: exactly pre- or post-compaction"
+        );
+        let mut db = TestDb::new(dev, test_config());
+        open(&mut db);
+        drain(&mut db);
+        for r in 0..4u8 {
+            for t in 0..4u8 {
+                assert_eq!(get(&db, &[r, t]), Some(vec![r, t]), "crash_at={crash_at}");
+            }
+        }
+        let mut dev = db.into_device();
+        let man = read_manifest(&mut dev);
+        assert_eq!(man.level(1).unwrap().len(), 3, "crash_at={crash_at}");
+        assert_eq!(man.level(2).unwrap().len(), 1, "crash_at={crash_at}");
+    }
+}
+
+/// A narrow database: 3 levels, 2 tables per level. The bottom level is
+/// reachable in a handful of flushes, so the true capacity ceiling — a
+/// full bottom level the merge cannot absorb into — is directly testable.
+type SmallDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 2, 1024, 4096>;
+
+fn read_small_manifest(dev: &mut MemDevice<4096>) -> Manifest<3, 2, 256> {
+    let mut scratch = [0u8; 4096];
+    block_on(Manifest::recover(dev, &mut scratch, 0, 1))
+        .unwrap()
+        .0
+}
+
+fn small_drain<D: BlockDevice>(db: &mut SmallDb<D>)
+where
+    D::Error: std::fmt::Debug,
+{
+    while db.compaction_pending() {
+        let mut c = TestCompaction::new();
+        loop {
+            match block_on(db.compact_step(&mut c)) {
+                Ok(Progress::More) => {}
+                Ok(Progress::Done) => break,
+                Err(e) => panic!("unexpected compaction error: {e:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_bottom_full_disjoint_nospace() {
+    let mut db = SmallDb::new(CountDevice::new(MemDevice::<4096>::new()), test_config());
+    block_on(db.open()).unwrap();
+    // Two flushes fill L0 (TABLES = 2); drain after each pair.
+    for keys in [[0u8, 1], [2, 3], [4, 5]] {
+        for k in keys {
+            block_on(db.put(&[k], &[k])).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        small_drain(&mut db);
+    }
+    let count_dev = db.into_device();
+    let mut mem = count_dev.inner;
+    let man = read_small_manifest(&mut mem);
+    assert_eq!(man.level(2).unwrap().len(), 2, "bottom level is full");
+    assert_eq!(man.level(1).unwrap().len(), 1, "L1 holds one table");
+    let mut db = SmallDb::new(CountDevice::new(mem), test_config());
+    block_on(db.open()).unwrap();
+    // Disjoint keys: the next job drains L0->L1 (L1 has one free slot);
+    // the job after that tries L1->L2 and hits the honest ceiling.
+    for k in [0x80u8, 0x81] {
+        block_on(db.put(&[k], &[k])).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    let mut c = TestCompaction::new();
+    loop {
+        match block_on(db.compact_step(&mut c)) {
+            Ok(Progress::More) => {}
+            Ok(Progress::Done) => break,
+            Err(e) => panic!("unexpected compaction error: {e:?}"),
+        }
+    }
+    let count_dev = db.into_device();
+    let writes_before = count_dev.writes;
+    let mut db = SmallDb::new(count_dev, test_config());
+    block_on(db.open()).unwrap();
+    // The L1->L2 merge would absorb no bottom table, so the output
+    // genuinely does not fit — NoSpace at select time, before any merge I/O.
+    let mut c = TestCompaction::new();
+    assert!(
+        matches!(block_on(db.compact_step(&mut c)), Err(Error::NoSpace)),
+        "full bottom level with disjoint ranges must fail cleanly"
+    );
+    let count_dev = db.into_device();
+    assert_eq!(
+        count_dev.writes, writes_before,
+        "NoSpace must fire at select time, before any merge I/O"
+    );
+    let mut mem = count_dev.inner;
+    let man = read_small_manifest(&mut mem);
+    assert_eq!(man.level(0).unwrap().len(), 0);
+    assert_eq!(man.level(1).unwrap().len(), 2);
+    assert_eq!(man.level(2).unwrap().len(), 2);
+    let mut db = SmallDb::new(mem, test_config());
+    block_on(db.open()).unwrap();
+    let mut buf = [0u8; 2048];
+    for k in [0u8, 1, 2, 3, 4, 5, 0x80, 0x81] {
+        let n = block_on(db.get(&[k], &mut buf)).unwrap().unwrap();
+        assert_eq!(&buf[..n], &[k], "key {k} survives the failed job");
+    }
 }
