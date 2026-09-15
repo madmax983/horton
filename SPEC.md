@@ -455,8 +455,38 @@ floor (`seq <= manifest.max_seq`).
   and SSTables; compaction emits the per-key keep-set (live view plus the
   newest version at or below each live snapshot watermark) and drops a
   bottommost newest tombstone only when it predates every live snapshot.
-- v0.6 (roadmap) — ESP32-S3 / Tallow port: SPI-flash `BlockDevice`,
-  budget re-tune.
+- v0.6 — ESP32-S3 / Tallow port.
+  - **Target build gate**: the library builds for
+    `xtensa-esp32s3-none-elf` with the ESP Rust fork (`-Z build-std=core`);
+    `xtensa-check.sh` reproduces it. The crate is `#![no_std]` +
+    `#![forbid(unsafe_code)]` + core-only, so the port needs no `unsafe`
+    and no new dependencies.
+  - **On-target smoke proof**: `xtensa-smoke/` is a bare-metal xtensa
+    binary (own reset vector, linker script, UART0 console, panic
+    handler) that boots under `qemu-system-xtensa -machine esp32s3`,
+    drives a `Db` through put/get/delete/flush/compact/scan/snapshot
+    against a RAM-backed `BlockDevice`, and prints `SMOKE PASS`/`FAIL`
+    over UART0. `run-smoke.sh` builds the flash image and runs QEMU.
+    This is the "it runs on the chip" proof — not just "it compiles".
+  - **SPI-flash `BlockDevice`**: `src/flash.rs` defines the `Flash`
+    trait (sector erase + program + read — the only `unsafe`-needing
+    half, implemented per-board) and `FlashBlockDevice<F>`, the safe
+    erase-aware `BlockDevice` wrapper. Horton block writes are
+    whole-sector (BLOCK = 4096 = flash sector size), so a write is
+    erase-sector then program — no read-modify-write, no hidden RAM.
+    The ESP32-S3 SPI register implementation is Tallow driver work and
+    needs real hardware to verify; it is explicitly out of scope here.
+    The wrapper's erase discipline is property-tested on host against a
+    strict mock flash (erase sets 0xFF, program only clears bits,
+    programming an unerased sector is an error).
+  - **Budget re-tune**: the `ESP32S3` const profile
+    (`BLOCK=4096, KEY_MAX=64, VAL_MAX=256, CAP=64, ARENA=8192, ...`)
+    sizes a database at well under 64 KiB of RAM; `BUDGET.md` shows the
+    accounting and the profile carries compile-time size assertions.
+  - Honest limits: QEMU proves logic on the target ISA, not flash
+    programming or timing; the SPI MMIO primitive and power-loss
+    behavior need hardware. Throughput numbers, if any, are measured —
+    never estimated.
 
 ## 10. Open questions for Mark
 

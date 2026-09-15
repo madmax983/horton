@@ -1,2 +1,5 @@
 /target/
 Cargo.lock
+xtensa-smoke/target/
+xtensa-smoke/build/
+.cargo-home/

@@ -476,8 +476,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
 
     /// Reads both slots and returns the winning manifest.
     ///
-    /// Picks the highest-seq slot with a valid CRC. Two all-zero slots mean a
-    /// fresh device (`true`). A blank slot paired with a corrupt one is also
+    /// Picks the highest-seq slot with a valid CRC. Two blank slots mean a
+    /// fresh device (`true`) — blank is all zeros on a zeroed device, all
+    /// `0xFF` on erased NOR flash. A blank slot paired with a corrupt one is
     /// treated as fresh: that is a torn *first* commit, and the WAL (whose
     /// head is still `wal_start`) replays everything — no data loss, the
     /// orphaned blocks are simply never referenced.
@@ -506,7 +507,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         }
     }
 
-    /// Reads one slot: blank (all zeros), corrupt, or a valid manifest.
+    /// Reads one slot: blank (all zeros on a zeroed device, all `0xFF` on
+    /// erased NOR flash), corrupt, or a valid manifest.
     async fn read_slot<D: BlockDevice, const BLOCK: usize>(
         device: &D,
         scratch: &mut [u8; BLOCK],
@@ -515,7 +517,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         poll_fn(|cx| device.poll_read_block(cx, slot, scratch))
             .await
             .map_err(Error::Device)?;
-        if scratch.iter().all(|&b| b == 0) {
+        if scratch.iter().all(|&b| b == 0) || scratch.iter().all(|&b| b == 0xFF) {
             return Ok(Slot::Blank);
         }
         Ok(Self::decode::<D::Error, BLOCK>(scratch)

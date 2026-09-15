@@ -1,0 +1,13 @@
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+# The esp toolchain ships prebuilt std only for the host; the Xtensa target
+# needs core built from source.
+[unstable]
+build-std = ["core"]
+
+[target.xtensa-esp32s3-none-elf]
+# -Tmemory.x places the image for the S3 IRAM alias (executable).
+# -nostartfiles keeps the toolchain's crt0 (which defines its own _start)
+#   out of the link; our _start is the true entry point.
+rustflags = ["-C", "link-arg=-Tmemory.x", "-C", "link-arg=-nostartfiles"]

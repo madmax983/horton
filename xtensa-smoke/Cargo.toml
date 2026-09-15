@@ -1,0 +1,13 @@
+[package]
+name = "horton-smoke"
+version = "0.6.0"
+edition = "2021"
+description = "Bare-metal ESP32-S3 smoke test for horton: boots under QEMU, drives a Db, reports over UART0"
+
+[dependencies]
+horton = { path = ".." }
+
+# Debug text for xtensa is bloated; the smoke must fit in 448 KiB of IRAM
+# alongside its .bss, so build it small.
+[profile.release]
+opt-level = "s"
