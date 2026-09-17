@@ -598,6 +598,46 @@ floor (`seq <= manifest.max_seq`).
       - SPEC claimed `RegBus` had `read`/`write`/`read_word`; the trait has
         only `read`/`write` — the doc, not the code, was wrong (fixed).
 
+- v0.9 — The proof leg (§8 test strategy, in full).
+  - **Scope**: close the three remaining verification gaps named in §8.
+    (1) `cargo miri` over the test suite — the crate is
+    `#![forbid(unsafe_code)]`, so miri is a pure UB-freedom check; the
+    gate is green on every test binary miri can run in the sandbox
+    (documented below with the exclusions, if any). (2) Structure-aware,
+    in-tree, dependency-free fuzzers for the WAL record decoder and the
+    SSTable block decoders: a seeded deterministic PRNG drives
+    bit-flips, truncations, and splice mutations over valid encoded
+    inputs; the assertion is never "correct output" but "no panic, no
+    UB, only clean `Error`s". (3) Crash-injector exhaustiveness beyond
+    flush: enumerate every block write as a crash point over compaction
+    merges and manifest commits (the surface v0.4–v0.8 added), asserting
+    the recovered DB equals the prefix-oracle state — never a mixture
+    of pre- and post-commit.
+  - **Measured**: miri 18/20 test binaries green (lib, alloc, compact,
+    crash_compact, crash_flush, crc, db incl. the exhaustive 64-script ×
+    four-crash-position injector and `oracle_random`, wal, wal_wrap,
+    memtable, manifest, sstable, scan, read_path, flush, flash, profile,
+    orphan_reclaim); fuzz 5/6 tests green under miri (wal_corpus,
+    wal_decoder, sstable_corpus, manifest_corpus, manifest_decoder).
+    Two environmental exclusions, both infrastructure hangs rather than
+    test failures, in a sandbox that rebooted 3× during the campaign:
+    (a) `esp32s3` — miri-as-rustc hangs on a futex during compilation
+    (cold sysroot rebuild did not help; plain rustc compiles fine);
+    (b) `sstable_decoder_never_panics` — miri hangs after ~17 min CPU
+    on the 300-mutation SSTable decoder fuzz (the other five fuzz tests,
+    same decoder families, are green under miri). All 900 decoder
+    mutations (300 each over WAL records, SSTable blocks, manifest
+    entries; seeded LCG, bit-flips/smears/truncations/splices, CRC
+    recomputed on some SSTable mutations to reach deeper parsing) pass
+    natively. Crash-compaction injector: 5 writes × crash positions
+    0..=5, recovery exposes either four L0 tables or one L1 table with
+    all four acknowledged keys intact — 2/2 green. Full suite:
+    148 debug + 148 release green. `cargo fmt --check` clean;
+    clippy `--all-targets` pedantic+nursery zero warnings;
+    `#![forbid(unsafe_code)]` holds (no production unsafe, no
+    non-test unwrap/expect). Xtensa ESP32-S3 build gate: PASS (see
+    log). QEMU smoke: PASS.
+
 ## 10. Open questions for Mark
 
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on

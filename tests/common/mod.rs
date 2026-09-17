@@ -58,6 +58,16 @@ impl<const BLOCK: usize> MemDevice<BLOCK> {
     pub fn new() -> Self {
         Self { blocks: Vec::new() }
     }
+
+    /// Test-only: raw block access for fault injection (fuzzing, torn
+    /// writes). Reads of never-written blocks are zeros; the vec only
+    /// holds blocks that were actually written.
+    // Not `const` on stable: `&mut` receivers in const fn need
+    // `const_mut_refs` (test-only helper).
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn blocks_mut(&mut self) -> &mut Vec<[u8; BLOCK]> {
+        &mut self.blocks
+    }
 }
 
 impl<const BLOCK: usize> Default for MemDevice<BLOCK> {

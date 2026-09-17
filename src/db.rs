@@ -849,13 +849,8 @@ impl<
             (st, t.len(), tt)
         };
 
-        let job = Self::select_job_inputs(
-            c,
-            src,
-            &src_refs[..src_take],
-            tgt,
-            &tgt_refs[..tgt_take],
-        )?;
+        let job =
+            Self::select_job_inputs(c, src, &src_refs[..src_take], tgt, &tgt_refs[..tgt_take])?;
         // The target absorbs the output table: it must fit once the
         // overlapping inputs leave. Checked here — before any merge I/O —
         // instead of failing at commit.
