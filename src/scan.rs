@@ -241,26 +241,23 @@ impl<
         Ok(())
     }
 
-    /// The source of the minimum live head key, or `None` when every
-    /// source is exhausted. Source 0 is the memtable; sources 1..=total
-    /// are table cursors in level-major order.
-    fn min_src(&self, total: usize) -> Option<usize> {
-        let mut min_src = usize::MAX;
+    /// The source of the minimum live head key, and that key itself, or
+    /// `None` when every source is exhausted. Source 0 is the memtable;
+    /// sources 1..=total are table cursors in level-major order. Carries
+    /// the leader's key alongside its source so callers (and this loop's
+    /// own comparisons) never re-derive it through another `cursor_pos`
+    /// lookup.
+    fn min_src(&self, total: usize) -> Option<(usize, &[u8])> {
+        let mut best: Option<(usize, &[u8])> = None;
         for src in 0..=total {
             let Some(k) = self.head_key(src) else {
                 continue;
             };
-            if min_src == usize::MAX {
-                min_src = src;
-                continue;
-            }
-            if let Some(m) = self.head_key(min_src) {
-                if k < m {
-                    min_src = src;
-                }
+            if best.is_none_or(|(_, m)| k < m) {
+                best = Some((src, k));
             }
         }
-        (min_src != usize::MAX).then_some(min_src)
+        best
     }
 
     /// Yields the next entry: copies the key into `key_buf` and the value
@@ -284,40 +281,34 @@ impl<
             // Pass 1: the source of the minimum live head key, or None
             // when every source is exhausted. Source 0 is the memtable;
             // sources 1..=total are table cursors in level-major order.
-            let Some(min_src) = self.min_src(total) else {
+            let Some((min_src, min_key)) = self.min_src(total) else {
                 return Ok(None);
             };
             // The end bound is exclusive: a head at/above it ends the scan.
-            let past_end = match self.head_key(min_src) {
-                Some(k) => self.has_end && k >= &self.end[..self.end_len],
-                None => true,
-            };
-            if past_end {
+            if self.has_end && min_key >= &self.end[..self.end_len] {
                 return Ok(None);
             }
             // Pass 2: among heads on the minimum key, the highest seq wins.
+            // `min_key` is invariant for this whole pass (computed once by
+            // `min_src` above), so it is compared directly instead of
+            // re-fetched through `cursor_pos` on every iteration.
             let mut winner_src = min_src;
             let mut winner_seq = 0u64;
             let mut winner_tombstone = false;
             let mut winner_key_len = 0usize;
             let mut winner_val_len = 0usize;
             for src in 0..=total {
-                let (Some(k), Some((klen, seq, tomb, vlen))) =
-                    (self.head_key(src), self.head_meta(src))
-                else {
+                let Some((k, seq, tomb, vlen)) = self.head(src) else {
                     continue;
                 };
-                let Some(m) = self.head_key(min_src) else {
-                    continue;
-                };
-                if k != m {
+                if k != min_key {
                     continue;
                 }
                 if seq > winner_seq {
                     winner_seq = seq;
                     winner_src = src;
                     winner_tombstone = tomb;
-                    winner_key_len = klen;
+                    winner_key_len = k.len();
                     winner_val_len = vlen;
                 }
             }
@@ -668,11 +659,14 @@ impl<
         }
     }
 
-    /// `(key_len, seq, tombstone, val_len)` of a live head.
-    fn head_meta(&self, src: usize) -> Option<(usize, u64, bool, usize)> {
+    /// Head `(key, seq, tombstone, val_len)` of a source, or `None` when
+    /// exhausted. Source 0 is the memtable; sources 1..=total are table
+    /// cursors in level-major order. One `cursor_pos` lookup instead of
+    /// the two `head_key`/`head_meta` used to cost a caller needing both.
+    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize)> {
         if src == 0 {
             self.mem_live.then_some((
-                self.mem_key_len,
+                &self.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
@@ -680,7 +674,8 @@ impl<
         } else {
             let (li, ti) = self.cursor_pos(src);
             let c = &self.cursors[li][ti];
-            c.live.then_some((c.key_len, c.seq, c.tombstone, c.val_len))
+            c.live
+                .then_some((&c.key[..c.key_len], c.seq, c.tombstone, c.val_len))
         }
     }
 }
