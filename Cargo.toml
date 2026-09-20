@@ -32,6 +32,10 @@ harness = false
 name = "compaction"
 harness = false
 
+[[bench]]
+name = "scan"
+harness = false
+
 # Keep debug symbols in release builds so instruction-count profiles
 # (valgrind --tool=callgrind / cachegrind) can attribute cost to functions.
 [profile.release]
