@@ -79,13 +79,13 @@ impl<const BLOCK: usize> horton::BlockDevice for MemDevice<BLOCK> {
         id: u64,
         buf: &[u8],
     ) -> Poll<Result<(), Self::Error>> {
-        if let Ok(i) = usize::try_from(id) {
-            if buf.len() == BLOCK {
-                while self.blocks.len() <= i {
-                    self.blocks.push([0u8; BLOCK]);
-                }
-                self.blocks[i].copy_from_slice(buf);
+        if let Ok(i) = usize::try_from(id)
+            && buf.len() == BLOCK
+        {
+            while self.blocks.len() <= i {
+                self.blocks.push([0u8; BLOCK]);
             }
+            self.blocks[i].copy_from_slice(buf);
         }
         Poll::Ready(Ok(()))
     }

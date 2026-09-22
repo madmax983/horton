@@ -7,7 +7,7 @@ use core::convert::Infallible;
 use core::task::{Context, Poll};
 
 use horton::device::BlockDevice;
-use horton::profile::{Esp32S3Compaction, Esp32S3Db, Esp32S3Scan, ESP32S3_RAM_BUDGET};
+use horton::profile::{ESP32S3_RAM_BUDGET, Esp32S3Compaction, Esp32S3Db, Esp32S3Scan};
 
 struct Dummy;
 

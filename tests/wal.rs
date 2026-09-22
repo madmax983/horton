@@ -4,10 +4,10 @@ mod common;
 
 use core::task::{Context, Poll};
 
-use common::{block_on, noop_waker, MemDevice};
+use common::{MemDevice, block_on, noop_waker};
+use horton::BlockDevice;
 use horton::memtable::MemTable;
 use horton::wal::{Op, WalWriter};
-use horton::BlockDevice;
 
 type W512 = WalWriter<MemDevice<512>, 512>;
 type T16 = MemTable<16, 512, 16, 32>;

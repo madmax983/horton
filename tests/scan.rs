@@ -6,7 +6,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{block_on, test_config, Lcg, MemDevice, TestDb};
+use common::{Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::{BlockDevice, Error, Scan};
 
 type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;

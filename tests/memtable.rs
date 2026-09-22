@@ -6,8 +6,8 @@
 
 use core::convert::Infallible;
 
-use horton::memtable::MemTable;
 use horton::Error;
+use horton::memtable::MemTable;
 
 type Small = MemTable<8, 256, 16, 32>;
 

@@ -4,8 +4,8 @@ mod common;
 
 use std::future::poll_fn;
 
-use common::{block_on, MemDevice};
-use horton::sstable::{bloom_k, plan_table, write_table, SstEntry, TableReader};
+use common::{MemDevice, block_on};
+use horton::sstable::{SstEntry, TableReader, bloom_k, plan_table, write_table};
 use horton::{BlockDevice, Error};
 
 const BLOCK: usize = 4096;

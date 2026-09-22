@@ -142,14 +142,14 @@ fn entry_fits<const BLOCK: usize>(payload: usize, entries: u64, elen: usize) -> 
 /// math (`ln 2 ≈ 693/1000`). Past 30 probes the false-positive gain is noise.
 #[must_use]
 pub fn bloom_k(bloom_bits: usize, entries: u64) -> u8 {
-    let mut k: u64 = 1;
-    if entries > 0 {
-        if let (Ok(m), Some(den)) = (u64::try_from(bloom_bits), entries.checked_mul(1000)) {
-            if let Some(num) = m.checked_mul(693).and_then(|num| num.checked_div(den)) {
-                k = num;
-            }
-        }
-    }
+    let k: u64 = if entries > 0
+        && let (Ok(m), Some(den)) = (u64::try_from(bloom_bits), entries.checked_mul(1000))
+        && let Some(num) = m.checked_mul(693).and_then(|num| num.checked_div(den))
+    {
+        num
+    } else {
+        1
+    };
     // Clamped to [1, 30], far below `u8::MAX`: the narrowing cast is exact.
     #[allow(clippy::cast_possible_truncation)]
     let narrowed = k.clamp(1, 30) as u8;
@@ -995,11 +995,7 @@ fn data_lookup<E>(
         let off = rstart.checked_add(i.checked_mul(2)?)?;
         let bytes: [u8; 2] = payload.get(off..off + 2)?.try_into().ok()?;
         let roff = usize::from(u16::from_le_bytes(bytes));
-        if roff >= rstart {
-            None
-        } else {
-            Some(roff)
-        }
+        if roff >= rstart { None } else { Some(roff) }
     };
     // Binary search over restart points: the first restart whose entry key
     // sorts at or after `key`. A key's version run is contiguous and newest
@@ -1285,7 +1281,7 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             match data_lookup::<D::Error>(&scratch[..payload_end], key, val_buf, block_id, max_seq)?
             {
                 BlockOutcome::Hit(DataHit::Value(n, seq)) => {
-                    return Ok(Lookup::Value { len: n, seq })
+                    return Ok(Lookup::Value { len: n, seq });
                 }
                 BlockOutcome::Hit(DataHit::Tombstone(seq)) => return Ok(Lookup::Tombstone { seq }),
                 // A larger key was seen: later blocks only hold larger keys.

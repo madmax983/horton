@@ -10,7 +10,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::task::{Context, Poll};
 
-use common::{block_on, test_config, CrashDevice, MemDevice, TestDb};
+use common::{CrashDevice, MemDevice, TestDb, block_on, test_config};
 use horton::{BlockDevice, Compaction, Manifest, Progress};
 
 const BLOCK: usize = 4096;

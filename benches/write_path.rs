@@ -73,13 +73,13 @@ impl<const BLOCK: usize> BlockDevice for MemDevice<BLOCK> {
         id: u64,
         buf: &[u8],
     ) -> Poll<Result<(), Self::Error>> {
-        if let Ok(i) = usize::try_from(id) {
-            if buf.len() == BLOCK {
-                while self.blocks.len() <= i {
-                    self.blocks.push([0u8; BLOCK]);
-                }
-                self.blocks[i].copy_from_slice(buf);
+        if let Ok(i) = usize::try_from(id)
+            && buf.len() == BLOCK
+        {
+            while self.blocks.len() <= i {
+                self.blocks.push([0u8; BLOCK]);
             }
+            self.blocks[i].copy_from_slice(buf);
         }
         Poll::Ready(Ok(()))
     }
@@ -108,8 +108,8 @@ impl Lcg {
     /// Uniform in `[lo, hi]`.
     const fn range(&mut self, lo: usize, hi: usize) -> usize {
         let span = (hi - lo + 1) as u64; // widening cast: no truncation possible
-                                         // The modulo bounds the value below `span` (a small key/value
-                                         // length), so it fits in `usize` on every bench target.
+        // The modulo bounds the value below `span` (a small key/value
+        // length), so it fits in `usize` on every bench target.
         #[allow(clippy::cast_possible_truncation)]
         let offset = (self.next() % span) as usize;
         lo + offset

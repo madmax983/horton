@@ -119,18 +119,18 @@ pub struct Scan<
 }
 
 impl<
-        'd,
-        D: BlockDevice,
-        const BLOCK: usize,
-        const KEY_MAX: usize,
-        const VAL_MAX: usize,
-        const CAP: usize,
-        const ARENA: usize,
-        const LEVELS: usize,
-        const TABLES: usize,
-        const BLOOM_BYTES: usize,
-        const FREELIST: usize,
-    > Scan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    'd,
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+    const BLOOM_BYTES: usize,
+    const FREELIST: usize,
+> Scan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
 {
     /// Creates an unpositioned scan over `db`. Call [`seek`](Scan::seek)
     /// before [`next`](Scan::next).
@@ -196,7 +196,7 @@ impl<
                 return Err(Error::KeyTooLarge {
                     len: e.len(),
                     max: KEY_MAX,
-                })
+                });
             }
             Some(e) => {
                 self.end[..e.len()].copy_from_slice(e);
@@ -599,17 +599,17 @@ impl<
         let db = self.db;
         self.mem_live = false;
         while self.mem_idx < db.memtable().slot_len() {
-            if let Some(v) = db.memtable().slot_view(self.mem_idx) {
-                if v.seq <= max_seq {
-                    self.mem_key[..v.key.len()].copy_from_slice(v.key);
-                    self.mem_key_len = v.key.len();
-                    self.mem_val[..v.val.len()].copy_from_slice(v.val);
-                    self.mem_val_len = v.val.len();
-                    self.mem_seq = v.seq;
-                    self.mem_tombstone = v.tombstone;
-                    self.mem_live = true;
-                    return;
-                }
+            if let Some(v) = db.memtable().slot_view(self.mem_idx)
+                && v.seq <= max_seq
+            {
+                self.mem_key[..v.key.len()].copy_from_slice(v.key);
+                self.mem_key_len = v.key.len();
+                self.mem_val[..v.val.len()].copy_from_slice(v.val);
+                self.mem_val_len = v.val.len();
+                self.mem_seq = v.seq;
+                self.mem_tombstone = v.tombstone;
+                self.mem_live = true;
+                return;
             }
             self.mem_idx += 1;
         }

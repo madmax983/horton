@@ -13,12 +13,12 @@
 
 mod common;
 
-use common::{block_on, test_config, TestDb};
+use common::{TestDb, block_on, test_config};
 use core::cell::RefCell;
 use horton::esp32s3::{
-    RegBus, SpiError, SpiFlash, CMD_PP, CMD_RDSR, CMD_SE, CMD_USR, CMD_WREN, REG_ADDR, REG_CMD,
-    REG_CTRL, REG_MISO_DLEN, REG_RD_STATUS, REG_USER, REG_USER1, REG_USER2, REG_W0, STATUS_WEL,
-    STATUS_WIP, USER_USR_ADDR, USER_USR_COMMAND, USER_USR_MISO,
+    CMD_PP, CMD_RDSR, CMD_SE, CMD_USR, CMD_WREN, REG_ADDR, REG_CMD, REG_CTRL, REG_MISO_DLEN,
+    REG_RD_STATUS, REG_USER, REG_USER1, REG_USER2, REG_W0, RegBus, STATUS_WEL, STATUS_WIP,
+    SpiError, SpiFlash, USER_USR_ADDR, USER_USR_COMMAND, USER_USR_MISO,
 };
 use horton::flash::{Flash, FlashBlockDevice};
 use std::rc::Rc;

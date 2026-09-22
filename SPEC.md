@@ -638,6 +638,68 @@ floor (`seq <= manifest.max_seq`).
     non-test unwrap/expect). Xtensa ESP32-S3 build gate: PASS (see
     log). QEMU smoke: PASS.
 
+- v0.10 — Archive API: seal a table, stream it to remote storage, forget
+  it locally.
+  - **Scope**: the flush-to-object-storage primitive for Tallow's Wi-Fi/TLS
+    side. `Db::level_tables(level)` lists the archive candidates at a level,
+    oldest first; `Db::archive_plan(level, table_id)` returns an
+    `ArchivePlan` — the level plus the `TableRef` (id and block range). The
+    caller streams every block in `[first_block, end_block())` through the
+    now-public `Db::device()` to durable remote storage, confirms the
+    upload, then calls `Db::archive_commit(level, table_id)`, which drops
+    the table from the manifest in one atomic manifest write and reclaims
+    its blocks into the free list strictly after the visibility point
+    (best-effort, exactly like compaction: a full free list cannot fail the
+    already-committed job; orphans are swept by the next open). Horton
+    performs no networking — the sink is caller code, and the table's bytes
+    are immutable once sealed, so the upload needs no coordination with
+    horton beyond "all bytes, then commit".
+  - **Crash ordering** is what makes this safe: a crash anywhere before the
+    commit leaves the table in the manifest, so the upload simply repeats —
+    the sink must therefore be idempotent per table id (re-uploading a fully
+    uploaded table is always allowed). A crash during the commit is decided
+    by the atomic manifest write: old slot (table still local, re-upload)
+    or new slot (table gone, bytes already remote). The commit never runs
+    before the upload is confirmed, so no crash can lose acknowledged data.
+    `archive_commit` is itself idempotent: `Ok(false)` when the table is
+    already gone — retry after an ambiguous crash, or a concurrent
+    compaction merged it away (the uploaded bytes remain a valid copy of
+    that data).
+  - **Tombstone rule** (the sharp edge, stated plainly): the commit drops
+    the table's tombstones from the local view. Archiving a tombstone-
+    bearing table above a deeper table resurrects the older version
+    locally. Insert-only workloads — sensor logs with timestamp keys — may
+    archive from any level; delete-bearing workloads must archive only from
+    the bottommost level, where nothing is deeper and nothing can
+    resurrect. There is no combined remote/local read model yet, so this
+    is a caller-side discipline enforced by documentation, not by code.
+  - **Proof**: `tests/archive.rs` — (1) round-trip: stream all planned
+    blocks into a mock sink, reopen the uploaded bytes through
+    `TableReader`, verify every key, commit idempotently, confirm archived
+    keys disappear locally and that reclaimed blocks are reused by a later
+    flush; (2) crash boundary: crash-inject the upload/manifest boundary at
+    every write position — recovery exposes either the complete local table
+    or the committed remote copy plus the remaining local table, and retry
+    converges when the commit was lost; (3) an executable demonstration of
+    the tombstone-resurrection hazard above.
+  - **Honest limits**: horton never sees the network; upload durability is
+    the caller's claim, and table identity across re-uploads is the sink's
+    per-table-id idempotency contract, not horton's. The archive API moves
+    data one sealed table at a time — no multi-table transaction.
+  - **Measured**: 151 debug + 151 release tests green (148 carried from
+    v0.9 plus the 3 new archive tests); `cargo fmt --check` clean; clippy
+    `--all-targets` pedantic+nursery zero warnings with `-D warnings`;
+    `#![forbid(unsafe_code)]` holds (the single `unwrap` in `src/` is
+    inside `model.rs`'s `#[cfg(test)]` module); zero dependencies, no `std`
+    in `src/`; release benches compile; `xtensa-esp32s3-none-elf` build
+    gate passes; `cargo +nightly miri test --test archive` 3/3 green.
+    Edition 2021 → 2024 (standing order) with rustfmt normalization and
+    9 collapsible-`if` collapses the newer clippy demanded — all
+    semantics-preserving; full suite re-greened after each. The v0.9 miri
+    qualifications (esp32s3 compile hang, sstable_decoder_never_panics
+    hang — both infra, not assertions) are unchanged and not re-litigated
+    here.
+
 ## 10. Open questions for Mark
 
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on

@@ -7,7 +7,7 @@
 use horton::{BlockDevice, Compaction, Error, Manifest, Progress};
 
 mod common;
-use common::{block_on, test_config, CrashDevice, MemDevice, TestDb};
+use common::{CrashDevice, MemDevice, TestDb, block_on, test_config};
 
 /// Caller scratch for `compact_step`, matching the test database shape.
 type TestCompaction = Compaction<4096, 256, 1024, 1024>;
@@ -204,7 +204,7 @@ fn compact_merges_overlapping_l1() {
         block_on(db.flush()).unwrap();
     }
     drain(&mut db); // L0 -> L1, now one L1 table exists
-                    // Four overlapping L0 tables covering [n-s], newer.
+    // Four overlapping L0 tables covering [n-s], newer.
     for t in 0..4u8 {
         for k in *b"nopqrs" {
             block_on(db.put(&[k], &[t])).unwrap();
@@ -488,7 +488,7 @@ fn compact_reclaims_inputs_when_output_is_empty() {
 #[test]
 #[allow(clippy::similar_names)] // s_a1/s_a2/... are intentionally parallel: seq of key X put N.
 fn compact_keep_set_matches_model() {
-    use horton::model::{model_keep_set, model_winner, Version};
+    use horton::model::{Version, model_keep_set, model_winner};
 
     type Chain<'a> = (&'a [u8], &'a [(u64, bool, &'a [u8])]);
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
@@ -503,7 +503,7 @@ fn compact_keep_set_matches_model() {
     let s_b2 = block_on(db.delete(b"b")).unwrap();
     let s_c1 = block_on(db.put(b"c", b"c1")).unwrap();
     let snap2 = db.snapshot().unwrap(); // observes a = a3, b deleted, c = c1
-                                        // Spread the versions across four L0 tables so the merge actually runs.
+    // Spread the versions across four L0 tables so the merge actually runs.
     block_on(db.flush()).unwrap();
     for t in 0..3u8 {
         block_on(db.put(&[b'x', t], &[t])).unwrap();
@@ -613,7 +613,7 @@ fn compact_keep_set_matches_model() {
 #[test]
 #[allow(clippy::similar_names)] // s_d1/s_d2/... are intentionally parallel: seq of key X put N.
 fn compact_keep_set_no_snapshots_and_duplicate_watermarks() {
-    use horton::model::{model_keep_set, model_winner, Version};
+    use horton::model::{Version, model_keep_set, model_winner};
 
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);

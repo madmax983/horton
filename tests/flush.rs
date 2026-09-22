@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{block_on, test_config, MemDevice, TestDb};
+use common::{MemDevice, TestDb, block_on, test_config};
 use horton::{Config, Error};
 
 fn open<D: horton::BlockDevice>(db: &mut TestDb<D>)

@@ -4,12 +4,17 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.3 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.10 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
 //! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
-//! (bump pointer plus free list), and the [`Db`] database (WAL + memtable +
+//! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
 //! flush into `SSTables`, multi-level bloom-gated reads with key-range
-//! pruning and highest-sequence-wins).
+//! pruning and highest-sequence-wins), the [`Scan`] merge iterator with
+//! snapshot reads, and the archive API ([`Db::archive_plan`],
+//! [`Db::archive_commit`], [`ArchivePlan`]) — seal a table, stream its
+//! blocks to caller-owned remote storage through [`Db::device`], then
+//! forget it locally. See SPEC §9 for the tombstone rule: delete-bearing
+//! workloads archive only from the bottommost level.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -36,16 +41,16 @@ pub mod sstable;
 pub mod wal;
 
 pub use alloc::{Bump, FreeList};
-pub use compact::{Compaction, Progress, COMPACTION_KMAX};
+pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
-pub use db::{Config, Db, OpenReport};
+pub use db::{ArchivePlan, Config, Db, OpenReport};
 pub use device::BlockDevice;
 pub use error::Error;
-pub use manifest::{KeyBound, Level, Manifest, TableRef, MANIFEST_MAGIC};
+pub use manifest::{KeyBound, Level, MANIFEST_MAGIC, Manifest, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
 pub use scan::Scan;
 pub use sstable::{
-    bloom_k, bloom_maybe_contains, plan_table, write_table, Lookup as SstLookup, SstEntry,
-    TablePlan, TableReader, SSTABLE_MAGIC,
+    Lookup as SstLookup, SSTABLE_MAGIC, SstEntry, TablePlan, TableReader, bloom_k,
+    bloom_maybe_contains, plan_table, write_table,
 };
 pub use wal::{Op, RecoverState, WalWriter};

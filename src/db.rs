@@ -14,7 +14,7 @@ use core::cell::RefCell;
 
 use crate::alloc::{Bump, FreeList};
 use crate::compact::{
-    init_cursor, ranges_overlap, Compaction, Input, MergeOutcome, Progress, State, COMPACTION_KMAX,
+    COMPACTION_KMAX, Compaction, Input, MergeOutcome, Progress, State, init_cursor, ranges_overlap,
 };
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -74,6 +74,24 @@ pub struct OpenReport {
     pub max_seq: u64,
     /// `SSTables` referenced by level 0 of the recovered manifest.
     pub l0_tables: usize,
+}
+
+/// A plan to archive (upload, then forget) one sealed `SSTable`.
+///
+/// Returned by [`Db::archive_plan`]: the table's level and placement
+/// record. The caller streams every block in
+/// `[table.first_block, table.end_block())` — read through
+/// [`Db::device`] — to durable remote storage, confirms the upload, then
+/// calls [`Db::archive_commit`] to drop the table from the manifest and
+/// reclaim its blocks. This is the flush-to-object-storage primitive: the
+/// table's bytes are immutable once sealed, so the upload needs no
+/// coordination with horton beyond "all bytes, then commit".
+#[derive(Debug, Clone, Copy)]
+pub struct ArchivePlan<const KEY_MAX: usize> {
+    /// The level holding the table.
+    pub level: usize,
+    /// The table's placement record: id and block range.
+    pub table: TableRef<KEY_MAX>,
 }
 
 /// Best hit seen so far by [`Db::get`]: the highest-sequence lookup result.
@@ -173,17 +191,17 @@ pub struct Db<
 }
 
 impl<
-        D: BlockDevice,
-        const BLOCK: usize,
-        const KEY_MAX: usize,
-        const VAL_MAX: usize,
-        const CAP: usize,
-        const ARENA: usize,
-        const LEVELS: usize,
-        const TABLES: usize,
-        const BLOOM_BYTES: usize,
-        const FREELIST: usize,
-    > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+    const BLOOM_BYTES: usize,
+    const FREELIST: usize,
+> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
 {
     const ASSERT_BLOCK: () = assert!(BLOCK == D::BLOCK, "BLOCK must equal D::BLOCK");
     const ASSERT_KEY: () = assert!(
@@ -280,8 +298,11 @@ impl<
         min
     }
 
-    /// The device, for the scan iterator's block reads.
-    pub(crate) const fn device(&self) -> &D {
+    /// The device, for the scan iterator's block reads — and for the
+    /// archive upload loop, which streams a sealed table's blocks through
+    /// it ([`Db::archive_plan`]).
+    #[must_use]
+    pub const fn device(&self) -> &D {
         self.wal.device()
     }
 
@@ -700,17 +721,17 @@ impl<
 }
 
 impl<
-        D: BlockDevice,
-        const BLOCK: usize,
-        const KEY_MAX: usize,
-        const VAL_MAX: usize,
-        const CAP: usize,
-        const ARENA: usize,
-        const LEVELS: usize,
-        const TABLES: usize,
-        const BLOOM_BYTES: usize,
-        const FREELIST: usize,
-    > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+    const BLOOM_BYTES: usize,
+    const FREELIST: usize,
+> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
 {
     /// Reports whether [`compact_step`](Db::compact_step) would select a
     /// compaction job right now: some level below the top holds `>= TABLES`
@@ -725,13 +746,111 @@ impl<
             return false;
         }
         for lvl in (0..LEVELS - 1).rev() {
-            if let Some(tables) = self.manifest.level(lvl) {
-                if tables.len() >= TABLES {
-                    return true;
-                }
+            if let Some(tables) = self.manifest.level(lvl)
+                && tables.len() >= TABLES
+            {
+                return true;
             }
         }
         false
+    }
+
+    /// The live table refs at `level`, oldest first — the archive
+    /// candidate list. Returns `None` for an out-of-range level.
+    #[must_use]
+    pub fn level_tables(&self, level: usize) -> Option<&[TableRef<KEY_MAX>]> {
+        self.manifest.level(level)
+    }
+
+    /// Plans the archival of one sealed table: returns its level and block
+    /// range for upload, or `None` when `table_id` is not at `level`
+    /// (already archived, compacted away, or never existed).
+    ///
+    /// The caller protocol:
+    ///
+    /// 1. Stream every block in `[plan.table.first_block,
+    ///    plan.table.end_block())` — read through [`Db::device`] — to the
+    ///    remote sink.
+    /// 2. Confirm the bytes are durably stored remotely (the sink is the
+    ///    caller's network code; horton never sees it).
+    /// 3. Call [`Db::archive_commit`].
+    ///
+    /// Crash order is what makes this safe: a crash anywhere before the
+    /// commit leaves the table in the manifest, so the upload simply
+    /// repeats — the sink must therefore be idempotent per table id
+    /// (re-uploading a fully uploaded table is always allowed). A crash
+    /// during the commit is decided by the atomic manifest write: old
+    /// slot (table still local, re-upload) or new slot (table gone, bytes
+    /// already remote). The commit never runs before the upload is
+    /// confirmed, so no crash can lose acknowledged data.
+    ///
+    /// Tombstone rule: the commit drops the table's tombstones from local
+    /// view. If a deeper level holds an older version of a key the
+    /// archived table deleted, that older version becomes visible locally
+    /// again. With deletes in the workload, archive only from the
+    /// bottommost level (nothing is deeper, so nothing can resurrect);
+    /// insert-only workloads — sensor logs with timestamp keys — are safe
+    /// from any level.
+    #[must_use]
+    pub fn archive_plan(&self, level: usize, table_id: u32) -> Option<ArchivePlan<KEY_MAX>> {
+        let tables = self.manifest.level(level)?;
+        let table = tables.iter().find(|t| t.id == table_id)?;
+        Some(ArchivePlan {
+            level,
+            table: *table,
+        })
+    }
+
+    /// Commits an archival: drops the table from the manifest in one
+    /// atomic manifest write and reclaims its blocks into the free list.
+    ///
+    /// Call only after the table's bytes are durably stored remotely —
+    /// once this returns `Ok(true)` the data is gone locally by design.
+    /// Returns `Ok(false)` when the table is no longer at `level`
+    /// (idempotent: safe to retry after a crash that may or may not have
+    /// committed, or when a concurrent compaction already merged it away —
+    /// the uploaded bytes are still a valid copy of that data).
+    ///
+    /// Reclamation is best-effort after the visibility point, exactly like
+    /// compaction: a full free list cannot fail the commit, and
+    /// un-reclaimed blocks become orphans the next [`Db::open`] sweep
+    /// reclaims.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Device`] on I/O failure. The manifest write is atomic:
+    /// either the table is gone (all of it) or it is still fully present.
+    pub async fn archive_commit(
+        &mut self,
+        level: usize,
+        table_id: u32,
+    ) -> Result<bool, Error<D::Error>> {
+        let Some(plan) = self.archive_plan(level, table_id) else {
+            return Ok(false);
+        };
+        let mut scratch = [0u8; BLOCK];
+        let mut staged = self.manifest;
+        if !staged.remove_table_from_level::<D::Error>(level, table_id)? {
+            return Ok(false);
+        }
+        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        staged
+            .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
+            .await?;
+        // Commit point passed: publish the staged state, then reclaim the
+        // table's run strictly after the visibility point.
+        self.manifest = staged;
+        let mut k = 0u64;
+        let blocks = u64::from(plan.table.block_count);
+        while k < blocks {
+            if let Some(id) = plan.table.first_block.checked_add(k)
+                && self.tbl_free.insert::<D::Error>(id).is_err()
+            {
+                break;
+            }
+            k += 1;
+        }
+        Ok(true)
     }
 
     /// Runs one bounded compaction step using the caller's `scratch`.
@@ -1050,10 +1169,10 @@ impl<
             let mut k = 0u64;
             let blocks = u64::from(input.tref.block_count);
             while k < blocks {
-                if let Some(id) = input.tref.first_block.checked_add(k) {
-                    if self.tbl_free.insert::<D::Error>(id).is_err() {
-                        break;
-                    }
+                if let Some(id) = input.tref.first_block.checked_add(k)
+                    && self.tbl_free.insert::<D::Error>(id).is_err()
+                {
+                    break;
                 }
                 k += 1;
             }

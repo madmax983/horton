@@ -1,7 +1,7 @@
 //! Bump allocator tests: runs, exhaustion, overflow, repositioning.
 
-use horton::alloc::Bump;
 use horton::Error;
+use horton::alloc::Bump;
 
 type DevError = core::convert::Infallible;
 

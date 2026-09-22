@@ -5,7 +5,7 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{block_on, test_config, CrashDevice, Lcg, MemDevice, TestDb};
+use common::{CrashDevice, Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::Error;
 
 fn open<D: horton::BlockDevice>(db: &mut TestDb<D>)

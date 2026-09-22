@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{block_on, test_config, MemDevice, TestDb};
+use common::{MemDevice, TestDb, block_on, test_config};
 
 fn key(n: u64) -> Vec<u8> {
     format!("k{n:04}").into_bytes()

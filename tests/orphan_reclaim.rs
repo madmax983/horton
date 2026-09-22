@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{block_on, CrashDevice, MemDevice, TestDb};
+use common::{CrashDevice, MemDevice, TestDb, block_on};
 use horton::{BlockDevice, Config, Error, KeyBound, Manifest, TableRef};
 
 use core::task::{Context, Poll};

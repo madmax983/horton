@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{block_on, test_config, TestDb};
+use common::{TestDb, block_on, test_config};
 use core::future::poll_fn;
 use horton::device::BlockDevice;
 use horton::flash::{Flash, FlashBlockDevice, FlashError};

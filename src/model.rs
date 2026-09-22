@@ -65,12 +65,12 @@ pub fn model_keep_set(
 ) -> ([usize; MODEL_MAX_SNAPSHOTS + 1], usize) {
     let mut kept = [0usize; MODEL_MAX_SNAPSHOTS + 1];
     // Bottommost tombstone drop.
-    if bottommost {
-        if let Some(newest) = versions.first() {
-            if newest.tombstone && model_may_drop_tombstone(newest.seq, true, oldest_snapshot) {
-                return (kept, 0);
-            }
-        }
+    if bottommost
+        && let Some(newest) = versions.first()
+        && newest.tombstone
+        && model_may_drop_tombstone(newest.seq, true, oldest_snapshot)
+    {
+        return (kept, 0);
     }
     let mut n_kept = 0usize;
     let nsnap = snapshots.len().min(MODEL_MAX_SNAPSHOTS);

@@ -13,8 +13,8 @@ use core::task::{Context, Poll};
 use std::cell::Cell;
 use std::rc::Rc;
 
-use common::{block_on, noop_waker, test_config, MemDevice};
-use horton::{bloom_k, plan_table, write_table, BlockDevice, Config, Manifest, SstEntry, TableRef};
+use common::{MemDevice, block_on, noop_waker, test_config};
+use horton::{BlockDevice, Config, Manifest, SstEntry, TableRef, bloom_k, plan_table, write_table};
 
 type DevError = core::convert::Infallible;
 type TestManifest = Manifest<7, 4, 256>;
@@ -284,15 +284,15 @@ fn concurrent_gets_do_not_panic_when_interleaved() {
         let mut fut_a = pin!(db.get(b"alpha", &mut buf_a));
         let mut fut_b = pin!(db.get(b"alpha", &mut buf_b));
         for _ in 0..64 {
-            if done_a.is_none() {
-                if let Poll::Ready(r) = fut_a.as_mut().poll(&mut cx) {
-                    done_a = Some(r);
-                }
+            if done_a.is_none()
+                && let Poll::Ready(r) = fut_a.as_mut().poll(&mut cx)
+            {
+                done_a = Some(r);
             }
-            if done_b.is_none() {
-                if let Poll::Ready(r) = fut_b.as_mut().poll(&mut cx) {
-                    done_b = Some(r);
-                }
+            if done_b.is_none()
+                && let Poll::Ready(r) = fut_b.as_mut().poll(&mut cx)
+            {
+                done_b = Some(r);
             }
             if done_a.is_some() && done_b.is_some() {
                 break;

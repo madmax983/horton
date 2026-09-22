@@ -19,10 +19,10 @@ mod common;
 
 use std::future::poll_fn;
 
-use common::{block_on, Lcg, MemDevice};
+use common::{Lcg, MemDevice, block_on};
 use horton::manifest::{KeyBound, Manifest, TableRef};
 use horton::{
-    bloom_k, crc32, write_table, BlockDevice, MemTable, Op, SstEntry, TableReader, WalWriter,
+    BlockDevice, MemTable, Op, SstEntry, TableReader, WalWriter, bloom_k, crc32, write_table,
 };
 
 const BLOCK: usize = 4096;

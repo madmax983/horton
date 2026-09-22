@@ -5,7 +5,7 @@ mod common;
 
 use std::future::poll_fn;
 
-use common::{block_on, MemDevice};
+use common::{MemDevice, block_on};
 use horton::manifest::{KeyBound, Manifest, TableRef};
 use horton::{BlockDevice, Error};
 
