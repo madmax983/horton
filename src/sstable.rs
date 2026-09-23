@@ -31,6 +31,7 @@
 
 use core::future::poll_fn;
 
+use crate::compress::{CompressScratch, decompress};
 use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -292,12 +293,22 @@ pub fn plan_table<'a, E, const BLOCK: usize, const KEY_MAX: usize>(
 /// `BLOCK - CRC_LEN`, so the reader locates it from the block end without
 /// knowing the payload length. Zero padding, if any, sits between the
 /// payload and the tail.
+///
+/// Data blocks (`restarts.is_some()`) are trial-compressed when `compress`
+/// is `Some`: the whole logical body (entries, zero fill, restart tail)
+/// is fed to the LZ77 codec, and the compressed form is kept when it
+/// saves at least [`COMPRESS_MIN_SAVING`](crate::compress::COMPRESS_MIN_SAVING)
+/// bytes. A kept block has bit 15 of the trailer count u16 set, with the
+/// low 15 bits carrying the compressed length; the reader branches on
+/// that bit. Bloom, index, and footer blocks (`restarts.is_none()`) are
+/// never compressed.
 async fn seal_block<D: BlockDevice, const BLOCK: usize>(
     device: &mut D,
     id: u64,
     buf: &mut [u8; BLOCK],
     payload_len: usize,
     restarts: Option<&[u16]>,
+    mut compress: Option<&mut CompressScratch<BLOCK>>,
 ) -> Result<(), Error<D::Error>> {
     let body_end = BLOCK - CRC_LEN;
     if let Some(rs) = restarts {
@@ -325,6 +336,28 @@ async fn seal_block<D: BlockDevice, const BLOCK: usize>(
     } else {
         buf[payload_len..body_end].fill(0);
     }
+
+    // Trial-compress data blocks. The codec stages its output
+    // separately; on success the staged bytes move into the block body,
+    // the tail is zeroed, and the last u16 of the logical body carries
+    // the flag: bit 15 set, low 15 bits the compressed length. The
+    // original restart count already lives inside the compressed
+    // payload, so the flag slot holds only the flag and length.
+    if restarts.is_some()
+        && let Some(cs) = compress.as_mut()
+        && let Some(clen) = cs.compress(&buf[..body_end])
+    {
+        let (body, _) = buf.split_at_mut(body_end);
+        body[..clen].copy_from_slice(&cs.compressed()[..clen]);
+        body[clen..body_end].fill(0);
+        // `compress` guarantees `clen < 1 << 15`; the mask is
+        // belt-and-braces so the flag bit can never be clobbered,
+        // hence the narrowing cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let flagged = 0x8000 | (clen as u16 & 0x7FFF);
+        body[body_end - 2..body_end].copy_from_slice(&flagged.to_le_bytes());
+    }
+
     let crc = crc32(&buf[..body_end]);
     buf[body_end..BLOCK].copy_from_slice(&crc.to_le_bytes());
     poll_fn(|cx| device.poll_write_block(cx, id, buf))
@@ -442,6 +475,11 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// longer fits. Returns [`PushOutcome::BlockSealed`] exactly when a
     /// device write happened.
     ///
+    /// `compress` is the caller's compression scratch (`None` = store raw).
+    /// A sealed data block is trial-compressed; the compressed form is
+    /// kept only when it saves at least
+    /// [`COMPRESS_MIN_SAVING`](crate::compress::COMPRESS_MIN_SAVING) bytes.
+    ///
     /// # Errors
     ///
     /// [`Error::KeyTooLarge`] / [`Error::ValueTooLarge`] for oversize
@@ -452,6 +490,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         &mut self,
         device: &mut D,
         e: SstEntry<'_>,
+        compress: Option<&mut CompressScratch<BLOCK>>,
     ) -> Result<PushOutcome, Error<D::Error>> {
         let (elen, kl, vl) = entry_sizes::<D::Error>(&e)?;
         if e.key.len() > KEY_MAX {
@@ -476,6 +515,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
                 &mut self.data,
                 self.payload,
                 Some(&self.restarts[..self.nrestarts]),
+                compress,
             )
             .await?;
             append_index::<D::Error, BLOCK>(
@@ -545,9 +585,13 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     ///
     /// [`Error::NoSpace`] when the table outgrows its pre-allocated run, or
     /// [`Error::Device`] on I/O failure.
+    ///
+    /// `compress` is the caller's compression scratch (`None` = store raw);
+    /// see [`push`](TableWriter::push).
     pub async fn finish<D: BlockDevice>(
         &mut self,
         device: &mut D,
+        compress: Option<&mut CompressScratch<BLOCK>>,
     ) -> Result<FinishedTable<KEY_MAX>, Error<D::Error>> {
         if self.n > 0 {
             let id = self
@@ -560,6 +604,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
                 &mut self.data,
                 self.payload,
                 Some(&self.restarts[..self.nrestarts]),
+                compress,
             )
             .await?;
             append_index::<D::Error, BLOCK>(
@@ -580,11 +625,27 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             .ok_or(Error::NoSpace)?;
         self.data.fill(0);
         self.data[..self.bloom.len()].copy_from_slice(&self.bloom);
-        seal_block(device, bloom_id, &mut self.data, self.bloom.len(), None).await?;
+        seal_block(
+            device,
+            bloom_id,
+            &mut self.data,
+            self.bloom.len(),
+            None,
+            None,
+        )
+        .await?;
 
         // Index block.
         let index_id = bloom_id.checked_add(1).ok_or(Error::NoSpace)?;
-        seal_block(device, index_id, &mut self.index, self.index_len, None).await?;
+        seal_block(
+            device,
+            index_id,
+            &mut self.index,
+            self.index_len,
+            None,
+            None,
+        )
+        .await?;
 
         // Footer block: magic | index | bloom | entry_count | k.
         let footer_id = index_id.checked_add(1).ok_or(Error::NoSpace)?;
@@ -594,7 +655,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data[16..24].copy_from_slice(&bloom_id.to_le_bytes());
         self.data[24..32].copy_from_slice(&self.entry_count.to_le_bytes());
         self.data[32] = self.k;
-        seal_block(device, footer_id, &mut self.data, 33, None).await?;
+        seal_block(device, footer_id, &mut self.data, 33, None, None).await?;
 
         // Table blocks are durable before the manifest commit makes them
         // visible.
@@ -626,6 +687,9 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
 /// flushed at the end, so the table is durable before the manifest commit
 /// that makes it visible.
 ///
+/// `compress` is the caller's compression scratch (`None` = store all data
+/// blocks raw); see [`TableWriter::push`].
+///
 /// # Errors
 ///
 /// [`Error::KeyTooLarge`] / [`Error::ValueTooLarge`] for oversize entries,
@@ -642,16 +706,55 @@ pub async fn write_table<
     base: u64,
     k: u8,
     entries: impl Iterator<Item = SstEntry<'a>>,
+    compress: Option<&mut CompressScratch<BLOCK>>,
 ) -> Result<u64, Error<D::Error>>
 where
     D: BlockDevice,
 {
     let mut w = TableWriter::<BLOCK, BLOOM_BYTES, KEY_MAX>::new(base, k);
+    // `compress` is threaded through every seal: reborrow the `&mut`
+    // each call since the parameter takes it by value.
+    let mut cs = compress;
     for e in entries {
-        w.push(device, e).await?;
+        w.push(device, e, cs.as_deref_mut()).await?;
     }
-    let done = w.finish(device).await?;
+    let done = w.finish(device, cs).await?;
     Ok(done.data_blocks + 3)
+}
+
+/// Inflates a CRC-verified physical data block into its logical form.
+///
+/// Inspects the compression flag (bit 15 of the trailer count u16). When
+/// clear, returns `Ok(false)` and the block is already logical — the
+/// caller keeps using the physical buffer. When set, decompresses the
+/// flagged payload into `decomp[..BLOCK-4]` and returns `Ok(true)`.
+///
+/// A set flag with an impossible length, or a decoder rejection, is
+/// [`Error::CorruptBlock`]: the CRC already passed, so this is a format
+/// violation rather than a torn write — but it is still an error, never
+/// a panic. Used by every data-block read path (point lookups, scans,
+/// compaction cursors, entry streams).
+pub(crate) fn inflate_data_block<E, const BLOCK: usize>(
+    raw: &[u8; BLOCK],
+    decomp: &mut [u8; BLOCK],
+    block_id: u64,
+) -> Result<bool, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
+    let trailer = u16::from_le_bytes(
+        raw[body_end - 2..body_end]
+            .try_into()
+            .map_err(|_| corrupt())?,
+    );
+    if trailer & 0x8000 == 0 {
+        return Ok(false);
+    }
+    let clen = usize::from(trailer & 0x7FFF);
+    if clen >= body_end {
+        return Err(corrupt());
+    }
+    decompress(&raw[..clen], &mut decomp[..body_end]).map_err(|_| corrupt())?;
+    Ok(true)
 }
 
 /// Byte offset where data entries end in a CRC-verified data block: the
@@ -1320,13 +1423,17 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the value,
     /// [`Error::CorruptBlock`] when the index block fails verification, or
     /// [`Error::Device`] on I/O failure.
+    ///
+    /// `decomp` is the caller's decompression buffer; see
+    /// [`lookup_at`](TableReader::lookup_at).
     pub async fn get(
         &self,
         scratch: &mut [u8; BLOCK],
+        decomp: &mut [u8; BLOCK],
         key: &[u8],
         val_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<D::Error>> {
-        self.get_at(scratch, key, val_buf, u64::MAX).await
+        self.get_at(scratch, decomp, key, val_buf, u64::MAX).await
     }
 
     /// Snapshot read: like [`get`](TableReader::get), but observes only
@@ -1337,15 +1444,22 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the value,
     /// [`Error::CorruptBlock`] when the index block fails verification, or
     /// [`Error::Device`] on I/O failure.
+    ///
+    /// `decomp` is the caller's decompression buffer; see
+    /// [`lookup_at`](TableReader::lookup_at).
     pub async fn get_at(
         &self,
         scratch: &mut [u8; BLOCK],
+        decomp: &mut [u8; BLOCK],
         key: &[u8],
         val_buf: &mut [u8],
         max_seq: u64,
     ) -> Result<Option<usize>, Error<D::Error>> {
         Ok(
-            match self.lookup_at(scratch, key, val_buf, max_seq).await? {
+            match self
+                .lookup_at(scratch, decomp, key, val_buf, max_seq)
+                .await?
+            {
                 Lookup::Value { len, .. } => Some(len),
                 Lookup::Tombstone { .. } | Lookup::Missing => None,
             },
@@ -1363,13 +1477,19 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the value,
     /// [`Error::CorruptBlock`] when the index block fails verification, or
     /// [`Error::Device`] on I/O failure.
+    ///
+    /// `decomp` is the caller's decompression buffer: data blocks flagged
+    /// compressed are inflated into it before parsing; raw blocks are
+    /// parsed in place from `scratch` with no copy.
     pub async fn lookup(
         &self,
         scratch: &mut [u8; BLOCK],
+        decomp: &mut [u8; BLOCK],
         key: &[u8],
         val_buf: &mut [u8],
     ) -> Result<Lookup, Error<D::Error>> {
-        self.lookup_at(scratch, key, val_buf, u64::MAX).await
+        self.lookup_at(scratch, decomp, key, val_buf, u64::MAX)
+            .await
     }
 
     /// Snapshot read: like [`lookup`](TableReader::lookup), but observes
@@ -1384,9 +1504,14 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the value,
     /// [`Error::CorruptBlock`] when the index block fails verification, or
     /// [`Error::Device`] on I/O failure.
+    ///
+    /// `decomp` is the caller's decompression buffer: data blocks flagged
+    /// compressed are inflated into it before parsing; raw blocks are
+    /// parsed in place from `scratch` with no copy.
     pub async fn lookup_at(
         &self,
         scratch: &mut [u8; BLOCK],
+        decomp: &mut [u8; BLOCK],
         key: &[u8],
         val_buf: &mut [u8],
         max_seq: u64,
@@ -1423,8 +1548,18 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             if check_block_crc::<D::Error, BLOCK>(scratch, block_id).is_err() {
                 return Ok(Lookup::Missing);
             }
-            match data_lookup::<D::Error>(&scratch[..payload_end], key, val_buf, block_id, max_seq)?
+            // A flagged block inflates into `decomp`; a raw block parses
+            // in place from `scratch`. A flag/decoding failure here is a
+            // format violation, not a torn write — but like a torn write
+            // it reads as absent, never as a wrong value.
+            let body_end = BLOCK - CRC_LEN;
+            let body: &[u8] = match inflate_data_block::<D::Error, BLOCK>(scratch, decomp, block_id)
             {
+                Err(_) => return Ok(Lookup::Missing),
+                Ok(true) => &decomp[..body_end],
+                Ok(false) => &scratch[..body_end],
+            };
+            match data_lookup::<D::Error>(body, key, val_buf, block_id, max_seq)? {
                 BlockOutcome::Hit(DataHit::Value(n, seq)) => {
                     return Ok(Lookup::Value { len: n, seq });
                 }

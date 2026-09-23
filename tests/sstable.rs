@@ -34,6 +34,7 @@ fn write(items: &[SstEntry<'_>], dev: &mut MemDevice<BLOCK>) -> (u64, u64) {
             BASE,
             k,
             items.iter().copied(),
+            None,
         ),
     )
     .unwrap();
@@ -47,13 +48,14 @@ fn get(
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, Error<core::convert::Infallible>> {
     let mut scratch = [0u8; BLOCK];
+    let mut decomp = [0u8; BLOCK];
     let mut buf = [0u8; 2048];
     let reader = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, BLOOM_BYTES>::open(
         dev,
         &mut scratch,
         footer,
     ))?;
-    let n = block_on(reader.get(&mut scratch, key, &mut buf))?;
+    let n = block_on(reader.get(&mut scratch, &mut decomp, key, &mut buf))?;
     Ok(n.map(|n| buf[..n].to_vec()))
 }
 
@@ -349,13 +351,14 @@ fn get_at(
     max_seq: u64,
 ) -> Result<Option<Vec<u8>>, Error<core::convert::Infallible>> {
     let mut scratch = [0u8; BLOCK];
+    let mut decomp = [0u8; BLOCK];
     let mut buf = [0u8; 2048];
     let reader = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, BLOOM_BYTES>::open(
         dev,
         &mut scratch,
         footer,
     ))?;
-    let n = block_on(reader.get_at(&mut scratch, key, &mut buf, max_seq))?;
+    let n = block_on(reader.get_at(&mut scratch, &mut decomp, key, &mut buf, max_seq))?;
     Ok(n.map(|n| buf[..n].to_vec()))
 }
 

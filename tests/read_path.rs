@@ -43,6 +43,7 @@ fn write_single(
         base,
         k,
         core::iter::once(entry()),
+        None,
     ))
     .expect("write table");
     let total = plan.data_blocks + 3;

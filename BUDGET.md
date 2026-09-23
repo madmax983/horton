@@ -1,4 +1,4 @@
-# Horton ESP32-S3 RAM budget (v0.6)
+# Horton ESP32-S3 RAM budget (v0.13)
 
 All numbers are **measured** with `core::mem::size_of` on the host
 (`tests/profile.rs` prints and asserts them); the layout is identical on
@@ -24,14 +24,19 @@ extra and not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 12,960 | WAL stage 4,096 + read buffer 4,096 + memtable 2,456 + manifest/snapshots/misc |
-| `Scan` | 6,296 | per-level/per-table scan cursors (indices, no block buffers) |
-| `Compaction` | 43,896 | 8 merge cursors × ~4.3 KiB (one 4 KiB block buffer each) + inputs + snapshot watermarks |
-| **Total** | **63,152** | |
+| `Db` | 17,064 | v0.6 baseline 12,960 + 4,096 decompression buffer (point reads inflate here) |
+| `Scan` | 10,392 | v0.6 baseline 6,296 + 4,096 logical block buffer (physical reads land in the shared `raw` buffer, inflate here) |
+| `Compaction` | 56,192 | v0.6 baseline 43,896 + 8,192 trial-compression scratch + 4,096 shared physical-read buffer (8 merge cursors share one `raw`; each keeps only its logical block) |
+| **Total** | **83,648** | |
 
-Budget: **65,536 bytes (64 KiB)** — `ESP32S3_RAM_BUDGET` in `src/profile.rs`,
-asserted by `tests/profile.rs`. Growth past it fails the test suite loudly;
-re-tuning is then a conscious SPEC decision, not silent bloat.
+Budget: **98,304 bytes (96 KiB)** — `ESP32S3_RAM_BUDGET` in `src/profile.rs`,
+asserted by `tests/profile.rs`. Raised from 64 KiB for v0.13: block
+compression costs ~20 KiB of caller-owned scratch, every byte load-bearing
+(the read path cannot inflate without a target; the writer cannot
+trial-compress without staging). 96 KiB is 19% of the S3's 512 KiB SRAM —
+still comfortable room for the kernel, stacks, and drivers. Growth past it
+fails the test suite loudly; re-tuning is then a conscious SPEC decision,
+not silent bloat.
 
 ## Context
 

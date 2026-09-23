@@ -25,6 +25,7 @@
 
 use core::future::poll_fn;
 
+use crate::compress::CompressScratch;
 use crate::db::MAX_SNAPSHOTS;
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -101,6 +102,18 @@ pub struct Compaction<
     pub(crate) out_len: usize,
     pub(crate) from_free: bool,
     pub(crate) writer: TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>,
+    /// Caller-owned compression scratch for the output table: every
+    /// sealed data block is trial-compressed (see
+    /// [`TableWriter::push`](crate::sstable::TableWriter::push)). Lives
+    /// for the job's duration; `const`-constructible so [`new`](Self::new)
+    /// stays `const`.
+    pub(crate) compress: CompressScratch<BLOCK>,
+    /// Shared physical-read scratch: one block buffer lent to
+    /// [`read_data_block`] on every cursor fill. The physical bytes are
+    /// dead once inflated into the cursor's `block`, so the eight merge
+    /// cursors share this instead of each owning one (saves 7 blocks of
+    /// RAM against the naive per-cursor layout).
+    pub(crate) raw: [u8; BLOCK],
     pub(crate) cursors: [Cursor<BLOCK, KEY_MAX, VAL_MAX>; COMPACTION_KMAX],
     /// The key currently being merged: a sealed output block may interrupt
     /// a key mid-versions, and matching on these bytes resumes it exactly
@@ -134,14 +147,20 @@ impl<const KEY_MAX: usize> Input<KEY_MAX> {
 }
 
 /// Read cursor over one input table's data blocks: the current block plus
-/// the parsed head entry. Owns its buffers so the k-way merge never
-/// allocates.
+/// the parsed head entry. Owns its logical block buffer so the k-way
+/// merge never allocates; the physical read scratch is shared — the
+/// [`Compaction`] (or [`EntryStream`]) hands its one `raw` buffer to
+/// [`read_data_block`] on each fill, since the physical bytes are dead
+/// once inflated.
 #[derive(Clone, Copy)]
 pub(crate) struct Cursor<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize> {
     first_block: u64,
     data_blocks: u64,
     block_idx: u64,
     block_id: u64,
+    /// Logical block: inflated here when the compression flag is set,
+    /// copied here from the physical read when clear. Every parser
+    /// below reads from here, so decompression is transparent.
     block: [u8; BLOCK],
     /// Start of the restart trailer: entries end at the first zero padding
     /// before this offset (the writer zero-fills `[payload..rstart)`).
@@ -213,6 +232,8 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             out_len: 0,
             from_free: false,
             writer: TableWriter::new(0, 0),
+            compress: CompressScratch::new(),
+            raw: [0u8; BLOCK],
             cursors: [Cursor::EMPTY; COMPACTION_KMAX],
             key: [0u8; KEY_MAX],
             key_len: 0,
@@ -343,7 +364,9 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                         seq,
                         tombstone,
                     };
-                    self.writer.push(device, e).await?
+                    self.writer
+                        .push(device, e, Some(&mut self.compress))
+                        .await?
                 };
                 // The emitted version is the newest at or below every
                 // threshold it satisfies (versions surface newest-first),
@@ -360,7 +383,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                     }
                     ti += 1;
                 }
-                advance_cursor(&*device, &mut self.cursors[head]).await?;
+                advance_cursor(&*device, &mut self.raw, &mut self.cursors[head]).await?;
                 if sealed == PushOutcome::BlockSealed {
                     return Ok(MergeOutcome::More);
                 }
@@ -369,7 +392,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                 // threshold. Only the head advances — a tied cursor parked
                 // on an older version may still serve a smaller threshold
                 // on a later iteration.
-                advance_cursor(&*device, &mut self.cursors[head]).await?;
+                advance_cursor(&*device, &mut self.raw, &mut self.cursors[head]).await?;
             }
         }
     }
@@ -397,8 +420,14 @@ async fn read_block_into<D: BlockDevice, const BLOCK: usize>(
         .map_err(Error::Device)
 }
 
-/// Loads data block `idx` of the cursor's table: reads, CRC-checks, and
-/// locates the entries end.
+/// Loads data block `idx` of the cursor's table: reads, CRC-checks,
+/// inflates when the compression flag is set, and locates the entries end.
+///
+/// `cur.block` always ends up holding the logical block: a flagged block
+/// is decompressed from `raw` into `cur.block`; a raw block is copied
+/// `raw -> block` (one `BLOCK`-sized memcpy) so every parser below keeps
+/// reading from a single buffer. `raw` is the caller's shared physical
+/// scratch — its contents are dead on return.
 async fn read_data_block<
     D: BlockDevice,
     const BLOCK: usize,
@@ -406,6 +435,7 @@ async fn read_data_block<
     const VAL_MAX: usize,
 >(
     device: &D,
+    raw: &mut [u8; BLOCK],
     cur: &mut Cursor<BLOCK, KEY_MAX, VAL_MAX>,
     idx: u64,
 ) -> Result<(), Error<D::Error>> {
@@ -415,8 +445,13 @@ async fn read_data_block<
         .ok_or(Error::CorruptBlock {
             id: cur.first_block,
         })?;
-    read_block_into(device, id, &mut cur.block).await?;
-    sstable::check_block_crc(&cur.block, id)?;
+    read_block_into(device, id, raw).await?;
+    sstable::check_block_crc(raw, id)?;
+    if sstable::inflate_data_block::<D::Error, BLOCK>(raw, &mut cur.block, id)? {
+        // Flagged: `cur.block` now holds the inflated logical block.
+    } else {
+        cur.block.copy_from_slice(raw);
+    }
     let rstart = sstable::data_entries_end(&cur.block, id)?;
     if rstart == 0 {
         // A data block always carries at least one entry.
@@ -474,6 +509,9 @@ fn parse_head_at<E, const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usi
 
 /// Positions a cursor on its table's first entry. A table with no data
 /// blocks parks exhausted.
+///
+/// `raw` is the caller's shared physical-read scratch, lent to
+/// [`read_data_block`] for the fill.
 pub(crate) async fn init_cursor<
     D: BlockDevice,
     const BLOCK: usize,
@@ -481,6 +519,7 @@ pub(crate) async fn init_cursor<
     const VAL_MAX: usize,
 >(
     device: &D,
+    raw: &mut [u8; BLOCK],
     tref: &TableRef<KEY_MAX>,
     cur: &mut Cursor<BLOCK, KEY_MAX, VAL_MAX>,
 ) -> Result<(), Error<D::Error>> {
@@ -495,7 +534,7 @@ pub(crate) async fn init_cursor<
     if data_blocks == 0 {
         return Ok(());
     }
-    read_data_block(device, cur, 0).await?;
+    read_data_block(device, raw, cur, 0).await?;
     if !parse_head_at(cur, 0)? {
         // The writer never emits an empty data block.
         return Err(Error::CorruptBlock {
@@ -507,6 +546,9 @@ pub(crate) async fn init_cursor<
 
 /// Advances the cursor past its head entry. Returns `true` when parked on a
 /// new head, `false` when the table is exhausted.
+///
+/// `raw` is the caller's shared physical-read scratch, lent to
+/// [`read_data_block`] when the next block loads.
 async fn advance_cursor<
     D: BlockDevice,
     const BLOCK: usize,
@@ -514,6 +556,7 @@ async fn advance_cursor<
     const VAL_MAX: usize,
 >(
     device: &D,
+    raw: &mut [u8; BLOCK],
     cur: &mut Cursor<BLOCK, KEY_MAX, VAL_MAX>,
 ) -> Result<bool, Error<D::Error>> {
     // Another entry in this block? Zero padding means the block's entries
@@ -529,7 +572,7 @@ async fn advance_cursor<
         cur.live = false;
         return Ok(false);
     }
-    read_data_block(device, cur, idx).await?;
+    read_data_block(device, raw, cur, idx).await?;
     if !parse_head_at(cur, 0)? {
         // The writer never emits an empty data block.
         return Err(Error::CorruptBlock { id: cur.block_id });
@@ -552,6 +595,9 @@ pub(crate) struct EntryStream<
     const VAL_MAX: usize,
 > {
     device: &'d D,
+    /// Physical-read scratch lent to the cursor fills; dead once a block
+    /// is inflated into `cur.block`.
+    raw: [u8; BLOCK],
     cur: Cursor<BLOCK, KEY_MAX, VAL_MAX>,
 }
 
@@ -570,8 +616,9 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX
         tref: &TableRef<KEY_MAX>,
     ) -> Result<Self, Error<D::Error>> {
         let mut cur = Cursor::EMPTY;
-        init_cursor(device, tref, &mut cur).await?;
-        Ok(Self { device, cur })
+        let mut raw = [0u8; BLOCK];
+        init_cursor(device, &mut raw, tref, &mut cur).await?;
+        Ok(Self { device, raw, cur })
     }
 
     /// The parked entry's key, sequence, and tombstone flag, or `None`
@@ -596,6 +643,6 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX
     /// [`Error::CorruptBlock`] when the next block fails its CRC or an
     /// entry fails to parse, or [`Error::Device`] on I/O failure.
     pub(crate) async fn advance(&mut self) -> Result<bool, Error<D::Error>> {
-        advance_cursor(self.device, &mut self.cur).await
+        advance_cursor(self.device, &mut self.raw, &mut self.cur).await
     }
 }

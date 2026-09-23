@@ -156,6 +156,7 @@ fn archive_roundtrip_bytes_verify_as_sstable() {
     }
     let end = first0.checked_add(u64::from(count0)).expect("end fits");
     let mut scratch = [0u8; BLOCK];
+    let mut decomp = [0u8; BLOCK];
     let reader = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, 1024>::open(
         &updev,
         &mut scratch,
@@ -165,7 +166,7 @@ fn archive_roundtrip_bytes_verify_as_sstable() {
     let mut vbuf = [0u8; 2048];
     for i in 0..4u8 {
         let key = [b'a', b'0' + i];
-        let n = block_on(reader.get(&mut scratch, &key, &mut vbuf))
+        let n = block_on(reader.get(&mut scratch, &mut decomp, &key, &mut vbuf))
             .expect("uploaded table reads cleanly")
             .expect("key present in uploaded table");
         assert_eq!(&vbuf[..n], &[b'v', b'a', b'0' + i]);

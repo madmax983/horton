@@ -234,6 +234,13 @@ pub struct Db<
     /// now lives here, for the life of the `Db`. Count `BLOCK` bytes of
     /// permanent RAM for this field against SPEC.md's RAM budget.
     get_scratch: RefCell<[u8; BLOCK]>,
+    /// Decompression buffer for point reads: data blocks flagged
+    /// compressed inflate into here before parsing (see
+    /// [`sstable::TableReader::lookup_at`](crate::sstable::TableReader::lookup_at)).
+    /// Same borrow discipline as `get_scratch`: `get_at` tries the shared
+    /// buffer and falls back to a stack buffer when a concurrent `get`
+    /// already holds it. Count another `BLOCK` bytes of permanent RAM.
+    decomp_scratch: RefCell<[u8; BLOCK]>,
 }
 
 /// WAL staging snapshot, taken before a mutation stages its records.
@@ -295,6 +302,7 @@ impl<
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
             get_scratch: RefCell::new([0u8; BLOCK]),
+            decomp_scratch: RefCell::new([0u8; BLOCK]),
         }
     }
 
@@ -687,10 +695,20 @@ impl<
             owned_scratch = [0u8; BLOCK];
             &mut owned_scratch
         };
+        // The decompression buffer follows the same discipline: shared
+        // when free, stack-local when a concurrent `get` holds it.
+        let mut shared_decomp = self.decomp_scratch.try_borrow_mut().ok();
+        let mut owned_decomp;
+        let decomp: &mut [u8; BLOCK] = if let Some(guard) = shared_decomp.as_mut() {
+            guard
+        } else {
+            owned_decomp = [0u8; BLOCK];
+            &mut owned_decomp
+        };
         // Level 0, newest table first: its tables overlap, and newer tables
         // hold higher sequence numbers.
         for tref in self.manifest.l0().iter().rev() {
-            self.consider_table(tref, key, max_seq, scratch, &mut acc)
+            self.consider_table(tref, key, max_seq, scratch, decomp, &mut acc)
                 .await?;
         }
         // Deeper levels in order. Highest-seq-wins keeps the result exact
@@ -700,7 +718,7 @@ impl<
             // `li < LEVELS` by construction; the fallback is unreachable.
             let tables = self.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
-                self.consider_table(tref, key, max_seq, scratch, &mut acc)
+                self.consider_table(tref, key, max_seq, scratch, decomp, &mut acc)
                     .await?;
             }
         }
@@ -878,6 +896,7 @@ impl<
         key: &[u8],
         max_seq: u64,
         scratch: &mut [u8; BLOCK],
+        decomp: &mut [u8; BLOCK],
         acc: &mut ReadAcc<VAL_MAX>,
     ) -> Result<(), Error<D::Error>> {
         // Both prunes are exact: the table's keys all lie within its bounds,
@@ -896,7 +915,10 @@ impl<
         // `tmp` (not `acc.stage`) receives the value: only a winning hit is
         // promoted, so a losing hit cannot clobber the staged winner.
         let mut tmp = [0u8; VAL_MAX];
-        match reader.lookup_at(scratch, key, &mut tmp, max_seq).await? {
+        match reader
+            .lookup_at(scratch, decomp, key, &mut tmp, max_seq)
+            .await?
+        {
             sstable::Lookup::Value { len, seq } if seq > acc.best_seq && seq <= max_seq => {
                 acc.best_seq = seq;
                 acc.stage[..len].copy_from_slice(&tmp[..len]);
@@ -993,13 +1015,17 @@ impl<
             None => self.tbl_bump.peek_run::<D::Error>(total)?,
         };
         // Pass 2: stream the blocks. `data` doubles as the manifest scratch
-        // below; it is a plain stack local.
+        // below; it is a plain stack local. `cs` is this flush's
+        // compression scratch: every data block is trial-compressed and
+        // the compressed form kept when it saves enough.
         let mut data = [0u8; BLOCK];
+        let mut cs = crate::compress::CompressScratch::<BLOCK>::new();
         let written = sstable::write_table::<D, BLOCK, BLOOM_BYTES, KEY_MAX>(
             self.wal.device_mut(),
             base,
             k,
             self.table.iter().map(sstable::SstEntry::from),
+            Some(&mut cs),
         )
         .await?;
         debug_assert_eq!(written, total);
@@ -1285,11 +1311,12 @@ impl<
         }
 
         let mut scratch = [0u8; BLOCK];
+        let mut decomp = [0u8; BLOCK];
         // Level 0, newest table first: its tables overlap, and newer
         // tables hold higher sequence numbers.
         for tref in self.manifest.l0().iter().rev() {
             if Some(tref.id) != exclude {
-                self.consider_table(tref, key, max_seq, &mut scratch, &mut acc)
+                self.consider_table(tref, key, max_seq, &mut scratch, &mut decomp, &mut acc)
                     .await?;
             }
         }
@@ -1299,7 +1326,7 @@ impl<
             let tables = self.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
                 if Some(tref.id) != exclude {
-                    self.consider_table(tref, key, max_seq, &mut scratch, &mut acc)
+                    self.consider_table(tref, key, max_seq, &mut scratch, &mut decomp, &mut acc)
                         .await?;
                 }
             }
@@ -1490,7 +1517,7 @@ impl<
         let device = self.wal.device_mut();
         for i in 0..job.n_inputs {
             let tref = c.inputs[i].tref;
-            init_cursor(&*device, &tref, &mut c.cursors[i]).await?;
+            init_cursor(&*device, &mut c.raw, &tref, &mut c.cursors[i]).await?;
         }
         c.state = State::Merging;
         Ok(true)
@@ -1583,8 +1610,10 @@ impl<
         // Seal the output table first: finish flushes, so its blocks are
         // durable before the manifest makes them visible.
         let out_ref = if c.writer.entry_count() > 0 {
-            let done: sstable::FinishedTable<KEY_MAX> =
-                c.writer.finish(self.wal.device_mut()).await?;
+            let done: sstable::FinishedTable<KEY_MAX> = c
+                .writer
+                .finish(self.wal.device_mut(), Some(&mut c.compress))
+                .await?;
             let total = done.data_blocks.checked_add(3).ok_or(Error::NoSpace)?;
             let id = staged.alloc_table_id::<D::Error>()?;
             Some(TableRef {

@@ -164,7 +164,7 @@ fn sstable_corpus(base: u64) -> (MemDevice<BLOCK>, Vec<[u8; BLOCK]>, u64) {
         });
     let k = bloom_k(1024 * 8, 40);
     let nblocks = block_on(write_table::<_, BLOCK, 1024, 256>(
-        &mut dev, base, k, entries,
+        &mut dev, base, k, entries, None,
     ))
     .unwrap();
     let pristine = dev.blocks_mut().clone();
@@ -177,6 +177,7 @@ fn sstable_corpus_is_valid() {
     let base = 136u64;
     let (dev, _, nblocks) = sstable_corpus(base);
     let mut scratch = [0u8; BLOCK];
+    let mut decomp = [0u8; BLOCK];
     let reader = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, 1024>::open(
         &dev,
         &mut scratch,
@@ -186,7 +187,7 @@ fn sstable_corpus_is_valid() {
     let mut val_buf = [0u8; 1024];
     for i in 0..40u8 {
         let key = format!("skey{i:02}");
-        let got = block_on(reader.get(&mut scratch, key.as_bytes(), &mut val_buf));
+        let got = block_on(reader.get(&mut scratch, &mut decomp, key.as_bytes(), &mut val_buf));
         if i % 13 == 12 {
             assert_eq!(got.unwrap(), None, "tombstone {i}");
         } else {
@@ -214,6 +215,7 @@ fn sstable_decoder_never_panics() {
         let mut dev = MemDevice::<BLOCK>::new();
         dev.blocks_mut().extend_from_slice(&blocks);
         let mut scratch = [0u8; BLOCK];
+        let mut decomp = [0u8; BLOCK];
         let mut val_buf = [0u8; 1024];
         let open = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, 1024>::open(
             &dev,
@@ -224,7 +226,8 @@ fn sstable_decoder_never_panics() {
             for j in 0..40u64 {
                 let key = format!("skey{j:02}");
                 // No panic is the assertion; any clean outcome is acceptable.
-                let _ = block_on(reader.get(&mut scratch, key.as_bytes(), &mut val_buf));
+                let _ =
+                    block_on(reader.get(&mut scratch, &mut decomp, key.as_bytes(), &mut val_buf));
             }
         }
     }

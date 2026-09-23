@@ -905,8 +905,97 @@ floor (`seq <= manifest.max_seq`).
     (`debug_assert!` only, side-effect-free); zero dependencies, no `std`
     in `src/`, `#![forbid(unsafe_code)]` holds.
 
-## 10. Open questions for Mark
+- v0.13 — Hand-rolled block compression.
+  - **Scope**: LZ77 block compression for SSTable data blocks, written
+    from scratch (no dependency, no `std`, no allocation, no panics):
+    new module `src/compress.rs` with `compress` / `decompress` and a
+    caller-owned `CompressScratch<BLOCK>` (hash table + compressed-output
+    staging). The writer trial-compresses every sealed data block and
+    keeps the compressed form only when it saves at least
+    `COMPRESS_MIN_SAVING` (128) bytes — otherwise the block is stored
+    raw. Tables therefore mix compressed and uncompressed blocks freely,
+    and pre-v0.13 all-raw tables read unchanged. Bloom, index, and footer
+    blocks are never compressed.
+  - **Format** — the per-block flag: data blocks already end with a
+    restart trailer whose last u16 is the restart count (writer-capped at
+    128, so bit 15 is always free). A sealed data block whose trailer u16
+    has bit 15 set is compressed: the low 15 bits are the compressed
+    payload length `clen`, and bytes `[0..clen]` are the compressed
+    stream. Bit 15 clear is the legacy raw layout, unchanged. The
+    compressed stream encodes the *entire* logical block `[0..BLOCK-4]`
+    (entries + zero fill + restart trailer), so the decompressed size is
+    always exactly `BLOCK - 4` — no length prefix, no ambiguity, and the
+    existing parsers run on the decompressed bytes untouched. The stream
+    itself is token/literal/match triples (4-bit literal length, 4-bit
+    match-length-minus-4, LZ4-style extension bytes, u16-LE match offset,
+    minimum match 4). The CRC still covers the physical block, so random
+    corruption is caught before the decoder ever runs; the decoder
+    additionally bounds-checks every read and write and returns
+    `CorruptBlock` on any malformed stream instead of panicking.
+  - **Caller scratch, both directions**: compressing needs working
+    memory, so `TableWriter::push` / `finish` and `write_table` take
+    `Option<&mut CompressScratch<BLOCK>>` (`None` = store raw, for
+    callers that want no compression). `Db::flush` owns one scratch per
+    flush on its stack; compaction owns one per job. Decompressing needs
+    a second block buffer on the read path: `Db` gains
+    `decomp_scratch: RefCell<[u8; BLOCK]>` beside `get_scratch`
+    (same borrow discipline), and scan/compaction cursors thread their
+    own. `sstable::read_data_block` is the single funnel — read the
+    physical block, verify its CRC, branch on the flag bit, decompress
+    into the caller buffer when flagged — used by point reads, scans,
+    compaction cursors, `EntryStream`, and the v0.12 tombstone check.
+  - **Crash model**: unchanged. Compression is a pure function applied
+    at seal time; the physical block (one block, CRC-sealed) and the
+    table's block count are identical in shape to raw blocks, so flush's
+    and compaction's crash stories hold verbatim. A torn compressed
+    block fails its CRC exactly like a torn raw block.
+  - **Proof**: `tests/compress.rs` — codec round-trips (empty, 1-byte,
+    all-zero, all-random, structured KV-ish data, max-size blocks);
+    decoder fuzz: a deterministic xorshift stream mutates valid streams
+    (bit flips, truncations, splices) and asserts the decoder never
+    panics — it returns `Err` or a fully-formed block; `cargo +nightly
+    miri test --test compress` green (Miri turns any UB or panic into a
+    failure). Ratio measurement on realistic KV data (common key
+    prefixes, JSON-ish values, prose): asserted to beat raw by a real
+    margin, with the measured ratio recorded here. Integration:
+    flush/scan/compact/ingest round-trips over compressed tables, plus a
+    mixed table (forced raw + forced compressed blocks) reading exactly.
+  - **Honest limits**: compression is best-effort per block — random or
+    already-compressed values store raw, and the 128-byte saving
+    threshold means marginally-compressible blocks stay raw too. No
+    dictionary, no training, no cross-block matches (each block is
+    independent, so random access never decompresses a neighbor). Every
+    read of a compressed block pays a decompression pass; write pays one
+    trial compression per data block plus 8 KiB of transient scratch
+    (4 KiB hash table + 4 KiB output staging, caller-owned). `clen` fits
+    15 bits: blocks whose compressed form exceeds 32767 bytes are stored
+    raw (irrelevant at `BLOCK = 4096`; documented, not silent).
+  - **Measured** (2026-09-23):
+    - 186 debug + 186 release tests green (174 carried from v0.12, 12 new
+      in `tests/compress.rs`); `cargo fmt --check` clean; `cargo clippy
+      --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery`
+      zero warnings; `./xtensa-check.sh` PASS (xtensa-esp32s3-none-elf);
+      `cargo +nightly miri test --test compress` 12/12 green.
+    - Ratios (BLOCK=4096, body 4092): structured KV data (common key
+      prefixes, JSON-ish values) compresses to 905/4092 = 0.221 (78%
+      saving); all-zero block to ~0.001; incompressible random stays raw
+      (codec declines, `COMPRESS_MIN_SAVING` = 128 enforced).
+    - End-to-end: flush of realistic data → 3/3 data blocks flagged;
+      4-table compaction → merged output 4/4 data blocks flagged, all 64
+      keys read exactly; archive→ingest round-trip preserves flags
+      bit-for-bit (payloads never re-compressed).
+    - Sizes: `CompressScratch<4096>` = 8,200 bytes (4,096 hash + 4,096
+      staging + 8 bookkeeping). ESP32-S3 profile: Db 17,064 + Scan
+      10,392 + Compaction 56,192 = 83,648 bytes, under the re-tuned
+      96 KiB `ESP32S3_RAM_BUDGET` (was 64 KiB; raised for v0.13 — see
+      `src/profile.rs` and `BUDGET.md` for the accounting).
+    - Audits: zero `unwrap`/`expect`/`panic!` in non-test `src/`;
+      `#![no_std]` + `#![forbid(unsafe_code)]` hold; zero dependencies;
+      every data-block read funnels through the flag check
+      (`read_data_block`/`inflate_data_block`); index/footer/bloom/manifest/WAL
+      paths verified never to touch the flag bit.
 
+## 10. Open questions for Mark
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on
    the v0.6 roadmap.
 2. ~~`no_alloc` hard line?~~ — decided 2026-09-12, refined later the same

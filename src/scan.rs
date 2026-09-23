@@ -99,7 +99,13 @@ pub struct Scan<
     end_len: usize,
     has_end: bool,
     max_seq: u64,
-    /// Shared block buffer; `block_id` says what it currently holds.
+    /// Physical block as last read (CRC-verified); `block` below is the
+    /// logical block inflated from it. Shared block buffer; `block_id`
+    /// says what it currently holds.
+    raw: [u8; BLOCK],
+    /// Logical block: `raw` copied here when uncompressed, decompressed
+    /// here when the compression flag is set. Every parser reads from
+    /// here, so decompression is transparent to the scan.
     block: [u8; BLOCK],
     block_id: Option<u64>,
     /// Memtable head: slot index plus cached entry bytes.
@@ -146,6 +152,7 @@ impl<
             end_len: 0,
             has_end: false,
             max_seq: u64::MAX,
+            raw: [0u8; BLOCK],
             block: [0u8; BLOCK],
             block_id: None,
             mem_idx: 0,
@@ -401,8 +408,27 @@ impl<
         Ok(())
     }
 
-    /// Reads and CRC-verifies block `id` into the shared buffer.
+    /// Reads and CRC-verifies block `id` into the shared buffer, inflating
+    /// it when the compression flag is set. Afterwards `self.block` holds
+    /// the logical block; every parser reads from there. For data blocks.
     async fn read_verify(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+        let db = self.db;
+        poll_fn(|cx| db.device().poll_read_block(cx, id, &mut self.raw))
+            .await
+            .map_err(Error::Device)?;
+        sstable::check_block_crc::<D::Error, BLOCK>(&self.raw, id)?;
+        if !sstable::inflate_data_block::<D::Error, BLOCK>(&self.raw, &mut self.block, id)? {
+            self.block.copy_from_slice(&self.raw);
+        }
+        self.block_id = Some(id);
+        Ok(())
+    }
+
+    /// Reads and CRC-verifies block `id` into the shared buffer with no
+    /// inflation. For index blocks, which are never compressed (their
+    /// tail bytes are index payload, not a restart count — running them
+    /// through the flag check would misread a coincidental bit).
+    async fn read_verify_index(&mut self, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
         poll_fn(|cx| db.device().poll_read_block(cx, id, &mut self.block))
             .await
@@ -448,7 +474,7 @@ impl<
         let db = self.db;
         let index_id = sstable::footer_index_block(db.device(), &mut self.block, footer).await?;
         self.block_id = Some(footer);
-        self.read_verify(index_id).await?;
+        self.read_verify_index(index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
         let data_id =
             sstable::index_lookup::<D::Error>(&self.block[..payload_end], start, index_id)?;
