@@ -11,11 +11,13 @@
 //! bloom-gated, and the hit with the highest sequence number wins.
 
 use core::cell::RefCell;
+use core::future::poll_fn;
 
 use crate::alloc::{Bump, FreeList};
 use crate::batch::WriteBatch;
 use crate::compact::{
-    COMPACTION_KMAX, Compaction, Input, MergeOutcome, Progress, State, init_cursor, ranges_overlap,
+    COMPACTION_KMAX, Compaction, EntryStream, Input, MergeOutcome, Progress, State, init_cursor,
+    ranges_overlap,
 };
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -93,6 +95,49 @@ pub struct ArchivePlan<const KEY_MAX: usize> {
     pub level: usize,
     /// The table's placement record: id and block range.
     pub table: TableRef<KEY_MAX>,
+}
+
+/// A placement-free table descriptor for re-attach (`ingest_table`).
+///
+/// Produced by [`ArchivePlan::sealed`] from a table that was archived away.
+/// It carries everything needed to validate and graft a copy of the table
+/// back into a database — possibly a different one — without any reference
+/// to where the table's blocks lived on the source device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedTable<const KEY_MAX: usize> {
+    /// The table's original id; ingest preserves it so the table is
+    /// idempotent across retries and database copies.
+    pub id: u32,
+    /// Total blocks: data blocks + bloom + index + footer.
+    pub block_count: u32,
+    /// Smallest key in the table.
+    pub first_key: KeyBound<KEY_MAX>,
+    /// Largest key in the table.
+    pub last_key: KeyBound<KEY_MAX>,
+    /// Highest sequence number in the table.
+    pub max_seq: u64,
+    /// Key/value entries (including tombstones); cross-checked against
+    /// the copied table's footer on ingest.
+    pub entry_count: u32,
+}
+
+impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
+    /// Strips this plan down to its placement-free sealed descriptor.
+    ///
+    /// The descriptor is a pure value: it can cross a device boundary
+    /// (e.g. to cold storage) and later re-enter through
+    /// [`Db::ingest_table`].
+    #[must_use]
+    pub const fn sealed(&self) -> SealedTable<KEY_MAX> {
+        SealedTable {
+            id: self.table.id,
+            block_count: self.table.block_count,
+            first_key: self.table.first_key,
+            last_key: self.table.last_key,
+            max_seq: self.table.max_seq,
+            entry_count: self.table.entry_count,
+        }
+    }
 }
 
 /// Best hit seen so far by [`Db::get`]: the highest-sequence lookup result.
@@ -672,6 +717,158 @@ impl<
         }
     }
 
+    /// Re-attaches an archived table from a source device (v0.12).
+    ///
+    /// `sealed` is the placement-free descriptor from
+    /// [`ArchivePlan::sealed`](ArchivePlan::sealed); `remote` holds the
+    /// table's blocks laid out contiguously starting at `src_base`. The
+    /// table is copied into a locally reserved run, its block CRCs are
+    /// verified as they land, its index/footer block pointers are
+    /// relocated to the destination layout, and the copy is validated
+    /// (footer magic/CRC plus the descriptor's entry count) before it is
+    /// grafted into L0 through one atomic manifest commit — the same
+    /// visibility point flush uses. Data/index/bloom block CRCs are
+    /// re-verified on the read paths, exactly as for flushed tables.
+    ///
+    /// Returns `Ok(true)` when the table was attached, `Ok(false)` when a
+    /// table with the same id and an identical descriptor is already
+    /// attached (idempotent retry). The re-attached table joins L0, not
+    /// its former level: L0 tolerates overlap and highest-sequence-wins
+    /// stays exact.
+    ///
+    /// Crash safety: the run is reserved, not claimed, until the manifest
+    /// commit lands, so a crash before the commit leaves only orphaned,
+    /// invisible blocks; a crash after it leaves the table fully
+    /// attached. Retrying after any crash converges to exactly one copy.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::IngestConflict`] when the id is already attached with a
+    /// *different* descriptor, [`Error::NoSpace`] when L0 is full or the
+    /// table region has no room, [`Error::CorruptBlock`] when the source
+    /// bytes fail validation (the manifest is untouched), or
+    /// [`Error::Device`] on I/O failure from either device.
+    pub async fn ingest_table<R>(
+        &mut self,
+        sealed: &SealedTable<KEY_MAX>,
+        remote: &R,
+        src_base: u64,
+    ) -> Result<bool, Error<D::Error>>
+    where
+        R: BlockDevice,
+        R::Error: Into<D::Error>,
+    {
+        // The source device must speak the same block size: the copy
+        // buffer is `BLOCK` bytes and the trait contract requires
+        // `buf.len() == R::BLOCK` on every call.
+        if R::BLOCK != BLOCK {
+            return Err(Error::BadBufferLen);
+        }
+        // Idempotency: the same descriptor attaches exactly once; a
+        // conflicting descriptor under a live id is refused.
+        if let Some(existing) = self.manifest.find_table(sealed.id) {
+            let same = existing.block_count == sealed.block_count
+                && existing.first_key == sealed.first_key
+                && existing.last_key == sealed.last_key
+                && existing.max_seq == sealed.max_seq
+                && existing.entry_count == sealed.entry_count;
+            return if same {
+                Ok(false)
+            } else {
+                Err(Error::IngestConflict { id: sealed.id })
+            };
+        }
+        // L0 must have room: like flush, a full L0 is the caller's signal
+        // to compact first.
+        if self.manifest.l0_is_full() {
+            return Err(Error::NoSpace);
+        }
+        let blocks = u64::from(sealed.block_count);
+        let total = usize::try_from(blocks).map_err(|_| Error::CorruptManifest)?;
+        // Reserve the run without claiming it (mirrors flush): free list
+        // first, then the bump. Nothing moves until the manifest commit
+        // below lands, so a crash mid-copy leaves only orphans.
+        let free_base = self.tbl_free.find_run(total);
+        let base = match free_base {
+            Some(b) => b,
+            None => self.tbl_bump.peek_run::<D::Error>(blocks)?,
+        };
+        // Stream the blocks from the source device, verifying each
+        // block's CRC as it lands so remote corruption fails fast,
+        // before the manifest commit.
+        let mut buf = [0u8; BLOCK];
+        for k in 0..sealed.block_count {
+            let src = src_base
+                .checked_add(u64::from(k))
+                .ok_or(Error::CorruptManifest)?;
+            poll_fn(|cx| remote.poll_read_block(cx, src, &mut buf))
+                .await
+                .map_err(|e| Error::Device(e.into()))?;
+            sstable::check_block_crc::<D::Error, BLOCK>(&buf, src)?;
+            let dst = base
+                .checked_add(u64::from(k))
+                .ok_or(Error::CorruptManifest)?;
+            poll_fn(|cx| self.wal.device_mut().poll_write_block(cx, dst, &buf))
+                .await
+                .map_err(Error::Device)?;
+        }
+        // Relocate the copy: index entries and the footer carry the
+        // absolute block ids of the table's original placement, which are
+        // rewritten to the destination layout and re-sealed.
+        sstable::relocate_table(self.wal.device_mut(), base, sealed.block_count, &mut buf).await?;
+        // Validate the relocated copy: footer magic/CRC plus the
+        // descriptor's entry count.
+        let footer = base
+            .checked_add(blocks)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(Error::CorruptManifest)?;
+        let reader = sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open(
+            self.wal.device(),
+            &mut buf,
+            footer,
+        )
+        .await?;
+        if reader.entry_count() != u64::from(sealed.entry_count) {
+            return Err(Error::CorruptBlock { id: footer });
+        }
+        // Graft into L0 through the atomic manifest commit. Future local
+        // tables must never collide with the ingested id, so the id floor
+        // advances past it (monotone; never lowers the counter).
+        let mut staged = self.manifest;
+        staged.advance_next_table_id(sealed.id.saturating_add(1));
+        staged.add_l0_table::<D::Error>(TableRef {
+            id: sealed.id,
+            first_block: base,
+            block_count: sealed.block_count,
+            first_key: sealed.first_key,
+            last_key: sealed.last_key,
+            max_seq: sealed.max_seq,
+            entry_count: sealed.entry_count,
+        })?;
+        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        staged
+            .commit(self.wal.device_mut(), &mut buf, slot_a, slot_b)
+            .await?;
+        // Commit point passed: publish the staged state, then claim the
+        // reserved run — strictly after the visibility point.
+        self.manifest = staged;
+        match free_base {
+            Some(b) => {
+                debug_assert_eq!(b, base);
+                // Must run unconditionally: `claim_run` removes the run
+                // from the free list, and `debug_assert!` does not
+                // evaluate its argument in release builds.
+                let claimed = self.tbl_free.claim_run(b, total);
+                debug_assert!(claimed, "find_run's own result must still claim");
+            }
+            None => {
+                self.tbl_bump
+                    .set_next(base.checked_add(blocks).ok_or(Error::NoSpace)?);
+            }
+        }
+        Ok(true)
+    }
+
     /// Considers one table for [`Db::get_at`]: key-range prune, sequence prune,
     /// then a bloom-gated lookup. A hit with a higher sequence number than
     /// the best so far — and visible at `max_seq` — is promoted into `acc`.
@@ -970,6 +1167,14 @@ impl<
         let Some(plan) = self.archive_plan(level, table_id) else {
             return Ok(false);
         };
+        // Tombstone-rule enforcement (v0.12): refuse to remove a table
+        // whose deletion would resurrect a shadowed value in any live
+        // view. v0.10's "only deeper tables are hazardous" prose was
+        // incomplete — a same-level, shallower, or re-ingested older copy
+        // can resurrect a value too — so the check reasons over every
+        // other table, not just deeper levels. Pure reads: the database
+        // is untouched on refusal.
+        self.check_no_resurrection(&plan.table).await?;
         let mut scratch = [0u8; BLOCK];
         let mut staged = self.manifest;
         if !staged.remove_table_from_level::<D::Error>(level, table_id)? {
@@ -993,6 +1198,123 @@ impl<
             k += 1;
         }
         Ok(true)
+    }
+
+    /// Tombstone-rule enforcement for [`Db::archive_commit`].
+    ///
+    /// Streams every tombstone in `candidate` and, for the live view and
+    /// every registered snapshot watermark, compares the current read
+    /// against a read excluding the candidate table. If the current view
+    /// is deleted but the exclusion reveals a value, removing the
+    /// candidate would resurrect that value and the archival is refused
+    /// with [`Error::WouldResurrect`]. Pure reads; the database is
+    /// untouched.
+    async fn check_no_resurrection(
+        &self,
+        candidate: &TableRef<KEY_MAX>,
+    ) -> Result<(), Error<D::Error>> {
+        let mut key = [0u8; KEY_MAX];
+        let mut val = [0u8; VAL_MAX];
+        let mut stream =
+            EntryStream::<D, BLOCK, KEY_MAX, VAL_MAX>::open(self.wal.device(), candidate).await?;
+        // Copy the head key out so the stream borrow ends before the
+        // read probes below.
+        while let Some((k, seq, tombstone)) = stream.head() {
+            let klen = k.len();
+            key[..klen].copy_from_slice(k);
+            if tombstone {
+                // The live view plus every registered snapshot watermark.
+                // Both probes use the same view watermark: a view whose
+                // watermark predates the tombstone cannot see it and is
+                // skipped, and for every other view the two reads differ
+                // only by the candidate. (Reading the alternate at
+                // `view.min(seq)` would hide later protective tombstones
+                // and falsely report a resurrection.)
+                let views = core::iter::once(u64::MAX)
+                    .chain(self.snapshots[..self.n_snapshots].iter().copied());
+                for view in views {
+                    if seq > view {
+                        continue;
+                    }
+                    let cur_hit = self
+                        .get_at_excluding(&key[..klen], &mut val, view, None)
+                        .await?;
+                    if cur_hit.is_none() {
+                        let alt_hit = self
+                            .get_at_excluding(&key[..klen], &mut val, view, Some(candidate.id))
+                            .await?;
+                        if alt_hit.is_some() {
+                            return Err(Error::WouldResurrect {
+                                table: candidate.id,
+                            });
+                        }
+                    }
+                }
+            }
+            if !stream.advance().await? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Db::get_at`] with one table excluded from the read.
+    ///
+    /// `exclude` holds a table id to skip (the archival candidate under
+    /// resurrection review, or `None` for a normal read). The memtable is
+    /// always included.
+    async fn get_at_excluding(
+        &self,
+        key: &[u8],
+        val_buf: &mut [u8],
+        max_seq: u64,
+        exclude: Option<u32>,
+    ) -> Result<Option<usize>, Error<D::Error>> {
+        let mut acc = ReadAcc::<VAL_MAX>::new();
+
+        if let Some(entry) = self.table.get_at(key, max_seq) {
+            // The memtable holds the newest mutations; `get_at` already
+            // selected the newest version at or below the snapshot.
+            acc.best_seq = entry.seq;
+            if entry.tombstone {
+                acc.best = Best::Tombstone;
+            } else {
+                acc.stage[..entry.val.len()].copy_from_slice(entry.val);
+                acc.best = Best::Value(entry.val.len());
+            }
+        }
+
+        let mut scratch = [0u8; BLOCK];
+        // Level 0, newest table first: its tables overlap, and newer
+        // tables hold higher sequence numbers.
+        for tref in self.manifest.l0().iter().rev() {
+            if Some(tref.id) != exclude {
+                self.consider_table(tref, key, max_seq, &mut scratch, &mut acc)
+                    .await?;
+            }
+        }
+        // Deeper levels in order. Highest-seq-wins keeps the result exact
+        // regardless of how tables are placed.
+        for li in 1..LEVELS {
+            let tables = self.manifest.level(li).unwrap_or(&[]);
+            for tref in tables {
+                if Some(tref.id) != exclude {
+                    self.consider_table(tref, key, max_seq, &mut scratch, &mut acc)
+                        .await?;
+                }
+            }
+        }
+
+        match acc.best {
+            Best::Missing | Best::Tombstone => Ok(None),
+            Best::Value(len) => {
+                if len > val_buf.len() {
+                    return Err(Error::BufferTooSmall { need: len });
+                }
+                val_buf[..len].copy_from_slice(&acc.stage[..len]);
+                Ok(Some(len))
+            }
+        }
     }
 
     /// Runs one bounded compaction step using the caller's `scratch`.

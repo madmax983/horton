@@ -209,6 +209,31 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         Ok(id)
     }
 
+    /// Raises the next-table-id floor to at least `floor`.
+    ///
+    /// Used when ingesting an externally-sealed table whose id may be
+    /// above the local counter: future local tables must never collide
+    /// with an ingested id. Idempotent and monotone — never lowers the
+    /// counter.
+    pub const fn advance_next_table_id(&mut self, floor: u32) {
+        if floor > self.next_table_id {
+            self.next_table_id = floor;
+        }
+    }
+
+    /// Finds a live table by id, searching every level.
+    #[must_use]
+    pub fn find_table(&self, id: u32) -> Option<&TableRef<KEY_MAX>> {
+        for lvl in 0..LEVELS {
+            for t in &self.levels[lvl].tables[..self.levels[lvl].len] {
+                if t.id == id {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
+
     /// True when level 0 already holds `TABLES` tables: flush must fail with
     /// [`Error::NoSpace`] until compaction (v0.4) drains it.
     #[must_use]

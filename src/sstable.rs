@@ -737,6 +737,136 @@ fn append_index<E, const BLOCK: usize>(
     Ok(())
 }
 
+/// Relocates a copied table to its destination block range.
+///
+/// The table's blocks must already sit at `[dst_base, dst_base +
+/// block_count)` in writer order (data blocks, bloom, index, footer).
+/// Data and bloom block contents are position-independent, but index
+/// entries carry absolute data-block ids and the footer carries the
+/// absolute index/bloom ids of the table's *original* placement, so this
+/// rewrites those pointers to the destination layout and re-seals the
+/// touched blocks' CRCs. The original placement is derived from the
+/// footer's own pointers (old bloom id minus the data-block count) and
+/// cross-checked for structural consistency — index entries that do not
+/// sit inside the derived original run are [`Error::CorruptBlock`], not
+/// silently mis-relocated.
+///
+/// # Errors
+///
+/// [`Error::CorruptBlock`] when a block fails its CRC, the footer magic
+/// is wrong, an index entry fails to parse, or a pointer does not match
+/// the table's self-described original layout; or [`Error::Device`] on
+/// I/O failure.
+pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
+    device: &mut D,
+    dst_base: u64,
+    block_count: u32,
+    scratch: &mut [u8; BLOCK],
+) -> Result<(), Error<D::Error>> {
+    let data_blocks = u64::from(
+        block_count
+            .checked_sub(3)
+            .ok_or(Error::CorruptBlock { id: dst_base })?,
+    );
+    let index_id = dst_base
+        .checked_add(data_blocks)
+        .and_then(|b| b.checked_add(1))
+        .ok_or(Error::CorruptBlock { id: dst_base })?;
+    let footer_id = index_id
+        .checked_add(1)
+        .ok_or(Error::CorruptBlock { id: dst_base })?;
+    let payload_len = BLOCK - CRC_LEN;
+
+    // Footer first: it names the table's original bloom/index block ids,
+    // from which the original table base is derived.
+    poll_fn(|cx| device.poll_read_block(cx, footer_id, scratch))
+        .await
+        .map_err(Error::Device)?;
+    check_block_crc::<D::Error, BLOCK>(scratch, footer_id)?;
+    let magic = u64::from_le_bytes(
+        scratch[0..8]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id: footer_id })?,
+    );
+    if magic != SSTABLE_MAGIC {
+        return Err(Error::CorruptBlock { id: footer_id });
+    }
+    let old_index = u64::from_le_bytes(
+        scratch[8..16]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id: footer_id })?,
+    );
+    let old_bloom = u64::from_le_bytes(
+        scratch[16..24]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id: footer_id })?,
+    );
+    // Structural check: bloom, index, footer are consecutive, so the
+    // original base is the bloom id minus the data-block count.
+    if old_index
+        != old_bloom
+            .checked_add(1)
+            .ok_or(Error::CorruptBlock { id: footer_id })?
+    {
+        return Err(Error::CorruptBlock { id: footer_id });
+    }
+    let old_base = old_bloom
+        .checked_sub(data_blocks)
+        .ok_or(Error::CorruptBlock { id: footer_id })?;
+
+    // Index block: rewrite each entry's absolute data-block id from the
+    // original layout to the destination layout.
+    poll_fn(|cx| device.poll_read_block(cx, index_id, scratch))
+        .await
+        .map_err(Error::Device)?;
+    check_block_crc::<D::Error, BLOCK>(scratch, index_id)?;
+    let mut off = 0usize;
+    while off < payload_len {
+        let (key_len, block_id, next) = match index_entry_parse(&scratch[..payload_len], off) {
+            Ok((key, block_id, next)) => (key.len(), block_id, next),
+            Err(()) if all_zero(&scratch[off..payload_len]) => break,
+            Err(()) => return Err(Error::CorruptBlock { id: index_id }),
+        };
+        let rel = block_id
+            .checked_sub(old_base)
+            .ok_or(Error::CorruptBlock { id: index_id })?;
+        if rel >= data_blocks {
+            return Err(Error::CorruptBlock { id: index_id });
+        }
+        let new_id = dst_base
+            .checked_add(rel)
+            .ok_or(Error::CorruptBlock { id: index_id })?;
+        let id_off = off + 2 + key_len;
+        scratch[id_off..id_off + 8].copy_from_slice(&new_id.to_le_bytes());
+        off = next;
+    }
+    let crc = crc32(&scratch[..payload_len]);
+    scratch[payload_len..BLOCK].copy_from_slice(&crc.to_le_bytes());
+    poll_fn(|cx| device.poll_write_block(cx, index_id, scratch))
+        .await
+        .map_err(Error::Device)?;
+
+    // Footer: rewrite the absolute index/bloom block ids.
+    poll_fn(|cx| device.poll_read_block(cx, footer_id, scratch))
+        .await
+        .map_err(Error::Device)?;
+    check_block_crc::<D::Error, BLOCK>(scratch, footer_id)?;
+    let dst_bloom = dst_base
+        .checked_add(data_blocks)
+        .ok_or(Error::CorruptBlock { id: footer_id })?;
+    let dst_index = dst_bloom
+        .checked_add(1)
+        .ok_or(Error::CorruptBlock { id: footer_id })?;
+    scratch[8..16].copy_from_slice(&dst_index.to_le_bytes());
+    scratch[16..24].copy_from_slice(&dst_bloom.to_le_bytes());
+    let crc = crc32(&scratch[..payload_len]);
+    scratch[payload_len..BLOCK].copy_from_slice(&crc.to_le_bytes());
+    poll_fn(|cx| device.poll_write_block(cx, footer_id, scratch))
+        .await
+        .map_err(Error::Device)?;
+    Ok(())
+}
+
 /// Checks a block's trailing CRC32.
 pub(crate) fn check_block_crc<E, const BLOCK: usize>(
     block: &[u8; BLOCK],
@@ -1112,6 +1242,7 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
     device: &'d D,
     index_block: u64,
     bloom_block: u64,
+    entry_count: u64,
     k: u8,
 }
 
@@ -1156,12 +1287,26 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         if k == 0 {
             return Err(Error::CorruptBlock { id: footer_block });
         }
+        let entry_count = u64::from_le_bytes(
+            scratch[24..32]
+                .try_into()
+                .map_err(|_| Error::CorruptBlock { id: footer_block })?,
+        );
         Ok(Self {
             device,
             index_block,
             bloom_block,
+            entry_count,
             k,
         })
+    }
+
+    /// The table's entry count (values plus tombstones), as recorded in
+    /// the verified footer. Used by ingest to cross-check a sealed
+    /// descriptor against the copied bytes.
+    #[must_use]
+    pub const fn entry_count(&self) -> u64 {
+        self.entry_count
     }
 
     /// Looks `key` up: bloom gate → index binary search → data block

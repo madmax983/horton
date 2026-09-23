@@ -4,7 +4,7 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.11 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.12 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
 //! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
 //! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
@@ -46,7 +46,7 @@ pub use alloc::{Bump, FreeList};
 pub use batch::WriteBatch;
 pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
-pub use db::{ArchivePlan, Config, Db, OpenReport};
+pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable};
 pub use device::BlockDevice;
 pub use error::Error;
 pub use manifest::{KeyBound, Level, MANIFEST_MAGIC, Manifest, TableRef};

@@ -536,3 +536,66 @@ async fn advance_cursor<
     }
     Ok(true)
 }
+
+/// Streams one table's entries for the tombstone-rule check.
+///
+/// A thin [`Cursor`] driver: it reuses compaction's entry parsing (and
+/// CRC verification), so the resurrection check sees exactly the entries
+/// compaction would merge. Parked on the first entry after
+/// [`open`](Self::open); [`head`](Self::head) returns `None` once the
+/// table is exhausted.
+pub(crate) struct EntryStream<
+    'd,
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+> {
+    device: &'d D,
+    cur: Cursor<BLOCK, KEY_MAX, VAL_MAX>,
+}
+
+impl<'d, D: BlockDevice, const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize>
+    EntryStream<'d, D, BLOCK, KEY_MAX, VAL_MAX>
+{
+    /// Opens the stream on `tref`'s first entry. A table with no data
+    /// blocks parks exhausted (its head is `None`).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptBlock`] when a data block fails its CRC or an
+    /// entry fails to parse, or [`Error::Device`] on I/O failure.
+    pub(crate) async fn open(
+        device: &'d D,
+        tref: &TableRef<KEY_MAX>,
+    ) -> Result<Self, Error<D::Error>> {
+        let mut cur = Cursor::EMPTY;
+        init_cursor(device, tref, &mut cur).await?;
+        Ok(Self { device, cur })
+    }
+
+    /// The parked entry's key, sequence, and tombstone flag, or `None`
+    /// when the table is exhausted.
+    #[must_use]
+    pub(crate) fn head(&self) -> Option<(&[u8], u64, bool)> {
+        if !self.cur.live {
+            return None;
+        }
+        Some((
+            &self.cur.key[..self.cur.key_len],
+            self.cur.seq,
+            self.cur.tombstone,
+        ))
+    }
+
+    /// Advances past the head entry. Returns `true` when parked on a new
+    /// head, `false` when the table is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptBlock`] when the next block fails its CRC or an
+    /// entry fails to parse, or [`Error::Device`] on I/O failure.
+    pub(crate) async fn advance(&mut self) -> Result<bool, Error<D::Error>> {
+        advance_cursor(self.device, &mut self.cur).await
+    }
+}

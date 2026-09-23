@@ -58,6 +58,20 @@ pub enum Error<E> {
         /// The WAL block size: the atomicity ceiling.
         max: usize,
     },
+    /// Archiving a table was refused: removing it would resurrect a value
+    /// that is currently shadowed by one of the table's tombstones in some
+    /// live view (live read or a registered snapshot). The database is
+    /// unchanged; remove or outlive the shadowing value first.
+    WouldResurrect {
+        /// Id of the table whose archival was refused.
+        table: u32,
+    },
+    /// An ingest was refused: a table with the same id is already
+    /// attached but its descriptor differs from the one being ingested.
+    IngestConflict {
+        /// The conflicting table id.
+        id: u32,
+    },
     /// The underlying block device reported an error.
     Device(E),
 }

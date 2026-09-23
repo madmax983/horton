@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::task::{Context, Poll};
 
 use common::{CrashDevice, MemDevice, TestDb, block_on, noop_waker, test_config};
-use horton::{BlockDevice, Compaction, Progress, TableReader};
+use horton::{BlockDevice, Compaction, Error, Progress, TableReader};
 
 const BLOCK: usize = 4096;
 
@@ -306,10 +306,12 @@ fn archive_crash_boundary_is_atomic() {
     }
 }
 
-/// The documented tombstone rule, made executable: archiving a
-/// tombstone-bearing L0 table while a deeper level holds an older version
-/// resurrects that version locally. With deletes in the workload, archive
-/// only from the bottommost level.
+/// The tombstone rule, made executable and now enforced (v0.12):
+/// archiving a tombstone-bearing L0 table while a deeper level holds an
+/// older version is refused with [`Error::WouldResurrect`], because
+/// removing the tombstone locally would resurrect that version. Delete
+/// workloads must archive from the bottommost level (or re-ingest the
+/// tombstone) instead.
 #[test]
 fn archive_l0_tombstone_resurrects_older_version() {
     let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
@@ -329,19 +331,21 @@ fn archive_l0_tombstone_resurrects_older_version() {
         block_on(db.get(b"k", &mut buf)).unwrap().is_none(),
         "tombstone hides v1 before archival"
     );
-    // Archive the tombstone table straight off L0.
+    // Archive the tombstone table straight off L0: refused, because the
+    // tombstone is load-bearing — removing it would resurrect v1.
     let l0 = db.level_tables(0).expect("level 0 exists");
     assert_eq!(l0.len(), 1, "only the tombstone table in L0");
     let (tid, first, count) = (l0[0].id, l0[0].first_block, l0[0].block_count);
     let sink = upload(&db, 0, tid);
     assert_eq!(sink.len(), count as usize);
     assert_eq!(sink[0].0, first);
-    assert!(block_on(db.archive_commit(0, tid)).unwrap());
-    // The tombstone is gone locally: v1 resurrects. The remote copy still
-    // carries the tombstone, so a remote-merged view stays correct — but
-    // local reads changed, which is why the rule exists.
-    let n = block_on(db.get(b"k", &mut buf))
-        .unwrap()
-        .expect("v1 resurrects after the tombstone is archived away");
-    assert_eq!(&buf[..n], b"v1");
+    assert_eq!(
+        block_on(db.archive_commit(0, tid)).unwrap_err(),
+        Error::WouldResurrect { table: tid }
+    );
+    // The tombstone stays local: reads are unchanged.
+    assert!(
+        block_on(db.get(b"k", &mut buf)).unwrap().is_none(),
+        "tombstone still hides v1 after refused archival"
+    );
 }

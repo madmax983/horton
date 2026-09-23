@@ -673,6 +673,9 @@ floor (`seq <= manifest.max_seq`).
     the bottommost level, where nothing is deeper and nothing can
     resurrect. There is no combined remote/local read model yet, so this
     is a caller-side discipline enforced by documentation, not by code.
+    (v0.12: the discipline is now enforced by `archive_commit` itself —
+    and the check is strictly stronger than the documented rule, which
+    missed resurrection via same-level or shallower tables; see below.)
   - **Proof**: `tests/archive.rs` — (1) round-trip: stream all planned
     blocks into a mock sink, reopen the uploaded bytes through
     `TableReader`, verify every key, commit idempotently, confirm archived
@@ -753,6 +756,154 @@ floor (`seq <= manifest.max_seq`).
     pedantic+nursery zero warnings; `xtensa-check.sh` PASS;
     `cargo +nightly miri test --test write_batch` 8/8 green; no
     `unwrap`/`expect` in non-test source.
+
+- v0.12 — Combined remote/local read model + table re-attach + tombstone-rule enforcement.
+  - **Scope**: completes v0.10's archive lifecycle. (a) The combined
+    remote/local read model: a table archived to remote storage and later
+    re-attached is consulted by `get`/`get_at`/`scan` alongside
+    never-archived tables, with highest-sequence-wins across both. This is
+    delivered as a specified-and-proven model, not new read-path
+    machinery: a re-attached table re-enters as an ordinary L0 table, so
+    the existing seq-ordered machinery covers it (see Design). (b)
+    `Db::ingest_table`: grafts an externally-stored sealed table back into
+    the LSM. The caller returns the `SealedTable` descriptor
+    (`ArchivePlan::sealed` — the placement-free half of the original plan:
+    id, block count, key bounds, max seq, entry count) and a `&R:
+    BlockDevice` source positioned at the table's first block; horton
+    copies the blocks into the local table region, verifies the footer
+    (magic + CRC32) and the entry count against the descriptor, then
+    grafts the table into L0 in one atomic manifest commit — the visibility
+    point, mirroring `archive_commit`. Returns `Ok(true)` on ingest,
+    `Ok(false)` when the table id is already attached with a matching
+    descriptor (the idempotent retry, mirroring `archive_commit`'s
+    `Ok(false)`); `Error::IngestConflict` when the id is attached with a
+    different shape (the caller mixed up tables). (c) `archive_commit` now
+    enforces the tombstone rule mechanically, replacing v0.10's
+    caller-side discipline: a table whose removal would resurrect a
+    deleted key in any live view is refused with
+    `Error::WouldResurrect { table }` before anything is mutated.
+  - **Design** — the three load-bearing choices:
+    - *Ingest copies; it does not reference.* A reference-attached cold
+      tier (the manifest recording remote handles, reads hitting the
+      network) would put a second device in `Db`'s type signature, thread
+      remote reads through `get`/`scan`/compaction, and explode the crash
+      model — for an embedded store whose reads must be bounded and
+      offline-capable. Copying the sealed table back into the local table
+      region keeps the manifest shape, the read path, compaction, and
+      recovery structurally identical, so every existing proof still
+      holds. Cost: one bounded, caller-driven table copy per re-attach. A
+      reference-attached tier is future work, explicitly not claimed.
+    - *Re-attach grafts at L0, not the original level.* L0 is the
+      overlap-tolerant level — newest-first + highest-seq-wins reads where
+      table position is only a pruning hint, whole-level compaction
+      merging by seq — so an old-seq table grafted at L0's newest position
+      is exactly what a flush does, and every ordering stays seq-exact.
+      Grafting at the original level could violate the levels-≥1
+      non-overlapping invariant (compaction has merged and drained levels
+      since the archive), on which compaction's tombstone-drop logic
+      relies: a new resurrection vector. The archived level is therefore
+      informational on re-attach.
+    - *A copied table is relocated, not just copied.* SSTable CRCs are
+      position-independent, but index entries store absolute data-block
+      ids and the footer stores the absolute bloom/index ids — a
+      byte-for-byte copy into a different local run is structurally valid
+      yet points back at the old placement (found the hard way: identical
+      bytes, matching CRCs, reader still lost). `sstable::relocate_table`
+      rewrites those pointers to the destination layout and re-seals the
+      index/footer CRCs. The table's original base is derived from the
+      footer's own pointers (old bloom id minus the data-block count, with
+      the bloom/index consecutiveness cross-checked) — never from the
+      caller's remote offset, which is a device position, not a placement.
+      Index entries that do not land inside the derived original run are
+      `CorruptBlock`, not silently mis-relocated.
+  - **Crash ordering**: ingest streams blocks into a reserved-but-unclaimed
+    run (free list first, then the bump — mirroring flush), verifying each
+    block's CRC32 as it lands, so a crash mid-copy leaves only orphans:
+    free-list blocks stay free-listed, bump blocks sit above the resume
+    point, and the next `open()` sweep reclaims both — exactly flush's
+    torn-table story. After the copy, the index/footer relocation rewrites
+    (two more block writes) and the footer/entry-count validation all
+    happen BEFORE the manifest commit, so a corrupt or misplaced copy can
+    never become visible; re-running ingest after any crash re-copies from
+    the source first, so a half-relocated copy is always overwritten
+    before relocation runs again. The manifest commit is the atomic
+    visibility point (it flushes the device, so the table blocks are
+    durable first): crash before it leaves the table absent and retry
+    converges via the idempotent id check; crash during it leaves the old
+    or the new slot, never a mix. `archive_commit`'s enforcement check is
+    pure reads before the staged manifest write — no new write positions,
+    so v0.10's crash proof for the commit stands unchanged.
+  - **The enforcement check, exactly**: a table with no tombstones is
+    always safe to archive — with no tombstones in `T`, the pre-archive
+    winner of any key deleted in any view is a tombstone outside `T`,
+    which still wins post-archive, so no deleted key can go live (this
+    fast path falls out of the loop below: no tombstone entries, no
+    checks). Otherwise, for each tombstone `(k, s)` in the table
+    (streamed via the compaction entry cursor, one at a time, no
+    accumulation) and each live view `t ∈ {u64::MAX} ∪ {live snapshot
+    watermarks}` with `s ≤ t` (a view that predates the tombstone cannot
+    see it): `cur = get_at(k, t)`; when `cur` is `None` — the tombstone is
+    the view's winner — compute `alt = get_at(k, t)` excluding the table,
+    with the SAME watermark; when `alt` is `Some`, archiving would
+    resurrect a live value in that view and the commit is refused. The
+    same-watermark comparison is load-bearing: reading the alternate at
+    `min(t, s)` would hide later protective tombstones and falsely report
+    a resurrection. The check is exact: `cur = None ∧ alt = Some` at the
+    same watermark holds exactly when the archived tombstone was hiding a
+    live value. It is strictly stronger than v0.10's documented
+    discipline, which warned only about deeper levels: a same-level or
+    shallower table holding a pre-delete value resurrects just as well.
+    The sharpest case is v0.12-native — archive `T(k→v@s1)`, delete `k`
+    `(s2)`, compact the tombstone to the bottommost level, re-ingest `T`
+    at L0, then archive the bottommost table: v0.10's "bottommost is
+    always safe" would revive `v@s1`; the check refuses it. The v0.10
+    proof `archive_l0_tombstone_resurrects_older_version` now asserts the
+    refusal (`Err(WouldResurrect)`, reads unchanged) instead of the
+    resurrection it used to demonstrate.
+  - **Proof**: `tests/attach.rs` — ingest round-trip (upload to a mock
+    remote `MemDevice`, archive, re-ingest, every key readable; second
+    ingest is `Ok(false)`; reclaimed blocks reused by a later flush);
+    highest-seq-wins across re-attached and local tables (a newer local
+    value wins, remote-only keys reappear, a later delete wins); `scan`
+    merges the re-attached keyspace; snapshot coherence (a re-attached
+    entry with `seq ≤ watermark` is visible at the snapshot — the
+    seq-based contract, undisturbed by the remote round trip);
+    enforcement: same-level and deeper-level resurrection both refused
+    with `WouldResurrect`, the v0.10-doc correction (bottommost archival
+    refused after re-ingest), tombstone-free tables archive freely, and a
+    refused table archives cleanly once the shadowing value is gone
+    (covered in `tests/archive.rs`, which now asserts the refusal);
+    footer/entry-count verification (corrupt remote bytes →
+    `CorruptBlock`, manifest untouched; descriptor mismatch →
+    `CorruptBlock`); mismatched source block size → `BadBufferLen` up
+    front; id conflict (`IngestConflict`); `NoSpace` when L0 is full;
+    `next_table_id` advancing past an ingested id on a fresh
+    database; crash injector over the ingest copy loop, the two relocation
+    writes, and the manifest commit — recovery exposes the table fully
+    present or fully absent, and retry converges to exactly-once.
+  - **Honest limits**: re-attach is a full table copy — there is no
+    network-attached cold tier; every re-attached read is local.
+    `ingest_table` requires the source's `BLOCK` to equal the database's
+    (`Error::BadBufferLen` up front — the copy buffer is one block and
+    the trait contract pins `buf.len()` to the device's own size) and its
+    `Error` type to convert into `D::Error` (`R::Error: Into<D::Error>`,
+    one unified error enum is the expected caller shape). Every copied
+    block's CRC is verified eagerly as it lands (so a torn remote block
+    fails the ingest, never a later read); the index/footer pointers are
+    then relocated and re-sealed, and data/index/bloom CRCs are re-verified
+    lazily on the read paths exactly like locally-flushed tables. The
+    tombstone check costs up to `tombstones × (1 + live snapshots)` point
+    reads; archival is caller-driven and rare, so this is bounded
+    but not free.
+  - **Measured**: 174/174 tests green in debug and release (159 carried
+    from v0.11 plus the 15 new `tests/attach.rs` proofs, and the v0.10
+    `archive_l0_tombstone_resurrects_older_version` proof updated to assert
+    the new `WouldResurrect` refusal); `cargo fmt --check` clean; clippy
+    `--all-targets` pedantic+nursery zero warnings with `-D warnings`;
+    `xtensa-check.sh` PASS; `cargo +nightly miri test --test attach` 15/15
+    green; no `unwrap`/`expect`/`panic!` in non-test source
+    (`debug_assert!` only, side-effect-free); zero dependencies, no `std`
+    in `src/`, `#![forbid(unsafe_code)]` holds.
 
 ## 10. Open questions for Mark
 
