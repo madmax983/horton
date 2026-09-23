@@ -521,3 +521,45 @@ fn mut_compact_ttl_purge_converts_expired_value() {
     assert_eq!(r, None, "expired value was not purged to a tombstone");
     db.release_snapshot(snap);
 }
+
+// ---------------------------------------------------------------------------
+// src/wal.rs
+// ---------------------------------------------------------------------------
+
+/// Kills `src/wal.rs:174 replace < with == in decode_record`: a torn tail
+/// shorter than `WAL_HEADER_LEN` at the end of a WAL block must stop
+/// recovery cleanly. The weakened guard (`==`) walks past the length check
+/// into the header indexing and panics out of bounds; the real guard
+/// returns `None` (torn tail) for any short buffer.
+#[test]
+fn mut_wal_short_torn_tail_stops_cleanly() {
+    use horton::wal::{Op, WalWriter};
+
+    const BLOCK: usize = 512;
+    // A 1-byte key + 2-byte value put encodes to 23 + 1 + 2 = 26 bytes, so
+    // 19 records fill 494 bytes, leaving an 18-byte tail (< 19).
+    let mut w: WalWriter<_, BLOCK> = WalWriter::new(MemDevice::<BLOCK>::new(), 0, 16);
+    for i in 0..19u8 {
+        block_on(w.append(u64::from(i) + 1, Op::Put, &[i], &[i, i])).unwrap();
+    }
+    block_on(w.commit()).unwrap();
+    // Craft a torn tail: valid magic + tiny length so the weakened guard
+    // walks into the header reads, then a valid op so it reaches the
+    // key/value length indexing — past the end of the 18-byte tail.
+    let tail: [u8; 18] = [
+        0x73, 0x6C, // WAL_MAGIC ("ls")
+        0x05, 0x00, 0x00, 0x00, // len = 5
+        0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, // seq filler
+        0x01, // op = Put
+        0x00, 0x00, // key_len = 0
+        0x00, // val_len low byte; the high byte is past the end
+    ];
+    let mut dev = w.into_device();
+    dev.blocks_mut()[0][494..512].copy_from_slice(&tail);
+    let mut w2: WalWriter<_, BLOCK> = WalWriter::new(dev, 0, 16);
+    let mut t = MemTable::<32, 2048, 16, 32>::new();
+    let st = block_on(w2.recover(&mut t)).unwrap();
+    // The clean prefix replayed in full; the torn tail stopped the scan
+    // without a panic and without an error.
+    assert_eq!(st.records, 19);
+}

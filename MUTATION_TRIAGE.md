@@ -11,7 +11,7 @@ Baseline for the campaigns: `f98f266` + the reliability branches merged.
 | `src/batch.rs` | 21 | 21 (tests in `tests/mutants.rs`) | 0 |
 | `src/crc.rs` | 100 | 100 (98 caught + 2 infinite-loop timeouts) | 0 |
 | `src/memtable.rs` | 118 viable (of 129) | all triaged | 0 (1 equivalent, rest killed; see below) |
-| `src/compact.rs` | 72 enumerated | all triaged | 0 (5 equivalent, documented below) |
+| `src/compact.rs` | 72 enumerated | all triaged | 0 (6 equivalent, documented below) |
 
 No production bugs were found by any mutant. (Two of the memtable "timeouts"
 were infinite-loop mutants — valid kills.) One latent test-oracle subtlety
