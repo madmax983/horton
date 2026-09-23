@@ -563,3 +563,78 @@ fn mut_wal_short_torn_tail_stops_cleanly() {
     // without a panic and without an error.
     assert_eq!(st.records, 19);
 }
+
+/// Kills `src/wal.rs:301 replace staged_bytes -> usize with 0`: the
+/// getter must report the bytes staged in RAM. `Db::write` drains a
+/// non-empty stage before batching (`db.rs:686`), so a lying getter would
+/// silently drop staged records from the atomicity protocol.
+#[test]
+fn mut_wal_staged_bytes_tracks_stage() {
+    use horton::wal::{Op, WalWriter};
+
+    const BLOCK: usize = 512;
+    let mut w: WalWriter<_, BLOCK> = WalWriter::new(MemDevice::<BLOCK>::new(), 0, 16);
+    assert_eq!(w.staged_bytes(), 0);
+    block_on(w.append(1, Op::Put, b"k", b"v")).unwrap();
+    // 23 overhead + 1 key + 1 value = 25 bytes staged, not yet durable.
+    assert_eq!(w.staged_bytes(), 25);
+    block_on(w.commit()).unwrap();
+    assert_eq!(w.staged_bytes(), 0);
+}
+
+/// Kills `src/wal.rs:330 replace max_seq -> u64 with 0` and `with 1`:
+/// the getter must track the highest sequence appended so far.
+#[test]
+fn mut_wal_max_seq_tracks_appends() {
+    use horton::wal::{Op, WalWriter};
+
+    const BLOCK: usize = 512;
+    let mut w: WalWriter<_, BLOCK> = WalWriter::new(MemDevice::<BLOCK>::new(), 0, 16);
+    assert_eq!(w.max_seq(), 0);
+    block_on(w.append(5, Op::Put, b"k", b"v")).unwrap();
+    assert_eq!(w.max_seq(), 5);
+    block_on(w.append(3, Op::Put, b"k", b"v")).unwrap();
+    assert_eq!(w.max_seq(), 5);
+    block_on(w.append(7, Op::Put, b"k", b"v")).unwrap();
+    assert_eq!(w.max_seq(), 7);
+}
+
+/// Kills `src/wal.rs:398 replace > with >= in append_inner`: a record
+/// that exactly fills the staging block must pack into it, not trigger
+/// a premature flush of the (empty) stage and waste a WAL block.
+#[test]
+fn mut_wal_exact_fit_packs_block() {
+    use horton::wal::{Op, WalWriter};
+
+    const BLOCK: usize = 512;
+    let mut w: WalWriter<_, BLOCK> = WalWriter::new(MemDevice::<BLOCK>::new(), 0, 16);
+    // 23 overhead + 1 key + 488 value = 512: exactly one block.
+    let v = [0xAA; 488];
+    block_on(w.append(1, Op::Put, b"k", &v)).unwrap();
+    assert_eq!(w.next_block(), 0, "exact-fit record must pack, not flush");
+    assert_eq!(w.staged_bytes(), 512);
+    block_on(w.commit()).unwrap();
+    assert_eq!(w.next_block(), 1);
+}
+
+/// Kills `src/wal.rs:549 replace > with >= in recover_from`: a record
+/// with `seq == seq_floor` is stale (already flushed into a table) and
+/// must be skipped, not replayed. Replaying the boundary would resurrect
+/// superseded versions into the memtable.
+#[test]
+fn mut_wal_seq_floor_boundary_skips() {
+    use horton::wal::{Op, WalWriter};
+
+    const BLOCK: usize = 512;
+    let mut w: WalWriter<_, BLOCK> = WalWriter::new(MemDevice::<BLOCK>::new(), 0, 16);
+    block_on(w.append(1, Op::Put, b"a", b"1")).unwrap();
+    block_on(w.append(2, Op::Put, b"b", b"2")).unwrap();
+    block_on(w.commit()).unwrap();
+    let dev = w.into_device();
+    let mut w2: WalWriter<_, BLOCK> = WalWriter::new(dev, 0, 16);
+    let mut t = MemTable::<32, 2048, 16, 32>::new();
+    // seq_floor = 1: the seq-1 record is stale, the seq-2 record is live.
+    let st = block_on(w2.recover_from(&mut t, 0, 1)).unwrap();
+    assert_eq!(st.records, 1, "seq_floor boundary record must be skipped");
+    assert_eq!(st.max_seq, 2);
+}
