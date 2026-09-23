@@ -56,7 +56,7 @@ pub use device::BlockDevice;
 pub use error::Error;
 pub use manifest::{KeyBound, Level, MANIFEST_MAGIC, Manifest, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
-pub use scan::Scan;
+pub use scan::{RevScan, Scan};
 pub use sstable::{
     Lookup as SstLookup, SSTABLE_MAGIC, SstEntry, TablePlan, TableReader, bloom_k,
     bloom_maybe_contains, plan_table, write_table,

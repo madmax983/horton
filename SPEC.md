@@ -994,6 +994,86 @@ floor (`seq <= manifest.max_seq`).
       every data-block read funnels through the flag check
       (`read_data_block`/`inflate_data_block`); index/footer/bloom/manifest/WAL
       paths verified never to touch the flag bit.
+- v0.14 — Reverse iteration.
+  - **Scope**: `RevScan` — the descending mirror of `Scan`.
+    `seek_prev(from, lower, max_seq)` positions at the last entry `<= from`
+    (an empty `from` starts at the last key; `lower` is an exclusive lower
+    bound, `None` scans to the first key); `prev(key_buf, val_buf)` yields
+    entries in descending key order. Merges the memtable and every SSTable
+    with the same highest-sequence-wins rule; tombstones are skipped
+    silently; entries with `seq > max_seq` are invisible, so scans at a
+    `Db::snapshot` watermark are repeatable. The borrow discipline matches
+    `Scan`: the scan borrows the database, so `put`/`flush`/`compact` cannot
+    shift cursors mid-scan. The buffer contract matches too:
+    `BufferTooSmall` fires before any cursor advances, so a retry yields the
+    same entry.
+  - **Design** — three load-bearing choices:
+    - *Ceiling-parked cursors, not backward links.* Blocks are
+      forward-linked only, so each table cursor parks at the greatest
+      visible entry satisfying a ceiling (`<= from` at seek,
+      `< yielded_key` after each yield). Parking binary-searches the
+      block's restart points for the last restart that can lead to a
+      qualifying entry, then scans regions backward (newest-first version
+      runs mean a backward region walk with a `>=` merge keeps the newest
+      visible version of each key). Per park: O(log R + regions), not
+      O(block).
+    - *The block walk goes down.* Initial positioning resolves the last
+      block with `first_key <= from` (new
+      `sstable::index_last_le_block`, sharing the index binary search with
+      `index_lookup`); a cursor that finds nothing visible in its block
+      steps to the previous data block. Every entry in block N-1 sorts at
+      or below block N's first entry, so the backward walk is complete,
+      and the ceiling still applies per block — a version run straddling a
+      block boundary cannot resurrect an already-yielded key.
+    - *Version runs are followed across blocks.* A block can seal
+      mid-run, so the run's newest versions may live in an earlier block
+      than the one the index resolves. Whenever a park's candidate is the
+      block's first key, the cursor follows the run backward
+      (`resolve_run`), adopting each earlier block's newest visible
+      version of the same key until a block's first key differs. Without
+      this, a backward walker parks on a stale version it met first —
+      caught by `revscan_seek_at_cross_block_version_run` during
+      development (seeking at `k` with a watermark hiding the run's head
+      returned v4 instead of v19).
+    - *Separate `RevScan`, shared block format.* The forward `Scan` is
+      untouched; `RevScan` reuses the verified readers
+      (`parse_data_entry`, `data_entries_end`, the CRC + inflation funnel)
+      and walks the memtable's sorted slots downward from `lower_bound`.
+      No format change, so the crash model is unchanged: reverse iteration
+      only reads.
+  - **Crash model**: unchanged — `RevScan` performs no writes. A torn data
+    block is `CorruptBlock`, never a silent skip, exactly like the forward
+    scan.
+  - **Proof**: `tests/revscan.rs` (15 tests) — mirrors `tests/scan.rs`:
+    empty DB; memtable-only descending; `seek_prev` at/above/below keys
+    and at empty `from`; exclusive lower bound; multi-table merge with
+    overlapping keys; dedup (highest sequence wins); tombstone
+    suppression; snapshot isolation; `BufferTooSmall`-before-advance on
+    both buffers; re-seek repositioning; cross-block version runs
+    (newest-visible-wins at snapshot watermarks, including the
+    mid-run-seal case that caught a real stale-version bug); runs longer
+    than one restart interval; randomized differential test against a
+    `BTreeMap` oracle; forward/reverse agreement (reversing the forward
+    range yields the reverse range, bounded and unbounded);
+    `cargo +nightly miri test --test revscan` green.
+  - **Honest limits**: no descending point lookup; reverse scans hold the
+    same `&Db` borrow as forward scans. Per-`prev()` cost is linear in the
+    source count, like the forward scan.
+  - **Measured** (2026-09-23):
+    - 201 debug + 201 release tests green (186 carried from v0.13, 15 new
+      in `tests/revscan.rs`); `cargo fmt --check` clean;
+      `cargo clippy --all-targets -- -D warnings -W clippy::pedantic
+      -W clippy::nursery` zero warnings; `./xtensa-check.sh` PASS
+      (xtensa-esp32s3-none-elf); `cargo +nightly miri test --test revscan`
+      15/15 green.
+    - Correctness: `revscan_seek_at_cross_block_version_run` caught a real
+      stale-version bug during development — a backward walker parking at
+      a block's first key settled on an older version when a block sealed
+      mid-run; the fix (`resolve_run` follows the run into earlier
+      blocks) is proven by the same test, including at a snapshot
+      watermark hiding the run's head (v19 selected over v4).
+    - Audits: zero `unwrap`/`expect`/`panic!` in non-test `src/`;
+      `#![no_std]` + `#![forbid(unsafe_code)]` hold; zero dependencies.
 
 ## 10. Open questions for Mark
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on

@@ -1025,6 +1025,61 @@ fn index_entry_parse(payload: &[u8], off: usize) -> Result<(&[u8], u64, usize), 
 }
 
 /// Binary-searches the index for the first data block that may hold `key`.
+/// Parses the index entry at position `i` by re-parsing from the start
+/// (O(n) per call, no allocation). Shared by the index searches below.
+fn index_entry_at(payload: &[u8], i: usize) -> Result<(&[u8], u64, usize), ()> {
+    let mut off = 0usize;
+    for _ in 0..i {
+        let (_, _, next) = index_entry_parse(payload, off)?;
+        off = next;
+    }
+    index_entry_parse(payload, off)
+}
+
+/// Counts index entries, then binary-searches for the first entry whose
+/// `first_key` sorts after `key`. Returns `(lo, count)` with `lo >= 1`, or
+/// `None` when `key` sorts before every block. Shared by [`index_lookup`]
+/// and [`index_last_le_block`].
+fn index_upper_bound<E>(
+    payload: &[u8],
+    key: &[u8],
+    index_id: u64,
+) -> Result<Option<(usize, usize)>, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: index_id };
+    // Count entries with one linear pass; the binary search below then
+    // re-parses on demand (O(n log n) byte scans, no allocation). The
+    // block's CRC already passed, so a parse failure is either genuine zero
+    // padding (all zeros to the end of the block body: the end of the index)
+    // or structural corruption — the two are distinguished explicitly.
+    let mut count = 0usize;
+    let mut off = 0usize;
+    while off < payload.len() {
+        if let Ok((_, _, next)) = index_entry_parse(payload, off) {
+            off = next;
+            count += 1;
+        } else if all_zero(&payload[off..]) {
+            break;
+        } else {
+            return Err(corrupt());
+        }
+    }
+    let mut lo = 0usize;
+    let mut hi = count;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (fkey, _, _) = index_entry_at(payload, mid).map_err(|()| corrupt())?;
+        if fkey <= key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return Ok(None);
+    }
+    Ok(Some((lo, count)))
+}
+/// Binary-searches the index for the first data block that may hold `key`.
 /// Returns the block id and the maximum number of data blocks a point
 /// lookup may walk forward from it (the index entry count minus the
 /// resolved position: the walk stays inside the table), or `None` when
@@ -1046,62 +1101,47 @@ pub(crate) fn index_lookup<E>(
     index_id: u64,
 ) -> Result<Option<(u64, usize)>, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: index_id };
-    // Count entries with one linear pass; the binary search below then
-    // re-parses on demand (O(n log n) byte scans, no allocation). The
-    // block's CRC already passed, so a parse failure is either genuine zero
-    // padding (all zeros to the end of the block body: the end of the index)
-    // or structural corruption — the two are distinguished explicitly.
-    let mut count = 0usize;
-    let mut off = 0usize;
-    while off < payload.len() {
-        if let Ok((_, _, next)) = index_entry_parse(payload, off) {
-            off = next;
-            count += 1;
-        } else if all_zero(&payload[off..]) {
-            break;
-        } else {
-            return Err(corrupt());
-        }
-    }
-    let entry_at = |i: usize| {
-        let mut off = 0usize;
-        for _ in 0..i {
-            let (_, _, next) = index_entry_parse(payload, off)?;
-            off = next;
-        }
-        index_entry_parse(payload, off)
-    };
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let (fkey, _, _) = entry_at(mid).map_err(|()| corrupt())?;
-        if fkey <= key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 {
+    let Some((lo, count)) = index_upper_bound(payload, key, index_id)? else {
         return Ok(None);
-    }
+    };
     // `lo - 1`: last restart with `first_key <= key`. Walk back over
     // duplicates of `key` — the run's newest versions live in the first
     // block it touches, which can be the block *before* the first
     // duplicate restart when a block seals mid-run.
     let mut pos = lo - 1;
     while pos > 0 {
-        let (fkey, _, _) = entry_at(pos).map_err(|()| corrupt())?;
+        let (fkey, _, _) = index_entry_at(payload, pos).map_err(|()| corrupt())?;
         if fkey != key {
             break;
         }
         pos -= 1;
     }
-    let (_, block_id, _) = entry_at(pos).map_err(|()| corrupt())?;
+    let (_, block_id, _) = index_entry_at(payload, pos).map_err(|()| corrupt())?;
     // The walk may visit every data block from `pos` onward — never past
     // the table's last data block (whose readers must not stray into the
     // bloom/index/footer blocks).
     Ok(Some((block_id, count - pos)))
+}
+
+/// Returns the last data block whose `first_key` sorts at or before `key`,
+/// or `None` when `key` sorts before every block. `pub(crate)` for the
+/// reverse scan's seek positioning: the greatest entry `<= key` lives in
+/// this block or an earlier one, so the reverse cursor walks backward from
+/// here. Unlike [`index_lookup`] there is no walk-back — duplicates of
+/// `key` in earlier blocks hold *older* versions, and the backward walk
+/// reaches them naturally.
+pub(crate) fn index_last_le_block<E>(
+    payload: &[u8],
+    key: &[u8],
+    index_id: u64,
+) -> Result<Option<u64>, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: index_id };
+    let Some((lo, _)) = index_upper_bound(payload, key, index_id)? else {
+        return Ok(None);
+    };
+    // `lo - 1`: last restart with `first_key <= key`.
+    let (_, block_id, _) = index_entry_at(payload, lo - 1).map_err(|()| corrupt())?;
+    Ok(Some(block_id))
 }
 
 /// Reads and verifies a table footer, returning its index block id.
