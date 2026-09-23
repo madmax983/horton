@@ -74,13 +74,107 @@ Equivalent at the API boundary.
 
 ## Not yet campaigned (honest gaps)
 
-`src/manifest.rs`, `src/sstable.rs`, `src/scan.rs`, `src/db.rs`
+`src/sstable.rs`, `src/scan.rs`, `src/db.rs`
 have not been mutation-tested. The WAL decoder is heavily covered by the
 structure-aware fuzzers (`tests/fuzz.rs`) and torn-write crash tests
 (`tests/crash_torn.rs`, `tests/crash_flush.rs`), which is mitigation, not a
 substitute. Rerun per file with the same setup when continuing; note the
 suite now includes the slower fuzz corpora, so scope `-- --skip` filters or
 raise timeouts accordingly.
+
+## `src/manifest.rs` campaign (2026-09-23)
+
+151 mutants enumerated; 102 caught, 32 unviable, 17 missed — all 17
+triaged. Campaign ran 2026-09-23 ~11:25–12:01 UTC in
+`~/workspace/horton-mutwal` (`--file src/manifest.rs`, baseline 18s +
+18s). Triage was done against the clean `~/workspace/horton` tree; every
+claimed kill was verified by manually applying the mutant and watching
+the targeted test fail.
+
+Killed by new regression tests in `tests/mutants.rs`:
+
+- `63:22` `>` → `==` and `>` → `>=` in `KeyBound::from_slice`: a key of
+  exactly `KEY_MAX` bytes is legal and must be accepted; the `==` mutant
+  also turns overlong keys into a `copy_from_slice` panic. Killed by
+  `mut_manifest_keybound_from_slice_boundary`.
+- `90:29` `<` → `==` in `KeyBound::min`: with a strictly smaller `other`,
+  the mutant returns the larger bound. Killed by
+  `mut_manifest_keybound_min_picks_lesser`.
+- `229:9` `next_table_id` → `0`: the getter must track `bump_table_id`.
+  Killed by `mut_manifest_next_table_id_tracks_bumps`.
+- `282:9` `l0_is_full` → `false`: level 0 holding `TABLES` tables must
+  report full — flush and ingest rely on it to fail fast with `NoSpace`.
+  Killed by `mut_manifest_l0_is_full_reports_full`.
+- `369:40` `<` → `<=` in `is_table_block_referenced`: block
+  `first_block + block_count` is one past the table; the mutant would
+  leak it in the open-time sweep. Killed by
+  `mut_manifest_block_ref_boundary`.
+- `468:18` `>` → `==` in `Manifest::decode`: the weakened guard walks
+  past the size check into an out-of-bounds CRC read (panic) on a
+  corrupt `payload_len`. Killed by
+  `mut_manifest_decode_rejects_oversized_total`.
+- `468:18` `>` → `>=` in `Manifest::decode`: an exactly-full block
+  (`total == BLOCK`) is a valid manifest and must decode. Killed by
+  `mut_manifest_decode_accepts_exact_fit` (hand-crafted 82-byte
+  manifest, `Manifest<1, 1, 8>`).
+- `537:14` `>` → `==` in `decode_bound`: the weakened guard walks past
+  the length check into a `copy_from_slice` panic on an overlong bound.
+  Killed by `mut_manifest_decode_bound_rejects_overlong`.
+- `537:14` `>` → `>=` in `decode_bound`: a `KEY_MAX`-length bound is
+  legal (`from_slice` accepts it) and must decode. Killed by
+  `mut_manifest_decode_bound_accepts_key_max`.
+- `687:16` `>` → `==` in `Encoder::bytes`: the weakened guard walks past
+  the bounds check into an out-of-bounds write (panic) on an oversized
+  manifest. Killed by `mut_manifest_encode_rejects_oversized`.
+
+Equivalent (with the reason, not a shrug):
+
+### `src/manifest.rs:90` — `KeyBound::min`: `<` → `<=`
+Differs only when the two bounds have equal key bytes. Every
+`KeyBound` constructor (`from_slice`, `EMPTY`, `decode_bound`) zeroes
+the trailing padding, and `min`/`max` only return their inputs — so
+equal slices imply byte-identical structs, and either way the same key
+is denoted. No observable difference. Equivalent.
+
+### `src/manifest.rs:106` — `KeyBound::max`: `>` → `>=`
+Same argument as `min` above: equal slices ⟺ byte-identical structs
+(all constructors zero padding), and the denoted key is unchanged.
+Equivalent.
+
+### `src/manifest.rs:260` — `advance_next_table_id`: `>` → `>=`
+Differs only when `floor == self.next_table_id`; the assignment then
+writes the identical value back. Documented by
+`mut_manifest_advance_next_table_id_noop_on_tie`. Equivalent.
+
+### `src/manifest.rs:380` — `max_seq`: `>` → `>=`
+Differs only when `tref.max_seq == max`; the assignment writes the
+identical value back. Equivalent.
+
+### `src/manifest.rs:396` — `table_region_end`: `>` → `>=`
+Differs only when `t_end == e`; `end = Some(t_end)` writes the identical
+value back. Equivalent.
+
+### `src/manifest.rs:687` — `Encoder::bytes`: `>` → `>=`
+Unkillable. The mutant differs only when a write ends exactly at
+`buf.len()`. In `encode`, if any write reaches `end == BLOCK` the
+original can never return `Ok`: a later non-empty write hits the same
+guard and yields `NoSpace`, and the trailing direct CRC write (since
+bounds-checked — see the bug below) yields `NoSpace` too. No input
+distinguishes success from failure; the mutant only converts the
+(now-fixed) latent CRC panic into an early `NoSpace`. Equivalent.
+
+### Production bug found and fixed
+Triage of the `Encoder::bytes` `>=` mutant exposed a real panic: the
+trailing CRC write in `Manifest::encode`
+(`out[crc_end..crc_end + 4].copy_from_slice(...)`) was not
+bounds-checked — the old comment claimed "`Encoder` already
+bounds-checked every write, so this fits", but the encoder never
+accounts for the 4 CRC bytes. A payload leaving fewer than 4 bytes for
+the CRC (e.g. 67-byte payload in an 82-byte block) panicked at
+`src/manifest.rs:445`. Fixed by checking `crc_end + 4 <= BLOCK` and
+returning `Error::NoSpace` (SPEC–PROOF–RED–GREEN: regression test
+`encode_crc_tail_is_bounds_checked` in `tests/manifest.rs` failed with
+the panic before the fix, passes after).
 
 ## `src/wal.rs` campaign (2026-09-23)
 

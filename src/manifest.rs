@@ -440,8 +440,11 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let payload_len = u32::try_from(enc.off - payload_start).map_err(|_| Error::NoSpace)?;
         out[8..12].copy_from_slice(&payload_len.to_le_bytes());
         let crc_end = payload_start + usize::try_from(payload_len).map_err(|_| Error::NoSpace)?;
+        let total = crc_end.checked_add(4).ok_or(Error::NoSpace)?;
+        if total > BLOCK {
+            return Err(Error::NoSpace);
+        }
         let crc = crc32(&out[..crc_end]);
-        // `Encoder` already bounds-checked every write, so this fits.
         out[crc_end..crc_end + 4].copy_from_slice(&crc.to_le_bytes());
         Ok(())
     }

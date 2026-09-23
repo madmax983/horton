@@ -638,3 +638,331 @@ fn mut_wal_seq_floor_boundary_skips() {
     assert_eq!(st.records, 1, "seq_floor boundary record must be skipped");
     assert_eq!(st.max_seq, 2);
 }
+
+// ---------------------------------------------------------------------------
+// src/manifest.rs
+// ---------------------------------------------------------------------------
+
+/// Kills `src/manifest.rs:63 replace > with ==` and `> with >=` in
+/// `KeyBound::from_slice`: a key of exactly `KEY_MAX` bytes is valid and
+/// must be accepted; a longer key must be rejected, not panicked on.
+#[test]
+fn mut_manifest_keybound_from_slice_boundary() {
+    use horton::KeyBound;
+
+    let full = [0xAA; 8];
+    let b = KeyBound::<8>::from_slice(&full);
+    assert!(b.is_some(), "KEY_MAX-length key must be accepted");
+    assert_eq!(b.unwrap().as_slice(), &full);
+    assert!(
+        KeyBound::<8>::from_slice(&[0xBB; 9]).is_none(),
+        "overlong key must be rejected"
+    );
+    assert!(
+        KeyBound::<8>::from_slice(&[0xCC; 3]).is_some(),
+        "short key must be accepted"
+    );
+}
+
+/// Kills `src/manifest.rs:90 replace < with ==` in `KeyBound::min`:
+/// when the other bound is strictly smaller, `min` must return it.
+#[test]
+fn mut_manifest_keybound_min_picks_lesser() {
+    use horton::KeyBound;
+
+    let big = KeyBound::<8>::from_slice(b"bbbb").unwrap();
+    let small = KeyBound::<8>::from_slice(b"aaaa").unwrap();
+    assert_eq!(big.min(small), small);
+    assert_eq!(small.min(big), small);
+    // Equal bounds: either is the same key.
+    assert_eq!(small.min(small).as_slice(), b"aaaa");
+}
+
+/// Kills `src/manifest.rs:229 replace next_table_id -> u32 with 0`:
+/// the getter must track `bump_table_id`.
+#[test]
+fn mut_manifest_next_table_id_tracks_bumps() {
+    use horton::Manifest;
+
+    let mut m = Manifest::<2, 4, 32>::new();
+    assert_eq!(m.next_table_id(), 0);
+    m.bump_table_id::<Infallible>().unwrap();
+    m.bump_table_id::<Infallible>().unwrap();
+    assert_eq!(m.next_table_id(), 2);
+}
+
+/// Kills `src/manifest.rs:260 replace > with >=` in
+/// `advance_next_table_id`: raising to the current value is a no-op; the
+/// assignment must write the identical value back.
+#[test]
+fn mut_manifest_advance_next_table_id_noop_on_tie() {
+    use horton::Manifest;
+
+    let mut m = Manifest::<2, 4, 32>::new();
+    m.bump_table_id::<Infallible>().unwrap();
+    m.bump_table_id::<Infallible>().unwrap();
+    assert_eq!(m.next_table_id(), 2);
+    // Raising to the current counter value changes nothing.
+    m.advance_next_table_id(2);
+    assert_eq!(m.next_table_id(), 2);
+    // Raising above advances; lowering never does.
+    m.advance_next_table_id(9);
+    assert_eq!(m.next_table_id(), 9);
+    m.advance_next_table_id(4);
+    assert_eq!(m.next_table_id(), 9);
+}
+
+/// Kills `src/manifest.rs:282 replace l0_is_full -> bool with false`:
+/// level 0 holding `TABLES` tables must report full — flush and ingest
+/// rely on this to fail fast with `NoSpace` before doing I/O.
+#[test]
+fn mut_manifest_l0_is_full_reports_full() {
+    use horton::{KeyBound, Manifest, TableRef};
+
+    fn tref(id: u32) -> TableRef<32> {
+        TableRef {
+            id,
+            first_block: u64::from(id) * 10,
+            block_count: 4,
+            first_key: KeyBound::from_slice(b"a").unwrap(),
+            last_key: KeyBound::from_slice(b"z").unwrap(),
+            max_seq: 10,
+            entry_count: 5,
+            rdel_blocks: 0,
+        }
+    }
+
+    let mut m = Manifest::<2, 4, 32>::new();
+    assert!(!m.l0_is_full());
+    for i in 0..4u32 {
+        m.add_l0_table::<Infallible>(tref(i)).unwrap();
+    }
+    assert!(m.l0_is_full(), "L0 with TABLES tables must report full");
+}
+
+/// Kills `src/manifest.rs:468 replace > with ==` in `Manifest::decode`:
+/// a `total` past the block end must be rejected as corrupt — never read
+/// out of bounds (the mutant turns the guard into a panic).
+#[test]
+fn mut_manifest_decode_rejects_oversized_total() {
+    use horton::{MANIFEST_MAGIC, Manifest};
+
+    const BLOCK: usize = 512;
+    let mut buf = [0u8; BLOCK];
+    buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
+    // payload_len chosen so total = 12 + len + 4 overflows the block.
+    buf[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    let res = Manifest::<2, 4, 32>::decode::<Infallible, BLOCK>(&buf);
+    assert!(
+        res.is_err(),
+        "total > BLOCK must be CorruptManifest, never a panic"
+    );
+}
+
+/// Kills `src/manifest.rs:468 replace > with >=` in `Manifest::decode`:
+/// a manifest that fills its block exactly (`total == BLOCK`) is valid and
+/// must decode — the mutant wrongly rejects it as corrupt.
+#[test]
+fn mut_manifest_decode_accepts_exact_fit() {
+    use horton::crc::crc32;
+    use horton::{MANIFEST_MAGIC, Manifest};
+
+    fn w64(buf: &mut [u8], off: &mut usize, v: u64) {
+        buf[*off..*off + 8].copy_from_slice(&v.to_le_bytes());
+        *off += 8;
+    }
+    fn w32(buf: &mut [u8], off: &mut usize, v: u32) {
+        buf[*off..*off + 4].copy_from_slice(&v.to_le_bytes());
+        *off += 4;
+    }
+    fn w16(buf: &mut [u8], off: &mut usize, v: u16) {
+        buf[*off..*off + 2].copy_from_slice(&v.to_le_bytes());
+        *off += 2;
+    }
+
+    // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys:
+    // payload = 8 + 8 + 4 + 4 + (4 + 38) = 66, total = 12 + 66 + 4 = 82.
+    const BLOCK: usize = 82;
+    const CRC_END: usize = 78;
+    let mut buf = [0u8; BLOCK];
+    buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
+    buf[8..12].copy_from_slice(&66u32.to_le_bytes());
+    let mut off = 12;
+    w64(&mut buf, &mut off, 7); // seq
+    w64(&mut buf, &mut off, 0); // wal_head
+    w32(&mut buf, &mut off, 0); // next_table_id
+    w32(&mut buf, &mut off, 1); // nlevels
+    w32(&mut buf, &mut off, 1); // level 0: one table
+    w32(&mut buf, &mut off, 7); // id
+    w64(&mut buf, &mut off, 100); // first_block
+    w32(&mut buf, &mut off, 4); // block_count
+    w16(&mut buf, &mut off, 1); // first_key len
+    buf[off] = b'a';
+    off += 1;
+    w16(&mut buf, &mut off, 1); // last_key len
+    buf[off] = b'z';
+    off += 1;
+    w64(&mut buf, &mut off, 10); // max_seq
+    w32(&mut buf, &mut off, 5); // entry_count
+    w32(&mut buf, &mut off, 0); // rdel_blocks
+    assert_eq!(off, CRC_END);
+    let crc = crc32(&buf[..CRC_END]);
+    buf[CRC_END..CRC_END + 4].copy_from_slice(&crc.to_le_bytes());
+
+    let m = Manifest::<1, 1, 8>::decode::<Infallible, BLOCK>(&buf)
+        .expect("exact-fit manifest must decode");
+    assert_eq!(m.seq(), 7);
+    assert_eq!(m.l0().len(), 1);
+}
+
+/// Kills `src/manifest.rs:369 replace < with <=` in
+/// `is_table_block_referenced`: block `first_block + block_count` is one
+/// past the table — treating it as referenced would leak the block in the
+/// open-time sweep.
+#[test]
+fn mut_manifest_block_ref_boundary() {
+    use horton::{KeyBound, Manifest, TableRef};
+
+    let mut m = Manifest::<2, 4, 32>::new();
+    m.add_l0_table::<Infallible>(TableRef {
+        id: 3,
+        first_block: 100,
+        block_count: 4,
+        first_key: KeyBound::from_slice(b"a").unwrap(),
+        last_key: KeyBound::from_slice(b"z").unwrap(),
+        max_seq: 10,
+        entry_count: 5,
+        rdel_blocks: 0,
+    })
+    .unwrap();
+    assert!(m.is_table_block_referenced(100));
+    assert!(m.is_table_block_referenced(103));
+    assert!(
+        !m.is_table_block_referenced(104),
+        "one-past-the-end block is not part of the table"
+    );
+    assert!(!m.is_table_block_referenced(99));
+}
+
+/// Kills `src/manifest.rs:537 replace > with >=` in `decode_bound`:
+/// a bound of exactly `KEY_MAX` bytes is legal (`from_slice` accepts it),
+/// so a manifest carrying one must decode.
+#[test]
+fn mut_manifest_decode_bound_accepts_key_max() {
+    use horton::{KeyBound, Manifest, TableRef};
+
+    let mut m = Manifest::<2, 4, 8>::new();
+    m.add_l0_table::<Infallible>(TableRef {
+        id: 1,
+        first_block: 50,
+        block_count: 4,
+        first_key: KeyBound::from_slice(&[0xAA; 8]).unwrap(),
+        last_key: KeyBound::from_slice(&[0xBB; 8]).unwrap(),
+        max_seq: 10,
+        entry_count: 5,
+        rdel_blocks: 0,
+    })
+    .unwrap();
+    let mut buf = [0u8; 512];
+    m.encode::<Infallible, 512>(&mut buf).unwrap();
+    let back = Manifest::<2, 4, 8>::decode::<Infallible, 512>(&buf)
+        .expect("KEY_MAX-length bound must decode");
+    assert_eq!(back.l0().len(), 1);
+}
+
+/// Kills `src/manifest.rs:537 replace > with ==` in `decode_bound`:
+/// a bound longer than `KEY_MAX` must be rejected as corrupt — never read
+/// past the bound array (the mutant turns the guard into a panic).
+#[test]
+fn mut_manifest_decode_bound_rejects_overlong() {
+    use horton::crc::crc32;
+    use horton::{KeyBound, MANIFEST_MAGIC, Manifest, TableRef};
+
+    let mut m = Manifest::<2, 4, 8>::new();
+    m.add_l0_table::<Infallible>(TableRef {
+        id: 1,
+        first_block: 50,
+        block_count: 4,
+        first_key: KeyBound::from_slice(b"a").unwrap(),
+        last_key: KeyBound::from_slice(b"z").unwrap(),
+        max_seq: 10,
+        entry_count: 5,
+        rdel_blocks: 0,
+    })
+    .unwrap();
+    let mut buf = [0u8; 512];
+    m.encode::<Infallible, 512>(&mut buf).unwrap();
+    // Patch first_key's u16 length to KEY_MAX + 1. Layout: header(12) +
+    // seq(8) + wal_head(8) + next_table_id(4) + nlevels(4) + count(4) +
+    // id(4) + first_block(8) + block_count(4) = offset 56.
+    assert_eq!(&buf[0..8], &MANIFEST_MAGIC.to_le_bytes());
+    buf[56..58].copy_from_slice(&9u16.to_le_bytes());
+    // Repair the CRC over the patched payload.
+    let payload_len = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+    let crc_end = 12 + payload_len;
+    let crc = crc32(&buf[..crc_end]);
+    buf[crc_end..crc_end + 4].copy_from_slice(&crc.to_le_bytes());
+
+    let res = Manifest::<2, 4, 8>::decode::<Infallible, 512>(&buf);
+    assert!(
+        res.is_err(),
+        "overlong bound must be CorruptManifest, never a panic"
+    );
+}
+
+/// Kills `src/manifest.rs:687 replace > with >=` in `Encoder::bytes`:
+/// a manifest that fills its block exactly must encode — the mutant
+/// wrongly reports `NoSpace` on the final exact-fit write.
+#[test]
+fn mut_manifest_encode_accepts_exact_fit() {
+    use horton::{KeyBound, Manifest, TableRef};
+
+    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 82.
+    let mut m = Manifest::<1, 1, 8>::new();
+    m.add_l0_table::<Infallible>(TableRef {
+        id: 7,
+        first_block: 100,
+        block_count: 4,
+        first_key: KeyBound::from_slice(b"a").unwrap(),
+        last_key: KeyBound::from_slice(b"z").unwrap(),
+        max_seq: 10,
+        entry_count: 5,
+        rdel_blocks: 0,
+    })
+    .unwrap();
+    let mut buf = [0u8; 82];
+    m.encode::<Infallible, 82>(&mut buf)
+        .expect("exact-fit manifest must encode");
+    // And it must round-trip through decode.
+    let back = Manifest::<1, 1, 8>::decode::<Infallible, 82>(&buf)
+        .expect("exact-fit manifest must decode");
+    assert_eq!(back.seq(), 0);
+    assert_eq!(back.l0().len(), 1);
+}
+
+/// Kills `src/manifest.rs:687 replace > with ==` in `Encoder::bytes`:
+/// a manifest larger than the block must fail with `NoSpace` — never
+/// write out of bounds (the mutant turns the guard into a panic).
+#[test]
+fn mut_manifest_encode_rejects_oversized() {
+    use horton::{KeyBound, Manifest, TableRef};
+
+    let mut m = Manifest::<2, 4, 256>::new();
+    m.add_l0_table::<Infallible>(TableRef {
+        id: 1,
+        first_block: 50,
+        block_count: 4,
+        first_key: KeyBound::from_slice(&[0xAA; 256]).unwrap(),
+        last_key: KeyBound::from_slice(&[0xBB; 256]).unwrap(),
+        max_seq: 10,
+        entry_count: 5,
+        rdel_blocks: 0,
+    })
+    .unwrap();
+    let mut buf = [0u8; 128];
+    let res = m.encode::<Infallible, 128>(&mut buf);
+    assert!(
+        res.is_err(),
+        "oversized manifest must be NoSpace, never a panic"
+    );
+}
