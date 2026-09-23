@@ -253,6 +253,24 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.next_block
     }
 
+    /// Bytes currently staged in RAM: durable only after
+    /// [`commit`](WalWriter::commit).
+    #[must_use]
+    pub const fn staged_bytes(&self) -> usize {
+        self.stage_len
+    }
+
+    /// Truncates the staging buffer back to `len` bytes, discarding staged
+    /// records that never became durable. Used to roll back a failed
+    /// commit so a failed mutation can never resurrect through a later
+    /// commit. Only valid when no block landed since the mark (`len` at
+    /// most `stage_len`); shrinking is exactly the case
+    /// [`write_stage`](WalWriter::write_stage) already re-zeroes.
+    pub fn truncate_stage(&mut self, len: usize) {
+        debug_assert!(len <= self.stage_len, "truncate past staged data");
+        self.stage_len = len;
+    }
+
     /// Repositions the append pointer to `block` (the WAL wrap).
     ///
     /// The caller must guarantee no live records exist: every record below

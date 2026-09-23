@@ -13,6 +13,7 @@
 use core::cell::RefCell;
 
 use crate::alloc::{Bump, FreeList};
+use crate::batch::WriteBatch;
 use crate::compact::{
     COMPACTION_KMAX, Compaction, Input, MergeOutcome, Progress, State, init_cursor, ranges_overlap,
 };
@@ -21,7 +22,7 @@ use crate::error::Error;
 use crate::manifest::{KeyBound, Manifest, TableRef};
 use crate::memtable::MemTable;
 use crate::sstable;
-use crate::wal::{Op, RecoverState, WalWriter};
+use crate::wal::{Op, RecoverState, WAL_RECORD_OVERHEAD, WalWriter};
 
 /// Placement of the database regions on the device.
 ///
@@ -188,6 +189,16 @@ pub struct Db<
     /// now lives here, for the life of the `Db`. Count `BLOCK` bytes of
     /// permanent RAM for this field against SPEC.md's RAM budget.
     get_scratch: RefCell<[u8; BLOCK]>,
+}
+
+/// WAL staging snapshot, taken before a mutation stages its records.
+/// Lets [`Db::rollback_commit`] undo a failed commit: staged-but-undurable
+/// records are truncated away, and sequence numbers are consumed only when
+/// a block actually landed.
+#[derive(Debug, Clone, Copy)]
+struct StageMark {
+    stage_len: usize,
+    next_block: u64,
 }
 
 impl<
@@ -381,6 +392,29 @@ impl<
         })
     }
 
+    /// Captures the WAL staging state before a mutation, for rollback.
+    const fn stage_mark(&self) -> StageMark {
+        StageMark {
+            stage_len: self.wal.staged_bytes(),
+            next_block: self.wal.next_block(),
+        }
+    }
+
+    /// Undoes a failed commit. If no block landed (`next_block`
+    /// unchanged), the staged records never became durable and are
+    /// truncated away. If a block landed but the device flush failed —
+    /// the device lied, indistinguishable from a crash at that instant —
+    /// the records may replay on recovery, so `seqs` sequence numbers are
+    /// consumed now and never reused.
+    fn rollback_commit(&mut self, mark: StageMark, seqs: u64) -> Result<(), Error<D::Error>> {
+        if self.wal.next_block() == mark.next_block {
+            self.wal.truncate_stage(mark.stage_len);
+        } else {
+            self.next_seq = self.next_seq.checked_add(seqs).ok_or(Error::NoSpace)?;
+        }
+        Ok(())
+    }
+
     /// Stores `key` → `val`, durable before it returns. Returns the sequence
     /// number assigned to the mutation.
     ///
@@ -392,8 +426,16 @@ impl<
     pub async fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, Error<D::Error>> {
         self.table.check_insert::<D::Error>(key, val, false)?;
         let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
-        self.wal.append(seq, Op::Put, key, val).await?;
-        self.wal.commit().await?;
+        let mark = self.stage_mark();
+        if let Err(e) = self.wal.append(seq, Op::Put, key, val).await {
+            self.rollback_commit(mark, 0)?;
+            return Err(e);
+        }
+        if let Err(e) = self.wal.commit().await {
+            let landed = self.wal.next_block() != mark.next_block;
+            self.rollback_commit(mark, u64::from(landed))?;
+            return Err(e);
+        }
         self.next_seq = seq;
         // The table is unchanged since check_insert, so this cannot fail.
         self.table.insert(key, val, seq, false)?;
@@ -409,12 +451,112 @@ impl<
     pub async fn delete(&mut self, key: &[u8]) -> Result<u64, Error<D::Error>> {
         self.table.check_insert::<D::Error>(key, &[], true)?;
         let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
-        self.wal.append(seq, Op::Delete, key, &[]).await?;
-        self.wal.commit().await?;
+        let mark = self.stage_mark();
+        if let Err(e) = self.wal.append(seq, Op::Delete, key, &[]).await {
+            self.rollback_commit(mark, 0)?;
+            return Err(e);
+        }
+        if let Err(e) = self.wal.commit().await {
+            let landed = self.wal.next_block() != mark.next_block;
+            self.rollback_commit(mark, u64::from(landed))?;
+            return Err(e);
+        }
         self.next_seq = seq;
         // The table is unchanged since check_insert, so this cannot fail.
         self.table.insert(key, &[], seq, true)?;
         Ok(seq)
+    }
+
+    /// Applies every op in `batch` atomically: all become durable and
+    /// visible together, or none does. Returns the base sequence number;
+    /// op `i` (in queue order) takes `base + i`.
+    ///
+    /// Atomicity rides on a single WAL commit: the batch is staged into
+    /// the WAL's RAM buffer and made durable by one block write, so the
+    /// torn-tail rule yields all-or-nothing for free. A batch whose
+    /// encoded size exceeds one block cannot commit atomically and is
+    /// rejected with [`Error::BatchTooLarge`] — never silently split.
+    /// An empty batch is a no-op returning the current sequence number.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BatchTooLarge`], [`Error::TableFull`],
+    /// [`Error::ArenaFull`], [`Error::NoSpace`], or [`Error::Device`].
+    /// A rejected batch leaves no trace: no WAL records, no staged bytes,
+    /// no consumed sequence numbers.
+    pub async fn write<const OPS: usize>(
+        &mut self,
+        batch: &WriteBatch<KEY_MAX, VAL_MAX, OPS>,
+    ) -> Result<u64, Error<D::Error>> {
+        let ops = batch.ops();
+        let n = ops.len();
+        if n == 0 {
+            return Ok(self.next_seq);
+        }
+        // Total capacity for the whole batch, up front: sizes were
+        // validated when the batch was built.
+        let mut need_arena = 0usize;
+        let mut need_wal = 0usize;
+        for op in ops {
+            need_arena = need_arena
+                .checked_add(op.key().len() + op.val().len())
+                .ok_or(Error::ArenaFull)?;
+            need_wal = need_wal
+                .checked_add(WAL_RECORD_OVERHEAD + op.key().len() + op.val().len())
+                .ok_or(Error::NoSpace)?;
+        }
+        if need_wal > BLOCK {
+            return Err(Error::BatchTooLarge {
+                bytes: need_wal,
+                max: BLOCK,
+            });
+        }
+        if self.table.len() + n > CAP {
+            return Err(Error::TableFull);
+        }
+        if self.table.arena_len() + need_arena > ARENA {
+            return Err(Error::ArenaFull);
+        }
+        // Drain any previously staged data so the batch still commits as
+        // one block write. (In practice the stage is always empty between
+        // Db calls — every mutation commits immediately.)
+        if self.wal.staged_bytes() > 0 {
+            self.wal.commit().await?;
+        }
+        debug_assert_eq!(self.wal.staged_bytes(), 0);
+
+        let base = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let nu64 = u64::try_from(n).map_err(|_| Error::NoSpace)?;
+        let last = base.checked_add(nu64 - 1).ok_or(Error::NoSpace)?;
+
+        let mark = self.stage_mark();
+        for (i, op) in ops.iter().enumerate() {
+            let seq = base
+                .checked_add(u64::try_from(i).map_err(|_| Error::NoSpace)?)
+                .ok_or(Error::NoSpace)?;
+            // Unreachable in practice: sizes were validated when the batch
+            // was built and the block fit was checked above. Roll back
+            // anyway — atomicity is never best-effort here.
+            if let Err(e) = self.wal.append(seq, op.kind(), op.key(), op.val()).await {
+                self.rollback_commit(mark, 0)?;
+                return Err(e);
+            }
+        }
+        if let Err(e) = self.wal.commit().await {
+            let landed = self.wal.next_block() != mark.next_block;
+            self.rollback_commit(mark, if landed { nu64 } else { 0 })?;
+            return Err(e);
+        }
+        self.next_seq = last;
+        // The table is unchanged since the capacity check, so this cannot fail.
+        for (i, op) in ops.iter().enumerate() {
+            let seq = base
+                .checked_add(u64::try_from(i).map_err(|_| Error::NoSpace)?)
+                .ok_or(Error::NoSpace)?;
+            self.table
+                .insert::<D::Error>(op.key(), op.val(), seq, op.kind() == Op::Delete)?;
+        }
+        Ok(base)
     }
 
     /// Reads `key` into `val_buf`: memtable first, then level 0 newest table

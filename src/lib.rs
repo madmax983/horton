@@ -4,13 +4,14 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.10 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.11 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
 //! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
 //! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
 //! flush into `SSTables`, multi-level bloom-gated reads with key-range
 //! pruning and highest-sequence-wins), the [`Scan`] merge iterator with
-//! snapshot reads, and the archive API ([`Db::archive_plan`],
+//! snapshot reads, atomic multi-op [`WriteBatch`] writes via
+//! [`Db::write`](Db::write), and the archive API ([`Db::archive_plan`],
 //! [`Db::archive_commit`], [`ArchivePlan`]) — seal a table, stream its
 //! blocks to caller-owned remote storage through [`Db::device`], then
 //! forget it locally. See SPEC §9 for the tombstone rule: delete-bearing
@@ -25,6 +26,7 @@
 #![allow(clippy::future_not_send)]
 
 pub mod alloc;
+pub mod batch;
 pub mod compact;
 pub mod crc;
 pub mod db;
@@ -41,6 +43,7 @@ pub mod sstable;
 pub mod wal;
 
 pub use alloc::{Bump, FreeList};
+pub use batch::WriteBatch;
 pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
 pub use db::{ArchivePlan, Config, Db, OpenReport};

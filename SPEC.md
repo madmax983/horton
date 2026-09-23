@@ -700,6 +700,60 @@ floor (`seq <= manifest.max_seq`).
     hang — both infra, not assertions) are unchanged and not re-litigated
     here.
 
+- v0.11 — Atomic write batches.
+  - **Scope**: `WriteBatch<const KEY_MAX, VAL_MAX, OPS>` — a caller-owned,
+    fixed-capacity batch of puts and deletes, no allocation.
+    `Db::write(&mut self, batch) -> Result<u64, Error>` applies every op
+    atomically and returns the base sequence number (op `i` gets
+    `base + i`); an empty batch is a no-op returning the current
+    `next_seq`. Validation is total and up front — key/value sizes at build
+    time, then WAL-block fit (structural, so an unatomically-large batch is
+    rejected the same way regardless of DB state), then memtable slot/arena
+    capacity for the whole batch — so a rejected batch is refused before a
+    single byte is staged and
+    leaves no trace: no WAL records, no staged bytes, no consumed seqs.
+  - **Crash ordering** (atomicity without a new WAL record type): the
+    batch is staged into the WAL's RAM buffer and made durable by ONE
+    `commit()` — a single block write plus device flush. Crash before the
+    commit: nothing durable, batch absent. Crash during the block write:
+    torn block, CRC fails, recovery stops before the batch — batch
+    absent. Crash after: recovery replays every record — batch present,
+    whole. The existing torn-tail rule gives all-or-nothing for free,
+    provided a batch never triggers an intermediate block write;
+    `Db::write` enforces this by requiring the batch's total encoded size
+    to fit one block (`Error::BatchTooLarge` otherwise) and committing
+    any previously staged data first. An over-block batch is rejected,
+    never split — splitting would silently void the atomicity contract.
+  - **Commit-failure rollback** (folded-in fix): `put`/`delete`/`write`
+    snapshot the WAL stage before staging; if the block write fails, the
+    stage is truncated back to the snapshot, so a failed mutation can
+    never resurrect through a later commit. If the block landed but the
+    device flush failed — the device lied, indistinguishable from a crash
+    at that instant — the mutation's sequence numbers are consumed and
+    the batch may surface atomically on the next recovery, exactly as a
+    crash would. Previously a failed `put` left its record staged *and*
+    reused its sequence number: a latent resurrection + seq-reuse bug,
+    now closed.
+  - **Proof**: `tests/write_batch.rs` — happy-path atomicity (all keys
+    visible, consecutive seqs, base seq returned), duplicate keys
+    last-wins within the batch, empty batch is a seq-conserving no-op,
+    over-block batch rejected with no trace (later ops take the expected
+    seqs), memtable-full rejection leaves WAL and seqs untouched, deletes
+    land as tombstones; crash injector over `Db::write` at every
+    block-write position — recovery exposes all or none of each batch,
+    and later writes never reuse a batch's seqs.
+  - **Honest limits**: an atomic batch is bounded by one WAL block —
+    worst case `OPS * (23 + KEY_MAX + VAL_MAX) <= BLOCK` bytes; larger
+    batches must be split by the caller into multiple `write()` calls,
+    each atomic alone but not atomic together. No cross-batch
+    transactions; that remains future work.
+  - **Measured**: 159/159 tests green in debug and release (8 new in
+    `tests/write_batch.rs`, including the crash-injector atomicity proof at
+    every block-write position); `cargo fmt --check` clean; clippy
+    pedantic+nursery zero warnings; `xtensa-check.sh` PASS;
+    `cargo +nightly miri test --test write_batch` 8/8 green; no
+    `unwrap`/`expect` in non-test source.
+
 ## 10. Open questions for Mark
 
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on

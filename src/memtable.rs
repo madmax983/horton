@@ -180,6 +180,12 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         self.len == 0
     }
 
+    /// Arena bytes in use.
+    #[must_use]
+    pub const fn arena_len(&self) -> usize {
+        self.arena_len
+    }
+
     /// Highest sequence number ever inserted (also updated on replay).
     #[must_use]
     pub const fn max_seq(&self) -> u64 {

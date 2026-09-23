@@ -48,6 +48,16 @@ pub enum Error<E> {
     CorruptManifest,
     /// Out of addressable blocks (WAL region exhausted, oversize record, …).
     NoSpace,
+    /// A [`WriteBatch`](crate::WriteBatch) already holds `OPS` operations.
+    BatchFull,
+    /// A [`WriteBatch`](crate::WriteBatch) does not fit one WAL block, so
+    /// it cannot commit atomically. Split it into smaller batches.
+    BatchTooLarge {
+        /// Total encoded size of the batch in bytes.
+        bytes: usize,
+        /// The WAL block size: the atomicity ceiling.
+        max: usize,
+    },
     /// The underlying block device reported an error.
     Device(E),
 }
