@@ -196,8 +196,7 @@ fn count_rdel_compaction_writes() -> usize {
 
 /// Runs build + one rdel compaction job with writes `>= crash_at` dropped.
 fn run_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
-    let dev: CrashDevice<MemDevice<BLOCK>, BLOCK> =
-        CrashDevice::new(build_with_rdel(), crash_at);
+    let dev: CrashDevice<MemDevice<BLOCK>, BLOCK> = CrashDevice::new(build_with_rdel(), crash_at);
     let mut db = TestDb::new(dev, test_config());
     block_on(db.open()).unwrap();
     drive_one(&mut db);

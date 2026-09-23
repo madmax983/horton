@@ -121,8 +121,8 @@ impl BlockDevice for CountingDevice {
     }
 }
 
-type CountDb = horton::Db<CountingDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
-type MemDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
+type CountDb = horton::Db<CountingDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type MemDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
 
 fn open_mem_db(dev: MemDevice<4096>, config: Config) -> MemDb {
     let mut db = MemDb::new(dev, config);
@@ -267,7 +267,7 @@ fn concurrent_gets_do_not_panic_when_interleaved() {
     // The first `get` is still suspended. The second `get` is polled
     // during this time. It must fall back to its own buffer instead of
     // panicking. Both calls must still return the right value.
-    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
+    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
     let mut dev = MemDevice::new();
     let t0 = write_single(&mut dev, 136, b"alpha", b"AAAA", 1, false, 0);
     commit_tables(&mut dev, &[(0, t0)]);

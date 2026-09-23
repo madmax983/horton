@@ -882,7 +882,7 @@ fn compact_l1_to_l2_crash_never_mixes_state() {
 /// A narrow database: 3 levels, 2 tables per level. The bottom level is
 /// reachable in a handful of flushes, so the true capacity ceiling — a
 /// full bottom level the merge cannot absorb into — is directly testable.
-type SmallDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 2, 1024, 4096>;
+type SmallDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 2, 1024, 4096, 8>;
 
 fn read_small_manifest(dev: &mut MemDevice<4096>) -> Manifest<3, 2, 256> {
     let mut scratch = [0u8; 4096];

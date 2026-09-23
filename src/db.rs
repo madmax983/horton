@@ -15,6 +15,7 @@ use core::future::poll_fn;
 
 use crate::alloc::{Bump, FreeList};
 use crate::batch::WriteBatch;
+use crate::cache::{BlockCache, CachePort, CacheStats};
 use crate::compact::{
     COMPACTION_KMAX, Compaction, EntryStream, Input, MergeOutcome, Progress, State, init_cursor,
     ranges_overlap,
@@ -223,6 +224,8 @@ pub struct Db<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
+    // Block-cache slots (cache::BlockCache). 0 disables the cache.
+    const CACHE: usize,
 > {
     wal: WalWriter<D, BLOCK>,
     table: MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
@@ -259,6 +262,13 @@ pub struct Db<
     /// buffer and falls back to a stack buffer when a concurrent `get`
     /// already holds it. Count another `BLOCK` bytes of permanent RAM.
     decomp_scratch: RefCell<[u8; BLOCK]>,
+    /// `SSTable` block cache (`CACHE` slots of `BLOCK` bytes plus one tag
+    /// per slot). Served on the read path — point reads, forward and
+    /// reverse scans — keyed by `(table_id, device_block_id)`. Same
+    /// `RefCell` discipline as `get_scratch`: contention degrades to a
+    /// silent bypass, never a panic. Count `CACHE * (BLOCK + tag)` bytes
+    /// of permanent RAM against SPEC.md's RAM budget.
+    cache: RefCell<BlockCache<BLOCK, CACHE>>,
 }
 
 /// WAL staging snapshot, taken before a mutation stages its records.
@@ -282,7 +292,8 @@ impl<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
-> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    const CACHE: usize,
+> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
 {
     const ASSERT_BLOCK: () = assert!(BLOCK == D::BLOCK, "BLOCK must equal D::BLOCK");
     const ASSERT_KEY: () = assert!(
@@ -321,6 +332,7 @@ impl<
             n_snapshots: 0,
             get_scratch: RefCell::new([0u8; BLOCK]),
             decomp_scratch: RefCell::new([0u8; BLOCK]),
+            cache: RefCell::new(BlockCache::new()),
         }
     }
 
@@ -396,6 +408,19 @@ impl<
     /// The manifest, for the scan iterator's table cursors.
     pub(crate) const fn manifest_ref(&self) -> &Manifest<LEVELS, TABLES, KEY_MAX> {
         &self.manifest
+    }
+
+    /// The block cache, for the scan iterators' block reads. Scans borrow
+    /// it through the same [`CachePort`] view the point-read path uses.
+    pub(crate) fn cache_port(&self) -> &dyn CachePort<BLOCK> {
+        &self.cache
+    }
+
+    /// Test-visible block-cache counters: hits, misses, occupancy. Lets
+    /// callers prove the cache is earning its RAM instead of trusting us.
+    #[must_use]
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.stats()
     }
 
     /// Opens the database: recovers the manifest, rebuilds the table-region
@@ -1063,8 +1088,10 @@ impl<
             .checked_add(u64::from(tref.block_count))
             .and_then(|end| end.checked_sub(1))
             .ok_or(Error::CorruptManifest)?;
-        let reader = sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open(
+        let reader = sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open_cached(
             self.wal.device(),
+            Some(&self.cache as &dyn CachePort<BLOCK>),
+            tref.id,
             scratch,
             footer,
             tref.first_block,
@@ -1347,7 +1374,8 @@ impl<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
-> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    const CACHE: usize,
+> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
 {
     /// Reports whether [`compact_step`](Db::compact_step) would select a
     /// compaction job right now: some level below the top holds `>= TABLES`
@@ -1464,6 +1492,10 @@ impl<
         // Commit point passed: publish the staged state, then reclaim the
         // table's run strictly after the visibility point.
         self.manifest = staged;
+        // The table's blocks are unreachable now; drop its cache entries
+        // so their slots serve the hot set (hygiene — ids never repeat,
+        // so stale entries could never be read).
+        self.cache.invalidate_table(table_id);
         let mut k = 0u64;
         let blocks = u64::from(plan.table.block_count);
         while k < blocks {
@@ -2143,6 +2175,10 @@ impl<
         // must not fail the compaction; un-reclaimed blocks stay orphans
         // and the next open() sweep reclaims them.
         for input in c.inputs.iter().take(c.n_inputs) {
+            // Drop the retired table's cache entries so their slots serve
+            // the hot set (hygiene — ids never repeat, so stale entries
+            // could never be read).
+            self.cache.invalidate_table(input.tref.id);
             let mut k = 0u64;
             let blocks = u64::from(input.tref.block_count);
             while k < blocks {

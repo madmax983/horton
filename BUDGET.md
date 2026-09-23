@@ -1,4 +1,4 @@
-# Horton ESP32-S3 RAM budget (v0.13)
+# Horton ESP32-S3 RAM budget (v0.16)
 
 All numbers are **measured** with `core::mem::size_of` on the host
 (`tests/profile.rs` prints and asserts them); the layout is identical on
@@ -24,13 +24,14 @@ extra and not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 17,064 | v0.6 baseline 12,960 + 4,096 decompression buffer (point reads inflate here) |
+| `Db` | 25,576 | v0.13 baseline 17,064 + 264 (v0.14/v0.15) + 8,248 block cache (`CACHE = 2`: 2 × 4096-byte images + tags) |
 | `Scan` | 10,392 | v0.6 baseline 6,296 + 4,096 logical block buffer (physical reads land in the shared `raw` buffer, inflate here) |
 | `Compaction` | 56,192 | v0.6 baseline 43,896 + 8,192 trial-compression scratch + 4,096 shared physical-read buffer (8 merge cursors share one `raw`; each keeps only its logical block) |
-| **Total** | **83,648** | |
+| **Total** | **92,520** | |
 
 Budget: **98,304 bytes (96 KiB)** — `ESP32S3_RAM_BUDGET` in `src/profile.rs`,
-asserted by `tests/profile.rs`. Raised from 64 KiB for v0.13: block
+asserted by `tests/profile.rs`. Kept at 96 KiB for v0.16: the 2-slot cache costs 8,248 bytes (measured),
+leaving 5,784 bytes of headroom. Raised from 64 KiB for v0.13: block
 compression costs ~20 KiB of caller-owned scratch, every byte load-bearing
 (the read path cannot inflate without a target; the writer cannot
 trial-compress without staging). 96 KiB is 19% of the S3's 512 KiB SRAM —

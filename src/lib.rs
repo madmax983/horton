@@ -4,7 +4,7 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.15 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.16 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
 //! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
 //! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
@@ -21,8 +21,14 @@
 //! transparently — range deletes ([`Db::delete_range`](Db::delete_range))
 //! with per-range tombstone sections in every table, and absolute-tick
 //! TTLs ([`Db::put_with_ttl`](Db::put_with_ttl)) with read-time expiry
-//! and compaction-time purge. See SPEC §9 for the tombstone rule:
-//! delete-bearing workloads archive only from the bottommost level.
+//! and compaction-time purge — and the caller-owned block cache
+//! ([`cache`]): a fixed-capacity CLOCK cache over inline storage, sized
+//! by the `CACHE` const generic on [`Db`] (`0` disables it), caching
+//! physical device-block images before CRC, bloom, decompression, TTL,
+//! and range-delete interpretation, with explicit invalidation when
+//! compaction or archive removal retires tables. See SPEC §9 for the
+//! tombstone rule: delete-bearing workloads archive only from the
+//! bottommost level.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -34,6 +40,7 @@
 
 pub mod alloc;
 pub mod batch;
+pub mod cache;
 pub mod compact;
 pub mod compress;
 pub mod crc;
@@ -52,6 +59,7 @@ pub mod wal;
 
 pub use alloc::{Bump, FreeList};
 pub use batch::WriteBatch;
+pub use cache::{BlockCache, CachePort, CacheStats};
 pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
 pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable};

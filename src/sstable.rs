@@ -31,6 +31,7 @@
 
 use core::future::poll_fn;
 
+use crate::cache::CachePort;
 use crate::compress::{CompressScratch, decompress};
 use crate::crc::crc32;
 use crate::device::BlockDevice;
@@ -1563,12 +1564,12 @@ pub(crate) fn index_last_le_block<E>(
 /// verification, or [`Error::Device`] on I/O failure.
 pub(crate) async fn footer_index_block<D: BlockDevice, const BLOCK: usize>(
     device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
     scratch: &mut [u8; BLOCK],
     footer_block: u64,
 ) -> Result<u64, Error<D::Error>> {
-    poll_fn(|cx| device.poll_read_block(cx, footer_block, scratch))
-        .await
-        .map_err(Error::Device)?;
+    read_block_cached(device, cache, table_id, footer_block, scratch, true).await?;
     check_block_crc::<D::Error, BLOCK>(scratch, footer_block)?;
     let magic = u64::from_le_bytes(
         scratch[0..8]
@@ -1825,8 +1826,11 @@ pub enum Lookup {
 ///
 /// [`Error::CorruptBlock`] when an rdel block fails verification, or
 /// [`Error::Device`] on I/O failure.
+#[allow(clippy::too_many_arguments)] // all eight are load-bearing; bundling just moves the arity.
 pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
     device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
     scratch: &mut [u8; BLOCK],
     rdel_first: u64,
     rdel_blocks: u32,
@@ -1838,9 +1842,9 @@ pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
         let id = rdel_first
             .checked_add(b)
             .ok_or(Error::CorruptBlock { id: rdel_first })?;
-        poll_fn(|cx| device.poll_read_block(cx, id, scratch))
-            .await
-            .map_err(Error::Device)?;
+        // Hot: covering probes run per key per table, so these blocks
+        // are re-read constantly — the cache's biggest win.
+        read_block_cached(device, cache, table_id, id, scratch, true).await?;
         let count = rdel_block_count::<D::Error, BLOCK>(scratch, id)?;
         let mut off = 0usize;
         for _ in 0..count {
@@ -1857,8 +1861,49 @@ pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
 
 /// Point-lookup reader over one table. Holds a shared device reference;
 /// every lookup reuses the caller's scratch block.
+/// Reads one `SSTable` block through the block cache when one is supplied.
+///
+/// On a hit the cached image is copied into `scratch` and no device I/O
+/// happens; on a miss the block is read from the device and then
+/// inserted (with `hot` setting the CLOCK reference bit — see
+/// [`crate::cache`]). The cached bytes are the physical image exactly as
+/// the device returned them, so every check the caller runs afterwards
+/// (CRC, magic, bloom, decompression) behaves byte-identically to a
+/// re-read, including corruption semantics. `table_id` is the owning
+/// table's manifest id: ids are monotone and never reused, so the key
+/// `(table_id, block_id)` names the image immutably.
+pub(crate) async fn read_block_cached<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    scratch: &mut [u8; BLOCK],
+    hot: bool,
+) -> Result<(), Error<D::Error>> {
+    if let Some(c) = cache
+        && c.get_into(table_id, block_id, scratch)
+    {
+        return Ok(());
+    }
+    poll_fn(|cx| device.poll_read_block(cx, block_id, scratch))
+        .await
+        .map_err(Error::Device)?;
+    if let Some(c) = cache {
+        c.put(table_id, block_id, scratch, hot);
+    }
+    Ok(())
+}
+
+/// Point-lookup reader over one table. Holds a shared device reference;
+/// every lookup reuses the caller's scratch block.
 pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize> {
     device: &'d D,
+    /// Owning table's id: first half of the block-cache key. Table ids
+    /// are monotone and never reused, so `(table_id, block_id)` names a
+    /// block image immutably.
+    table_id: u32,
+    /// Block cache, or `None` for standalone readers (tests, tooling).
+    cache: Option<&'d dyn CachePort<BLOCK>>,
     index_block: u64,
     bloom_block: u64,
     entry_count: u64,
@@ -1875,7 +1920,13 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
 {
     /// Opens the table ending at `footer_block`: reads and verifies the
     /// footer (magic + CRC). `rdel_first` is the table's first block: the
-    /// range-tombstone section precedes the data blocks.
+    /// range-tombstone section precedes the data blocks. `table_id` is the
+    /// table's manifest id — the block-cache key's first half — and
+    /// `cache` (if any) serves the footer and every later block read.
+    /// Opens a table reader without a cache: every block is read from
+    /// the device. This is the original pre-v0.16 API, kept for
+    /// pre-visibility reads (ingest validation) that must not populate
+    /// the cache.
     ///
     /// # Errors
     ///
@@ -1887,9 +1938,26 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         footer_block: u64,
         rdel_first: u64,
     ) -> Result<Self, Error<D::Error>> {
-        poll_fn(|cx| device.poll_read_block(cx, footer_block, scratch))
-            .await
-            .map_err(Error::Device)?;
+        Self::open_cached(device, None, 0, scratch, footer_block, rdel_first).await
+    }
+
+    /// Opens a table reader with an optional block cache. `Db` point
+    /// reads and scans use this; `table_id` tags every cached block.
+    /// Pass `None` (or `CACHE = 0`) to read straight from the device.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptBlock`] when the footer is missing or fails
+    /// verification, or [`Error::Device`] on I/O failure.
+    pub async fn open_cached(
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        table_id: u32,
+        scratch: &mut [u8; BLOCK],
+        footer_block: u64,
+        rdel_first: u64,
+    ) -> Result<Self, Error<D::Error>> {
+        read_block_cached(device, cache, table_id, footer_block, scratch, true).await?;
         check_block_crc::<D::Error, BLOCK>(scratch, footer_block)?;
         let magic = u64::from_le_bytes(
             scratch[0..8]
@@ -1925,6 +1993,8 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         );
         Ok(Self {
             device,
+            table_id,
+            cache,
             index_block,
             bloom_block,
             entry_count,
@@ -1958,6 +2028,8 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     ) -> Result<Option<u64>, Error<D::Error>> {
         covering_rdel_seq_in(
             self.device,
+            self.cache,
+            self.table_id,
             scratch,
             self.rdel_first,
             self.rdel_blocks,
@@ -2081,19 +2153,32 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     ) -> Result<Lookup, Error<D::Error>> {
         let device = self.device;
         // Bloom gate (advisory: corruption just disables the optimization,
-        // never the lookup).
-        poll_fn(|cx| device.poll_read_block(cx, self.bloom_block, scratch))
-            .await
-            .map_err(Error::Device)?;
+        // never the lookup). The cached image is byte-identical to a
+        // re-read, so the advisory-CRC rule below behaves the same.
+        read_block_cached(
+            device,
+            self.cache,
+            self.table_id,
+            self.bloom_block,
+            scratch,
+            true,
+        )
+        .await?;
         if check_block_crc::<D::Error, BLOCK>(scratch, self.bloom_block).is_ok()
             && !bloom_maybe_contains(&scratch[..BLOOM_BYTES], key, self.k)
         {
             return Ok(Lookup::Missing);
         }
         // Index: structural; corruption is an error, never a silent miss.
-        poll_fn(|cx| device.poll_read_block(cx, self.index_block, scratch))
-            .await
-            .map_err(Error::Device)?;
+        read_block_cached(
+            device,
+            self.cache,
+            self.table_id,
+            self.index_block,
+            scratch,
+            true,
+        )
+        .await?;
         check_block_crc::<D::Error, BLOCK>(scratch, self.index_block)?;
         let payload_end = BLOCK - CRC_LEN;
         let Some((mut block_id, mut remaining)) =
@@ -2105,9 +2190,7 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         // forward, and `remaining` keeps it inside the table's data blocks.
         loop {
             // Data: a torn block is treated as absent.
-            poll_fn(|cx| device.poll_read_block(cx, block_id, scratch))
-                .await
-                .map_err(Error::Device)?;
+            read_block_cached(device, self.cache, self.table_id, block_id, scratch, true).await?;
             if check_block_crc::<D::Error, BLOCK>(scratch, block_id).is_err() {
                 return Ok(Lookup::Missing);
             }

@@ -130,7 +130,7 @@ fn make_val(buf: &mut [u8; 256], rng: &mut Lcg, len: usize) -> usize {
     len
 }
 
-type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8192>;
+type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8192, 8>;
 
 const WAL_START: u64 = 8;
 const WAL_END: u64 = 8 + 4000;
@@ -147,6 +147,10 @@ const FLUSHED_BATCHES: usize = 3;
 /// replay every one of these records into a fresh memtable.
 const UNFLUSHED_BATCH: usize = 400;
 
+// 595 KiB stack frame: the bench `Db` is ~193 KiB by design (64 KiB
+// memtable arena) and `main` runs on the 8 MiB main-thread stack, so
+// this is intentional, not an overflow risk.
+#[allow(clippy::large_stack_frames)]
 fn main() {
     let device = MemDevice::<4096>::new();
     let mut db = BenchDb::new(device, config());

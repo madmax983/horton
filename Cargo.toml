@@ -1,6 +1,6 @@
 [package]
 name = "horton"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 description = "Zero-dependency, zero-allocation LSM-tree KV store (no_std, no_alloc)"
 license = "MIT OR Apache-2.0"

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use common::{Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::{BlockDevice, RevScan};
 
-type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
+type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
 
 fn open<D: BlockDevice>(db: &mut TestDb<D>)
 where
@@ -467,7 +467,9 @@ fn revscan_agrees_with_forward_scan() {
     // Forward collect (mirrors tests/scan.rs).
     let mut fwd = {
         let mut scan =
-            horton::Scan::<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>::new(&db);
+            horton::Scan::<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>::new(
+                &db,
+            );
         block_on(scan.seek(b"", None, u64::MAX)).unwrap();
         let mut out = Vec::new();
         let mut kbuf = [0u8; 256];
@@ -483,7 +485,9 @@ fn revscan_agrees_with_forward_scan() {
     // Bounded agreement: forward [b, d) reversed == reverse (b, d].
     let mut fwd_bounded = {
         let mut scan =
-            horton::Scan::<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>::new(&db);
+            horton::Scan::<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>::new(
+                &db,
+            );
         block_on(scan.seek(b"k\x05", Some(b"k\x08"), u64::MAX)).unwrap();
         let mut out = Vec::new();
         let mut kbuf = [0u8; 256];

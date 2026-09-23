@@ -16,8 +16,6 @@
 //! reported *before* any cursor advances, so retrying with a larger buffer
 //! yields the same entry — never silent truncation, never a skipped entry.
 
-use core::future::poll_fn;
-
 use crate::db::Db;
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -29,6 +27,8 @@ use crate::sstable;
 /// shared buffer only for the winning entry.
 #[derive(Clone, Copy)]
 struct ScanCursor<const KEY_MAX: usize> {
+    /// Owning table's manifest id: first half of the block-cache key.
+    table_id: u32,
     first_block: u64,
     data_blocks: u64,
     block_idx: u64,
@@ -54,6 +54,7 @@ impl<const KEY_MAX: usize> ScanCursor<KEY_MAX> {
     /// stable, hence a `const fn` instead of an associated constant.
     const fn empty() -> Self {
         Self {
+            table_id: 0,
             first_block: 0,
             data_blocks: 0,
             block_idx: 0,
@@ -94,8 +95,21 @@ pub struct Scan<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
+    const CACHE: usize,
 > {
-    db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>,
+    db: &'d Db<
+        D,
+        BLOCK,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        LEVELS,
+        TABLES,
+        BLOOM_BYTES,
+        FREELIST,
+        CACHE,
+    >,
     start: [u8; KEY_MAX],
     start_len: usize,
     end: [u8; KEY_MAX],
@@ -144,13 +158,26 @@ impl<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
-> Scan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    const CACHE: usize,
+> Scan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
 {
     /// Creates an unpositioned scan over `db`. Call [`seek`](Scan::seek)
     /// before [`next`](Scan::next).
     #[must_use]
     pub const fn new(
-        db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>,
+        db: &'d Db<
+            D,
+            BLOCK,
+            KEY_MAX,
+            VAL_MAX,
+            CAP,
+            ARENA,
+            LEVELS,
+            TABLES,
+            BLOOM_BYTES,
+            FREELIST,
+            CACHE,
+        >,
     ) -> Self {
         Self {
             db,
@@ -349,12 +376,12 @@ impl<
                     winner_expire_at = exp;
                 }
             }
-            let (winner_bid, winner_off, winner_end) = if winner_src == 0 {
-                (0u64, 0usize, 0usize)
+            let (winner_table, winner_bid, winner_off, winner_end) = if winner_src == 0 {
+                (0u32, 0u64, 0usize, 0usize)
             } else {
                 let (wli, wti) = self.cursor_pos(winner_src);
                 let c = &self.cursors[wli][wti];
-                (c.block_id, c.off, c.end)
+                (c.table_id, c.block_id, c.off, c.end)
             };
             // The winner key is materialized into a local buffer first, so a
             // hidden winner (tombstone, range-covered, or expired) never
@@ -406,7 +433,7 @@ impl<
             if winner_src == 0 {
                 val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
             } else {
-                self.ensure_block(winner_bid).await?;
+                self.ensure_block(winner_table, winner_bid).await?;
                 let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
                     &self.block,
                     winner_off,
@@ -461,11 +488,19 @@ impl<
     /// Reads and CRC-verifies block `id` into the shared buffer, inflating
     /// it when the compression flag is set. Afterwards `self.block` holds
     /// the logical block; every parser reads from there. For data blocks.
-    async fn read_verify(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+    async fn read_verify(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
-        poll_fn(|cx| db.device().poll_read_block(cx, id, &mut self.raw))
-            .await
-            .map_err(Error::Device)?;
+        // Cold insert: a scan streams each data block once with no reuse,
+        // so scan blocks must not displace the point-read hot set.
+        sstable::read_block_cached(
+            db.device(),
+            Some(db.cache_port()),
+            table_id,
+            id,
+            &mut self.raw,
+            false,
+        )
+        .await?;
         sstable::check_block_crc::<D::Error, BLOCK>(&self.raw, id)?;
         if !sstable::inflate_data_block::<D::Error, BLOCK>(&self.raw, &mut self.block, id)? {
             self.block.copy_from_slice(&self.raw);
@@ -478,22 +513,28 @@ impl<
     /// inflation. For index blocks, which are never compressed (their
     /// tail bytes are index payload, not a restart count — running them
     /// through the flag check would misread a coincidental bit).
-    async fn read_verify_index(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+    async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
-        poll_fn(|cx| db.device().poll_read_block(cx, id, &mut self.block))
-            .await
-            .map_err(Error::Device)?;
+        sstable::read_block_cached(
+            db.device(),
+            Some(db.cache_port()),
+            table_id,
+            id,
+            &mut self.block,
+            true,
+        )
+        .await?;
         sstable::check_block_crc::<D::Error, BLOCK>(&self.block, id)?;
         self.block_id = Some(id);
         Ok(())
     }
 
     /// Ensures the shared buffer holds block `id` (verified on load).
-    async fn ensure_block(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+    async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         if self.block_id == Some(id) {
             return Ok(());
         }
-        self.read_verify(id).await
+        self.read_verify(table_id, id).await
     }
 
     /// Adds a cursor over `tref`, parked at the first entry `>= start` with
@@ -532,9 +573,16 @@ impl<
             .and_then(|end| end.checked_sub(1))
             .ok_or(Error::CorruptManifest)?;
         let db = self.db;
-        let index_id = sstable::footer_index_block(db.device(), &mut self.block, footer).await?;
+        let index_id = sstable::footer_index_block(
+            db.device(),
+            Some(db.cache_port()),
+            tref.id,
+            &mut self.block,
+            footer,
+        )
+        .await?;
         self.block_id = Some(footer);
-        self.read_verify_index(index_id).await?;
+        self.read_verify_index(tref.id, index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
         let data_id =
             sstable::index_lookup::<D::Error>(&self.block[..payload_end], start, index_id)?;
@@ -557,7 +605,7 @@ impl<
             .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
             })?;
-        self.read_verify(bid).await?;
+        self.read_verify(tref.id, bid).await?;
         let end = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, bid)?;
         if end == 0 {
             // A data block always carries at least one entry.
@@ -565,6 +613,7 @@ impl<
         }
         let ti = self.cursor_counts[li];
         self.cursors[li][ti] = ScanCursor {
+            table_id: tref.id,
             first_block: data_first,
             data_blocks,
             block_idx,
@@ -597,12 +646,13 @@ impl<
     ) -> Result<(), Error<D::Error>> {
         let max_seq = self.max_seq;
         loop {
-            let (bid, off, end, idx, first, nblocks) = {
+            let (tid, bid, off, end, idx, first, nblocks) = {
                 let c = &self.cursors[li][ti];
                 if !c.live {
                     return Ok(());
                 }
                 (
+                    c.table_id,
                     c.block_id,
                     c.next,
                     c.end,
@@ -611,7 +661,7 @@ impl<
                     c.data_blocks,
                 )
             };
-            self.ensure_block(bid).await?;
+            self.ensure_block(tid, bid).await?;
             let mut off = off;
             // Scan this block's entries for the next visible one.
             let parked = loop {
@@ -666,7 +716,7 @@ impl<
             let nid = first
                 .checked_add(idx + 1)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            self.read_verify(nid).await?;
+            self.read_verify(tid, nid).await?;
             let nend = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, nid)?;
             if nend == 0 {
                 return Err(Error::CorruptBlock { id: nid });
@@ -802,6 +852,8 @@ impl<
                 }
                 if let Some(q) = sstable::covering_rdel_seq_in(
                     db.device(),
+                    Some(db.cache_port()),
+                    tref.id,
                     &mut scratch,
                     tref.first_block,
                     tref.rdel_blocks,
@@ -830,6 +882,8 @@ impl<
 /// mid-block without re-deriving the region structure anyway.
 #[derive(Clone, Copy)]
 struct RevCursor<const KEY_MAX: usize> {
+    /// Owning table's manifest id: first half of the block-cache key.
+    table_id: u32,
     first_block: u64,
     block_idx: u64,
     block_id: u64,
@@ -851,6 +905,7 @@ struct RevCursor<const KEY_MAX: usize> {
 impl<const KEY_MAX: usize> RevCursor<KEY_MAX> {
     const fn empty() -> Self {
         Self {
+            table_id: 0,
             first_block: 0,
             block_idx: 0,
             block_id: 0,
@@ -932,8 +987,21 @@ pub struct RevScan<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
+    const CACHE: usize,
 > {
-    db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>,
+    db: &'d Db<
+        D,
+        BLOCK,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        LEVELS,
+        TABLES,
+        BLOOM_BYTES,
+        FREELIST,
+        CACHE,
+    >,
     /// Inclusive ceiling: entries qualify when `key <= ceil`. Set when
     /// `seek_prev`'s `from` is non-empty; an empty `from` means no
     /// ceiling — the scan starts at the last key.
@@ -987,13 +1055,40 @@ impl<
     const TABLES: usize,
     const BLOOM_BYTES: usize,
     const FREELIST: usize,
-> RevScan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>
+    const CACHE: usize,
+>
+    RevScan<
+        'd,
+        D,
+        BLOCK,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        LEVELS,
+        TABLES,
+        BLOOM_BYTES,
+        FREELIST,
+        CACHE,
+    >
 {
     /// Creates an unpositioned reverse scan over `db`. Call
     /// [`seek_prev`](RevScan::seek_prev) before [`prev`](RevScan::prev).
     #[must_use]
     pub const fn new(
-        db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST>,
+        db: &'d Db<
+            D,
+            BLOCK,
+            KEY_MAX,
+            VAL_MAX,
+            CAP,
+            ARENA,
+            LEVELS,
+            TABLES,
+            BLOOM_BYTES,
+            FREELIST,
+            CACHE,
+        >,
     ) -> Self {
         Self {
             db,
@@ -1190,12 +1285,12 @@ impl<
                     winner_expire_at = exp;
                 }
             }
-            let (winner_bid, winner_off, winner_end) = if winner_src == 0 {
-                (0u64, 0usize, 0usize)
+            let (winner_table, winner_bid, winner_off, winner_end) = if winner_src == 0 {
+                (0u32, 0u64, 0usize, 0usize)
             } else {
                 let (wli, wti) = self.cursor_pos(winner_src);
                 let c = &self.cursors[wli][wti];
-                (c.block_id, c.off, c.end)
+                (c.table_id, c.block_id, c.off, c.end)
             };
             // The winner key is materialized into a local buffer first, so a
             // hidden winner (tombstone, range-covered, or expired) never
@@ -1247,7 +1342,7 @@ impl<
             if winner_src == 0 {
                 val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
             } else {
-                self.ensure_block(winner_bid).await?;
+                self.ensure_block(winner_table, winner_bid).await?;
                 let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
                     &self.block,
                     winner_off,
@@ -1332,11 +1427,19 @@ impl<
     /// Reads and CRC-verifies block `id` into the shared buffer, inflating
     /// it when the compression flag is set. Afterwards `self.block` holds
     /// the logical block; every parser reads from there. For data blocks.
-    async fn read_verify(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+    async fn read_verify(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
-        poll_fn(|cx| db.device().poll_read_block(cx, id, &mut self.raw))
-            .await
-            .map_err(Error::Device)?;
+        // Cold insert: a scan streams each data block once with no reuse,
+        // so scan blocks must not displace the point-read hot set.
+        sstable::read_block_cached(
+            db.device(),
+            Some(db.cache_port()),
+            table_id,
+            id,
+            &mut self.raw,
+            false,
+        )
+        .await?;
         sstable::check_block_crc::<D::Error, BLOCK>(&self.raw, id)?;
         if !sstable::inflate_data_block::<D::Error, BLOCK>(&self.raw, &mut self.block, id)? {
             self.block.copy_from_slice(&self.raw);
@@ -1349,22 +1452,28 @@ impl<
     /// inflation. For index blocks, which are never compressed (their
     /// tail bytes are index payload, not a restart count — running them
     /// through the flag check would misread a coincidental bit).
-    async fn read_verify_index(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+    async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
-        poll_fn(|cx| db.device().poll_read_block(cx, id, &mut self.block))
-            .await
-            .map_err(Error::Device)?;
+        sstable::read_block_cached(
+            db.device(),
+            Some(db.cache_port()),
+            table_id,
+            id,
+            &mut self.block,
+            true,
+        )
+        .await?;
         sstable::check_block_crc::<D::Error, BLOCK>(&self.block, id)?;
         self.block_id = Some(id);
         Ok(())
     }
 
     /// Ensures the shared buffer holds block `id` (verified on load).
-    async fn ensure_block(&mut self, id: u64) -> Result<(), Error<D::Error>> {
+    async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         if self.block_id == Some(id) {
             return Ok(());
         }
-        self.read_verify(id).await
+        self.read_verify(table_id, id).await
     }
 
     /// Adds a cursor over `tref`, parked at the greatest entry `<= from`
@@ -1405,9 +1514,16 @@ impl<
             .and_then(|end| end.checked_sub(1))
             .ok_or(Error::CorruptManifest)?;
         let db = self.db;
-        let index_id = sstable::footer_index_block(db.device(), &mut self.block, footer).await?;
+        let index_id = sstable::footer_index_block(
+            db.device(),
+            Some(db.cache_port()),
+            tref.id,
+            &mut self.block,
+            footer,
+        )
+        .await?;
         self.block_id = Some(footer);
-        self.read_verify_index(index_id).await?;
+        self.read_verify_index(tref.id, index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
         // Last data block whose first key sorts at/before `from`; empty
         // `from` starts at the table's last data block.
@@ -1435,7 +1551,7 @@ impl<
             .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
             })?;
-        self.read_verify(bid).await?;
+        self.read_verify(tref.id, bid).await?;
         let end = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, bid)?;
         if end == 0 {
             // A data block always carries at least one entry.
@@ -1443,6 +1559,7 @@ impl<
         }
         let ti = self.cursor_counts[li];
         self.cursors[li][ti] = RevCursor {
+            table_id: tref.id,
             first_block: data_first,
             block_idx,
             block_id: bid,
@@ -1501,14 +1618,14 @@ impl<
         let bound_copy: Option<(&[u8], bool)> = bound.map(|_| (&bkey[..blen], bincl));
         let max_seq = self.max_seq;
         loop {
-            let (bid, end, idx, first) = {
+            let (tid, bid, end, idx, first) = {
                 let c = &self.cursors[li][ti];
                 if !c.live {
                     return Ok(());
                 }
-                (c.block_id, c.end, c.block_idx, c.first_block)
+                (c.table_id, c.block_id, c.end, c.block_idx, c.first_block)
             };
-            self.ensure_block(bid).await?;
+            self.ensure_block(tid, bid).await?;
             if let Some((key, klen, seq, tomb, vlen, exp, off)) =
                 self.search_block_rev(bid, end, bound_copy, max_seq)?
             {
@@ -1521,7 +1638,7 @@ impl<
                 let fkey = self.block_first_key(end, bid)?;
                 let (key, klen, seq, tomb, vlen, exp, off, bid, end, idx) =
                     if idx > 0 && key[..klen] == *fkey {
-                        self.resolve_run(first, idx, &key[..klen], max_seq)
+                        self.resolve_run(tid, first, idx, &key[..klen], max_seq)
                             .await?
                             .unwrap_or((key, klen, seq, tomb, vlen, exp, off, bid, end, idx))
                     } else {
@@ -1550,7 +1667,7 @@ impl<
             let nid = first
                 .checked_add(idx - 1)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            self.read_verify(nid).await?;
+            self.read_verify(tid, nid).await?;
             let nend = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, nid)?;
             if nend == 0 {
                 return Err(Error::CorruptBlock { id: nid });
@@ -1573,6 +1690,7 @@ impl<
     /// block holds a visible `key` (the caller's candidate stands).
     async fn resolve_run(
         &mut self,
+        table_id: u32,
         first: u64,
         idx: u64,
         key: &[u8],
@@ -1590,7 +1708,7 @@ impl<
             let pbid = first
                 .checked_add(pidx)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            self.read_verify(pbid).await?;
+            self.read_verify(table_id, pbid).await?;
             let pend = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, pbid)?;
             if pend == 0 {
                 return Err(Error::CorruptBlock { id: pbid });
@@ -1951,6 +2069,8 @@ impl<
                 }
                 if let Some(q) = sstable::covering_rdel_seq_in(
                     db.device(),
+                    Some(db.cache_port()),
+                    tref.id,
                     &mut scratch,
                     tref.first_block,
                     tref.rdel_blocks,

@@ -23,10 +23,10 @@ use crate::{Db, Scan};
 /// cannot inflate a block without a target, and the writer cannot trial-
 /// compress without staging. 83,648 bytes is 16% of the S3's 512 KiB
 /// SRAM; the budget below keeps comfortable room for the kernel.
-pub type Esp32S3Db<D> = Db<D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64>;
+pub type Esp32S3Db<D> = Db<D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64, 2>;
 
 /// [`Scan`] instantiated for the ESP32-S3 profile.
-pub type Esp32S3Scan<'d, D> = Scan<'d, D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64>;
+pub type Esp32S3Scan<'d, D> = Scan<'d, D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64, 2>;
 
 /// [`Compaction`] scratch instantiated for the ESP32-S3 profile.
 pub type Esp32S3Compaction = Compaction<4096, 32, 64, 64>;

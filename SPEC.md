@@ -1184,6 +1184,89 @@ floor (`seq <= manifest.max_seq`).
     (one-block cache); range-heavy tables make this linear in tombstone
     count — measured, not hidden.
 
+- v0.16 — Caller-owned block cache.
+  - **Scope**: a fixed-capacity, allocation-free SSTable block cache
+    (`cache::BlockCache<const BLOCK: usize, const SLOTS: usize>`) that sits
+    on the read path — point reads (`TableReader`), forward scans and
+    reverse scans. Data, index, bloom-filter, footer, and range-tombstone
+    blocks are all served from it; the WAL, manifest, and compaction merge
+    reads bypass it deliberately (below). The cache is caller-owned memory
+    in the strictest sense: it lives inside `Db` as a const-generic field
+    (`CACHE` slots, `0` disables it), constructed by `Db::new`, counted in
+    the RAM budget, never global, never allocated.
+  - **Cache key**: `(table_id: u32, device_block_id: u64)`. Table ids are
+    monotone and never reused within a manifest lineage
+    (`next_table_id` only bumps; re-attach advances the floor past the
+    ingested id), and a table's device blocks are immutable from the
+    moment its id becomes visible. So a cached entry can never name live
+    data it doesn't describe: even after a table is dropped and its blocks
+    are reclaimed by the free list, the new table's fresh id misses the
+    old entries. Correctness rests on id monotonicity, not on timely
+    invalidation.
+  - **Invalidation protocol** (explicit hygiene, not correctness): when
+    compaction drops input tables — the only path that retires live table
+    ids — `Db` calls `cache.invalidate_table(id)` for each dropped id,
+    freeing the slots for the hot set. Flush creates tables under fresh
+    ids (nothing to invalidate); re-attach relocates blocks *before* the
+    manifest commit, so no read can have cached the destination yet, and
+    the source blocks are copied verbatim (identical bytes would hit
+    correctly anyway).
+  - **Eviction policy: CLOCK (second-chance)**. Each slot carries one
+    reference bit and the cache keeps one hand index — O(1) amortized,
+    one byte of policy state per slot, no linked lists, no allocation.
+    Chosen over direct-mapped (conflict misses: a sequential scan would
+    evict hot index blocks it collides with, repeatedly) and over true
+    LRU (needs a doubly-linked list — more mutable state, more proof
+    surface — for a marginal win: scan streams defeat LRU and CLOCK
+    equally, and the hot set behaves the same under both). Scan streaming
+    gets one refinement: data blocks pulled by a scan insert *cold*
+    (reference bit clear), so a full-table scan sweeps its own blocks out
+    behind it instead of displacing the point-read hot set; index, bloom,
+    footer, and rdel blocks insert hot. Compaction bypasses the cache
+    entirely — it streams whole tables once with no reuse, and inserting
+    that stream would churn the cache for zero benefit.
+  - **Byte-identity rule**: the cache stores the physical block image
+    exactly as the device returned it. CRC verification, the
+    bloom-is-advisory rule, compression-flag inflation, and TTL/range
+    shadowing all run *after* the cache, on identical bytes — a hit is
+    indistinguishable from a re-read, including all corruption semantics.
+    The v0.15 per-key rdel-block scan is the biggest winner: repeated
+    covering probes across keys now hit the cache instead of the device.
+  - **Concurrency**: `Db::get` is `&self`; the cache sits behind the same
+    `RefCell` discipline as `get_scratch`. Contention (two interleaved
+    `get`s on one executor) degrades to a silent bypass via
+    `try_borrow_mut` — never a panic, never a wrong byte.
+  - **Crash model**: the cache is DRAM-only and introduces no durable
+    state and no new commit points — a crash simply empties it, and
+    recovery never consults it. The crash injector needs no new cases;
+    the new test pins the invariant (crash mid-write with the cache hot,
+    reopen, reads are exact).
+  - **Proof**: `tests/cache.rs` — hit/miss accounting against a counting
+    `BlockDevice` (identical logical reads, strictly fewer device reads),
+    byte-identity vs uncached reads incl. corrupt-bloom behavior,
+    CLOCK eviction order, cold-insert scan behavior, `invalidate_table`
+    slot reclamation, `CACHE = 0` disabled-cache correctness, compaction
+    invalidation (post-compaction reads served fresh), re-attach safety,
+    TTL/range-tombstone reads through the cache, and the crash-reopen
+    invariant; `cargo +nightly miri test --test cache` green.
+  - **Measured** (2026-09-23): `BlockCache<4096, 8>` = 32,920 bytes,
+    `BlockCache<4096, 2>` = 8,248 bytes (4096-byte image + tag +
+    bookkeeping per slot). ESP32-S3 profile (`CACHE = 2`, 2 slots):
+    Db 25,576 + Scan 10,536 + Compaction 56,408 = 92,520 ≤ 98,304
+    budget — 5,784 bytes of headroom, asserted by `tests/profile.rs`.
+    Standard test profile (`CACHE = 8`): repeat point reads do zero
+    table-region device reads (`tests/cache.rs`
+    `repeat_point_read_is_served_from_cache`). Debug-stack note: the
+    pre-existing ~352 KiB `Manifest::recover` stack probe plus an inline
+    cache pushes stack-heavy debug tests near the 2 MiB test-thread
+    limit; `CACHE = 8` on the standard `TestDb` keeps ~300 KiB of margin
+    (fails at 1.625 MiB, passes at 1.75 MiB `RUST_MIN_STACK`).
+  - **Honest limits**: the cache does not reduce the *first* read of a
+    block, and a scan larger than the cache still streams from the device
+    (cold insert only bounds the damage to the hot set). Hit rate is
+    workload-shaped; the metrics (`Db::cache_stats`) are there so the
+    caller can see it instead of trusting us.
+
 ## 10. Open questions for Mark
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on
    the v0.6 roadmap.

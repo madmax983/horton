@@ -12,8 +12,8 @@ use common::{Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::model::{VersionTtl, model_visible_value};
 use horton::{Compaction, Progress, RevScan, Scan};
 
-type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
-type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096>;
+type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
 
 fn open(db: &mut TestDb<MemDevice<4096>>) {
     block_on(db.open()).unwrap();
