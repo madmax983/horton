@@ -134,7 +134,7 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         let mut ip = 0usize; // input position
         let mut anchor = 0usize; // start of pending literals
         while ip < body {
-            let (mpos, mlen) = self.find_match(src, ip, body);
+            let (mpos, mlen, h) = self.find_match(src, ip, body);
             if mlen >= MIN_MATCH {
                 let lit_len = ip - anchor;
                 // Encoded match length E = mlen - MIN_MATCH; the nibble
@@ -174,7 +174,13 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
                 ip = end;
                 anchor = ip;
             } else {
-                self.insert(src, ip);
+                // `find_match` already hashed `ip` to probe the table; on
+                // this miss, record `ip` there without hashing it again.
+                // `h == HASH_SIZE` marks the near-tail case where it
+                // couldn't hash at all (mirrors `insert`'s own no-op).
+                if h != HASH_SIZE {
+                    self.insert_at(h, ip);
+                }
                 ip += 1;
             }
         }
@@ -208,33 +214,43 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         (v.wrapping_mul(0x9E37_79B9) >> (32 - HASH_BITS)) as usize
     }
 
+    /// Records `p` in bucket `h`, which the caller has already hashed.
+    const fn insert_at(&mut self, h: usize, p: usize) {
+        // `p` indexes `src`, whose length is at most `BLOCK`
+        // (a few KiB): the narrowing cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let p32 = p as u32;
+        self.head[h] = p32;
+    }
+
     /// Records position `p` in the hash table. No-op near the tail.
     const fn insert(&mut self, src: &[u8], p: usize) {
         if p + MIN_MATCH <= src.len() {
             let h = Self::hash(src, p);
-            // `p` indexes `src`, whose length is at most `BLOCK`
-            // (a few KiB): the narrowing cast is exact.
-            #[allow(clippy::cast_possible_truncation)]
-            let p32 = p as u32;
-            self.head[h] = p32;
+            self.insert_at(h, p);
         }
     }
 
     /// Finds the longest match at `ip`: the most recent position with the
     /// same 4-byte hash, within a 32 KiB window. Single probe — bounded
     /// and simple; the table always holds the freshest candidate.
-    fn find_match(&self, src: &[u8], ip: usize, body: usize) -> (usize, usize) {
+    ///
+    /// Also returns the bucket `ip` hashed to, or `HASH_SIZE` on the
+    /// early-return path (too close to the tail to hash at all) — so a
+    /// caller that misses can record `ip` via [`insert_at`](Self::insert_at)
+    /// without hashing the same 4 bytes a second time.
+    fn find_match(&self, src: &[u8], ip: usize, body: usize) -> (usize, usize, usize) {
         if ip + MIN_MATCH > body {
-            return (0, 0);
+            return (0, 0, HASH_SIZE);
         }
         let h = Self::hash(src, ip);
         let cand = self.head[h];
         if cand == u32::MAX {
-            return (0, 0);
+            return (0, 0, h);
         }
         let pos = cand as usize;
         if pos >= ip || ip - pos > 32768 {
-            return (0, 0);
+            return (0, 0, h);
         }
         // Count the match, capped so one token pair stays sane.
         let mut len = 0usize;
@@ -242,7 +258,7 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         while len < cap && src[pos + len] == src[ip + len] {
             len += 1;
         }
-        (pos, len)
+        (pos, len, h)
     }
 
     /// Appends one byte; `false` when the staging buffer is full.
