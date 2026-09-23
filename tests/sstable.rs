@@ -19,6 +19,7 @@ const fn entry<'a>(key: &'a [u8], val: &'a [u8], seq: u64) -> SstEntry<'a> {
         val,
         seq,
         tombstone: false,
+        expire_at: 0,
     }
 }
 
@@ -35,6 +36,7 @@ fn write(items: &[SstEntry<'_>], dev: &mut MemDevice<BLOCK>) -> (u64, u64) {
             k,
             items.iter().copied(),
             None,
+            0,
         ),
     )
     .unwrap();
@@ -54,6 +56,7 @@ fn get(
         dev,
         &mut scratch,
         footer,
+        BASE,
     ))?;
     let n = block_on(reader.get(&mut scratch, &mut decomp, key, &mut buf))?;
     Ok(n.map(|n| buf[..n].to_vec()))
@@ -133,6 +136,7 @@ fn tombstone_reads_as_missing() {
             val: b"",
             seq: 2,
             tombstone: true,
+            expire_at: 0,
         },
         entry(b"c", b"3", 3),
     ];
@@ -194,6 +198,7 @@ fn corrupt_footer_rejected() {
         &dev,
         &mut scratch,
         footer,
+        BASE,
     ));
     assert!(matches!(res, Err(Error::CorruptBlock { id }) if id == footer));
 }
@@ -357,6 +362,7 @@ fn get_at(
         dev,
         &mut scratch,
         footer,
+        BASE,
     ))?;
     let n = block_on(reader.get_at(&mut scratch, &mut decomp, key, &mut buf, max_seq))?;
     Ok(n.map(|n| buf[..n].to_vec()))
@@ -388,6 +394,7 @@ fn version_run_crossing_blocks() {
             val: &vals[i],
             seq: s,
             tombstone: false,
+            expire_at: 0,
         });
     }
     for (i, v) in (1..=VERSIONS).rev().enumerate() {
@@ -396,6 +403,7 @@ fn version_run_crossing_blocks() {
             val: &vals[3 + i],
             seq: v,
             tombstone: false,
+            expire_at: 0,
         });
     }
     items.push(SstEntry {
@@ -403,6 +411,7 @@ fn version_run_crossing_blocks() {
         val: &vals[3 + 500], // 3 `a` values + 500 `k` versions precede `z`
         seq: 3000,
         tombstone: false,
+        expire_at: 0,
     });
     let (n, data_blocks) = write(&items, &mut dev);
     assert!(

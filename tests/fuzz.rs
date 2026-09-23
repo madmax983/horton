@@ -161,10 +161,11 @@ fn sstable_corpus(base: u64) -> (MemDevice<BLOCK>, Vec<[u8; BLOCK]>, u64) {
             val: v,
             seq: i as u64 + 1,
             tombstone: i % 13 == 12,
+            expire_at: 0,
         });
     let k = bloom_k(1024 * 8, 40);
     let nblocks = block_on(write_table::<_, BLOCK, 1024, 256>(
-        &mut dev, base, k, entries, None,
+        &mut dev, base, k, entries, None, 0,
     ))
     .unwrap();
     let pristine = dev.blocks_mut().clone();
@@ -182,6 +183,7 @@ fn sstable_corpus_is_valid() {
         &dev,
         &mut scratch,
         base + nblocks - 1,
+        base,
     ))
     .unwrap();
     let mut val_buf = [0u8; 1024];
@@ -221,6 +223,7 @@ fn sstable_decoder_never_panics() {
             &dev,
             &mut scratch,
             footer,
+            base,
         ));
         if let Ok(reader) = open {
             for j in 0..40u64 {
@@ -242,6 +245,7 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
         entry_count: 5,
+        rdel_blocks: 0,
     }
 }
 

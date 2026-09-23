@@ -164,3 +164,76 @@ fn post_compaction_state_is_coherent() {
     block_on(db.open()).unwrap();
     assert!(!db.compaction_pending());
 }
+
+/// Builds a database with range tombstones: 4 puts across 4 flushes (to
+/// fill L0 like [`build`]), with a range delete covering two keys in the
+/// second flush, so L0 holds tables with rdel sections.
+fn build_with_rdel() -> MemDevice<BLOCK> {
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
+    block_on(db.open()).unwrap();
+    for i in 0..4u8 {
+        block_on(db.put(&[b'k', b'0' + i], &[b'v', b'0' + i])).unwrap();
+        if i == 1 {
+            block_on(db.delete_range(b"k1", b"k3")).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    assert!(db.compaction_pending());
+    db.into_device()
+}
+
+/// Counts the block writes one L0→L1 job performs on the rdel database.
+fn count_rdel_compaction_writes() -> usize {
+    let dev = CountDevice {
+        inner: build_with_rdel(),
+        writes: 0,
+    };
+    let mut db = TestDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+    drive_one(&mut db);
+    db.into_device().writes
+}
+
+/// Runs build + one rdel compaction job with writes `>= crash_at` dropped.
+fn run_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
+    let dev: CrashDevice<MemDevice<BLOCK>, BLOCK> =
+        CrashDevice::new(build_with_rdel(), crash_at);
+    let mut db = TestDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+    drive_one(&mut db);
+    db.into_device().into_inner()
+}
+
+/// Exhaustive: every crash point of one L0→L1 compaction job carrying
+/// range tombstones (exercises the rdel two-pass count/write: the output
+/// reserves and streams rdel blocks before the data merge).
+///
+/// The manifest commit is the job's last device write, so a crash either
+/// lands it (post-compaction) or drops it (pre-compaction, orphans swept
+/// on open). The logical map is k0, k2, k3 live — k1 deleted by the range
+/// tombstone (k2's put is newer than the tombstone, so it survives) — in
+/// every case.
+#[test]
+fn crash_during_rdel_compaction_is_atomic() {
+    let w = count_rdel_compaction_writes();
+    // Sanity: the rdel section adds blocks vs the 5-write data-only job.
+    assert!(w > 5, "rdel output should write more blocks, got {w}");
+
+    let mut want = BTreeMap::new();
+    want.insert(vec![b'k', b'0'], vec![b'v', b'0']);
+    want.insert(vec![b'k', b'2'], vec![b'v', b'2']);
+    want.insert(vec![b'k', b'3'], vec![b'v', b'3']);
+
+    for crash_at in 0..=w {
+        let dev = run_rdel_crashed(crash_at);
+        let mut db = TestDb::new(dev, test_config());
+        let rep = block_on(db.open()).unwrap();
+        assert_eq!(live_map(&db), want, "crash_at={crash_at}");
+        assert_eq!(rep.recovered_records, 0, "crash_at={crash_at}");
+        if crash_at == w {
+            assert_eq!(rep.l0_tables, 0, "crash_at={crash_at}");
+        } else {
+            assert_eq!(rep.l0_tables, 4, "crash_at={crash_at}");
+        }
+    }
+}

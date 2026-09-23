@@ -37,6 +37,12 @@ pub enum Op {
     Put = 1,
     /// Delete a key (tombstone).
     Delete = 2,
+    /// Delete a key range `[key, val)`: `key` is the inclusive start,
+    /// `val` the exclusive end.
+    RangeDelete = 3,
+    /// Insert with an absolute expiry tick: like [`Op::Put`] with an 8-byte
+    /// little-endian `expire_at` appended after the value.
+    PutTtl = 4,
 }
 
 impl Op {
@@ -52,6 +58,8 @@ impl Op {
         match byte {
             1 => Some(Self::Put),
             2 => Some(Self::Delete),
+            3 => Some(Self::RangeDelete),
+            4 => Some(Self::PutTtl),
             _ => None,
         }
     }
@@ -62,11 +70,22 @@ const fn record_len(key_len: usize, val_len: usize) -> usize {
     WAL_RECORD_OVERHEAD + key_len + val_len
 }
 
+/// Total encoded length of a [`Op::PutTtl`] record: like [`record_len`]
+/// plus the 8-byte expiry.
+const fn record_len_ttl(key_len: usize, val_len: usize) -> usize {
+    WAL_RECORD_OVERHEAD + key_len + val_len + 8
+}
+
 /// Serializes one record into `out`.
 ///
-/// Precondition: `out.len() >= record_len(key.len(), val.len())`,
+/// For [`Op::PutTtl`], `extra` carries the 8-byte little-endian `expire_at`
+/// appended after the value; for every other op it is empty (enforced by
+/// [`WalWriter::append`] vs [`WalWriter::append_ttl`]).
+///
+/// Precondition: `out.len() >= record_len(key.len(), val.len()) + extra.len()`,
 /// `key.len() <= 0xFFFF`, and `val.len() <= 0xFFFF` (upheld by
 /// [`WalWriter::append`]). Returns the bytes written.
+#[allow(clippy::too_many_arguments)]
 fn encode_record(
     out: &mut [u8],
     seq: u64,
@@ -75,11 +94,21 @@ fn encode_record(
     key_len: u16,
     val: &[u8],
     val_len: u16,
+    extra: &[u8],
 ) -> usize {
     let kl = usize::from(key_len);
     let vl = usize::from(val_len);
-    // len covers seq..=crc32: 8 + 1 + 2 + 2 + kl + vl + 4 = 17 + kl + vl.
-    let len = 17u32 + u32::from(key_len) + u32::from(val_len);
+    let el = extra.len();
+    // `extra` is either empty or the 8-byte TTL expiry (precondition,
+    // upheld by the caller). The length field must cover exactly the
+    // bytes written below; the debug_assert ties the two together — a
+    // defensive clamp on one side only would desync them.
+    debug_assert!(el == 0 || el == 8);
+    let el32: u32 = if el == 8 { 8 } else { 0 };
+    debug_assert_eq!(el, el32 as usize);
+    // len covers seq..=crc32: 8 + 1 + 2 + 2 + kl + vl + el + 4. No
+    // overflow: key_len/val_len are u16 and `extra` is at most 8 bytes.
+    let len = 17u32 + u32::from(key_len) + u32::from(val_len) + el32;
     out[0..2].copy_from_slice(&WAL_MAGIC.to_le_bytes());
     out[2..6].copy_from_slice(&len.to_le_bytes());
     out[6..14].copy_from_slice(&seq.to_le_bytes());
@@ -88,10 +117,11 @@ fn encode_record(
     out[17..19].copy_from_slice(&val_len.to_le_bytes());
     out[19..19 + kl].copy_from_slice(&key[..kl]);
     out[19 + kl..19 + kl + vl].copy_from_slice(&val[..vl]);
-    let crc_end = 19 + kl + vl;
+    out[19 + kl + vl..19 + kl + vl + el].copy_from_slice(extra);
+    let crc_end = 19 + kl + vl + el;
     let crc = crc32(&out[2..crc_end]);
     out[crc_end..crc_end + 4].copy_from_slice(&crc.to_le_bytes());
-    record_len(kl, vl)
+    record_len(kl, vl) + el
 }
 
 /// A successfully decoded record, borrowing the input block.
@@ -100,6 +130,8 @@ struct Decoded<'a> {
     op: Op,
     key: &'a [u8],
     val: &'a [u8],
+    /// For [`Op::PutTtl`]: the absolute expiry tick; 0 otherwise.
+    expire_at: u64,
     total_len: usize,
 }
 
@@ -156,12 +188,20 @@ fn decode_record(buf: &[u8]) -> Option<Decoded<'_>> {
     let op = Op::from_u8(buf[14])?;
     let kl = usize::from(u16::from_le_bytes([buf[15], buf[16]]));
     let vl = usize::from(u16::from_le_bytes([buf[17], buf[18]]));
-    if WAL_RECORD_OVERHEAD - 6 + kl + vl != len {
+    // A PutTtl record carries 8 expiry bytes after the value.
+    let el = if op == Op::PutTtl { 8 } else { 0 };
+    if WAL_RECORD_OVERHEAD - 6 + kl + vl + el != len {
         return None;
     }
     let key = buf.get(19..19 + kl)?;
     let val = buf.get(19 + kl..19 + kl + vl)?;
-    let crc_at = 19 + kl + vl;
+    let expiry_off = 19 + kl + vl;
+    let expire_at = if op == Op::PutTtl {
+        u64::from_le_bytes(buf.get(expiry_off..expiry_off + 8)?.try_into().ok()?)
+    } else {
+        0
+    };
+    let crc_at = expiry_off + el;
     let stored = u32::from_le_bytes(buf.get(crc_at..crc_at + 4)?.try_into().ok()?);
     if crc32(buf.get(2..crc_at)?) != stored {
         return None;
@@ -171,6 +211,7 @@ fn decode_record(buf: &[u8]) -> Option<Decoded<'_>> {
         op,
         key,
         val,
+        expire_at,
         total_len: total,
     })
 }
@@ -290,7 +331,10 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     }
 
     /// Appends a record to the staging buffer. Not durable until
-    /// [`commit`](WalWriter::commit). For [`Op::Delete`], `val` is ignored.
+    /// [`commit`](WalWriter::commit). For [`Op::Delete`], `val` is ignored;
+    /// for [`Op::RangeDelete`], `key` is the inclusive start and `val` the
+    /// exclusive end. [`Op::PutTtl`] cannot be appended here — use
+    /// [`append_ttl`](WalWriter::append_ttl), which carries the expiry.
     ///
     /// # Errors
     ///
@@ -305,6 +349,38 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         key: &[u8],
         val: &[u8],
     ) -> Result<(), Error<D::Error>> {
+        debug_assert_ne!(op, Op::PutTtl, "PutTtl needs append_ttl");
+        self.append_inner(seq, op, key, val, 0).await
+    }
+
+    /// Appends a [`Op::PutTtl`] record: like [`append`](WalWriter::append)
+    /// with [`Op::Put`], plus the absolute expiry tick `expire_at` (a value
+    /// with `expire_at <= now` reads as absent; 0 means "never expires" and
+    /// is stored as a plain [`Op::Put`]).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`append`](WalWriter::append).
+    pub async fn append_ttl(
+        &mut self,
+        seq: u64,
+        key: &[u8],
+        val: &[u8],
+        expire_at: u64,
+    ) -> Result<(), Error<D::Error>> {
+        let op = if expire_at == 0 { Op::Put } else { Op::PutTtl };
+        self.append_inner(seq, op, key, val, expire_at).await
+    }
+
+    /// Shared append path; `expire_at` is used only for [`Op::PutTtl`].
+    async fn append_inner(
+        &mut self,
+        seq: u64,
+        op: Op,
+        key: &[u8],
+        val: &[u8],
+        expire_at: u64,
+    ) -> Result<(), Error<D::Error>> {
         let key_len = u16::try_from(key.len()).map_err(|_| Error::KeyTooLarge {
             len: key.len(),
             max: usize::from(u16::MAX),
@@ -314,13 +390,19 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             len: vlen,
             max: usize::from(u16::MAX),
         })?;
-        let rlen = record_len(key.len(), vlen);
+        let rlen = if op == Op::PutTtl {
+            record_len_ttl(key.len(), vlen)
+        } else {
+            record_len(key.len(), vlen)
+        };
         if rlen > BLOCK {
             return Err(Error::NoSpace);
         }
         if self.stage_len + rlen > BLOCK {
             self.write_stage().await?;
         }
+        let expiry = expire_at.to_le_bytes();
+        let extra = if op == Op::PutTtl { &expiry[..] } else { &[] };
         let n = encode_record(
             &mut self.stage[self.stage_len..],
             seq,
@@ -329,6 +411,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             key_len,
             &val[..vlen],
             val_len,
+            extra,
         );
         debug_assert_eq!(n, rlen);
         self.stage_len += n;
@@ -458,16 +541,35 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             while off < BLOCK {
                 match scan_record(&block[off..]) {
                     Scan::Record(rec) => {
-                        let tombstone = rec.op == Op::Delete;
                         if rec.seq > state.max_seq {
                             state.max_seq = rec.seq;
                         }
                         // Stale pre-wrap records: already in a table, never
                         // replayed (see the `seq_floor` docs above).
                         if rec.seq > seq_floor {
-                            table
-                                .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
-                                .map_err(|_| Error::CorruptWal { offset: id })?;
+                            match rec.op {
+                                Op::RangeDelete => {
+                                    table
+                                        .insert_range_del::<D::Error>(rec.key, rec.val, rec.seq)
+                                        .map_err(|_| Error::CorruptWal { offset: id })?;
+                                }
+                                Op::PutTtl => {
+                                    table
+                                        .insert_ttl::<D::Error>(
+                                            rec.key,
+                                            rec.val,
+                                            rec.seq,
+                                            rec.expire_at,
+                                        )
+                                        .map_err(|_| Error::CorruptWal { offset: id })?;
+                                }
+                                _ => {
+                                    let tombstone = rec.op == Op::Delete;
+                                    table
+                                        .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
+                                        .map_err(|_| Error::CorruptWal { offset: id })?;
+                                }
+                            }
                             state.records += 1;
                         }
                         off += rec.total_len;

@@ -45,6 +45,8 @@ struct ScanCursor<const KEY_MAX: usize> {
     seq: u64,
     tombstone: bool,
     val_len: usize,
+    /// Absolute expiry tick of the head entry; 0 = no expiry.
+    expire_at: u64,
 }
 
 impl<const KEY_MAX: usize> ScanCursor<KEY_MAX> {
@@ -65,6 +67,7 @@ impl<const KEY_MAX: usize> ScanCursor<KEY_MAX> {
             seq: 0,
             tombstone: false,
             val_len: 0,
+            expire_at: 0,
         }
     }
 }
@@ -99,6 +102,9 @@ pub struct Scan<
     end_len: usize,
     has_end: bool,
     max_seq: u64,
+    /// Caller-supplied clock for TTL reads: values with nonzero
+    /// `expire_at <= now` are suppressed.
+    now: u64,
     /// Physical block as last read (CRC-verified); `block` below is the
     /// logical block inflated from it. Shared block buffer; `block_id`
     /// says what it currently holds.
@@ -117,6 +123,8 @@ pub struct Scan<
     mem_seq: u64,
     mem_tombstone: bool,
     mem_live: bool,
+    /// Absolute expiry tick of the memtable head; 0 = no expiry.
+    mem_expire_at: u64,
     /// One cursor row per level; `cursor_counts[li]` says how many of row
     /// `li` are in use. (Nested rather than flat: stable Rust forbids
     /// const-generic products like `LEVELS * TABLES` in array lengths.)
@@ -152,6 +160,7 @@ impl<
             end_len: 0,
             has_end: false,
             max_seq: u64::MAX,
+            now: 0,
             raw: [0u8; BLOCK],
             block: [0u8; BLOCK],
             block_id: None,
@@ -163,6 +172,7 @@ impl<
             mem_seq: 0,
             mem_tombstone: false,
             mem_live: false,
+            mem_expire_at: 0,
             cursors: [[ScanCursor::empty(); TABLES]; LEVELS],
             cursor_counts: [0; LEVELS],
         }
@@ -191,6 +201,23 @@ impl<
         end: Option<&[u8]>,
         max_seq: u64,
     ) -> Result<(), Error<D::Error>> {
+        self.seek_with_time(start, end, max_seq, 0).await
+    }
+
+    /// Timed seek: like [`seek`](Scan::seek), but values whose `expire_at`
+    /// is nonzero and `<= now` are suppressed, and range tombstones hide
+    /// the keys they cover. Callers without a clock pass `now = 0`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`seek`](Scan::seek).
+    pub async fn seek_with_time(
+        &mut self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        max_seq: u64,
+        now: u64,
+    ) -> Result<(), Error<D::Error>> {
         if start.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
                 len: start.len(),
@@ -218,6 +245,7 @@ impl<
         self.start[..start.len()].copy_from_slice(start);
         self.start_len = start.len();
         self.max_seq = max_seq;
+        self.now = now;
         self.block_id = None;
 
         // Copy the shared ref: everything derived from it lives
@@ -304,8 +332,9 @@ impl<
             let mut winner_tombstone = false;
             let mut winner_key_len = 0usize;
             let mut winner_val_len = 0usize;
+            let mut winner_expire_at = 0u64;
             for src in 0..=total {
-                let Some((k, seq, tomb, vlen)) = self.head(src) else {
+                let Some((k, seq, tomb, vlen, exp)) = self.head(src) else {
                     continue;
                 };
                 if k != min_key {
@@ -317,6 +346,7 @@ impl<
                     winner_tombstone = tomb;
                     winner_key_len = k.len();
                     winner_val_len = vlen;
+                    winner_expire_at = exp;
                 }
             }
             let (winner_bid, winner_off, winner_end) = if winner_src == 0 {
@@ -326,13 +356,12 @@ impl<
                 let c = &self.cursors[wli][wti];
                 (c.block_id, c.off, c.end)
             };
-            // Buffer checks and the key copy happen *before* any cursor
-            // advances, so BufferTooSmall never consumes an entry.
-            if winner_key_len > key_buf.len() {
-                return Err(Error::BufferTooSmall {
-                    need: winner_key_len,
-                });
-            }
+            // The winner key is materialized into a local buffer first, so a
+            // hidden winner (tombstone, range-covered, or expired) never
+            // touches the caller's buffers: a hidden key must not fail
+            // the scan with `BufferTooSmall`, and its bytes are still
+            // needed to advance past it below.
+            let mut wkey = [0u8; KEY_MAX];
             {
                 let wk: &[u8] = if winner_src == 0 {
                     &self.mem_key[..winner_key_len]
@@ -340,29 +369,53 @@ impl<
                     let (wli, wti) = self.cursor_pos(winner_src);
                     &self.cursors[wli][wti].key[..winner_key_len]
                 };
-                key_buf[..winner_key_len].copy_from_slice(wk);
+                wkey[..winner_key_len].copy_from_slice(wk);
             }
-            if !winner_tombstone && winner_val_len > val_buf.len() {
+            let wkey = &wkey[..winner_key_len];
+            // Range tombstones and TTL expiry shadow the point winner: a
+            // covering range tombstone newer than the winning version, or a
+            // winning value with `expire_at <= now`, hides the key. An
+            // expired winner never falls through to an older version.
+            let covered = self
+                .covering_rdel_seq(wkey)
+                .await?
+                .is_some_and(|q| q > winner_seq);
+            let expired =
+                !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
+            if winner_tombstone || covered || expired {
+                // Hidden: advance past the key without yielding it and
+                // without demanding caller buffer space for it.
+                self.advance_past_key(wkey, total).await?;
+                continue;
+            }
+            // Buffer checks and the key copy happen *before* any cursor
+            // advances, so BufferTooSmall never consumes an entry.
+            if winner_key_len > key_buf.len() {
+                return Err(Error::BufferTooSmall {
+                    need: winner_key_len,
+                });
+            }
+            key_buf[..winner_key_len].copy_from_slice(wkey);
+            if winner_val_len > val_buf.len() {
                 return Err(Error::BufferTooSmall {
                     need: winner_val_len,
                 });
             }
             // Copy the winner's value while its cursor is still parked.
-            if !winner_tombstone {
-                if winner_src == 0 {
-                    val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
-                } else {
-                    self.ensure_block(winner_bid).await?;
-                    let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
-                        &self.block,
-                        winner_off,
-                        winner_end,
-                        winner_bid,
-                    )
-                    .map_err(|_| Error::CorruptBlock { id: winner_bid })?;
-                    debug_assert_eq!(entry.val.len(), winner_val_len);
-                    val_buf[..entry.val.len()].copy_from_slice(entry.val);
-                }
+            // (A tombstone winner continued above, so this always copies.)
+            if winner_src == 0 {
+                val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
+            } else {
+                self.ensure_block(winner_bid).await?;
+                let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
+                    &self.block,
+                    winner_off,
+                    winner_end,
+                    winner_bid,
+                )
+                .map_err(|_| Error::CorruptBlock { id: winner_bid })?;
+                debug_assert_eq!(entry.val.len(), winner_val_len);
+                val_buf[..entry.val.len()].copy_from_slice(entry.val);
             }
             // Advance every head sitting on the minimum key — the winner
             // included. Compare against the copy in `key_buf`: the heads
@@ -372,9 +425,6 @@ impl<
             // otherwise an older version would be yielded as a duplicate.
             self.advance_past_key(&key_buf[..winner_key_len], total)
                 .await?;
-            if winner_tombstone {
-                continue;
-            }
             return Ok(Some((winner_key_len, winner_val_len)));
         }
     }
@@ -455,16 +505,26 @@ impl<
         li: usize,
         start: &[u8],
     ) -> Result<(), Error<D::Error>> {
-        let data_blocks =
-            u64::from(tref.block_count)
-                .checked_sub(3)
-                .ok_or(Error::CorruptBlock {
-                    id: tref.first_block,
-                })?;
-        if data_blocks == 0 {
-            return Err(Error::CorruptBlock {
+        // The data section starts after the table's range-tombstone
+        // section; the scan cursor walks data blocks only.
+        let data_first = tref
+            .first_block
+            .checked_add(u64::from(tref.rdel_blocks))
+            .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
-            });
+            })?;
+        let data_blocks = u64::from(tref.block_count)
+            .checked_sub(u64::from(tref.rdel_blocks))
+            .and_then(|n| n.checked_sub(3))
+            .ok_or(Error::CorruptBlock {
+                id: tref.first_block,
+            })?;
+        if data_blocks == 0 {
+            // Range-only table (flush or compaction carrying nothing but
+            // range tombstones): no point cursor to add. Its rdel section
+            // still shadows keys via the separate covering probes, which
+            // walk the manifest, not the cursors.
+            return Ok(());
         }
         let footer = tref
             .first_block
@@ -483,7 +543,7 @@ impl<
         // lookups; the scan cursor walks blocks on its own.)
         let block_idx = match data_id {
             Some((id, _)) => id
-                .checked_sub(tref.first_block)
+                .checked_sub(data_first)
                 .ok_or(Error::CorruptBlock { id })?,
             None => 0,
         };
@@ -492,8 +552,7 @@ impl<
                 id: tref.first_block,
             });
         }
-        let bid = tref
-            .first_block
+        let bid = data_first
             .checked_add(block_idx)
             .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
@@ -506,10 +565,11 @@ impl<
         }
         let ti = self.cursor_counts[li];
         self.cursors[li][ti] = ScanCursor {
-            first_block: tref.first_block,
+            first_block: data_first,
             data_blocks,
             block_idx,
             block_id: bid,
+            expire_at: 0,
             off: 0,
             next: 0,
             end,
@@ -578,19 +638,21 @@ impl<
                         entry.seq,
                         entry.tombstone,
                         entry.val.len(),
+                        entry.expire_at,
                         off,
                         next,
                     ));
                 }
                 off = next;
             };
-            if let Some((key, klen, seq, tomb, vlen, eoff, next)) = parked {
+            if let Some((key, klen, seq, tomb, vlen, exp, eoff, next)) = parked {
                 let c = &mut self.cursors[li][ti];
                 c.key = key;
                 c.key_len = klen;
                 c.seq = seq;
                 c.tombstone = tomb;
                 c.val_len = vlen;
+                c.expire_at = exp;
                 c.off = eoff;
                 c.next = next;
                 c.live = true;
@@ -625,8 +687,11 @@ impl<
         let db = self.db;
         self.mem_live = false;
         while self.mem_idx < db.memtable().slot_len() {
+            // Range-tombstone slots sort by their start key but are not
+            // point versions: the merge never yields them as entries.
             if let Some(v) = db.memtable().slot_view(self.mem_idx)
                 && v.seq <= max_seq
+                && !v.range_del
             {
                 self.mem_key[..v.key.len()].copy_from_slice(v.key);
                 self.mem_key_len = v.key.len();
@@ -634,6 +699,7 @@ impl<
                 self.mem_val_len = v.val.len();
                 self.mem_seq = v.seq;
                 self.mem_tombstone = v.tombstone;
+                self.mem_expire_at = v.expire_at;
                 self.mem_live = true;
                 return;
             }
@@ -685,24 +751,71 @@ impl<
         }
     }
 
-    /// Head `(key, seq, tombstone, val_len)` of a source, or `None` when
-    /// exhausted. Source 0 is the memtable; sources 1..=total are table
-    /// cursors in level-major order. One `cursor_pos` lookup instead of
-    /// the two `head_key`/`head_meta` used to cost a caller needing both.
-    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize)> {
+    /// Head `(key, seq, tombstone, val_len, expire_at)` of a source, or
+    /// `None` when exhausted. Source 0 is the memtable; sources 1..=total
+    /// are table cursors in level-major order. One `cursor_pos` lookup
+    /// instead of the two `head_key`/`head_meta` used to cost a caller
+    /// needing both.
+    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize, u64)> {
         if src == 0 {
             self.mem_live.then_some((
                 &self.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
+                self.mem_expire_at,
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
             let c = &self.cursors[li][ti];
-            c.live
-                .then_some((&c.key[..c.key_len], c.seq, c.tombstone, c.val_len))
+            c.live.then_some((
+                &c.key[..c.key_len],
+                c.seq,
+                c.tombstone,
+                c.val_len,
+                c.expire_at,
+            ))
         }
+    }
+
+    /// Highest range-tombstone sequence at/below `max_seq` covering `key`,
+    /// across the memtable and every table with a range-tombstone section —
+    /// or `None` when no range tombstone covers `key`. Tables without an
+    /// rdel section, and tables whose `[first_key, last_key]` cannot contain
+    /// `key`, are skipped without I/O. (`last_key` carries the greatest
+    /// exclusive rdel end inclusively, so the bound prune is a conservative
+    /// superset: it may probe a table whose rdels miss, never skip one
+    /// whose rdels hit.)
+    async fn covering_rdel_seq(&self, key: &[u8]) -> Result<Option<u64>, Error<D::Error>> {
+        let max_seq = self.max_seq;
+        let db = self.db;
+        let mut best: Option<u64> = db.memtable().max_covering_rdel(key, max_seq);
+        let mut scratch = [0u8; BLOCK];
+        for li in 0..LEVELS {
+            let tables = db.manifest_ref().level(li).unwrap_or(&[]);
+            for tref in tables {
+                if tref.rdel_blocks == 0 {
+                    continue;
+                }
+                if tref.first_key.as_slice() > key || tref.last_key.as_slice() < key {
+                    continue;
+                }
+                if let Some(q) = sstable::covering_rdel_seq_in(
+                    db.device(),
+                    &mut scratch,
+                    tref.first_block,
+                    tref.rdel_blocks,
+                    key,
+                    max_seq,
+                )
+                .await?
+                    && best.is_none_or(|b| q > b)
+                {
+                    best = Some(q);
+                }
+            }
+        }
+        Ok(best)
     }
 }
 
@@ -731,6 +844,8 @@ struct RevCursor<const KEY_MAX: usize> {
     seq: u64,
     tombstone: bool,
     val_len: usize,
+    /// Absolute expiry tick of the head entry; 0 = no expiry.
+    expire_at: u64,
 }
 
 impl<const KEY_MAX: usize> RevCursor<KEY_MAX> {
@@ -747,6 +862,7 @@ impl<const KEY_MAX: usize> RevCursor<KEY_MAX> {
             seq: 0,
             tombstone: false,
             val_len: 0,
+            expire_at: 0,
         }
     }
 }
@@ -777,8 +893,8 @@ impl<const KEY_MAX: usize> RevCursor<KEY_MAX> {
 /// cursor per table. No allocation, no hidden buffering.
 ///
 /// A reverse block head: key bytes, key length, sequence number,
-/// tombstone flag, value length, and entry offset.
-type RevHead<const KEY_MAX: usize> = ([u8; KEY_MAX], usize, u64, bool, usize, usize);
+/// tombstone flag, value length, expiry tick, and entry offset.
+type RevHead<const KEY_MAX: usize> = ([u8; KEY_MAX], usize, u64, bool, usize, u64, usize);
 /// A reverse block head plus its block location: head, block id, entries
 /// end, and block index within the table.
 type RevHeadAt<const KEY_MAX: usize> = (
@@ -787,6 +903,7 @@ type RevHeadAt<const KEY_MAX: usize> = (
     u64,
     bool,
     usize,
+    u64,
     usize,
     u64,
     usize,
@@ -827,6 +944,9 @@ pub struct RevScan<
     lower_len: usize,
     has_lower: bool,
     max_seq: u64,
+    /// Caller-supplied clock for TTL reads: values with nonzero
+    /// `expire_at <= now` are suppressed.
+    now: u64,
     /// Physical block as last read (CRC-verified); `block` below is the
     /// logical block inflated from it. Shared block buffer; `block_id`
     /// says what it currently holds.
@@ -846,6 +966,8 @@ pub struct RevScan<
     mem_seq: u64,
     mem_tombstone: bool,
     mem_live: bool,
+    /// Absolute expiry tick of the memtable head; 0 = no expiry.
+    mem_expire_at: u64,
     /// One cursor row per level; `cursor_counts[li]` says how many of row
     /// `li` are in use. (Nested rather than flat: stable Rust forbids
     /// const-generic products like `LEVELS * TABLES` in array lengths.)
@@ -881,6 +1003,7 @@ impl<
             lower_len: 0,
             has_lower: false,
             max_seq: u64::MAX,
+            now: 0,
             raw: [0u8; BLOCK],
             block: [0u8; BLOCK],
             block_id: None,
@@ -892,6 +1015,7 @@ impl<
             mem_seq: 0,
             mem_tombstone: false,
             mem_live: false,
+            mem_expire_at: 0,
             cursors: [[RevCursor::empty(); TABLES]; LEVELS],
             cursor_counts: [0; LEVELS],
         }
@@ -917,6 +1041,24 @@ impl<
         from: &[u8],
         lower: Option<&[u8]>,
         max_seq: u64,
+    ) -> Result<(), Error<D::Error>> {
+        self.seek_prev_with_time(from, lower, max_seq, 0).await
+    }
+
+    /// Timed reverse seek: like [`seek_prev`](RevScan::seek_prev), but
+    /// values whose `expire_at` is nonzero and `<= now` are suppressed,
+    /// and range tombstones hide the keys they cover. Callers without a
+    /// clock pass `now = 0`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`seek_prev`](RevScan::seek_prev).
+    pub async fn seek_prev_with_time(
+        &mut self,
+        from: &[u8],
+        lower: Option<&[u8]>,
+        max_seq: u64,
+        now: u64,
     ) -> Result<(), Error<D::Error>> {
         if from.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
@@ -947,6 +1089,7 @@ impl<
             self.ceil_len = from.len();
         }
         self.max_seq = max_seq;
+        self.now = now;
         let db = self.db;
         // Memtable cursor: last slot at/below `from` (or the last slot
         // when `from` is empty).
@@ -1030,8 +1173,9 @@ impl<
             let mut winner_tombstone = false;
             let mut winner_key_len = 0usize;
             let mut winner_val_len = 0usize;
+            let mut winner_expire_at = 0u64;
             for src in 0..=total {
-                let Some((k, seq, tomb, vlen)) = self.head(src) else {
+                let Some((k, seq, tomb, vlen, exp)) = self.head(src) else {
                     continue;
                 };
                 if k != max_key {
@@ -1043,6 +1187,7 @@ impl<
                     winner_tombstone = tomb;
                     winner_key_len = k.len();
                     winner_val_len = vlen;
+                    winner_expire_at = exp;
                 }
             }
             let (winner_bid, winner_off, winner_end) = if winner_src == 0 {
@@ -1052,13 +1197,12 @@ impl<
                 let c = &self.cursors[wli][wti];
                 (c.block_id, c.off, c.end)
             };
-            // Buffer checks and the key copy happen *before* any cursor
-            // advances, so BufferTooSmall never consumes an entry.
-            if winner_key_len > key_buf.len() {
-                return Err(Error::BufferTooSmall {
-                    need: winner_key_len,
-                });
-            }
+            // The winner key is materialized into a local buffer first, so a
+            // hidden winner (tombstone, range-covered, or expired) never
+            // touches the caller's buffers: a hidden key must not fail
+            // the scan with `BufferTooSmall`, and its bytes are still
+            // needed to advance past it below.
+            let mut wkey = [0u8; KEY_MAX];
             {
                 let wk: &[u8] = if winner_src == 0 {
                     &self.mem_key[..winner_key_len]
@@ -1066,29 +1210,53 @@ impl<
                     let (wli, wti) = self.cursor_pos(winner_src);
                     &self.cursors[wli][wti].key[..winner_key_len]
                 };
-                key_buf[..winner_key_len].copy_from_slice(wk);
+                wkey[..winner_key_len].copy_from_slice(wk);
             }
-            if !winner_tombstone && winner_val_len > val_buf.len() {
+            let wkey = &wkey[..winner_key_len];
+            // Range tombstones and TTL expiry shadow the point winner: a
+            // covering range tombstone newer than the winning version, or a
+            // winning value with `expire_at <= now`, hides the key. An
+            // expired winner never falls through to an older version.
+            let covered = self
+                .covering_rdel_seq(wkey)
+                .await?
+                .is_some_and(|q| q > winner_seq);
+            let expired =
+                !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
+            if winner_tombstone || covered || expired {
+                // Hidden: advance past the key without yielding it and
+                // without demanding caller buffer space for it.
+                self.advance_past_key_rev(wkey, total).await?;
+                continue;
+            }
+            // Buffer checks and the key copy happen *before* any cursor
+            // advances, so BufferTooSmall never consumes an entry.
+            if winner_key_len > key_buf.len() {
+                return Err(Error::BufferTooSmall {
+                    need: winner_key_len,
+                });
+            }
+            key_buf[..winner_key_len].copy_from_slice(wkey);
+            if winner_val_len > val_buf.len() {
                 return Err(Error::BufferTooSmall {
                     need: winner_val_len,
                 });
             }
             // Copy the winner's value while its cursor is still parked.
-            if !winner_tombstone {
-                if winner_src == 0 {
-                    val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
-                } else {
-                    self.ensure_block(winner_bid).await?;
-                    let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
-                        &self.block,
-                        winner_off,
-                        winner_end,
-                        winner_bid,
-                    )
-                    .map_err(|_| Error::CorruptBlock { id: winner_bid })?;
-                    debug_assert_eq!(entry.val.len(), winner_val_len);
-                    val_buf[..entry.val.len()].copy_from_slice(entry.val);
-                }
+            // (A tombstone winner continued above, so this always copies.)
+            if winner_src == 0 {
+                val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
+            } else {
+                self.ensure_block(winner_bid).await?;
+                let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
+                    &self.block,
+                    winner_off,
+                    winner_end,
+                    winner_bid,
+                )
+                .map_err(|_| Error::CorruptBlock { id: winner_bid })?;
+                debug_assert_eq!(entry.val.len(), winner_val_len);
+                val_buf[..entry.val.len()].copy_from_slice(entry.val);
             }
             // Advance every head sitting on the maximum key — the winner
             // included. Compare against the copy in `key_buf`: the heads
@@ -1099,9 +1267,6 @@ impl<
             // duplicate.
             self.advance_past_key_rev(&key_buf[..winner_key_len], total)
                 .await?;
-            if winner_tombstone {
-                continue;
-            }
             return Ok(Some((winner_key_len, winner_val_len)));
         }
     }
@@ -1213,16 +1378,26 @@ impl<
         li: usize,
         from: &[u8],
     ) -> Result<(), Error<D::Error>> {
-        let data_blocks =
-            u64::from(tref.block_count)
-                .checked_sub(3)
-                .ok_or(Error::CorruptBlock {
-                    id: tref.first_block,
-                })?;
-        if data_blocks == 0 {
-            return Err(Error::CorruptBlock {
+        // The data section starts after the table's range-tombstone
+        // section; the scan cursor walks data blocks only.
+        let data_first = tref
+            .first_block
+            .checked_add(u64::from(tref.rdel_blocks))
+            .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
-            });
+            })?;
+        let data_blocks = u64::from(tref.block_count)
+            .checked_sub(u64::from(tref.rdel_blocks))
+            .and_then(|n| n.checked_sub(3))
+            .ok_or(Error::CorruptBlock {
+                id: tref.first_block,
+            })?;
+        if data_blocks == 0 {
+            // Range-only table (flush or compaction carrying nothing but
+            // range tombstones): no point cursor to add. Its rdel section
+            // still shadows keys via the separate covering probes, which
+            // walk the manifest, not the cursors.
+            return Ok(());
         }
         let footer = tref
             .first_block
@@ -1245,7 +1420,7 @@ impl<
                 index_id,
             )? {
                 Some(id) => id
-                    .checked_sub(tref.first_block)
+                    .checked_sub(data_first)
                     .ok_or(Error::CorruptBlock { id })?,
                 None => return Ok(()),
             }
@@ -1255,8 +1430,7 @@ impl<
                 id: tref.first_block,
             });
         }
-        let bid = tref
-            .first_block
+        let bid = data_first
             .checked_add(block_idx)
             .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
@@ -1269,7 +1443,7 @@ impl<
         }
         let ti = self.cursor_counts[li];
         self.cursors[li][ti] = RevCursor {
-            first_block: tref.first_block,
+            first_block: data_first,
             block_idx,
             block_id: bid,
             off: 0,
@@ -1280,6 +1454,7 @@ impl<
             seq: 0,
             tombstone: false,
             val_len: 0,
+            expire_at: 0,
         };
         self.cursor_counts[li] += 1;
         // Park at the inclusive ceiling, or unconditionally at the last
@@ -1334,7 +1509,7 @@ impl<
                 (c.block_id, c.end, c.block_idx, c.first_block)
             };
             self.ensure_block(bid).await?;
-            if let Some((key, klen, seq, tomb, vlen, off)) =
+            if let Some((key, klen, seq, tomb, vlen, exp, off)) =
                 self.search_block_rev(bid, end, bound_copy, max_seq)?
             {
                 // A version run can straddle data blocks: when the
@@ -1344,13 +1519,13 @@ impl<
                 // Following the run is what keeps a backward walker from
                 // settling on a stale version it met first.
                 let fkey = self.block_first_key(end, bid)?;
-                let (key, klen, seq, tomb, vlen, off, bid, end, idx) =
+                let (key, klen, seq, tomb, vlen, exp, off, bid, end, idx) =
                     if idx > 0 && key[..klen] == *fkey {
                         self.resolve_run(first, idx, &key[..klen], max_seq)
                             .await?
-                            .unwrap_or((key, klen, seq, tomb, vlen, off, bid, end, idx))
+                            .unwrap_or((key, klen, seq, tomb, vlen, exp, off, bid, end, idx))
                     } else {
-                        (key, klen, seq, tomb, vlen, off, bid, end, idx)
+                        (key, klen, seq, tomb, vlen, exp, off, bid, end, idx)
                     };
                 let c = &mut self.cursors[li][ti];
                 c.key = key;
@@ -1358,6 +1533,7 @@ impl<
                 c.seq = seq;
                 c.tombstone = tomb;
                 c.val_len = vlen;
+                c.expire_at = exp;
                 c.off = off;
                 c.block_id = bid;
                 c.end = end;
@@ -1422,9 +1598,11 @@ impl<
             match self.search_block_rev(pbid, pend, Some((&kk[..klen], true)), max_seq)? {
                 // A single binding avoids clippy's similar-names lint; the
                 // tuple fields are (key, key_len, seq, tombstone, val_len,
-                // offset) per `RevHead`.
+                // expire_at, offset) per `RevHead`.
                 Some(hit) if hit.0[..hit.1] == kk[..klen] => {
-                    best = Some((hit.0, hit.1, hit.2, hit.3, hit.4, hit.5, pbid, pend, pidx));
+                    best = Some((
+                        hit.0, hit.1, hit.2, hit.3, hit.4, hit.5, hit.6, pbid, pend, pidx,
+                    ));
                     // The run can only straddle further while it starts at
                     // this block's first key.
                     if hit.0[..hit.1] != *self.block_first_key(pend, pbid)? {
@@ -1446,8 +1624,8 @@ impl<
     /// Searches the loaded block (`bid`, entries ending at `end`) for the
     /// greatest entry satisfying `bound` with `seq <= max_seq`. Returns
     /// the entry's key bytes, key length, seq, tombstone flag, value
-    /// length, and offset — or `None` when the block holds no qualifying
-    /// entry.
+    /// length, expiry tick, and offset — or `None` when the block holds
+    /// no qualifying entry.
     ///
     /// Positioning binary-searches the restart points for the last
     /// restart that can lead to a qualifying entry, then walks regions
@@ -1603,6 +1781,7 @@ impl<
                             entry.seq,
                             entry.tombstone,
                             entry.val.len(),
+                            entry.expire_at,
                             off,
                         ));
                     }
@@ -1654,8 +1833,11 @@ impl<
         let db = self.db;
         self.mem_live = false;
         while self.mem_idx < db.memtable().slot_len() {
+            // Range-tombstone slots sort by their start key but are not
+            // point versions: the merge never yields them as entries.
             if let Some(v) = db.memtable().slot_view(self.mem_idx)
                 && v.seq <= max_seq
+                && !v.range_del
             {
                 self.mem_key[..v.key.len()].copy_from_slice(v.key);
                 self.mem_key_len = v.key.len();
@@ -1663,6 +1845,7 @@ impl<
                 self.mem_val_len = v.val.len();
                 self.mem_seq = v.seq;
                 self.mem_tombstone = v.tombstone;
+                self.mem_expire_at = v.expire_at;
                 self.mem_live = true;
                 return;
             }
@@ -1717,23 +1900,70 @@ impl<
         }
     }
 
-    /// Head `(key, seq, tombstone, val_len)` of a source, or `None` when
-    /// exhausted. Source 0 is the memtable; sources 1..=total are table
-    /// cursors in level-major order. One `cursor_pos` lookup instead of
-    /// the two `head_key`/`head_meta` used to cost a caller needing both.
-    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize)> {
+    /// Head `(key, seq, tombstone, val_len, expire_at)` of a source, or
+    /// `None` when exhausted. Source 0 is the memtable; sources 1..=total
+    /// are table cursors in level-major order. One `cursor_pos` lookup
+    /// instead of the two `head_key`/`head_meta` used to cost a caller
+    /// needing both.
+    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize, u64)> {
         if src == 0 {
             self.mem_live.then_some((
                 &self.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
+                self.mem_expire_at,
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
             let c = &self.cursors[li][ti];
-            c.live
-                .then_some((&c.key[..c.key_len], c.seq, c.tombstone, c.val_len))
+            c.live.then_some((
+                &c.key[..c.key_len],
+                c.seq,
+                c.tombstone,
+                c.val_len,
+                c.expire_at,
+            ))
         }
+    }
+
+    /// Highest range-tombstone sequence at/below `max_seq` covering `key`,
+    /// across the memtable and every table with a range-tombstone section —
+    /// or `None` when no range tombstone covers `key`. Tables without an
+    /// rdel section, and tables whose `[first_key, last_key]` cannot contain
+    /// `key`, are skipped without I/O. (`last_key` carries the greatest
+    /// exclusive rdel end inclusively, so the bound prune is a conservative
+    /// superset: it may probe a table whose rdels miss, never skip one
+    /// whose rdels hit.)
+    async fn covering_rdel_seq(&self, key: &[u8]) -> Result<Option<u64>, Error<D::Error>> {
+        let max_seq = self.max_seq;
+        let db = self.db;
+        let mut best: Option<u64> = db.memtable().max_covering_rdel(key, max_seq);
+        let mut scratch = [0u8; BLOCK];
+        for li in 0..LEVELS {
+            let tables = db.manifest_ref().level(li).unwrap_or(&[]);
+            for tref in tables {
+                if tref.rdel_blocks == 0 {
+                    continue;
+                }
+                if tref.first_key.as_slice() > key || tref.last_key.as_slice() < key {
+                    continue;
+                }
+                if let Some(q) = sstable::covering_rdel_seq_in(
+                    db.device(),
+                    &mut scratch,
+                    tref.first_block,
+                    tref.rdel_blocks,
+                    key,
+                    max_seq,
+                )
+                .await?
+                    && best.is_none_or(|b| q > b)
+                {
+                    best = Some(q);
+                }
+            }
+        }
+        Ok(best)
     }
 }

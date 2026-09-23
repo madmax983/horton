@@ -20,6 +20,11 @@ struct Slot {
     val_len: u16,
     seq: u64,
     tombstone: bool,
+    /// True for a range tombstone: `key` is the inclusive start, the
+    /// value bytes hold the exclusive end.
+    range_del: bool,
+    /// Absolute expiry tick for TTL puts; 0 = no expiry.
+    expire_at: u64,
 }
 
 impl Slot {
@@ -30,6 +35,8 @@ impl Slot {
         val_len: 0,
         seq: 0,
         tombstone: false,
+        range_del: false,
+        expire_at: 0,
     };
 }
 
@@ -42,6 +49,9 @@ pub struct Lookup<'a> {
     pub seq: u64,
     /// True when this entry is a deletion marker.
     pub tombstone: bool,
+    /// Absolute expiry tick; 0 = no expiry. Reads suppress the value when
+    /// `expire_at <= now`.
+    pub expire_at: u64,
 }
 
 /// One memtable entry, borrowed. Yielded by [`MemTable::iter`] in
@@ -56,12 +66,18 @@ pub struct Entry<
 > {
     /// Key bytes.
     pub key: &'a [u8],
-    /// Value bytes (empty for tombstones).
+    /// Value bytes (empty for tombstones; the range end for range
+    /// tombstones).
     pub val: &'a [u8],
     /// Sequence number of the mutation that wrote this entry.
     pub seq: u64,
     /// True when this entry is a deletion marker.
     pub tombstone: bool,
+    /// True for a range tombstone: `key` is the inclusive start, `val` the
+    /// exclusive end.
+    pub range_del: bool,
+    /// Absolute expiry tick; 0 = no expiry.
+    pub expire_at: u64,
 }
 
 /// Key-ascending, sequence-descending iterator over memtable entries.
@@ -94,6 +110,8 @@ impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_M
             val: &self.table.arena[voff..voff + vl],
             seq: slot.seq,
             tombstone: slot.tombstone,
+            range_del: slot.range_del,
+            expire_at: slot.expire_at,
         })
     }
 }
@@ -127,6 +145,19 @@ struct Plan {
     key_len: u16,
     val_off: u32,
     val_len: u16,
+}
+
+/// The slot contents [`MemTable::apply`] writes beyond the [`Plan`]
+/// offsets: key/value bytes plus the per-version metadata. Bundled so the
+/// apply call stays under the argument-count lint.
+#[derive(Clone, Copy)]
+struct Apply<'a> {
+    key: &'a [u8],
+    val: &'a [u8],
+    seq: u64,
+    tombstone: bool,
+    range_del: bool,
+    expire_at: u64,
 }
 
 impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize> Default
@@ -270,7 +301,59 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         })
     }
 
-    fn apply(&mut self, plan: Plan, key: &[u8], val: &[u8], seq: u64, tombstone: bool) {
+    /// Validates a range-tombstone insert: both bounds are non-empty keys
+    /// within `KEY_MAX`, with `start < end`.
+    fn plan_range_del<E>(&self, start: &[u8], end: &[u8]) -> Result<Plan, Error<E>> {
+        for bound in [start, end] {
+            if bound.is_empty() {
+                return Err(Error::EmptyKey);
+            }
+            if bound.len() > KEY_MAX {
+                return Err(Error::KeyTooLarge {
+                    len: bound.len(),
+                    max: KEY_MAX,
+                });
+            }
+        }
+        if start >= end {
+            // Empty or inverted range: nothing to shadow. The Db API
+            // no-ops these before the WAL; this arm is belt-and-braces
+            // for direct memtable users.
+            return Err(Error::EmptyKey);
+        }
+        let pos = match self.find_run(start) {
+            Ok(run) => run,
+            Err(pos) => pos,
+        };
+        if self.len >= CAP {
+            return Err(Error::TableFull);
+        }
+        let need = start.len() + end.len();
+        if self.arena_len + need > ARENA {
+            return Err(Error::ArenaFull);
+        }
+        let key_off = u32::try_from(self.arena_len).map_err(|_| Error::ArenaFull)?;
+        let key_len = u16::try_from(start.len()).map_err(|_| Error::KeyTooLarge {
+            len: start.len(),
+            max: KEY_MAX,
+        })?;
+        let val_off = key_off
+            .checked_add(u32::from(key_len))
+            .ok_or(Error::ArenaFull)?;
+        let val_len = u16::try_from(end.len()).map_err(|_| Error::KeyTooLarge {
+            len: end.len(),
+            max: KEY_MAX,
+        })?;
+        Ok(Plan {
+            pos,
+            key_off,
+            key_len,
+            val_off,
+            val_len,
+        })
+    }
+
+    fn apply(&mut self, plan: Plan, a: Apply<'_>) {
         let Plan {
             pos,
             key_off,
@@ -282,8 +365,8 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         let vl = usize::from(val_len);
         let koff = key_off as usize;
         let voff = val_off as usize;
-        self.arena[koff..koff + kl].copy_from_slice(&key[..kl]);
-        self.arena[voff..voff + vl].copy_from_slice(&val[..vl]);
+        self.arena[koff..koff + kl].copy_from_slice(&a.key[..kl]);
+        self.arena[voff..voff + vl].copy_from_slice(&a.val[..vl]);
         self.arena_len = voff + vl;
         self.slots.copy_within(pos..self.len, pos + 1);
         self.slots[pos] = Slot {
@@ -291,12 +374,14 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             key_len,
             val_off,
             val_len,
-            seq,
-            tombstone,
+            seq: a.seq,
+            tombstone: a.tombstone,
+            range_del: a.range_del,
+            expire_at: a.expire_at,
         };
         self.len += 1;
-        if seq > self.max_seq {
-            self.max_seq = seq;
+        if a.seq > self.max_seq {
+            self.max_seq = a.seq;
         }
     }
 
@@ -327,7 +412,91 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         tombstone: bool,
     ) -> Result<(), Error<E>> {
         let plan = self.plan(key, val, tombstone)?;
-        self.apply(plan, key, val, seq, tombstone);
+        self.apply(
+            plan,
+            Apply {
+                key,
+                val,
+                seq,
+                tombstone,
+                range_del: false,
+                expire_at: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Appends `key`'s new version with an absolute expiry tick
+    /// (`expire_at == 0` means no expiry). Same ordering contract as
+    /// [`insert`](MemTable::insert).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EmptyKey`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`],
+    /// [`Error::TableFull`], or [`Error::ArenaFull`].
+    pub fn insert_ttl<E>(
+        &mut self,
+        key: &[u8],
+        val: &[u8],
+        seq: u64,
+        expire_at: u64,
+    ) -> Result<(), Error<E>> {
+        let plan = self.plan(key, val, false)?;
+        self.apply(
+            plan,
+            Apply {
+                key,
+                val,
+                seq,
+                tombstone: false,
+                range_del: false,
+                expire_at,
+            },
+        );
+        Ok(())
+    }
+
+    /// Appends a range tombstone `[start, end)`. The slot sorts by `start`
+    /// and stores `end` in the value bytes; it is invisible to
+    /// [`get_at`](MemTable::get_at) and counted by
+    /// [`max_covering_rdel`](MemTable::max_covering_rdel). The caller must
+    /// pass `start < end` (the [`Db`](crate::Db) API no-ops empty ranges
+    /// before the WAL, so recovery never replays one either).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EmptyKey`], [`Error::KeyTooLarge`], [`Error::TableFull`],
+    /// or [`Error::ArenaFull`].
+    pub fn insert_range_del<E>(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        seq: u64,
+    ) -> Result<(), Error<E>> {
+        let plan = self.plan_range_del(start, end)?;
+        self.apply(
+            plan,
+            Apply {
+                key: start,
+                val: end,
+                seq,
+                tombstone: true,
+                range_del: true,
+                expire_at: 0,
+            },
+        );
+        Ok(())
+    }
+
+    /// Validates a range-tombstone insert (both bounds are keys) without
+    /// mutating the table.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EmptyKey`], [`Error::KeyTooLarge`], [`Error::TableFull`],
+    /// or [`Error::ArenaFull`].
+    pub fn check_insert_range_del<E>(&self, start: &[u8], end: &[u8]) -> Result<(), Error<E>> {
+        let _plan = self.plan_range_del(start, end)?;
         Ok(())
     }
 
@@ -347,6 +516,12 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             if self.slot_key(slot) != key {
                 break;
             }
+            // Range tombstones sort by their start key but are not
+            // versions of `key`: skip them in the run walk.
+            if slot.range_del {
+                idx += 1;
+                continue;
+            }
             if slot.seq <= max_seq {
                 let voff = slot.val_off as usize;
                 let vl = usize::from(slot.val_len);
@@ -354,11 +529,36 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
                     val: &self.arena[voff..voff + vl],
                     seq: slot.seq,
                     tombstone: slot.tombstone,
+                    expire_at: slot.expire_at,
                 });
             }
             idx += 1;
         }
         None
+    }
+
+    /// Highest sequence number at or below `max_seq` of a range tombstone
+    /// covering `key` (`start <= key < end`), or `None` when no live
+    /// tombstone covers it. Linear in the slot count: range tombstones are
+    /// rare, and point lookups already paid the binary search.
+    #[must_use]
+    pub fn max_covering_rdel(&self, key: &[u8], max_seq: u64) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        for slot in &self.slots[..self.len] {
+            if !slot.range_del || slot.seq > max_seq {
+                continue;
+            }
+            let koff = slot.key_off as usize;
+            let kl = usize::from(slot.key_len);
+            let voff = slot.val_off as usize;
+            let vl = usize::from(slot.val_len);
+            let start = &self.arena[koff..koff + kl];
+            let end = &self.arena[voff..voff + vl];
+            if start <= key && key < end && best.is_none_or(|b| slot.seq > b) {
+                best = Some(slot.seq);
+            }
+        }
+        best
     }
 
     /// Iterates entries in key-ascending, sequence-descending order. Used
@@ -392,6 +592,8 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             val: &self.arena[voff..voff + vl],
             seq: slot.seq,
             tombstone: slot.tombstone,
+            range_del: slot.range_del,
+            expire_at: slot.expire_at,
         })
     }
 
@@ -417,6 +619,10 @@ pub(crate) struct SlotView<'a> {
     pub seq: u64,
     /// True when this entry is a deletion marker.
     pub tombstone: bool,
+    /// True for a range tombstone (scan iterators skip these).
+    pub range_del: bool,
+    /// Absolute expiry tick; 0 = no expiry.
+    pub expire_at: u64,
 }
 
 impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize>

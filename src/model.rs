@@ -22,6 +22,13 @@
 //!    core of one scan step, [`model_keep_set`] the exact per-key keep-set
 //!    the compaction merge emits, and [`model_may_drop_tombstone`] the rule
 //!    that keeps compaction from breaking snapshot isolation.
+//! 3. **Range deletes + TTL.** A range tombstone is a pseudo-version: it
+//!    joins the per-key winner race at its own sequence number, and a
+//!    winning value with `expire_at <= now` is suppressed to absent.
+//!    [`model_visible_value`] is that rule, and
+//!    [`model_ttl_emit_tombstone`] pins compaction's purge emission:
+//!    an expired value becomes a tombstone at the same sequence number —
+//!    never a silent drop (see its docs for why the drop is unsound).
 
 /// One key-version in the model: a mutation's sequence number and whether
 /// it was a deletion.
@@ -223,6 +230,79 @@ pub const fn model_manifest_recover(a: SlotState, b: SlotState) -> Option<u64> {
         (SlotState::Invalid, SlotState::Valid(sb)) => Some(sb),
         (SlotState::Invalid, SlotState::Invalid) => None,
     }
+}
+
+/// One key-version in the range/TTL model: a point mutation plus its
+/// expiry (0 = none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersionTtl {
+    /// Sequence number assigned to the mutation.
+    pub seq: u64,
+    /// True for a deletion marker.
+    pub tombstone: bool,
+    /// Absolute expiry tick; 0 means the value never expires.
+    pub expire_at: u64,
+}
+
+/// Models winner selection for one key under range deletes and TTL.
+///
+/// The candidate set is the key's point versions plus one pseudo-version
+/// per range tombstone covering the key (`covering_rdels`, already
+/// restricted to tombstones whose range contains the key; sequences above
+/// `max_seq` are filtered here). Among candidates with `seq <= max_seq`,
+/// the highest sequence number wins. A tombstone winner — point or range —
+/// hides the key. A value winner with `expire_at != 0 && expire_at <= now`
+/// is suppressed: the read observes absence, exactly like `get_at` and the
+/// scans behave.
+///
+/// Returns `true` iff the key reads as a live value.
+#[must_use]
+pub fn model_visible_value(
+    versions: &[VersionTtl],
+    covering_rdels: &[u64],
+    max_seq: u64,
+    now: u64,
+) -> bool {
+    // (winning seq, point-version index or None for a range tombstone).
+    let mut win: Option<(u64, Option<usize>)> = None;
+    for (i, v) in versions.iter().enumerate() {
+        if v.seq <= max_seq && win.is_none_or(|(s, _)| v.seq > s) {
+            win = Some((v.seq, Some(i)));
+        }
+    }
+    for &q in covering_rdels {
+        if q <= max_seq && win.is_none_or(|(s, _)| q > s) {
+            win = Some((q, None));
+        }
+    }
+    match win {
+        Some((_, Some(i))) => {
+            let v = versions[i];
+            !v.tombstone && (v.expire_at == 0 || v.expire_at > now)
+        }
+        // Range-tombstone winner, or nothing visible: absent.
+        _ => false,
+    }
+}
+
+/// Models compaction's TTL purge emission rule.
+///
+/// A value version with `expire_at != 0 && expire_at <= purge_before` is
+/// emitted as a point tombstone **at the same sequence number** — never
+/// dropped, even when it is not the key's newest version.
+///
+/// Why the drop is unsound: take versions `v2@10` (expired) and `v1@5`
+/// (live), purge cutoff reached. A snapshot read at `max_seq = 7` sees
+/// `v1@5` and returns it — correct. But a read at `max_seq = 12` must see
+/// absence: the newest visible version is the expired `v2`. Drop `v2` and
+/// the `max_seq = 12` read falls through to `v1@5` and returns a value the
+/// pre-compaction database hid. The expired version is load-bearing for
+/// every view in `[v2.seq, next_newer.seq)`; converting it to a tombstone
+/// preserves each of those views exactly, and the ordinary tombstone
+/// keep/drop rules then apply.
+#[must_use]
+pub const fn model_ttl_emit_tombstone(expire_at: u64, purge_before: u64) -> bool {
+    expire_at != 0 && expire_at <= purge_before
 }
 
 #[cfg(test)]
@@ -427,5 +507,96 @@ mod tests {
         let (kept, n) = model_keep_set(&[], &[5], true, 5);
         assert_eq!(n, 0);
         assert_eq!(kept, [0usize; MODEL_MAX_SNAPSHOTS + 1]);
+    }
+
+    #[test]
+    fn visible_value_range_tombstone_wins() {
+        let vs = [VersionTtl {
+            seq: 5,
+            tombstone: false,
+            expire_at: 0,
+        }];
+        // Covering tombstone at seq 7 shadows the value; at max_seq 6 the
+        // value is still visible; above it the key is absent.
+        assert!(model_visible_value(&vs, &[7], 6, 0));
+        assert!(!model_visible_value(&vs, &[7], 7, 0));
+        assert!(!model_visible_value(&vs, &[7], u64::MAX, 0));
+        // Tombstone above max_seq is invisible.
+        assert!(model_visible_value(&vs, &[9], 8, 0));
+    }
+
+    #[test]
+    fn visible_value_newer_point_beats_range_tombstone() {
+        let vs = [
+            VersionTtl {
+                seq: 9,
+                tombstone: false,
+                expire_at: 0,
+            },
+            VersionTtl {
+                seq: 5,
+                tombstone: false,
+                expire_at: 0,
+            },
+        ];
+        assert!(model_visible_value(&vs, &[7], u64::MAX, 0));
+        // Point tombstone winner hides the key even with no range tomb.
+        let vs2 = [
+            VersionTtl {
+                seq: 9,
+                tombstone: true,
+                expire_at: 0,
+            },
+            VersionTtl {
+                seq: 5,
+                tombstone: false,
+                expire_at: 0,
+            },
+        ];
+        assert!(!model_visible_value(&vs2, &[], u64::MAX, 0));
+    }
+
+    #[test]
+    fn visible_value_ttl_suppression() {
+        let vs = [VersionTtl {
+            seq: 5,
+            tombstone: false,
+            expire_at: 100,
+        }];
+        assert!(model_visible_value(&vs, &[], u64::MAX, 99));
+        assert!(model_visible_value(&vs, &[], u64::MAX, 0));
+        assert!(!model_visible_value(&vs, &[], u64::MAX, 100));
+        assert!(!model_visible_value(&vs, &[], u64::MAX, 1000));
+        // No expiry: never suppressed.
+        let vs2 = [VersionTtl {
+            seq: 5,
+            tombstone: false,
+            expire_at: 0,
+        }];
+        assert!(model_visible_value(&vs2, &[], u64::MAX, u64::MAX));
+        // TTL applies to the winner only: an expired older version under a
+        // live newer one is irrelevant.
+        let vs3 = [
+            VersionTtl {
+                seq: 9,
+                tombstone: false,
+                expire_at: 0,
+            },
+            VersionTtl {
+                seq: 5,
+                tombstone: false,
+                expire_at: 100,
+            },
+        ];
+        assert!(model_visible_value(&vs3, &[], u64::MAX, 1000));
+    }
+
+    #[test]
+    fn ttl_emit_tombstone_rule() {
+        assert!(model_ttl_emit_tombstone(100, 100));
+        assert!(model_ttl_emit_tombstone(50, 100));
+        assert!(!model_ttl_emit_tombstone(101, 100));
+        assert!(!model_ttl_emit_tombstone(0, u64::MAX));
+        assert!(!model_ttl_emit_tombstone(100, 0));
     }
 }

@@ -35,6 +35,7 @@ fn write_single(
         val,
         seq,
         tombstone,
+        expire_at: 0,
     };
     let plan = plan_table::<DevError, 4096, 256>(core::iter::once(entry())).expect("plan table");
     let k = bloom_k(1024 * 8, plan.entry_count);
@@ -44,6 +45,7 @@ fn write_single(
         k,
         core::iter::once(entry()),
         None,
+        0,
     ))
     .expect("write table");
     let total = plan.data_blocks + 3;
@@ -56,6 +58,7 @@ fn write_single(
         last_key: plan.last_key,
         max_seq: plan.max_seq,
         entry_count: u32::try_from(plan.entry_count).expect("entry count fits"),
+        rdel_blocks: 0,
     }
 }
 

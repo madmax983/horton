@@ -161,6 +161,7 @@ fn archive_roundtrip_bytes_verify_as_sstable() {
         &updev,
         &mut scratch,
         end - 1,
+        0,
     ))
     .expect("uploaded bytes form a valid SSTable");
     let mut vbuf = [0u8; 2048];

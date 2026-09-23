@@ -53,6 +53,9 @@ pub struct SstEntry<'a> {
     pub seq: u64,
     /// True for a deletion marker.
     pub tombstone: bool,
+    /// Absolute expiry tick; 0 = no expiry. Stored on the wire only for
+    /// non-tombstone entries (op byte [`Op::PutTtl`]).
+    pub expire_at: u64,
 }
 
 impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: usize>
@@ -65,6 +68,7 @@ impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_M
             val: e.val,
             seq: e.seq,
             tombstone: e.tombstone,
+            expire_at: e.expire_at,
         }
     }
 }
@@ -114,7 +118,13 @@ fn entry_sizes<E>(e: &SstEntry<'_>) -> Result<(usize, u16, u16), Error<E>> {
         len: vl_raw,
         max: usize::from(u16::MAX),
     })?;
-    Ok((ENTRY_HEADER + e.key.len() + vl_raw, kl, vl))
+    // TTL entries carry an 8-byte expiry after the value.
+    let ttl = if !e.tombstone && e.expire_at != 0 {
+        8
+    } else {
+        0
+    };
+    Ok((ENTRY_HEADER + e.key.len() + vl_raw + ttl, kl, vl))
 }
 
 /// Whether an entry of `elen` bytes fits in a data block holding `payload`
@@ -548,12 +558,24 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data[p..p + 2].copy_from_slice(&kl.to_le_bytes());
         self.data[p + 2..p + 4].copy_from_slice(&vl.to_le_bytes());
         self.data[p + 4..p + 12].copy_from_slice(&e.seq.to_le_bytes());
-        self.data[p + 12] = if e.tombstone { Op::Delete } else { Op::Put }.to_u8();
+        let ttl = !e.tombstone && e.expire_at != 0;
+        self.data[p + 12] = if e.tombstone {
+            Op::Delete
+        } else if ttl {
+            Op::PutTtl
+        } else {
+            Op::Put
+        }
+        .to_u8();
         let ko = p + ENTRY_HEADER;
         self.data[ko..ko + e.key.len()].copy_from_slice(e.key);
         // Tombstones store no value bytes.
         let vlen = if e.tombstone { 0 } else { e.val.len() };
         self.data[ko + e.key.len()..ko + e.key.len() + vlen].copy_from_slice(&e.val[..vlen]);
+        if ttl {
+            let eo = ko + e.key.len() + vlen;
+            self.data[eo..eo + 8].copy_from_slice(&e.expire_at.to_le_bytes());
+        }
         if self.block_first_len == 0 {
             self.block_first[..e.key.len()].copy_from_slice(e.key);
             self.block_first_len = e.key.len();
@@ -581,6 +603,11 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// index, and footer blocks and flushes the device. Reports the table's
     /// shape for the manifest's [`TableRef`](crate::manifest::TableRef).
     ///
+    /// `rdel_blocks` is the table's range-tombstone section length,
+    /// written by the caller *before* this writer's `base` (see
+    /// [`write_rdel_blocks`]); the footer records it so readers can find
+    /// the section.
+    ///
     /// # Errors
     ///
     /// [`Error::NoSpace`] when the table outgrows its pre-allocated run, or
@@ -592,6 +619,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         &mut self,
         device: &mut D,
         compress: Option<&mut CompressScratch<BLOCK>>,
+        rdel_blocks: u32,
     ) -> Result<FinishedTable<KEY_MAX>, Error<D::Error>> {
         if self.n > 0 {
             let id = self
@@ -647,7 +675,8 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         )
         .await?;
 
-        // Footer block: magic | index | bloom | entry_count | k.
+        // Footer block: magic | index | bloom | entry_count | k |
+        // rdel_blocks.
         let footer_id = index_id.checked_add(1).ok_or(Error::NoSpace)?;
         self.data.fill(0);
         self.data[0..8].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
@@ -655,7 +684,8 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data[16..24].copy_from_slice(&bloom_id.to_le_bytes());
         self.data[24..32].copy_from_slice(&self.entry_count.to_le_bytes());
         self.data[32] = self.k;
-        seal_block(device, footer_id, &mut self.data, 33, None, None).await?;
+        self.data[33..37].copy_from_slice(&rdel_blocks.to_le_bytes());
+        seal_block(device, footer_id, &mut self.data, 37, None, None).await?;
 
         // Table blocks are durable before the manifest commit makes them
         // visible.
@@ -707,6 +737,7 @@ pub async fn write_table<
     k: u8,
     entries: impl Iterator<Item = SstEntry<'a>>,
     compress: Option<&mut CompressScratch<BLOCK>>,
+    rdel_blocks: u32,
 ) -> Result<u64, Error<D::Error>>
 where
     D: BlockDevice,
@@ -718,8 +749,348 @@ where
     for e in entries {
         w.push(device, e, cs.as_deref_mut()).await?;
     }
-    let done = w.finish(device, cs).await?;
+    let done = w.finish(device, cs, rdel_blocks).await?;
     Ok(done.data_blocks + 3)
+}
+
+/// One range tombstone staged for a table's rdel section.
+#[derive(Debug, Clone, Copy)]
+pub struct RdelEntry<'a> {
+    /// Inclusive start (non-empty).
+    pub start: &'a [u8],
+    /// Exclusive end (non-empty).
+    pub end: &'a [u8],
+    /// Sequence number of the range delete.
+    pub seq: u64,
+}
+
+/// Trailer bytes of an rdel block: `count u16` + `crc32`.
+const RDEL_TRAILER: usize = 6;
+
+/// Planned shape of a table's range-tombstone section.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RdelPlan<'a> {
+    /// Blocks the section occupies (0 when there are no tombstones).
+    pub(crate) blocks: u32,
+    /// Smallest tombstone start (`None` when empty).
+    pub(crate) first: Option<&'a [u8]>,
+    /// Largest tombstone end (`None` when empty).
+    pub(crate) max_end: Option<&'a [u8]>,
+    /// Highest tombstone sequence number (0 when empty).
+    pub(crate) max_seq: u64,
+}
+
+/// Plans a table's range-tombstone section: block count, smallest start,
+/// largest end, highest sequence. Uses the exact packing rule as
+/// [`write_rdel_blocks`] so plan and write agree.
+pub(crate) fn plan_rdel_blocks<'a, E, const BLOCK: usize>(
+    rdels: impl Iterator<Item = RdelEntry<'a>>,
+) -> Result<RdelPlan<'a>, Error<E>> {
+    let mut blocks = 0u32;
+    let mut payload = 0usize;
+    let mut plan = RdelPlan {
+        blocks: 0,
+        first: None,
+        max_end: None,
+        max_seq: 0,
+    };
+    for r in rdels {
+        if plan.first.is_none() {
+            plan.first = Some(r.start);
+        }
+        if plan.max_end.is_none_or(|end| r.end > end) {
+            plan.max_end = Some(r.end);
+        }
+        if r.seq > plan.max_seq {
+            plan.max_seq = r.seq;
+        }
+        let el = rdel_entry_len::<E>(r.start.len(), r.end.len())?;
+        if el + RDEL_TRAILER > BLOCK {
+            return Err(Error::NoSpace);
+        }
+        if payload + el + RDEL_TRAILER > BLOCK {
+            blocks += 1;
+            payload = 0;
+        }
+        payload += el;
+    }
+    if payload > 0 {
+        blocks += 1;
+    }
+    plan.blocks = blocks;
+    Ok(plan)
+}
+
+/// Wire length of one rdel entry: `start_len u16 | end_len u16 | seq u64 |
+/// start | end`.
+fn rdel_entry_len<E>(start_len: usize, end_len: usize) -> Result<usize, Error<E>> {
+    start_len
+        .checked_add(end_len)
+        .and_then(|n| n.checked_add(12))
+        .ok_or(Error::NoSpace)
+}
+
+/// Seals one rdel block: entries at `[0..payload]`, `count u16` at
+/// `[BLOCK-6..BLOCK-4]`, CRC over `[0..BLOCK-4]`. Rdel blocks are never
+/// compressed (like bloom/index/footer).
+async fn seal_rdel_block<D: BlockDevice, const BLOCK: usize>(
+    device: &mut D,
+    id: u64,
+    buf: &mut [u8; BLOCK],
+    payload: usize,
+    count: u32,
+) -> Result<(), Error<D::Error>> {
+    let body_end = BLOCK - CRC_LEN;
+    buf[payload..body_end - 2].fill(0);
+    let count16 = u16::try_from(count).map_err(|_| Error::NoSpace)?;
+    buf[body_end - 2..body_end].copy_from_slice(&count16.to_le_bytes());
+    let crc = crc32(&buf[..body_end]);
+    buf[body_end..BLOCK].copy_from_slice(&crc.to_le_bytes());
+    poll_fn(|cx| device.poll_write_block(cx, id, buf))
+        .await
+        .map_err(Error::Device)?;
+    buf.fill(0);
+    Ok(())
+}
+
+/// Streaming writer for a table's range-tombstone section: `push` one
+/// tombstone at a time, `finish` seals the trailing partial block.
+/// Returns block counts, never allocates.
+///
+/// The section layout is `[rdel block]*`: entries packed greedily at
+/// `[0..payload]`, zero padding, `count u16` at `[BLOCK-6..BLOCK-4]`,
+/// CRC32 over `[0..BLOCK-4]`. Rdel blocks are never compressed.
+pub(crate) struct RdelWriter<const BLOCK: usize> {
+    base: u64,
+    buf: [u8; BLOCK],
+    payload: usize,
+    count: u32,
+    blocks: u32,
+}
+
+impl<const BLOCK: usize> RdelWriter<BLOCK> {
+    /// Writer for the section starting at `base`. `const`-constructible.
+    #[must_use]
+    pub(crate) const fn new(base: u64) -> Self {
+        Self {
+            base,
+            buf: [0u8; BLOCK],
+            payload: 0,
+            count: 0,
+            blocks: 0,
+        }
+    }
+
+    /// Appends one tombstone, sealing the current block first when the
+    /// entry no longer fits.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when the tombstone cannot fit in an empty
+    /// block, or [`Error::Device`] on I/O failure.
+    pub(crate) async fn push<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        r: RdelEntry<'_>,
+    ) -> Result<(), Error<D::Error>> {
+        let slen = u16::try_from(r.start.len()).map_err(|_| Error::KeyTooLarge {
+            len: r.start.len(),
+            max: usize::from(u16::MAX),
+        })?;
+        let elen = u16::try_from(r.end.len()).map_err(|_| Error::KeyTooLarge {
+            len: r.end.len(),
+            max: usize::from(u16::MAX),
+        })?;
+        let el = rdel_entry_len::<D::Error>(usize::from(slen), usize::from(elen))?;
+        if el + RDEL_TRAILER > BLOCK {
+            return Err(Error::NoSpace);
+        }
+        if self.payload + el + RDEL_TRAILER > BLOCK {
+            let id = self
+                .base
+                .checked_add(u64::from(self.blocks))
+                .ok_or(Error::NoSpace)?;
+            seal_rdel_block(device, id, &mut self.buf, self.payload, self.count).await?;
+            self.blocks += 1;
+            self.payload = 0;
+            self.count = 0;
+        }
+        let sl = usize::from(slen);
+        let elen_usize = usize::from(elen);
+        self.buf[self.payload..self.payload + 2].copy_from_slice(&slen.to_le_bytes());
+        self.buf[self.payload + 2..self.payload + 4].copy_from_slice(&elen.to_le_bytes());
+        self.buf[self.payload + 4..self.payload + 12].copy_from_slice(&r.seq.to_le_bytes());
+        self.buf[self.payload + 12..self.payload + 12 + sl].copy_from_slice(r.start);
+        self.buf[self.payload + 12 + sl..self.payload + 12 + sl + elen_usize]
+            .copy_from_slice(r.end);
+        self.payload += el;
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Seals the trailing partial block. Returns the total blocks
+    /// written — 0 when nothing was pushed (no section exists).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Device`] on I/O failure.
+    pub(crate) async fn finish<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+    ) -> Result<u32, Error<D::Error>> {
+        if self.count > 0 {
+            let id = self
+                .base
+                .checked_add(u64::from(self.blocks))
+                .ok_or(Error::NoSpace)?;
+            seal_rdel_block(device, id, &mut self.buf, self.payload, self.count).await?;
+            self.blocks += 1;
+            self.count = 0;
+            self.payload = 0;
+        }
+        Ok(self.blocks)
+    }
+}
+
+/// Exact block counter mirroring [`RdelWriter`]'s greedy packing: feed it
+/// the same entry sequence and [`finish`](RdelCounter::finish) returns the
+/// block count [`RdelWriter::finish`] would report. The compaction
+/// range-tombstone merge re-sorts entries across inputs, so its repacked
+/// block count is not bounded by the inputs' rdel block counts (a sorted
+/// merge is not a subsequence of the concatenation); the merge therefore
+/// counts exactly in a dry-run pass and reserves that many blocks.
+///
+/// The boundary logic here must stay identical to [`RdelWriter::push`]:
+/// a sealed block holds `payload` bytes with `payload + RDEL_TRAILER <=
+/// BLOCK`, sealing exactly when the next entry stops fitting.
+pub(crate) struct RdelCounter<const BLOCK: usize> {
+    payload: usize,
+    count: u32,
+    blocks: u32,
+}
+
+impl<const BLOCK: usize> RdelCounter<BLOCK> {
+    /// Counter for a section that would start at `base` (unused: counting
+    /// needs no I/O, but the shape mirrors [`RdelWriter::new`]).
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            payload: 0,
+            count: 0,
+            blocks: 0,
+        }
+    }
+
+    /// Accounts for one tombstone, sealing the current block first when
+    /// the entry no longer fits — exactly as [`RdelWriter::push`] does.
+    pub(crate) const fn push(&mut self, r: RdelEntry<'_>) {
+        // `RdelWriter::push` rejects an entry that cannot fit in an empty
+        // block with `NoSpace`; merged entries always came out of a valid
+        // block, so this cannot trigger and needs no error path.
+        let el = 12 + r.start.len() + r.end.len();
+        if self.payload + el + RDEL_TRAILER > BLOCK {
+            self.blocks += 1;
+            self.payload = 0;
+            self.count = 0;
+        }
+        self.payload += el;
+        self.count += 1;
+    }
+
+    /// Returns the total blocks the counted entries would occupy — 0 when
+    /// nothing was pushed, matching [`RdelWriter::finish`].
+    #[must_use]
+    pub(crate) const fn finish(&self) -> u32 {
+        if self.count > 0 {
+            self.blocks + 1
+        } else {
+            self.blocks
+        }
+    }
+}
+
+/// Writes a table's range-tombstone section at `[base, base+n)`: `rdels`
+/// in `(start asc, seq desc)` order, packed greedily into blocks. Returns
+/// the block count — 0 when `rdels` is empty (no section is written).
+///
+/// The blocks are durable only after the caller's commit-point flush: the
+/// data-section writer's [`TableWriter::finish`] flushes, and both flush
+/// and compaction call it after their rdel section is written.
+///
+/// # Errors
+///
+/// [`Error::NoSpace`] when a single tombstone cannot fit in an empty
+/// block, or [`Error::Device`] on I/O failure.
+pub(crate) async fn write_rdel_blocks<D, const BLOCK: usize>(
+    device: &mut D,
+    base: u64,
+    rdels: impl Iterator<Item = RdelEntry<'_>>,
+) -> Result<u32, Error<D::Error>>
+where
+    D: BlockDevice,
+{
+    let mut w = RdelWriter::<BLOCK>::new(base);
+    for r in rdels {
+        w.push(device, r).await?;
+    }
+    w.finish(device).await
+}
+
+/// Verifies an rdel block's CRC and returns its entry count.
+pub(crate) fn rdel_block_count<E, const BLOCK: usize>(
+    block: &[u8; BLOCK],
+    id: u64,
+) -> Result<usize, Error<E>> {
+    check_block_crc::<E, BLOCK>(block, id)?;
+    let raw = u16::from_le_bytes(
+        block[BLOCK - CRC_LEN - 2..BLOCK - CRC_LEN]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id })?,
+    );
+    // Rdel blocks are never compressed: bit 15 set is corruption, not the
+    // data-block compression flag.
+    if raw & 0x8000 != 0 {
+        return Err(Error::CorruptBlock { id });
+    }
+    Ok(usize::from(raw))
+}
+
+/// Parses the rdel entry at `off`: `(entry, next_offset)`. Panic-free:
+/// every offset is bounds- and overflow-checked. The caller maps `Err`
+/// to [`Error::CorruptBlock`] with the block id it already knows.
+pub(crate) fn rdel_parse_at(block: &[u8], off: usize) -> Result<(RdelEntry<'_>, usize), ()> {
+    let sl = usize::from(u16::from_le_bytes(
+        block
+            .get(off..off + 2)
+            .ok_or(())?
+            .try_into()
+            .map_err(|_| ())?,
+    ));
+    let el = usize::from(u16::from_le_bytes(
+        block
+            .get(off + 2..off + 4)
+            .ok_or(())?
+            .try_into()
+            .map_err(|_| ())?,
+    ));
+    // The writer never emits empty bounds; in a CRC-verified block an
+    // empty bound is corruption.
+    if sl == 0 || el == 0 {
+        return Err(());
+    }
+    let seq = u64::from_le_bytes(
+        block
+            .get(off + 4..off + 12)
+            .ok_or(())?
+            .try_into()
+            .map_err(|_| ())?,
+    );
+    let start_at = off.checked_add(12).ok_or(())?;
+    let start_end = start_at.checked_add(sl).ok_or(())?;
+    let end_end = start_end.checked_add(el).ok_or(())?;
+    let start = block.get(start_at..start_end).ok_or(())?;
+    let end = block.get(start_end..end_end).ok_or(())?;
+    Ok((RdelEntry { start, end, seq }, end_end))
 }
 
 /// Inflates a CRC-verified physical data block into its logical form.
@@ -785,6 +1156,8 @@ pub(crate) struct ParsedDataEntry<'a> {
     pub(crate) val: &'a [u8],
     pub(crate) seq: u64,
     pub(crate) tombstone: bool,
+    /// Absolute expiry tick; 0 = no expiry.
+    pub(crate) expire_at: u64,
     pub(crate) next: usize,
 }
 
@@ -812,6 +1185,7 @@ pub(crate) fn parse_data_entry<E, const BLOCK: usize>(
         val,
         seq: entry.seq,
         tombstone,
+        expire_at: entry.expire_at,
         next,
     })
 }
@@ -860,19 +1234,62 @@ fn append_index<E, const BLOCK: usize>(
 /// is wrong, an index entry fails to parse, or a pointer does not match
 /// the table's self-described original layout; or [`Error::Device`] on
 /// I/O failure.
+fn relocate_index_entries<E, const BLOCK: usize>(
+    scratch: &mut [u8; BLOCK],
+    index_id: u64,
+    payload_len: usize,
+    old_base: u64,
+    rdel: u64,
+    data_blocks: u64,
+    dst_base: u64,
+) -> Result<(), Error<E>> {
+    let mut off = 0usize;
+    while off < payload_len {
+        let (key_len, block_id, next) = match index_entry_parse(&scratch[..payload_len], off) {
+            Ok((key, block_id, next)) => (key.len(), block_id, next),
+            Err(()) if all_zero(&scratch[off..payload_len]) => break,
+            Err(()) => return Err(Error::CorruptBlock { id: index_id }),
+        };
+        let tblock = block_id
+            .checked_sub(old_base)
+            .ok_or(Error::CorruptBlock { id: index_id })?;
+        // Data blocks sit after the rdel section: `tblock` is a
+        // table-relative index into `[rdel, rdel + data_blocks)`.
+        if tblock < rdel
+            || tblock
+                >= rdel
+                    .checked_add(data_blocks)
+                    .ok_or(Error::CorruptBlock { id: index_id })?
+        {
+            return Err(Error::CorruptBlock { id: index_id });
+        }
+        let new_id = dst_base
+            .checked_add(tblock)
+            .ok_or(Error::CorruptBlock { id: index_id })?;
+        let id_off = off + 2 + key_len;
+        scratch[id_off..id_off + 8].copy_from_slice(&new_id.to_le_bytes());
+        off = next;
+    }
+    Ok(())
+}
+
 pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
     device: &mut D,
     dst_base: u64,
     block_count: u32,
+    rdel_blocks: u32,
     scratch: &mut [u8; BLOCK],
 ) -> Result<(), Error<D::Error>> {
-    let data_blocks = u64::from(
-        block_count
-            .checked_sub(3)
-            .ok_or(Error::CorruptBlock { id: dst_base })?,
-    );
+    let rdel = u64::from(rdel_blocks);
+    let data_blocks = u64::from(block_count)
+        .checked_sub(rdel)
+        .and_then(|n| n.checked_sub(3))
+        .ok_or(Error::CorruptBlock { id: dst_base })?;
+    // Data section starts after the rdel section: index and footer shift
+    // by the rdel count.
     let index_id = dst_base
-        .checked_add(data_blocks)
+        .checked_add(rdel)
+        .and_then(|b| b.checked_add(data_blocks))
         .and_then(|b| b.checked_add(1))
         .ok_or(Error::CorruptBlock { id: dst_base })?;
     let footer_id = index_id
@@ -905,7 +1322,8 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
             .map_err(|_| Error::CorruptBlock { id: footer_id })?,
     );
     // Structural check: bloom, index, footer are consecutive, so the
-    // original base is the bloom id minus the data-block count.
+    // original base is the bloom id minus the data-block count and the
+    // rdel-block count.
     if old_index
         != old_bloom
             .checked_add(1)
@@ -915,6 +1333,7 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
     }
     let old_base = old_bloom
         .checked_sub(data_blocks)
+        .and_then(|b| b.checked_sub(rdel))
         .ok_or(Error::CorruptBlock { id: footer_id })?;
 
     // Index block: rewrite each entry's absolute data-block id from the
@@ -923,26 +1342,15 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
         .await
         .map_err(Error::Device)?;
     check_block_crc::<D::Error, BLOCK>(scratch, index_id)?;
-    let mut off = 0usize;
-    while off < payload_len {
-        let (key_len, block_id, next) = match index_entry_parse(&scratch[..payload_len], off) {
-            Ok((key, block_id, next)) => (key.len(), block_id, next),
-            Err(()) if all_zero(&scratch[off..payload_len]) => break,
-            Err(()) => return Err(Error::CorruptBlock { id: index_id }),
-        };
-        let rel = block_id
-            .checked_sub(old_base)
-            .ok_or(Error::CorruptBlock { id: index_id })?;
-        if rel >= data_blocks {
-            return Err(Error::CorruptBlock { id: index_id });
-        }
-        let new_id = dst_base
-            .checked_add(rel)
-            .ok_or(Error::CorruptBlock { id: index_id })?;
-        let id_off = off + 2 + key_len;
-        scratch[id_off..id_off + 8].copy_from_slice(&new_id.to_le_bytes());
-        off = next;
-    }
+    relocate_index_entries::<D::Error, BLOCK>(
+        scratch,
+        index_id,
+        payload_len,
+        old_base,
+        rdel,
+        data_blocks,
+        dst_base,
+    )?;
     let crc = crc32(&scratch[..payload_len]);
     scratch[payload_len..BLOCK].copy_from_slice(&crc.to_le_bytes());
     poll_fn(|cx| device.poll_write_block(cx, index_id, scratch))
@@ -955,7 +1363,8 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
         .map_err(Error::Device)?;
     check_block_crc::<D::Error, BLOCK>(scratch, footer_id)?;
     let dst_bloom = dst_base
-        .checked_add(data_blocks)
+        .checked_add(rdel)
+        .and_then(|b| b.checked_add(data_blocks))
         .ok_or(Error::CorruptBlock { id: footer_id })?;
     let dst_index = dst_bloom
         .checked_add(1)
@@ -1183,6 +1592,8 @@ struct ParsedEntry<'a> {
     val: &'a [u8],
     seq: u64,
     op: Op,
+    /// For [`Op::PutTtl`]: the absolute expiry tick; 0 otherwise.
+    expire_at: u64,
 }
 
 /// Parses the entry at `off`: `(entry, next_offset)`.
@@ -1205,23 +1616,44 @@ fn data_entry_parse(payload: &[u8], off: usize) -> Result<(ParsedEntry<'_>, usiz
     let op = Op::from_u8(slice_at(payload, off + 12, 1)?[0]).ok_or(())?;
     let key = slice_at(payload, off + ENTRY_HEADER, kl)?;
     let val = slice_at(payload, off + ENTRY_HEADER + kl, vl)?;
-    let next = off
+    let mut next = off
         .checked_add(ENTRY_HEADER)
         .ok_or(())?
         .checked_add(kl)
         .ok_or(())?
         .checked_add(vl)
         .ok_or(())?;
+    // TTL entries carry an 8-byte expiry after the value.
+    let expire_at = if op == Op::PutTtl {
+        let bytes = slice_at(payload, next, 8)?;
+        next = next.checked_add(8).ok_or(())?;
+        u64::from_le_bytes(bytes.try_into().map_err(|_| ())?)
+    } else {
+        0
+    };
     if next > payload.len() {
         return Err(());
     }
-    Ok((ParsedEntry { key, val, seq, op }, next))
+    Ok((
+        ParsedEntry {
+            key,
+            val,
+            seq,
+            op,
+            expire_at,
+        },
+        next,
+    ))
 }
 
 /// What a data-block search found, with the entry's sequence number.
 enum DataHit {
-    /// Live value: byte length and sequence number.
-    Value(usize, u64),
+    /// Live value: byte length, sequence number, expiry tick (0 = none).
+    Value {
+        len: usize,
+        seq: u64,
+        expire_at: u64,
+    },
     /// Deletion marker: sequence number.
     Tombstone(u64),
 }
@@ -1325,10 +1757,11 @@ fn data_lookup<E>(
                             });
                         }
                         val_buf[..entry.val.len()].copy_from_slice(entry.val);
-                        return Ok(BlockOutcome::Hit(DataHit::Value(
-                            entry.val.len(),
-                            entry.seq,
-                        )));
+                        return Ok(BlockOutcome::Hit(DataHit::Value {
+                            len: entry.val.len(),
+                            seq: entry.seq,
+                            expire_at: entry.expire_at,
+                        }));
                     }
                     off = next;
                     if off >= rstart {
@@ -1369,6 +1802,9 @@ pub enum Lookup {
         len: usize,
         /// The entry's sequence number.
         seq: u64,
+        /// Absolute expiry tick; 0 = no expiry. The caller suppresses the
+        /// value when `expire_at <= now`.
+        expire_at: u64,
     },
     /// Deletion marker: shadows the same key in older tables.
     Tombstone {
@@ -1379,6 +1815,46 @@ pub enum Lookup {
     Missing,
 }
 
+/// Highest sequence number at or below `max_seq` of a range tombstone
+/// covering `key` in the rdel section starting at `rdel_first`
+/// (`rdel_blocks` blocks), or `None` when no live tombstone covers it.
+/// The reader-free form, for callers (like the scan merge) that walk
+/// tables without opening a [`TableReader`] per key.
+///
+/// # Errors
+///
+/// [`Error::CorruptBlock`] when an rdel block fails verification, or
+/// [`Error::Device`] on I/O failure.
+pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    scratch: &mut [u8; BLOCK],
+    rdel_first: u64,
+    rdel_blocks: u32,
+    key: &[u8],
+    max_seq: u64,
+) -> Result<Option<u64>, Error<D::Error>> {
+    let mut best: Option<u64> = None;
+    for b in 0..u64::from(rdel_blocks) {
+        let id = rdel_first
+            .checked_add(b)
+            .ok_or(Error::CorruptBlock { id: rdel_first })?;
+        poll_fn(|cx| device.poll_read_block(cx, id, scratch))
+            .await
+            .map_err(Error::Device)?;
+        let count = rdel_block_count::<D::Error, BLOCK>(scratch, id)?;
+        let mut off = 0usize;
+        for _ in 0..count {
+            let (e, next) =
+                rdel_parse_at(&scratch[..], off).map_err(|()| Error::CorruptBlock { id })?;
+            off = next;
+            if e.seq <= max_seq && e.start <= key && key < e.end && best.is_none_or(|s| e.seq > s) {
+                best = Some(e.seq);
+            }
+        }
+    }
+    Ok(best)
+}
+
 /// Point-lookup reader over one table. Holds a shared device reference;
 /// every lookup reuses the caller's scratch block.
 pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize> {
@@ -1387,13 +1863,19 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
     bloom_block: u64,
     entry_count: u64,
     k: u8,
+    /// First block of the range-tombstone section (`first_block` of the
+    /// table; the section precedes the data blocks).
+    rdel_first: u64,
+    /// Range-tombstone blocks, from the verified footer.
+    rdel_blocks: u32,
 }
 
 impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     TableReader<'d, D, BLOCK, BLOOM_BYTES>
 {
     /// Opens the table ending at `footer_block`: reads and verifies the
-    /// footer (magic + CRC).
+    /// footer (magic + CRC). `rdel_first` is the table's first block: the
+    /// range-tombstone section precedes the data blocks.
     ///
     /// # Errors
     ///
@@ -1403,6 +1885,7 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         device: &'d D,
         scratch: &mut [u8; BLOCK],
         footer_block: u64,
+        rdel_first: u64,
     ) -> Result<Self, Error<D::Error>> {
         poll_fn(|cx| device.poll_read_block(cx, footer_block, scratch))
             .await
@@ -1435,13 +1918,53 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
                 .try_into()
                 .map_err(|_| Error::CorruptBlock { id: footer_block })?,
         );
+        let rdel_blocks = u32::from_le_bytes(
+            scratch[33..37]
+                .try_into()
+                .map_err(|_| Error::CorruptBlock { id: footer_block })?,
+        );
         Ok(Self {
             device,
             index_block,
             bloom_block,
             entry_count,
             k,
+            rdel_first,
+            rdel_blocks,
         })
+    }
+
+    /// Range-tombstone blocks in this table (0 when the table has no
+    /// range-tombstone section).
+    #[must_use]
+    pub const fn rdel_blocks(&self) -> u32 {
+        self.rdel_blocks
+    }
+
+    /// Highest sequence number at or below `max_seq` of a range tombstone
+    /// covering `key`, or `None` when no live tombstone covers it. Reads
+    /// each rdel block once into `scratch`; corruption is
+    /// [`Error::CorruptBlock`], never a silent miss.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptBlock`] when an rdel block fails verification, or
+    /// [`Error::Device`] on I/O failure.
+    pub async fn covering_rdel_seq(
+        &self,
+        scratch: &mut [u8; BLOCK],
+        key: &[u8],
+        max_seq: u64,
+    ) -> Result<Option<u64>, Error<D::Error>> {
+        covering_rdel_seq_in(
+            self.device,
+            scratch,
+            self.rdel_first,
+            self.rdel_blocks,
+            key,
+            max_seq,
+        )
+        .await
     }
 
     /// The table's entry count (values plus tombstones), as recorded in
@@ -1600,8 +2123,16 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
                 Ok(false) => &scratch[..body_end],
             };
             match data_lookup::<D::Error>(body, key, val_buf, block_id, max_seq)? {
-                BlockOutcome::Hit(DataHit::Value(n, seq)) => {
-                    return Ok(Lookup::Value { len: n, seq });
+                BlockOutcome::Hit(DataHit::Value {
+                    len,
+                    seq,
+                    expire_at,
+                }) => {
+                    return Ok(Lookup::Value {
+                        len,
+                        seq,
+                        expire_at,
+                    });
                 }
                 BlockOutcome::Hit(DataHit::Tombstone(seq)) => return Ok(Lookup::Tombstone { seq }),
                 // A larger key was seen: later blocks only hold larger keys.

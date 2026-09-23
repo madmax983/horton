@@ -25,6 +25,7 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
         entry_count: 5,
+        rdel_blocks: 0,
     }
 }
 

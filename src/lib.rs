@@ -4,22 +4,25 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.13 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.15 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
 //! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
 //! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
 //! flush into `SSTables`, multi-level bloom-gated reads with key-range
 //! pruning and highest-sequence-wins), the [`Scan`] merge iterator with
-//! snapshot reads, atomic multi-op [`WriteBatch`] writes via
-//! [`Db::write`](Db::write), the archive API ([`Db::archive_plan`],
-//! [`Db::archive_commit`], [`ArchivePlan`]) — seal a table, stream its
-//! blocks to caller-owned remote storage through [`Db::device`], then
-//! forget it locally — and hand-rolled LZ77 block compression
-//! ([`compress`]): the writer trial-compresses every data block and keeps
-//! the compressed form when it saves at least
+//! snapshot reads and reverse iteration, atomic multi-op [`WriteBatch`]
+//! writes via [`Db::write`](Db::write), the archive API
+//! ([`Db::archive_plan`], [`Db::archive_commit`], [`ArchivePlan`]) — seal
+//! a table, stream its blocks to caller-owned remote storage through
+//! [`Db::device`], then forget it locally — hand-rolled LZ77 block
+//! compression ([`compress`]): the writer trial-compresses every data
+//! block and keeps the compressed form when it saves at least
 //! [`compress::COMPRESS_MIN_SAVING`] bytes; every read path decompresses
-//! transparently. See SPEC §9 for the tombstone rule: delete-bearing
-//! workloads archive only from the bottommost level.
+//! transparently — range deletes ([`Db::delete_range`](Db::delete_range))
+//! with per-range tombstone sections in every table, and absolute-tick
+//! TTLs ([`Db::put_with_ttl`](Db::put_with_ttl)) with read-time expiry
+//! and compaction-time purge. See SPEC §9 for the tombstone rule:
+//! delete-bearing workloads archive only from the bottommost level.
 
 #![no_std]
 #![forbid(unsafe_code)]

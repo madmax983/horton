@@ -205,4 +205,16 @@ impl Lcg {
             .wrapping_add(1_442_695_040_888_963_407);
         self.0 >> 33
     }
+
+    /// Returns the next value reduced modulo `bound` as a `usize`.
+    /// `bound` must be non-zero; the result is always `< bound`.
+    // Not `const`: mutates the generator state (test-only helper).
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn next_bounded(&mut self, bound: usize) -> usize {
+        // Widening: `usize` to `u64` is always exact.
+        let b = bound as u64;
+        // The remainder is `< bound`, so it fits in `usize` on any target
+        // where `bound` itself does.
+        usize::try_from(self.next() % b).unwrap_or(0)
+    }
 }

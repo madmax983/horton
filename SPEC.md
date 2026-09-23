@@ -1074,6 +1074,115 @@ floor (`seq <= manifest.max_seq`).
       watermark hiding the run's head (v19 selected over v4).
     - Audits: zero `unwrap`/`expect`/`panic!` in non-test `src/`;
       `#![no_std]` + `#![forbid(unsafe_code)]` hold; zero dependencies.
+- v0.15 — Range deletes + TTL.
+  - **Scope**: `Db::delete_range(start, end)` writes a range tombstone —
+    one sequence number shadowing every key in `[start, end)` — and
+    `Db::put_with_ttl(key, val, expire_at)` writes a value that reads
+    suppress once a caller-supplied time reaches `expire_at`. Horton owns
+    no clock: every read takes a `now: u64` (monotonic caller tick —
+    seconds, millis, or a logical epoch; only ordering matters), defaulting
+    to 0 ("no time has passed") on the existing APIs. Range tombstones
+    flow through the WAL, memtable, SSTables, point reads, forward and
+    reverse scans, flush, archive/ingest, and compaction.
+  - **Time model** (the one load-bearing decision): Horton never calls a
+    clock. `put_with_ttl` stores an absolute `expire_at`; reads compare it
+    against the `now` the caller passes. A value with
+    `expire_at <= now` is suppressed — the read behaves as if the newest
+    visible version were absent — but the bytes stay on device until
+    compaction's purge removes them. `expire_at == 0` means "no expiry"
+    and is stored exactly like a plain `put` (op byte `Put`, no expiry
+    field), so non-TTL data pays nothing. Clock skew between writers is
+    the caller's problem; Horton only promises the ordering contract:
+    suppress iff `expire_at <= now`.
+  - **Durable formats**:
+    - WAL: `Op::RangeDelete = 3` reuses the record shape with
+      key = range start, val = range end. `Op::PutTtl = 4` is a `Put`
+      record with an 8-byte little-endian `expire_at` appended after the
+      value (before the CRC); `Put`/`Delete`/`RangeDelete` records are
+      byte-identical to v0.14.
+    - SSTable data entries: op byte `4` marks a TTL entry, with the same
+      8-byte expiry after the value. Entry header stays 13 bytes for
+      non-TTL entries.
+    - SSTable layout gains a range-tombstone section **before** the data
+      blocks: `[rdel]* [data]* [bloom] [index] [footer]`. Rdel blocks
+      hold `[start_len u16][end_len u16][seq u64][start][end]` entries
+      sorted by `(start asc, seq desc)`, a `count u16` trailer, and the
+      standard CRC. The footer grows by `rdel_blocks u32`; `TableRef`
+      (and the manifest encoding) gains `rdel_blocks: u32` so readers
+      find the section without extra I/O (`rdel_first = first_block`,
+      `data_first = first_block + rdel_blocks`).
+  - **Visibility ordering**: a range tombstone is a pseudo-version. The
+    winner for a key at `max_seq` is the highest-`seq <= max_seq` entry
+    among the key's point versions *and* every range tombstone covering
+    the key (memtable slots scanned linearly; SSTable rdel blocks scanned
+    per table with a one-block cache on the scan). A winning value with
+    `expire_at != 0 && expire_at <= now` resolves to absent. Table
+    `first_key`/`last_key`/`max_seq` expand to cover range-tombstone
+    ranges and sequences, so pruning (`covers`, `max_seq <= best_seq`)
+    stays sound.
+  - **Compaction** — two mechanisms:
+    - *TTL purge never silently drops.* Dropping a non-newest expired
+      version is unsound: at a snapshot view where the expired version is
+      the newest visible, reads must see absent, and only that version's
+      presence (or a tombstone at its seq) guarantees it. So an emitted
+      value with `expire_at <= purge_before` is **converted to a point
+      tombstone at the same sequence number**, newest or not; the existing
+      threshold/bottommost machinery then keeps or drops the tombstone
+      exactly as if the caller had deleted the key. `purge_before == 0`
+      disables the purge. The cutoff lives on
+      `Compaction::purge_before` (set before driving a job; changing it
+      mid-job is safe but incoherent — documented).
+    - *Range-tombstone merge at select time.* The output's rdel section is
+      fully determined by the inputs, so `compact_select` stream-merges
+      the inputs' sorted rdel sections and writes the output rdel blocks
+      before the data merge starts (same crash story as data blocks:
+      invisible until the manifest commit, orphans swept on open).
+      Same-`seq` overlapping tombstones coalesce to their union (exact
+      for equal sequences). An older identical `(start, end)` tombstone is
+      dropped only when the output is bottommost, its `seq` is below the
+      oldest snapshot, **and** the newer identical tombstone shadowing it
+      has `seq <= oldest_snapshot` — then no live snapshot falls between
+      the two sequences, so the older was never decisive. Otherwise the
+      older is retained: a live snapshot between the two sequences still
+      needs it, and dropping it would resurrect covered keys at that
+      snapshot. A tombstone that is the newest covering its range is never
+      dropped (unlike a point tombstone, whose whole key goes with it —
+      dropping a range tombstone alone would resurrect its covered
+      values). Partial shadowing between different-`seq` tombstones is
+      kept — correct, merely uncompacted (documented limit).
+  - **Flush**: writes the memtable's range tombstones (sorted by start)
+    as the table's rdel section, then data blocks; `TableRef` bounds and
+    `max_seq` fold in the rdel ranges. A flush carrying only range
+    tombstones still seals a table (zero data blocks).
+  - **Archive interplay**: `archive_commit` refuses a candidate carrying
+    range tombstones with `WouldResurrect` unless the tombstones provably
+    shadow nothing outside the candidate — no other table's key range
+    overlaps the tombstone range, and no memtable key inside the range
+    changes visibility when the candidate is excluded (checked per key
+    against the live and snapshot views). Conservative by design:
+    enumerating shadowed keys across SSTables would be O(database) per
+    tombstone. The documented remedy is to compact first (merging the
+    tombstone into the overlapping table), then archive.
+  - **Crash model**: `delete_range`/`put_with_ttl` are single-WAL-record
+    atomic commits, exactly like `put`. Rdel blocks are ordinary block
+    writes before the manifest commit — torn ones are orphans, swept on
+    open, and the crash injector enumerates them automatically.
+  - **Proof**: `model_visible` (model.rs) — the pure winner rule over
+    version lists and range tombstones with TTL suppression — plus
+    `tests/range_ttl.rs`: range shadowing incl. exclusive end,
+    newer-put-wins, snapshot views, flush/compaction traversal, bottommost
+    range-tombstone drop, TTL suppression before/after expiry in
+    `get`/`scan`/reverse-scan, WAL recovery of both op kinds, compaction
+    TTL→tombstone conversion (live view absent, snapshot view intact),
+    archive refusal/acceptance, and a randomized differential test against
+    the model; `cargo +nightly miri test --test range_ttl` green.
+  - **Honest limits**: `WriteBatch` carries no range/TTL ops (documented;
+    batches stay point-only). Range-tombstone dedup is limited to exact
+    duplicates and same-seq coalescing — differently-sequenced overlaps
+    are kept. Archive is conservative around range tombstones (refuses
+    unless provably safe). Scans pay a per-table rdel-block scan per key
+    (one-block cache); range-heavy tables make this linear in tombstone
+    count — measured, not hidden.
 
 ## 10. Open questions for Mark
 1. ~~First target~~ — decided 2026-09-12: x86_64 + macOS first, ESP32-S3 on

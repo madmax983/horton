@@ -7,7 +7,7 @@
 //! Layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman02" | payload_len: u32 | payload | crc32: u32
+//! magic: u64 = "hrtman03" | payload_len: u32 | payload | crc32: u32
 //! ```
 //!
 //! `payload` is variable-length (only populated levels are stored):
@@ -18,7 +18,7 @@
 //! tableref: id: u32 | first_block: u64 | block_count: u32
 //!           | fk_len: u16 | fk_bytes[KEY_MAX]
 //!           | lk_len: u16 | lk_bytes[KEY_MAX]
-//!           | max_seq: u64 | entry_count: u32
+//!           | max_seq: u64 | entry_count: u32 | rdel_blocks: u32
 //! ```
 //!
 //! `crc32` covers `magic` through the end of `payload`. The rest of the block
@@ -31,14 +31,15 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman02".
+/// Manifest block magic: ASCII "hrtman03".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
-/// layout with fixed `KEY_MAX` key bounds; "hrtman02" is the v0.4.1 layout
-/// with length-prefixed key bounds. A foreign magic decodes as
+/// layout with fixed `KEY_MAX` key bounds; "hrtman02" was the v0.4.1
+/// layout with length-prefixed key bounds; "hrtman03" is the v0.15 layout
+/// with the per-table `rdel_blocks` count. A foreign magic decodes as
 /// [`Error::CorruptManifest`] — old bytes are rejected, never misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman02");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman03");
 
 /// Fixed-size key bound: `len` significant bytes of `bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,39 @@ impl<const KEY_MAX: usize> KeyBound<KEY_MAX> {
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes[..usize::from(self.len)]
     }
+
+    /// The lesser bound; [`KeyBound::EMPTY`] (len 0) loses to any real key.
+    /// Used to fold range-tombstone bounds into a table's key range.
+    #[must_use]
+    pub fn min(self, other: Self) -> Self {
+        if self.len == 0 {
+            return other;
+        }
+        if other.len == 0 {
+            return self;
+        }
+        if other.as_slice() < self.as_slice() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The greater bound; [`KeyBound::EMPTY`] loses to any real key.
+    #[must_use]
+    pub fn max(self, other: Self) -> Self {
+        if self.len == 0 {
+            return other;
+        }
+        if other.len == 0 {
+            return self;
+        }
+        if other.as_slice() > self.as_slice() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// One `SSTable` placement record.
@@ -82,18 +116,24 @@ impl<const KEY_MAX: usize> KeyBound<KEY_MAX> {
 pub struct TableRef<const KEY_MAX: usize> {
     /// Table id, unique per database lifetime.
     pub id: u32,
-    /// First block id of the table (data blocks, bloom, index, footer).
+    /// First block id of the table: the range-tombstone section, then
+    /// data blocks, bloom, index, footer.
     pub first_block: u64,
-    /// Total blocks: data blocks + bloom + index + footer.
+    /// Total blocks: rdel blocks + data blocks + bloom + index + footer.
     pub block_count: u32,
-    /// Smallest key in the table.
+    /// Smallest key in the table (includes range-tombstone bounds).
     pub first_key: KeyBound<KEY_MAX>,
-    /// Largest key in the table.
+    /// Largest key in the table (includes range-tombstone bounds; a
+    /// tombstone's exclusive end is stored as-is, so `last_key` may name
+    /// one past the last covered key — conservative for overlap checks,
+    /// never unsound).
     pub last_key: KeyBound<KEY_MAX>,
-    /// Highest sequence number in the table.
+    /// Highest sequence number in the table (includes range tombstones).
     pub max_seq: u64,
     /// Key/value entries (including tombstones).
     pub entry_count: u32,
+    /// Range-tombstone blocks at `[first_block, first_block + rdel_blocks)`.
+    pub rdel_blocks: u32,
 }
 
 impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
@@ -106,6 +146,7 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
         last_key: KeyBound::EMPTY,
         max_seq: 0,
         entry_count: 0,
+        rdel_blocks: 0,
     };
 
     /// One past the last block id of the table.
@@ -393,6 +434,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 enc.bytes(&tref.last_key.bytes[..usize::from(tref.last_key.len)])?;
                 enc.u64(tref.max_seq)?;
                 enc.u32(tref.entry_count)?;
+                enc.u32(tref.rdel_blocks)?;
             }
         }
         let payload_len = u32::try_from(enc.off - payload_start).map_err(|_| Error::NoSpace)?;
@@ -474,6 +516,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let last_key = Self::decode_bound(dec)?;
         let max_seq = dec.u64().map_err(|()| corrupt())?;
         let entry_count = dec.u32().map_err(|()| corrupt())?;
+        let rdel_blocks = dec.u32().map_err(|()| corrupt())?;
         Ok(TableRef {
             id,
             first_block,
@@ -482,6 +525,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             last_key,
             max_seq,
             entry_count,
+            rdel_blocks,
         })
     }
 

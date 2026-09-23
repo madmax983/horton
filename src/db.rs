@@ -108,7 +108,7 @@ pub struct SealedTable<const KEY_MAX: usize> {
     /// The table's original id; ingest preserves it so the table is
     /// idempotent across retries and database copies.
     pub id: u32,
-    /// Total blocks: data blocks + bloom + index + footer.
+    /// Total blocks: rdel blocks + data blocks + bloom + index + footer.
     pub block_count: u32,
     /// Smallest key in the table.
     pub first_key: KeyBound<KEY_MAX>,
@@ -119,6 +119,10 @@ pub struct SealedTable<const KEY_MAX: usize> {
     /// Key/value entries (including tombstones); cross-checked against
     /// the copied table's footer on ingest.
     pub entry_count: u32,
+    /// Range-tombstone blocks at the table's start; cross-checked against
+    /// the copied table's footer on ingest, and needed to locate the data
+    /// section when relocating the table.
+    pub rdel_blocks: u32,
 }
 
 impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
@@ -136,6 +140,7 @@ impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
             last_key: self.table.last_key,
             max_seq: self.table.max_seq,
             entry_count: self.table.entry_count,
+            rdel_blocks: self.table.rdel_blocks,
         }
     }
 }
@@ -160,6 +165,14 @@ struct ReadAcc<const VAL_MAX: usize> {
     stage: [u8; VAL_MAX],
     best: Best,
     best_seq: u64,
+    /// Expiry tick of the winning value; 0 = no expiry. Checked against
+    /// the caller's `now` before the value is returned.
+    best_expire_at: u64,
+    /// Highest range-tombstone sequence covering the key at/below the
+    /// snapshot, across the memtable and every considered table. Beats
+    /// the point winner when strictly newer (sequences are unique per
+    /// mutation, so equality cannot happen).
+    cover_seq: u64,
 }
 
 impl<const VAL_MAX: usize> ReadAcc<VAL_MAX> {
@@ -168,6 +181,8 @@ impl<const VAL_MAX: usize> ReadAcc<VAL_MAX> {
             stage: [0u8; VAL_MAX],
             best: Best::Missing,
             best_seq: 0,
+            best_expire_at: 0,
+            cover_seq: 0,
         }
     }
 }
@@ -183,7 +198,10 @@ struct JobInputs<const KEY_MAX: usize> {
     last: KeyBound<KEY_MAX>,
     /// Summed entry counts (for the bloom filter sizing).
     total_entries: u64,
-    /// Summed data blocks (for the output run reservation).
+    /// Summed data blocks, excluding each table's rdel blocks and the 3
+    /// framing blocks (for the output run reservation). The merged rdel
+    /// section gets its own exact budget from a dry-run pass; see
+    /// `count_rdel_merge`.
     total_data: u64,
 }
 
@@ -520,6 +538,73 @@ impl<
         Ok(seq)
     }
 
+    /// Deletes every key in `[start, end)` via one range tombstone, durable
+    /// before it returns. An empty or inverted range (`start >= end`) is a
+    /// no-op: it consumes no sequence number, writes no WAL record, and
+    /// returns the current sequence number. Returns the sequence number
+    /// assigned to the tombstone.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`put`](Db::put).
+    pub async fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<u64, Error<D::Error>> {
+        if start >= end {
+            return Ok(self.next_seq);
+        }
+        self.table.check_insert_range_del::<D::Error>(start, end)?;
+        let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let mark = self.stage_mark();
+        if let Err(e) = self.wal.append(seq, Op::RangeDelete, start, end).await {
+            self.rollback_commit(mark, 0)?;
+            return Err(e);
+        }
+        if let Err(e) = self.wal.commit().await {
+            let landed = self.wal.next_block() != mark.next_block;
+            self.rollback_commit(mark, u64::from(landed))?;
+            return Err(e);
+        }
+        self.next_seq = seq;
+        // The table is unchanged since check_insert_range_del, so this
+        // cannot fail.
+        self.table.insert_range_del::<D::Error>(start, end, seq)?;
+        Ok(seq)
+    }
+
+    /// Puts `key`/`val` with an absolute expiry tick, durable before it
+    /// returns. Horton owns no clock: `expire_at` is caller-defined, and
+    /// timed reads ([`get_at_with_time`](Db::get_at_with_time)) suppress
+    /// the value once `expire_at <= now`. `expire_at == 0` means no
+    /// expiry and behaves exactly like [`put`](Db::put). Returns the
+    /// sequence number assigned to the mutation.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`put`](Db::put).
+    pub async fn put_with_ttl(
+        &mut self,
+        key: &[u8],
+        val: &[u8],
+        expire_at: u64,
+    ) -> Result<u64, Error<D::Error>> {
+        self.table.check_insert::<D::Error>(key, val, false)?;
+        let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let mark = self.stage_mark();
+        if let Err(e) = self.wal.append_ttl(seq, key, val, expire_at).await {
+            self.rollback_commit(mark, 0)?;
+            return Err(e);
+        }
+        if let Err(e) = self.wal.commit().await {
+            let landed = self.wal.next_block() != mark.next_block;
+            self.rollback_commit(mark, u64::from(landed))?;
+            return Err(e);
+        }
+        self.next_seq = seq;
+        // The table is unchanged since check_insert, so this cannot fail.
+        self.table
+            .insert_ttl::<D::Error>(key, val, seq, expire_at)?;
+        Ok(seq)
+    }
+
     /// Applies every op in `batch` atomically: all become durable and
     /// visible together, or none does. Returns the base sequence number;
     /// op `i` (in queue order) takes `base + i`.
@@ -636,7 +721,7 @@ impl<
         key: &[u8],
         val_buf: &mut [u8],
     ) -> Result<Option<usize>, Error<D::Error>> {
-        self.get_at(key, val_buf, u64::MAX).await
+        self.get_at_with_time(key, val_buf, u64::MAX, 0).await
     }
 
     /// Reads `key` into `val_buf` as of a snapshot: like [`get`](Db::get),
@@ -667,6 +752,47 @@ impl<
         val_buf: &mut [u8],
         max_seq: u64,
     ) -> Result<Option<usize>, Error<D::Error>> {
+        self.get_at_with_time(key, val_buf, max_seq, 0).await
+    }
+
+    /// Timed read: like [`get`](Db::get), but values whose `expire_at` is
+    /// nonzero and `<= now` are suppressed — they read as missing (a
+    /// newer live version still wins; an expired winner never falls
+    /// through to an older version). Horton owns no clock: `now` is the
+    /// caller's tick, compared against the absolute `expire_at` stored by
+    /// [`put_with_ttl`](Db::put_with_ttl).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`get`](Db::get).
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub async fn get_with_time(
+        &self,
+        key: &[u8],
+        val_buf: &mut [u8],
+        now: u64,
+    ) -> Result<Option<usize>, Error<D::Error>> {
+        self.get_at_with_time(key, val_buf, u64::MAX, now).await
+    }
+
+    /// Timed read: like [`get_at`](Db::get_at), but values whose
+    /// `expire_at` is nonzero and `<= now` are suppressed — they read as
+    /// missing (a newer live version still wins; an expired winner never
+    /// falls through to an older version). Callers without a clock pass
+    /// `now = 0`, which is what [`get`](Db::get) and
+    /// [`get_at`](Db::get_at) do.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`get_at`](Db::get_at).
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub async fn get_at_with_time(
+        &self,
+        key: &[u8],
+        val_buf: &mut [u8],
+        max_seq: u64,
+        now: u64,
+    ) -> Result<Option<usize>, Error<D::Error>> {
         // The winning value's bytes are staged here; table lookups copy
         // into a per-table buffer first so a losing hit can never clobber
         // the winner. Values are at most VAL_MAX bytes (enforced on the
@@ -675,14 +801,21 @@ impl<
 
         if let Some(entry) = self.table.get_at(key, max_seq) {
             // The memtable holds the newest mutations; `get_at` already
-            // selected the newest version at or below the snapshot.
+            // selected the newest version at or below the snapshot, and
+            // skips range-tombstone slots (they are not versions of `key`).
             acc.best_seq = entry.seq;
             if entry.tombstone {
                 acc.best = Best::Tombstone;
             } else {
                 acc.stage[..entry.val.len()].copy_from_slice(entry.val);
                 acc.best = Best::Value(entry.val.len());
+                acc.best_expire_at = entry.expire_at;
             }
+        }
+        // A memtable range tombstone covering `key` beats any older point
+        // version; the per-table probes happen inside `consider_table`.
+        if let Some(q) = self.table.max_covering_rdel(key, max_seq) {
+            acc.cover_seq = q;
         }
 
         // Use the shared buffer when it is free (see `get_scratch`). Fall
@@ -726,6 +859,15 @@ impl<
         match acc.best {
             Best::Missing | Best::Tombstone => Ok(None),
             Best::Value(len) => {
+                // A covering range tombstone newer than the point winner
+                // hides the key; an expired winner reads as missing and
+                // never falls through to an older version.
+                if acc.cover_seq > acc.best_seq {
+                    return Ok(None);
+                }
+                if acc.best_expire_at != 0 && acc.best_expire_at <= now {
+                    return Ok(None);
+                }
                 if len > val_buf.len() {
                     return Err(Error::BufferTooSmall { need: len });
                 }
@@ -789,7 +931,8 @@ impl<
                 && existing.first_key == sealed.first_key
                 && existing.last_key == sealed.last_key
                 && existing.max_seq == sealed.max_seq
-                && existing.entry_count == sealed.entry_count;
+                && existing.entry_count == sealed.entry_count
+                && existing.rdel_blocks == sealed.rdel_blocks;
             return if same {
                 Ok(false)
             } else {
@@ -833,7 +976,14 @@ impl<
         // Relocate the copy: index entries and the footer carry the
         // absolute block ids of the table's original placement, which are
         // rewritten to the destination layout and re-sealed.
-        sstable::relocate_table(self.wal.device_mut(), base, sealed.block_count, &mut buf).await?;
+        sstable::relocate_table(
+            self.wal.device_mut(),
+            base,
+            sealed.block_count,
+            sealed.rdel_blocks,
+            &mut buf,
+        )
+        .await?;
         // Validate the relocated copy: footer magic/CRC plus the
         // descriptor's entry count.
         let footer = base
@@ -844,9 +994,12 @@ impl<
             self.wal.device(),
             &mut buf,
             footer,
+            base,
         )
         .await?;
-        if reader.entry_count() != u64::from(sealed.entry_count) {
+        if reader.entry_count() != u64::from(sealed.entry_count)
+            || reader.rdel_blocks() != sealed.rdel_blocks
+        {
             return Err(Error::CorruptBlock { id: footer });
         }
         // Graft into L0 through the atomic manifest commit. Future local
@@ -862,6 +1015,7 @@ impl<
             last_key: sealed.last_key,
             max_seq: sealed.max_seq,
             entry_count: sealed.entry_count,
+            rdel_blocks: sealed.rdel_blocks,
         })?;
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
         staged
@@ -909,9 +1063,13 @@ impl<
             .checked_add(u64::from(tref.block_count))
             .and_then(|end| end.checked_sub(1))
             .ok_or(Error::CorruptManifest)?;
-        let reader =
-            sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open(self.wal.device(), scratch, footer)
-                .await?;
+        let reader = sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open(
+            self.wal.device(),
+            scratch,
+            footer,
+            tref.first_block,
+        )
+        .await?;
         // `tmp` (not `acc.stage`) receives the value: only a winning hit is
         // promoted, so a losing hit cannot clobber the staged winner.
         let mut tmp = [0u8; VAL_MAX];
@@ -919,16 +1077,30 @@ impl<
             .lookup_at(scratch, decomp, key, &mut tmp, max_seq)
             .await?
         {
-            sstable::Lookup::Value { len, seq } if seq > acc.best_seq && seq <= max_seq => {
+            sstable::Lookup::Value {
+                len,
+                seq,
+                expire_at,
+            } if seq > acc.best_seq && seq <= max_seq => {
                 acc.best_seq = seq;
                 acc.stage[..len].copy_from_slice(&tmp[..len]);
                 acc.best = Best::Value(len);
+                acc.best_expire_at = expire_at;
             }
             sstable::Lookup::Tombstone { seq } if seq > acc.best_seq && seq <= max_seq => {
                 acc.best_seq = seq;
                 acc.best = Best::Tombstone;
             }
             _ => {}
+        }
+        // A range tombstone in this table covering `key` shadows older
+        // point versions; the accumulator keeps the highest covering
+        // sequence and compares it against the point winner at the end.
+        if reader.rdel_blocks() > 0
+            && let Some(q) = reader.covering_rdel_seq(scratch, key, max_seq).await?
+            && q > acc.cover_seq
+        {
+            acc.cover_seq = q;
         }
         Ok(())
     }
@@ -958,6 +1130,60 @@ impl<
         Ok(())
     }
 
+    /// Writes the memtable's range-tombstone section at `base`, returning
+    /// the blocks written.
+    async fn write_flush_rdel(
+        device: &mut D,
+        table: &MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        base: u64,
+    ) -> Result<u32, Error<D::Error>> {
+        sstable::write_rdel_blocks::<D, BLOCK>(
+            device,
+            base,
+            table.iter().filter_map(|e| {
+                if e.range_del {
+                    Some(sstable::RdelEntry {
+                        start: e.key,
+                        end: e.val,
+                        seq: e.seq,
+                    })
+                } else {
+                    None
+                }
+            }),
+        )
+        .await
+    }
+
+    /// Builds the flushed table's [`TableRef`]. Key bounds and `max_seq`
+    /// cover both sections: range tombstones participate in table pruning
+    /// and winner selection.
+    fn flush_tref(
+        id: u32,
+        base: u64,
+        total: u64,
+        plan: &sstable::TablePlan<KEY_MAX>,
+        rdel_plan: &sstable::RdelPlan<'_>,
+    ) -> Result<TableRef<KEY_MAX>, Error<D::Error>> {
+        let rdel_first = rdel_plan
+            .first
+            .and_then(KeyBound::from_slice)
+            .unwrap_or(KeyBound::EMPTY);
+        let rdel_last = rdel_plan
+            .max_end
+            .and_then(KeyBound::from_slice)
+            .unwrap_or(KeyBound::EMPTY);
+        Ok(TableRef {
+            id,
+            first_block: base,
+            block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
+            first_key: plan.first_key.min(rdel_first),
+            last_key: plan.last_key.max(rdel_last),
+            max_seq: plan.max_seq.max(rdel_plan.max_seq),
+            entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::NoSpace)?,
+            rdel_blocks: rdel_plan.blocks,
+        })
+    }
     /// Flushes the memtable into a new `SSTable` and commits the manifest.
     ///
     /// Protocol: commit the WAL (every acked mutation is durable) → plan the
@@ -1000,12 +1226,32 @@ impl<
         if self.manifest.l0_is_full() {
             return Err(Error::NoSpace);
         }
-        // Pass 1: pure computation of the table shape.
+        // Pass 1: pure computation of the table shape. Point entries and
+        // range tombstones are planned separately: the rdel section sits
+        // *before* the data section on device.
         let plan = sstable::plan_table::<D::Error, BLOCK, KEY_MAX>(
-            self.table.iter().map(sstable::SstEntry::from),
+            self.table
+                .iter()
+                .filter(|e| !e.range_del)
+                .map(sstable::SstEntry::from),
         )?;
+        let rdel_plan =
+            sstable::plan_rdel_blocks::<D::Error, BLOCK>(self.table.iter().filter_map(|e| {
+                if e.range_del {
+                    Some(sstable::RdelEntry {
+                        start: e.key,
+                        end: e.val,
+                        seq: e.seq,
+                    })
+                } else {
+                    None
+                }
+            }))?;
         let k = sstable::bloom_k(BLOOM_BYTES * 8, plan.entry_count);
-        let total = plan.data_blocks.checked_add(3).ok_or(Error::NoSpace)?;
+        let total = u64::from(rdel_plan.blocks)
+            .checked_add(plan.data_blocks)
+            .and_then(|n| n.checked_add(3))
+            .ok_or(Error::NoSpace)?;
         let total_usize = usize::try_from(total).map_err(|_| Error::NoSpace)?;
         // Reserve the run without claiming it: free list first, then the
         // bump. Neither moves until the manifest commit below has landed.
@@ -1014,36 +1260,41 @@ impl<
             Some(b) => b,
             None => self.tbl_bump.peek_run::<D::Error>(total)?,
         };
-        // Pass 2: stream the blocks. `data` doubles as the manifest scratch
-        // below; it is a plain stack local. `cs` is this flush's
+        // Pass 2: stream the blocks — the rdel section first, then the data
+        // section at `base + rdel_blocks`. `data` doubles as the manifest
+        // scratch below; it is a plain stack local. `cs` is this flush's
         // compression scratch: every data block is trial-compressed and
         // the compressed form kept when it saves enough.
         let mut data = [0u8; BLOCK];
         let mut cs = crate::compress::CompressScratch::<BLOCK>::new();
+        let rdel_written = Self::write_flush_rdel(self.wal.device_mut(), &self.table, base).await?;
+        debug_assert_eq!(rdel_written, rdel_plan.blocks);
+        let data_base = base
+            .checked_add(u64::from(rdel_plan.blocks))
+            .ok_or(Error::NoSpace)?;
         let written = sstable::write_table::<D, BLOCK, BLOOM_BYTES, KEY_MAX>(
             self.wal.device_mut(),
-            base,
+            data_base,
             k,
-            self.table.iter().map(sstable::SstEntry::from),
+            self.table
+                .iter()
+                .filter(|e| !e.range_del)
+                .map(sstable::SstEntry::from),
             Some(&mut cs),
+            rdel_plan.blocks,
         )
         .await?;
-        debug_assert_eq!(written, total);
+        debug_assert_eq!(
+            written.checked_add(u64::from(rdel_plan.blocks)),
+            Some(total)
+        );
         // The manifest commit is the atomic visibility point. Stage the new
         // manifest in a copy and publish it only after the commit lands, so
         // a returned I/O error leaves the in-memory state exactly as it was
         // and the flush can simply be retried.
         let mut staged = self.manifest;
         let id = staged.alloc_table_id::<D::Error>()?;
-        let tref = TableRef {
-            id,
-            first_block: base,
-            block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
-            first_key: plan.first_key,
-            last_key: plan.last_key,
-            max_seq: plan.max_seq,
-            entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::NoSpace)?,
-        };
+        let tref = Self::flush_tref(id, base, total, &plan, &rdel_plan)?;
         staged.add_l0_table::<D::Error>(tref)?;
         // Advance the WAL head past the flushed records; wrap the region
         // when it is exhausted. Folded into this same atomic commit, so no
@@ -1281,6 +1532,123 @@ impl<
                 break;
             }
         }
+        // Range tombstones: detaching the candidate must not resurrect a
+        // key the tombstone currently hides. For each tombstone, the live
+        // view plus every snapshot that can see it must observe no
+        // difference with the candidate excluded. Two conservative,
+        // bounded checks (full key enumeration would be O(database)):
+        //
+        // 1. No other table's key range may overlap the tombstone range —
+        //    a deeper table could hold a key this tombstone hides.
+        // 2. No memtable point key inside the range may flip from
+        //    hidden to visible when the candidate is excluded.
+        //
+        // Refusal is the safe answer; the documented remedy is to
+        // compact first (merging the tombstone into the overlapping
+        // table), then archive.
+        let mut raw = [0u8; BLOCK];
+        let mut b = 0u32;
+        while b < candidate.rdel_blocks {
+            let id =
+                candidate
+                    .first_block
+                    .checked_add(u64::from(b))
+                    .ok_or(Error::CorruptBlock {
+                        id: candidate.first_block,
+                    })?;
+            poll_fn(|cx| self.wal.device().poll_read_block(cx, id, &mut raw))
+                .await
+                .map_err(Error::Device)?;
+            let count = sstable::rdel_block_count::<D::Error, BLOCK>(&raw, id)?;
+            let mut off = 0usize;
+            let mut i = 0usize;
+            while i < count {
+                // Bounded by the stored count: the count/CRC trailer is
+                // never parsed as entries.
+                let (e, next) = sstable::rdel_parse_at(&raw[..], off)
+                    .map_err(|()| Error::CorruptBlock { id })?;
+                self.check_rdel_no_resurrection(
+                    candidate, e.start, e.end, e.seq, &mut key, &mut val,
+                )
+                .await?;
+                off = next;
+                i += 1;
+            }
+            b += 1;
+        }
+        Ok(())
+    }
+
+    /// One range tombstone's share of the archival resurrection review.
+    /// Refuses with [`Error::WouldResurrect`] unless the tombstone
+    /// provably shadows nothing outside the candidate.
+    async fn check_rdel_no_resurrection(
+        &self,
+        candidate: &TableRef<KEY_MAX>,
+        start: &[u8],
+        end: &[u8],
+        seq: u64,
+        key: &mut [u8; KEY_MAX],
+        val: &mut [u8; VAL_MAX],
+    ) -> Result<(), Error<D::Error>> {
+        let refuse = || Error::WouldResurrect {
+            table: candidate.id,
+        };
+        // Table bounds are inclusive; the tombstone end is exclusive, so
+        // treating it as inclusive is conservative (a table starting
+        // exactly at `end` holds no covered key, but flagging it only
+        // skips an archive, never a result).
+        let start_b = KeyBound::from_slice(start).ok_or(Error::CorruptBlock {
+            id: candidate.first_block,
+        })?;
+        let end_b = KeyBound::from_slice(end).ok_or(Error::CorruptBlock {
+            id: candidate.first_block,
+        })?;
+        for lvl in 0..LEVELS {
+            let tables = self.manifest.level(lvl).ok_or(Error::NoSpace)?;
+            for t in tables {
+                if t.id != candidate.id && ranges_overlap(t.first_key, t.last_key, start_b, end_b) {
+                    return Err(refuse());
+                }
+            }
+        }
+        // The live view plus every registered snapshot watermark. A view
+        // whose watermark predates the tombstone cannot see it and is
+        // skipped, mirroring the point-tombstone review.
+        let views =
+            core::iter::once(u64::MAX).chain(self.snapshots[..self.n_snapshots].iter().copied());
+        for view in views {
+            if seq > view {
+                continue;
+            }
+            // The memtable iterator is key-ascending, so the range walk
+            // stops at `end`. Range-tombstone slots are skipped (they
+            // affect both reads equally); memtable point tombstones are
+            // skipped (they win in both reads, so no flip is possible).
+            for entry in &self.table {
+                let k = entry.key;
+                if k < start {
+                    continue;
+                }
+                if k >= end {
+                    break;
+                }
+                if entry.range_del || entry.tombstone {
+                    continue;
+                }
+                let klen = k.len();
+                key[..klen].copy_from_slice(k);
+                let cur_hit = self.get_at_excluding(&key[..klen], val, view, None).await?;
+                if cur_hit.is_none() {
+                    let alt_hit = self
+                        .get_at_excluding(&key[..klen], val, view, Some(candidate.id))
+                        .await?;
+                    if alt_hit.is_some() {
+                        return Err(refuse());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1307,7 +1675,16 @@ impl<
             } else {
                 acc.stage[..entry.val.len()].copy_from_slice(entry.val);
                 acc.best = Best::Value(entry.val.len());
+                acc.best_expire_at = entry.expire_at;
             }
+        }
+        // Memtable range tombstones hide the key exactly like table ones;
+        // expiry is read-time (`now = 0` here), so TTL values still count
+        // as live for the resurrection review.
+        if let Some(q) = self.table.max_covering_rdel(key, max_seq)
+            && q > acc.cover_seq
+        {
+            acc.cover_seq = q;
         }
 
         let mut scratch = [0u8; BLOCK];
@@ -1335,6 +1712,12 @@ impl<
         match acc.best {
             Best::Missing | Best::Tombstone => Ok(None),
             Best::Value(len) => {
+                // A covering range tombstone newer than the point winner
+                // hides the key. (`now = 0`: TTL values read as live, the
+                // conservative choice for a resurrection review.)
+                if acc.cover_seq > acc.best_seq {
+                    return Ok(None);
+                }
                 if len > val_buf.len() {
                     return Err(Error::BufferTooSmall { need: len });
                 }
@@ -1422,6 +1805,56 @@ impl<
     /// level's tables (all of L0, or the oldest table of a deeper level)
     /// plus the target level's overlapping tables. Returns `false` when no
     /// level is full and there is no work.
+    /// Counts the output table's range-tombstone section with a dry-run of
+    /// the rdel merge. A sorted cross-input merge is not a subsequence of
+    /// the concatenation, so greedy repacking can use a different block
+    /// count than the inputs' rdel blocks (more or fewer); only an exact
+    /// count is reservation-safe. The write pass replays the same
+    /// deterministic merge over the immutable input sections, so the
+    /// budget always matches. The select-time oldest snapshot pins both
+    /// passes: a snapshot taken mid-compaction always has a seq above
+    /// every version being merged.
+    async fn count_output_rdel(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        job: &JobInputs<KEY_MAX>,
+        bottommost: bool,
+        oldest_snapshot: u64,
+    ) -> Result<u32, Error<D::Error>> {
+        let device = self.wal.device_mut();
+        crate::compact::count_rdel_merge(
+            &*device,
+            &c.inputs[..job.n_inputs],
+            &mut c.raw,
+            bottommost,
+            oldest_snapshot,
+        )
+        .await
+    }
+
+    /// Reports whether a compaction output at `tgt` covering
+    /// `[first, last]` is bottommost: tombstones drop only when the output
+    /// reaches the bottommost level holding the merged range, because
+    /// nothing below can hide an older version of a dropped key.
+    fn is_bottommost_output(
+        &self,
+        tgt: usize,
+        first: KeyBound<KEY_MAX>,
+        last: KeyBound<KEY_MAX>,
+    ) -> bool {
+        for lvl in tgt + 1..LEVELS {
+            let Some(tables) = self.manifest.level(lvl) else {
+                break;
+            };
+            for t in tables {
+                if ranges_overlap(first, last, t.first_key, t.last_key) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -1467,26 +1900,34 @@ impl<
         if tgt_len - job.n_tgt_inputs + 1 > TABLES {
             return Err(Error::NoSpace);
         }
-        // Tombstones drop only when the output reaches the bottommost level
-        // holding the merged range: nothing below can hide an older version
-        // of a dropped key.
-        let mut bottommost = true;
-        'levels: for lvl in tgt + 1..LEVELS {
-            let Some(tables) = self.manifest.level(lvl) else {
-                break 'levels;
-            };
-            for t in tables {
-                if ranges_overlap(job.first, job.last, t.first_key, t.last_key) {
-                    bottommost = false;
-                    break 'levels;
-                }
-            }
-        }
-        // Reserve the output run: the merge only shrinks the inputs (dedup
-        // plus tombstone drops), so their data blocks plus the 3 framing
-        // blocks always suffice. Free list first, then the bump — claimed
-        // only after the manifest commit, exactly like flush.
-        let out_blocks = job.total_data.checked_add(3).ok_or(Error::NoSpace)?;
+        let bottommost = self.is_bottommost_output(tgt, job.first, job.last);
+        // The output's range-tombstone section is fully determined by the
+        // inputs, so its exact block budget is counted first with a
+        // dry-run of the merge. A sorted cross-input merge is not a
+        // subsequence of the concatenation, so greedy repacking can use a
+        // different block count than the inputs' rdel blocks (more or
+        // fewer); only an exact count is reservation-safe. The write pass
+        // replays the same deterministic merge over the immutable input
+        // sections, so the budget always matches (debug-asserted below).
+        // The select-time oldest snapshot pins both passes: a snapshot
+        // taken mid-compaction always has a seq above every version being
+        // merged.
+        let oldest_snapshot = self.oldest_snapshot_seq();
+        let rdel_budget = self
+            .count_output_rdel(c, &job, bottommost, oldest_snapshot)
+            .await?;
+        // Reserve the output run: the data merge only shrinks the inputs
+        // (dedup plus tombstone drops), so their data blocks always
+        // suffice for the data section; the rdel section gets its exact
+        // counted budget; plus the 3 framing blocks. Free list first,
+        // then the bump — claimed only after the manifest commit, exactly
+        // like flush.
+        let out_blocks = job
+            .total_data
+            .checked_add(u64::from(rdel_budget))
+            .ok_or(Error::NoSpace)?
+            .checked_add(3)
+            .ok_or(Error::NoSpace)?;
         let out_len = usize::try_from(out_blocks).map_err(|_| Error::NoSpace)?;
         let (out_base, from_free) = match self.tbl_free.find_run(out_len) {
             Some(b) => (b, true),
@@ -1507,10 +1948,42 @@ impl<
         let (sorted, n) = self.sorted_snapshot_watermarks();
         c.snapshots = sorted;
         c.n_snapshots = n;
-        c.oldest_snapshot = self.oldest_snapshot_seq();
+        c.oldest_snapshot = oldest_snapshot;
         c.n_inputs = job.n_inputs;
+        // The output's range-tombstone section streams out now, before the
+        // data merge starts: a bounded k-way merge over the inputs'
+        // sorted rdel sections (see `RdelMerger`). Crash story matches the
+        // data blocks: invisible until the manifest commit, orphans swept
+        // on open.
+        let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(out_base);
+        let mut rdel_stats = crate::compact::RdelStats::<KEY_MAX>::new();
+        {
+            let device = self.wal.device_mut();
+            let mut merger = crate::compact::RdelMerger::<KEY_MAX>::new(
+                &c.inputs[..job.n_inputs],
+                bottommost,
+                c.oldest_snapshot,
+            );
+            while merger.next_merged(&*device, &mut c.raw).await? {
+                let e = merger.current_entry();
+                rdel_out.push(&mut *device, e).await?;
+                rdel_stats.observe::<D::Error>(&e, out_base)?;
+            }
+            c.rdel_blocks = rdel_out.finish(&mut *device).await?;
+        }
+        debug_assert_eq!(
+            c.rdel_blocks, rdel_budget,
+            "rdel merge replay diverged from its counted budget"
+        );
+        c.rdel_first = rdel_stats.first;
+        c.rdel_last = rdel_stats.last;
+        c.rdel_max_seq = rdel_stats.max_seq;
+        // The data section starts after the rdel section.
+        let data_base = out_base
+            .checked_add(u64::from(c.rdel_blocks))
+            .ok_or(Error::NoSpace)?;
         c.writer = sstable::TableWriter::new(
-            out_base,
+            data_base,
             sstable::bloom_k(BLOOM_BYTES * 8, job.total_entries),
         );
         // Position one cursor per input on its first entry.
@@ -1557,7 +2030,10 @@ impl<
                 .total_entries
                 .checked_add(u64::from(t.entry_count))
                 .ok_or(Error::NoSpace)?;
+            let rdel = u64::from(t.rdel_blocks);
             let data = u64::from(t.block_count)
+                .checked_sub(rdel)
+                .ok_or(Error::CorruptBlock { id: t.first_block })?
                 .checked_sub(3)
                 .ok_or(Error::CorruptBlock { id: t.first_block })?;
             job.total_data = job.total_data.checked_add(data).ok_or(Error::NoSpace)?;
@@ -1608,22 +2084,30 @@ impl<
         let mut scratch = [0u8; BLOCK];
         let mut staged = self.manifest;
         // Seal the output table first: finish flushes, so its blocks are
-        // durable before the manifest makes them visible.
-        let out_ref = if c.writer.entry_count() > 0 {
+        // durable before the manifest makes them visible. A merge that
+        // kept only range tombstones (no point entries) still seals a
+        // table — range-only tables are first-class (zero data blocks).
+        let out_ref = if c.writer.entry_count() > 0 || c.rdel_blocks > 0 {
             let done: sstable::FinishedTable<KEY_MAX> = c
                 .writer
-                .finish(self.wal.device_mut(), Some(&mut c.compress))
+                .finish(self.wal.device_mut(), Some(&mut c.compress), c.rdel_blocks)
                 .await?;
-            let total = done.data_blocks.checked_add(3).ok_or(Error::NoSpace)?;
+            let total = u64::from(c.rdel_blocks)
+                .checked_add(done.data_blocks)
+                .and_then(|n| n.checked_add(3))
+                .ok_or(Error::NoSpace)?;
             let id = staged.alloc_table_id::<D::Error>()?;
             Some(TableRef {
                 id,
                 first_block: c.out_base,
                 block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
-                first_key: done.first_key,
-                last_key: done.last_key,
-                max_seq: done.max_seq,
+                // `KeyBound::min/max` let `EMPTY` lose, so a missing
+                // section never corrupts the bounds.
+                first_key: done.first_key.min(c.rdel_first),
+                last_key: done.last_key.max(c.rdel_last),
+                max_seq: done.max_seq.max(c.rdel_max_seq),
                 entry_count: u32::try_from(done.entry_count).map_err(|_| Error::NoSpace)?,
+                rdel_blocks: c.rdel_blocks,
             })
         } else {
             None
