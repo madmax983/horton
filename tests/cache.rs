@@ -580,3 +580,119 @@ fn reopen_starts_with_a_cold_volatile_cache() {
     assert_eq!(get(&db, b"k"), Some(b"v".to_vec()));
     assert!(db.cache_stats().hits > 0, "then it warms up again");
 }
+
+/// Counts block writes; everything else passes through.
+struct WriteCountDevice<D> {
+    inner: D,
+    writes: usize,
+}
+
+impl<D: BlockDevice> BlockDevice for WriteCountDevice<D> {
+    type Error = D::Error;
+    const BLOCK: usize = D::BLOCK;
+
+    fn poll_read_block(
+        &self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_read_block(cx, id, buf)
+    }
+
+    fn poll_write_block(
+        &mut self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &[u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        self.writes += 1;
+        self.inner.poll_write_block(cx, id, buf)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+}
+
+/// Crash during compaction, then reopen: the cache is volatile, so no
+/// stale entry can survive the crash — under EITHER manifest outcome.
+///
+/// Before the crash the cache is warm against the four L0 tables. After
+/// the crash and reopen the stats start cold and every key reads
+/// correctly: in the pre-commit outcome the tables the cache was warm
+/// against are still live (served fresh from the device), and in the
+/// post-commit outcome they are retired — but a resurrected stale entry
+/// is structurally impossible twice over: the cache memory did not
+/// survive the process boundary, and table ids are monotone so a future
+/// table can never collide with a retired tag.
+#[test]
+fn crash_during_compaction_reopens_with_cold_cache() {
+    let build = || {
+        let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+        block_on(db.open()).unwrap();
+        for i in 0u8..4 {
+            block_on(db.put(&[b'k', i], &[b'v', i])).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        // Warm the cache against one key (one table's blocks fit in the 8
+        // slots; warming all four would evict itself): first read
+        // populates, second read hits.
+        assert_eq!(get(&db, b"k\x00"), Some(b"v\x00".to_vec()));
+        assert_eq!(get(&db, b"k\x00"), Some(b"v\x00".to_vec()));
+        assert!(db.cache_stats().hits > 0, "cache was warm");
+        assert!(db.compaction_pending());
+        db.into_device()
+    };
+
+    // One L0→L1 job: 4 table blocks + the manifest commit.
+    let dev = WriteCountDevice {
+        inner: build(),
+        writes: 0,
+    };
+    let mut db = TestDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+    drain(&mut db);
+    let w = db.into_device().writes;
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
+
+    // Crash before the first job write (pre-commit: L0 intact) and after
+    // the last (post-commit: L0 drained into L1).
+    for crash_at in [0, w] {
+        let dev = common::CrashDevice::<MemDevice<4096>, 4096>::new(build(), crash_at);
+        let mut db = TestDb::new(dev, test_config());
+        // Drive the (crashing) job, then reopen on the crashed device.
+        let mut c = TestCompaction::new();
+        while db.compaction_pending() {
+            while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+        }
+        let dev = db.into_device().into_inner();
+        let mut db = TestDb::new(dev, test_config());
+        block_on(db.open()).unwrap();
+
+        // Cold stats: nothing survived the crash.
+        assert_eq!(
+            db.cache_stats(),
+            CacheStats {
+                hits: 0,
+                misses: 0,
+                len: 0,
+                capacity: 8,
+            },
+            "crash_at={crash_at}"
+        );
+        // Every key reads correctly under both manifest outcomes.
+        for i in 0u8..4 {
+            assert_eq!(
+                get(&db, &[b'k', i]),
+                Some(vec![b'v', i]),
+                "crash_at={crash_at}"
+            );
+        }
+        // The cache warms up again and serves hits (one key: one table's
+        // blocks fit the 8 slots).
+        assert_eq!(get(&db, b"k\x00"), Some(b"v\x00".to_vec()));
+        assert_eq!(get(&db, b"k\x00"), Some(b"v\x00".to_vec()));
+        assert!(db.cache_stats().hits > 0, "crash_at={crash_at}");
+    }
+}

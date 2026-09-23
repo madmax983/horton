@@ -174,6 +174,79 @@ impl<D: BlockDevice, const BLOCK: usize> BlockDevice for CrashDevice<D, BLOCK> {
     }
 }
 
+/// Crash injector, torn-write variant: write number `torn_at` lands only
+/// its first `torn_len` bytes (the tail reads back as zeros — a torn
+/// block), and writes numbered above `torn_at` are dropped entirely, as
+/// if power died mid-block. Recovery then sees the torn block followed
+/// by the truncated prefix before it. [`CrashDevice`] drops whole
+/// writes; this one models the finer fault the double-buffered manifest
+/// is designed for: a torn slot must decode as corrupt and lose to the
+/// healthy slot, never as a torn half-manifest.
+#[derive(Debug)]
+pub struct TornDevice<D, const BLOCK: usize> {
+    inner: D,
+    torn_at: usize,
+    torn_len: usize,
+    writes: usize,
+}
+
+impl<D, const BLOCK: usize> TornDevice<D, BLOCK> {
+    /// Wraps `inner`; write `torn_at` lands `torn_len` leading bytes and
+    /// no write after it lands at all.
+    pub const fn new(inner: D, torn_at: usize, torn_len: usize) -> Self {
+        Self {
+            inner,
+            torn_at,
+            torn_len,
+            writes: 0,
+        }
+    }
+
+    /// Returns the wrapped device.
+    pub fn into_inner(self) -> D {
+        self.inner
+    }
+}
+
+impl<D: BlockDevice, const BLOCK: usize> BlockDevice for TornDevice<D, BLOCK> {
+    type Error = D::Error;
+    const BLOCK: usize = BLOCK;
+
+    fn poll_read_block(
+        &self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_read_block(cx, id, buf)
+    }
+
+    fn poll_write_block(
+        &mut self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &[u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        let n = self.writes;
+        self.writes += 1;
+        if n > self.torn_at {
+            return Poll::Ready(Ok(())); // power died: the write never lands
+        }
+        if n == self.torn_at {
+            // The torn block: leading bytes land, the tail stays zeros.
+            let mut torn = [0u8; BLOCK];
+            let k = self.torn_len.min(buf.len()).min(BLOCK);
+            torn[..k].copy_from_slice(&buf[..k]);
+            return self.inner.poll_write_block(cx, id, &torn);
+        }
+        self.inner.poll_write_block(cx, id, buf)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+}
+
 /// `Db` with the standard test geometry: 4 KiB blocks, 256 B keys,
 /// 1 KiB values, 64 slots, 4 KiB arena, 7 levels, 4 L0 tables, 1024-byte
 /// bloom filters, and a 4096-entry free list (covers the whole table

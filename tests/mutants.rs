@@ -1,0 +1,523 @@
+//! Mutation-testing killers: regression tests whose sole job is to kill
+//! mutants that the feature test-suites miss.
+//!
+//! Each test is named `mut_<area>_<behavior>` and carries a comment naming
+//! the mutant(s) it kills. These tests are part of the permanent suite: a
+//! future refactor that breaks the asserted behavior fails here first.
+
+mod common;
+
+use core::convert::Infallible;
+
+use horton::WriteBatch;
+use horton::memtable::MemTable;
+use horton::{BlockDevice, Compaction, Error, Progress, Scan};
+
+use common::{MemDevice, TestDb, block_on, test_config};
+
+const KEY_MAX: usize = 32;
+const VAL_MAX: usize = 64;
+
+/// Caller scratch for `compact_step`, matching the test database shape.
+type TestCompaction = Compaction<4096, 256, 1024, 1024>;
+
+fn open<D: BlockDevice>(db: &mut TestDb<D>)
+where
+    D::Error: std::fmt::Debug,
+{
+    block_on(db.open()).unwrap();
+}
+
+fn get<D: BlockDevice>(db: &TestDb<D>, key: &[u8]) -> Option<Vec<u8>>
+where
+    D::Error: std::fmt::Debug,
+{
+    let mut buf = [0u8; 2048];
+    block_on(db.get(key, &mut buf))
+        .unwrap()
+        .map(|n| buf[..n].to_vec())
+}
+
+fn get_now<D: BlockDevice>(db: &TestDb<D>, key: &[u8], now: u64) -> Option<Vec<u8>>
+where
+    D::Error: std::fmt::Debug,
+{
+    let mut buf = [0u8; 2048];
+    block_on(db.get_with_time(key, &mut buf, now))
+        .unwrap()
+        .map(|n| buf[..n].to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// src/batch.rs
+// ---------------------------------------------------------------------------
+
+/// Kills `replace WriteBatch::is_empty -> bool with true`: a batch holding
+/// an op must report non-empty, and `clear()` must restore emptiness.
+#[test]
+fn mut_batch_is_empty_reflects_len() {
+    let mut b = WriteBatch::<KEY_MAX, VAL_MAX, 4>::new();
+    assert!(b.is_empty());
+    b.put(b"k", b"v").unwrap();
+    assert!(!b.is_empty());
+    b.clear();
+    assert!(b.is_empty());
+}
+
+/// Kills `replace WriteBatch::capacity -> usize with 0` and `... with 1`:
+/// capacity is the `OPS` const, not a hardcoded small number.
+#[test]
+fn mut_batch_capacity_reports_ops() {
+    assert_eq!(WriteBatch::<KEY_MAX, VAL_MAX, 1>::new().capacity(), 1);
+    assert_eq!(WriteBatch::<KEY_MAX, VAL_MAX, 7>::new().capacity(), 7);
+    assert_eq!(WriteBatch::<KEY_MAX, VAL_MAX, 64>::new().capacity(), 64);
+}
+
+// ---------------------------------------------------------------------------
+// src/memtable.rs
+// ---------------------------------------------------------------------------
+
+/// Kills `replace MemTable::is_empty -> bool with true`: a table holding
+/// slots must report non-empty. The feature suite asserts emptiness of a
+/// fresh table but never the non-empty side.
+#[test]
+fn mut_memtable_is_empty_reflects_len() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    assert!(t.is_empty());
+    t.insert::<Infallible>(b"k", b"v", 1, false).unwrap();
+    assert!(!t.is_empty());
+}
+
+/// Kills `replace > with >= in MemTable::plan` (src/memtable.rs:262 for
+/// keys, :273 for values): a key of exactly `KEY_MAX` bytes and a value of
+/// exactly `VAL_MAX` bytes are both legal — the bounds are inclusive. The
+/// mutants reject them with the absurd `KeyTooLarge { len: 16, max: 16 }` /
+/// `ValueTooLarge { len: 32, max: 32 }`.
+#[test]
+fn mut_memtable_key_val_max_are_inclusive() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    t.insert::<Infallible>(&[9u8; 16], b"v", 1, false).unwrap();
+    let e = t.get(&[9u8; 16]).unwrap();
+    assert_eq!(e.val, b"v");
+    t.insert::<Infallible>(b"k", &[7u8; 32], 2, false).unwrap();
+    let e = t.get(b"k").unwrap();
+    assert_eq!(e.val, &[7u8; 32]);
+}
+
+/// Kills `replace > with >= in MemTable::plan` (src/memtable.rs:288): an
+/// insert whose bytes land exactly on the arena limit fits — the bound is
+/// inclusive. The mutant rejects the last byte with `ArenaFull`.
+#[test]
+fn mut_memtable_arena_exact_fit_is_allowed() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    // 8 x (1 + 31) = 256 bytes: exactly the arena limit.
+    for i in 0..8u8 {
+        let k = [i];
+        t.insert::<Infallible>(&k, &[i; 31], u64::from(i) + 1, false)
+            .unwrap();
+    }
+    assert_eq!(t.len(), 8);
+    assert_eq!(t.arena_len(), 256);
+}
+
+/// Kills five `plan_range_del` mutants (src/memtable.rs:311 `> with
+/// ==/</>=`, :318 `>= with <`, :328 `>= with <`). The feature suite never
+/// exercises range-tombstone validation directly, so the bound checks,
+/// the empty/inverted-range rejection, and the table-full check were all
+/// untested.
+#[test]
+fn mut_memtable_range_del_validates_bounds() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    // KEY_MAX-sized bounds are legal (inclusive).
+    t.insert_range_del::<Infallible>(&[8u8; 16], &[9u8; 16], 1)
+        .unwrap();
+    // Oversized bound rejected.
+    assert!(matches!(
+        t.insert_range_del::<Infallible>(&[8u8; 17], &[9u8; 16], 2),
+        Err(Error::KeyTooLarge { .. })
+    ));
+    // Empty bound rejected.
+    assert!(matches!(
+        t.insert_range_del::<Infallible>(b"", &[9u8; 16], 3),
+        Err(Error::EmptyKey)
+    ));
+    // Inverted range rejected.
+    assert!(matches!(
+        t.insert_range_del::<Infallible>(b"b", b"a", 4),
+        Err(Error::EmptyKey)
+    ));
+    // Empty range (start == end) rejected.
+    assert!(matches!(
+        t.insert_range_del::<Infallible>(b"a", b"a", 5),
+        Err(Error::EmptyKey)
+    ));
+}
+
+/// Kills seven `plan_range_del` arena-accounting mutants
+/// (src/memtable.rs:331 `+ with -/*`, :332 `> with ==/</>=` and `+ with
+/// -/*`). The feature suite never fills a memtable's arena via range
+/// tombstones, so the size math was untested. Scenario A pins the
+/// overflow-reject side; scenario B pins the exact-fit-allow side.
+#[test]
+fn mut_memtable_range_del_arena_accounting() {
+    // Scenario A: 240 bytes used; a 32-byte range del must NOT fit.
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    for i in 0..5u8 {
+        t.insert::<Infallible>(&[i; 16], &[i; 32], u64::from(i) + 1, false)
+            .unwrap();
+    }
+    assert_eq!(t.arena_len(), 240);
+    assert!(matches!(
+        t.insert_range_del::<Infallible>(&[8u8; 16], &[9u8; 16], 100),
+        Err(Error::ArenaFull)
+    ));
+    // Scenario B: 224 bytes used; a 32-byte range del fits exactly.
+    let mut u = MemTable::<8, 256, 16, 32>::new();
+    for i in 0..7u8 {
+        u.insert_range_del::<Infallible>(&[i; 16], &[0x80 + i; 16], u64::from(i) + 1)
+            .unwrap();
+    }
+    assert_eq!(u.arena_len(), 224);
+    u.insert_range_del::<Infallible>(&[0x70; 16], &[0x90; 16], 100)
+        .unwrap();
+    assert_eq!(u.arena_len(), 256);
+}
+
+/// Kills `replace < with <= in MemTable::get_at` (src/memtable.rs:514):
+/// the run-walk must stop at `self.len`. The mutant reads one slot past
+/// the used region; on a full table that is `slots[CAP]` — an index-out-
+/// of-bounds panic. The feature suite never snapshot-reads a full table
+/// past the end of a max-key run.
+#[test]
+fn mut_memtable_get_at_stops_at_len() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    // Fill to CAP; the max key (b"h") has seq 100.
+    for i in 0u8..8 {
+        let k = [b'a' + i];
+        let seq = if i == 7 { 100 } else { u64::from(i) + 1 };
+        t.insert::<Infallible>(&k, b"v", seq, false).unwrap();
+    }
+    assert_eq!(t.len(), 8);
+    // Snapshot older than b"h"'s only version: no match, walk runs to the end.
+    assert!(t.get_at(b"h", 50).is_none());
+    // Sanity: live view still finds it.
+    assert!(t.get(b"h").is_some());
+}
+
+/// Kills `replace += with -=` and `replace += with *=` in
+/// `MemTable::get_at` (src/memtable.rs:522): the run walk must skip
+/// range tombstones by advancing. The `-=` mutant walks backwards
+/// (underflow panic); the `*=` mutant never advances (infinite loop).
+/// The feature suite never puts a range tombstone inside a looked-up
+/// key's run.
+#[test]
+fn mut_memtable_get_at_skips_range_del() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    // Put first (older), then a range tombstone starting at "m" (newer).
+    // The rdel sorts first in "m"'s run, so get_at must skip it.
+    t.insert::<Infallible>(b"m", b"v", 1, false).unwrap();
+    t.insert_range_del::<Infallible>(b"m", b"z", 2).unwrap();
+    let e = t.get_at(b"m", u64::MAX).unwrap();
+    assert_eq!(e.val, b"v");
+}
+
+/// Kills `replace MemTable::max_covering_rdel -> Option<u64> with None`
+/// / `Some(0)` / `Some(1)` (src/memtable.rs:546) and the logic mutants in
+/// its scan (:548 `||`→`&&`, `!` deletion, `>`→`==`/`<`/`>=`; :557
+/// `&&`→`||`, `<=`→`>`, `<`→`==`/`>`/`<=`, `>`→`==`/`<` in the best-seq
+/// update): the highest covering range tombstone's seq must be reported
+/// accurately. The feature suite never queries `max_covering_rdel`
+/// directly.
+#[test]
+fn mut_memtable_max_covering_rdel_reports_seq() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), None);
+    // A regular put must not be mistaken for a range del.
+    t.insert::<Infallible>(b"m", b"v", 1, false).unwrap();
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), None);
+    t.insert_range_del::<Infallible>(b"a", b"z", 7).unwrap();
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), Some(7));
+    assert_eq!(t.max_covering_rdel(b"m", 7), Some(7));
+    // Outside the range, or before the rdel's seq: no cover.
+    assert_eq!(t.max_covering_rdel(b"zz", u64::MAX), None);
+    assert_eq!(t.max_covering_rdel(b"m", 6), None);
+    // Boundaries: start <= key < end.
+    assert_eq!(t.max_covering_rdel(b"a", u64::MAX), Some(7));
+    assert_eq!(t.max_covering_rdel(b"z", u64::MAX), None);
+    // Two covering rdels with different starts (lower seq sorts first):
+    // the highest seq wins.
+    let mut u = MemTable::<8, 256, 16, 32>::new();
+    u.insert_range_del::<Infallible>(b"a", b"z", 5).unwrap();
+    u.insert_range_del::<Infallible>(b"b", b"y", 7).unwrap();
+    assert_eq!(u.max_covering_rdel(b"m", u64::MAX), Some(7));
+    assert_eq!(u.max_covering_rdel(b"m", 6), Some(5));
+}
+
+/// Kills `replace MemTable::check_insert -> Result with Ok(())` and
+/// `replace MemTable::check_insert_range_del -> Result with Ok(())`
+/// (src/memtable.rs:395, :499): the validation shims must actually
+/// validate. The feature suite never calls them with invalid input
+/// directly.
+#[test]
+fn mut_memtable_check_inserts_validate() {
+    let t = MemTable::<8, 256, 16, 32>::new();
+    assert!(
+        t.check_insert::<Infallible>(&[0u8; 17], b"v", false)
+            .is_err()
+    );
+    assert!(t.check_insert::<Infallible>(b"", b"v", false).is_err());
+    assert!(t.check_insert_range_del::<Infallible>(b"b", b"a").is_err());
+    assert!(
+        t.check_insert_range_del::<Infallible>(&[0u8; 17], b"z")
+            .is_err()
+    );
+    // Valid inputs still pass.
+    t.check_insert::<Infallible>(b"k", b"v", false).unwrap();
+    t.check_insert_range_del::<Infallible>(b"a", b"z").unwrap();
+}
+
+/// Kills `replace MemTable::insert_ttl -> Result with Ok(())`
+/// (src/memtable.rs:444): a TTL insert must actually store the entry.
+/// The feature suite never inserts via `insert_ttl` directly.
+#[test]
+fn mut_memtable_insert_ttl_stores_entry() {
+    let mut t = MemTable::<8, 256, 16, 32>::new();
+    t.insert_ttl::<Infallible>(b"k", b"v", 1, 999).unwrap();
+    let e = t.get(b"k").unwrap();
+    assert_eq!(e.val, b"v");
+    assert_eq!(e.expire_at, 999);
+}
+
+/// Kills `replace MemTable::arena_len -> usize with 0` and `... with 1`:
+/// `Db::write` relies on `arena_len()` for its up-front whole-batch arena
+/// check ("the table is unchanged since the capacity check, so this cannot
+/// fail"). With the check weakened, an overflowing batch commits to the
+/// WAL, applies a prefix of its ops, then fails — breaking batch
+/// atomicity. Correct code rejects the batch before touching anything.
+#[test]
+fn mut_db_write_arena_check_is_atomic() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // Fill the arena to 4016 of 4096 bytes (8 puts x 502 bytes).
+    for i in 0..8u8 {
+        let key = [b'f', i];
+        block_on(db.put(&key, &vec![i; 500])).unwrap();
+    }
+    // 22 + 102 = 124 bytes: fits the weakened check, overflows the real
+    // arena after the first op lands (4016 + 22 + 102 > 4096).
+    let mut b = WriteBatch::<256, 1024, 2>::new();
+    b.put(b"a1", &[0u8; 20]).unwrap();
+    b.put(b"b2", &[1u8; 100]).unwrap();
+    assert!(matches!(block_on(db.write(&b)), Err(Error::ArenaFull)));
+    assert_eq!(get(&db, b"a1"), None, "batch was not atomic");
+    assert_eq!(get(&db, b"b2"), None, "batch was not atomic");
+}
+
+/// Kills the `slot_len`, `slot_view`, and `lower_bound` mutants
+/// (src/memtable.rs:579,585,591,592,604): the memtable scan path must see
+/// every resident entry. The feature suite only scans flushed (sstable)
+/// data, so the memtable scan path was uncovered. Data stays in the
+/// memtable (no flush): `slot_len -> 0/1` truncates the scan, `slot_view
+/// -> None` empties it, `lower_bound -> 0/1` mispositions the seek.
+#[test]
+fn mut_memtable_scan_sees_resident_entries() {
+    type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    block_on(db.put(b"a", b"1")).unwrap();
+    block_on(db.put(b"b", b"2")).unwrap();
+    block_on(db.put(b"c", b"3")).unwrap();
+    let mut scan = TestScan::new(&db);
+    block_on(scan.seek(b"", None, u64::MAX)).unwrap();
+    let mut kbuf = [0u8; 256];
+    let mut vbuf = [0u8; 1024];
+    let mut out = Vec::new();
+    while let Some((klen, _)) = block_on(scan.next(&mut kbuf, &mut vbuf)).unwrap() {
+        out.push(kbuf[..klen].to_vec());
+    }
+    assert_eq!(
+        out,
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "memtable scan missed resident entries"
+    );
+    // Seek into the middle: lower_bound must position correctly.
+    let mut scan = TestScan::new(&db);
+    block_on(scan.seek(b"b", None, u64::MAX)).unwrap();
+    let mut out = Vec::new();
+    while let Some((klen, _)) = block_on(scan.next(&mut kbuf, &mut vbuf)).unwrap() {
+        out.push(kbuf[..klen].to_vec());
+    }
+    assert_eq!(
+        out,
+        vec![b"b".to_vec(), b"c".to_vec()],
+        "memtable scan seek mispositioned"
+    );
+}
+// src/compact.rs
+// ---------------------------------------------------------------------------
+
+/// Kills `replace Compaction::reset with ()` (src/compact.rs:282): the
+/// scratch is documented as reusable across jobs — a finished job leaves it
+/// idle and the next `compact_step` selects a fresh job. With `reset` as a
+/// no-op the second job skips selection on the stale `State::Merging` and
+/// merges exhausted cursors, corrupting the manifest. The existing suite
+/// always uses a fresh scratch per job (`drive_one`), so nothing else
+/// covers this.
+#[test]
+fn mut_compact_scratch_reusable_across_jobs() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    let mut c = TestCompaction::new();
+    for round in 0..2u8 {
+        // Fill L0 (TABLES = 4): one flush per table.
+        for t in 0..4u8 {
+            let base = round * 4 + t;
+            for i in 0..8u8 {
+                let key = [b'k', base, i];
+                block_on(db.put(&key, &[base, i])).unwrap();
+            }
+            block_on(db.flush()).unwrap();
+        }
+        // Drive exactly one job to completion with the SAME scratch.
+        loop {
+            match block_on(db.compact_step(&mut c)) {
+                Ok(Progress::More) => {}
+                Ok(Progress::Done) => break,
+                Err(e) => panic!("round {round}: unexpected compaction error: {e:?}"),
+            }
+        }
+        // The job must actually have drained L0: with `reset` as a no-op
+        // the second round's step skips selection on the stale
+        // `State::Merging`, "commits" the exhausted cursors, and leaves
+        // the fresh L0 tables behind while reporting `Done`.
+        assert!(
+            !db.compaction_pending(),
+            "round {round}: L0 still full after the job"
+        );
+    }
+    // Both jobs' data must be intact and visible.
+    for round in 0..2u8 {
+        for t in 0..4u8 {
+            let base = round * 4 + t;
+            for i in 0..8u8 {
+                let key = [b'k', base, i];
+                assert_eq!(get(&db, &key), Some(vec![base, i]), "lost key {key:?}");
+            }
+        }
+    }
+}
+
+/// Kills `replace || with && in merge_step` (src/compact.rs:368): the
+/// per-key restart must fire when the key LENGTH changes, even when the
+/// shared prefix bytes happen to match the stale tail of the key buffer.
+/// Merge order here is `wy < x < xy < z`: after `x`, the buffer still
+/// holds `wy`'s `y` at index 1, so with `&&` the mutant sees `xy` as a
+/// continuation of `x`, never restarts `served`, and drops `xy`'s version
+/// (the test observes `None`; correct code yields `Some("3")`).
+#[test]
+fn mut_compact_prefix_key_restarts_per_key_state() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    for (k, v) in [
+        (b"wy".as_slice(), b"1".as_slice()),
+        (b"x", b"2"),
+        (b"xy", b"3"),
+        (b"z", b"4"),
+    ] {
+        block_on(db.put(k, v)).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    let mut c = TestCompaction::new();
+    loop {
+        match block_on(db.compact_step(&mut c)) {
+            Ok(Progress::More) => {}
+            Ok(Progress::Done) => break,
+            Err(e) => panic!("unexpected compaction error: {e:?}"),
+        }
+    }
+    assert_eq!(get(&db, b"wy"), Some(b"1".to_vec()));
+    assert_eq!(get(&db, b"x"), Some(b"2".to_vec()));
+    assert_eq!(
+        get(&db, b"xy"),
+        Some(b"3".to_vec()),
+        "prefix key xy lost by the merge"
+    );
+    assert_eq!(get(&db, b"z"), Some(b"4".to_vec()));
+}
+
+/// Kills `replace <= with > in Compaction::merge_step`
+/// (src/compact.rs:385): the bottommost-tombstone-drop decision must treat
+/// a TTL value as a tombstone exactly when it is EXPIRED
+/// (`expire_at <= purge_before`). The mutant inverts the test, so a
+/// not-yet-expired value is dropped as if it were a tombstone — silent
+/// data loss. The feature suite never compacts a live (unexpired) TTL
+/// value through a bottommost compaction.
+#[test]
+fn mut_compact_ttl_unexpired_survives_bottommost() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    // Four tables in L0 to trigger compaction; TTL expires at 300 while
+    // the purge cutoff is 200, so the values are NOT expired.
+    for i in 0..4u8 {
+        let k = [b'k', i];
+        block_on(db.put_with_ttl(&k, b"v", 300)).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    let mut c = TestCompaction::new();
+    c.purge_before = 200;
+    loop {
+        match block_on(db.compact_step(&mut c)) {
+            Ok(Progress::More) => {}
+            Ok(Progress::Done) => break,
+            Err(e) => panic!("unexpected compaction error: {e:?}"),
+        }
+    }
+    // Still live at time 200: must survive bottommost compaction.
+    for i in 0..4u8 {
+        let k = [b'k', i];
+        assert_eq!(
+            get_now(&db, &k, 200),
+            Some(b"v".to_vec()),
+            "unexpired TTL value lost by compaction"
+        );
+    }
+}
+
+/// Kills `delete ! in Compaction::merge_step` (src/compact.rs:406):
+/// the TTL purge must convert an expired value into a tombstone
+/// (`!tombstone && expire_at != 0 && expire_at <= purge_before`). The
+/// mutant disables the purge for values, so an expired value survives
+/// compaction as a live value. A snapshot pins the pre-compaction seq so
+/// the bottommost drop cannot hide the difference; the read is at a time
+/// before expiry, where the purged tombstone (clean) hides the key but
+/// the unpurged value (mutant) is still visible.
+#[test]
+fn mut_compact_ttl_purge_converts_expired_value() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    open(&mut db);
+    let k0 = [b'k', 0];
+    // Expires at 100; the purge cutoff is 200, the read time is 50.
+    block_on(db.put_with_ttl(&k0, b"v", 100)).unwrap();
+    let snap = db.snapshot().unwrap();
+    block_on(db.flush()).unwrap();
+    for i in 1..4u8 {
+        let k = [b'k', i];
+        block_on(db.put_with_ttl(&k, b"v", 100)).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    let mut c = TestCompaction::new();
+    c.purge_before = 200;
+    loop {
+        match block_on(db.compact_step(&mut c)) {
+            Ok(Progress::More) => {}
+            Ok(Progress::Done) => break,
+            Err(e) => panic!("unexpected compaction error: {e:?}"),
+        }
+    }
+    // The expired value was purged to a tombstone: not visible even
+    // before its expiry time, because the tombstone won the merge.
+    let mut buf = [0u8; 2048];
+    let r = block_on(db.get_at_with_time(&k0, &mut buf, snap, 50)).unwrap();
+    assert_eq!(r, None, "expired value was not purged to a tombstone");
+    db.release_snapshot(snap);
+}
