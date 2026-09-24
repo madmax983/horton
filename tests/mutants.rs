@@ -727,6 +727,7 @@ fn mut_manifest_l0_is_full_reports_full() {
             first_key: KeyBound::from_slice(b"a").unwrap(),
             last_key: KeyBound::from_slice(b"z").unwrap(),
             max_seq: 10,
+            min_seq: 0,
             entry_count: 5,
             rdel_blocks: 0,
         }
@@ -781,13 +782,13 @@ fn mut_manifest_decode_accepts_exact_fit() {
     }
 
     // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys:
-    // payload = 8 + 8 + 4 + 8 + 8 + 4 + (4 + 38) = 82,
-    // total = 12 + 82 + 4 = 98.
-    const BLOCK: usize = 98;
-    const CRC_END: usize = 94;
+    // payload = 8 + 8 + 4 + 8 + 8 + 4 + (4 + 46) = 90,
+    // total = 12 + 90 + 4 = 106.
+    const BLOCK: usize = 106;
+    const CRC_END: usize = 102;
     let mut buf = [0u8; BLOCK];
     buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-    buf[8..12].copy_from_slice(&82u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&90u32.to_le_bytes());
     let mut off = 12;
     w64(&mut buf, &mut off, 7); // seq
     w64(&mut buf, &mut off, 0); // wal_head
@@ -806,6 +807,7 @@ fn mut_manifest_decode_accepts_exact_fit() {
     buf[off] = b'z';
     off += 1;
     w64(&mut buf, &mut off, 10); // max_seq
+    w64(&mut buf, &mut off, 3); // min_seq
     w32(&mut buf, &mut off, 5); // entry_count
     w32(&mut buf, &mut off, 0); // rdel_blocks
     assert_eq!(off, CRC_END);
@@ -834,6 +836,7 @@ fn mut_manifest_block_ref_boundary() {
         first_key: KeyBound::from_slice(b"a").unwrap(),
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     })
@@ -862,6 +865,7 @@ fn mut_manifest_decode_bound_accepts_key_max() {
         first_key: KeyBound::from_slice(&[0xAA; 8]).unwrap(),
         last_key: KeyBound::from_slice(&[0xBB; 8]).unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     })
@@ -889,6 +893,7 @@ fn mut_manifest_decode_bound_rejects_overlong() {
         first_key: KeyBound::from_slice(b"a").unwrap(),
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     })
@@ -921,7 +926,7 @@ fn mut_manifest_decode_bound_rejects_overlong() {
 fn mut_manifest_encode_accepts_exact_fit() {
     use horton::{KeyBound, Manifest, TableRef};
 
-    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 98.
+    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 106.
     let mut m = Manifest::<1, 1, 8>::new();
     m.add_l0_table::<Infallible>(TableRef {
         id: 7,
@@ -930,15 +935,16 @@ fn mut_manifest_encode_accepts_exact_fit() {
         first_key: KeyBound::from_slice(b"a").unwrap(),
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     })
     .unwrap();
-    let mut buf = [0u8; 98];
-    m.encode::<Infallible, 98>(&mut buf)
+    let mut buf = [0u8; 106];
+    m.encode::<Infallible, 106>(&mut buf)
         .expect("exact-fit manifest must encode");
     // And it must round-trip through decode.
-    let back = Manifest::<1, 1, 8>::decode::<Infallible, 98>(&buf)
+    let back = Manifest::<1, 1, 8>::decode::<Infallible, 106>(&buf)
         .expect("exact-fit manifest must decode");
     assert_eq!(back.seq(), 0);
     assert_eq!(back.l0().len(), 1);
@@ -959,6 +965,7 @@ fn mut_manifest_encode_rejects_oversized() {
         first_key: KeyBound::from_slice(&[0xAA; 256]).unwrap(),
         last_key: KeyBound::from_slice(&[0xBB; 256]).unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     })

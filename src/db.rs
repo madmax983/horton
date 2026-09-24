@@ -109,7 +109,7 @@ pub struct SealedTable<const KEY_MAX: usize> {
     /// The table's original id; ingest preserves it so the table is
     /// idempotent across retries and database copies.
     pub id: u32,
-    /// Total blocks: rdel blocks + data blocks + bloom + index + footer.
+    /// Total blocks: data blocks + rdel blocks + bloom + index + footer.
     pub block_count: u32,
     /// Smallest key in the table.
     pub first_key: KeyBound<KEY_MAX>,
@@ -117,6 +117,10 @@ pub struct SealedTable<const KEY_MAX: usize> {
     pub last_key: KeyBound<KEY_MAX>,
     /// Highest sequence number in the table.
     pub max_seq: u64,
+    /// Lowest sequence number in the table; cross-checked against the
+    /// copied table's footer on ingest (compaction's tombstone-drop rule
+    /// relies on it).
+    pub min_seq: u64,
     /// Key/value entries (including tombstones); cross-checked against
     /// the copied table's footer on ingest.
     pub entry_count: u32,
@@ -140,6 +144,7 @@ impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
             first_key: self.table.first_key,
             last_key: self.table.last_key,
             max_seq: self.table.max_seq,
+            min_seq: self.table.min_seq,
             entry_count: self.table.entry_count,
             rdel_blocks: self.table.rdel_blocks,
         }
@@ -998,6 +1003,7 @@ impl<
                 && existing.first_key == sealed.first_key
                 && existing.last_key == sealed.last_key
                 && existing.max_seq == sealed.max_seq
+                && existing.min_seq == sealed.min_seq
                 && existing.entry_count == sealed.entry_count
                 && existing.rdel_blocks == sealed.rdel_blocks;
             return if same {
@@ -1025,21 +1031,8 @@ impl<
         // block's CRC as it lands so remote corruption fails fast,
         // before the manifest commit.
         let mut buf = [0u8; BLOCK];
-        for k in 0..sealed.block_count {
-            let src = src_base
-                .checked_add(u64::from(k))
-                .ok_or(Error::CorruptManifest)?;
-            poll_fn(|cx| remote.poll_read_block(cx, src, &mut buf))
-                .await
-                .map_err(|e| Error::Device(e.into()))?;
-            sstable::check_block_crc::<D::Error, BLOCK>(&buf, src)?;
-            let dst = base
-                .checked_add(u64::from(k))
-                .ok_or(Error::CorruptManifest)?;
-            poll_fn(|cx| self.wal.device_mut().poll_write_block(cx, dst, &buf))
-                .await
-                .map_err(Error::Device)?;
-        }
+        self.copy_verified_blocks(remote, src_base, base, sealed.block_count, &mut buf)
+            .await?;
         // Relocate the copy: index entries and the footer carry the
         // absolute block ids of the table's original placement, which are
         // rewritten to the destination layout and re-sealed.
@@ -1061,11 +1054,11 @@ impl<
             self.wal.device(),
             &mut buf,
             footer,
-            base,
         )
         .await?;
         if reader.entry_count() != u64::from(sealed.entry_count)
             || reader.rdel_blocks() != sealed.rdel_blocks
+            || reader.min_seq() != sealed.min_seq
         {
             return Err(Error::CorruptBlock { id: footer });
         }
@@ -1085,6 +1078,7 @@ impl<
             first_key: sealed.first_key,
             last_key: sealed.last_key,
             max_seq: sealed.max_seq,
+            min_seq: sealed.min_seq,
             entry_count: sealed.entry_count,
             rdel_blocks: sealed.rdel_blocks,
         })?;
@@ -1113,6 +1107,38 @@ impl<
         Ok(true)
     }
 
+    /// Copies `count` blocks from `remote` at `src_base` to the local
+    /// device at `dst_base`, verifying each block's CRC as it lands.
+    async fn copy_verified_blocks<R>(
+        &mut self,
+        remote: &R,
+        src_base: u64,
+        dst_base: u64,
+        count: u32,
+        buf: &mut [u8; BLOCK],
+    ) -> Result<(), Error<D::Error>>
+    where
+        R: BlockDevice,
+        R::Error: Into<D::Error>,
+    {
+        for k in 0..count {
+            let src = src_base
+                .checked_add(u64::from(k))
+                .ok_or(Error::CorruptManifest)?;
+            poll_fn(|cx| remote.poll_read_block(cx, src, buf))
+                .await
+                .map_err(|e| Error::Device(e.into()))?;
+            sstable::check_block_crc::<D::Error, BLOCK>(buf, src)?;
+            let dst = dst_base
+                .checked_add(u64::from(k))
+                .ok_or(Error::CorruptManifest)?;
+            poll_fn(|cx| self.wal.device_mut().poll_write_block(cx, dst, buf))
+                .await
+                .map_err(Error::Device)?;
+        }
+        Ok(())
+    }
+
     /// Considers one table for [`Db::get_at`]: key-range prune, sequence prune,
     /// then a bloom-gated lookup. A hit with a higher sequence number than
     /// the best so far — and visible at `max_seq` — is promoted into `acc`.
@@ -1130,18 +1156,13 @@ impl<
         if !tref.covers(key) || tref.max_seq <= acc.best_seq {
             return Ok(());
         }
-        let footer = tref
-            .first_block
-            .checked_add(u64::from(tref.block_count))
-            .and_then(|end| end.checked_sub(1))
-            .ok_or(Error::CorruptManifest)?;
+        let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
         let reader = sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open_cached(
             self.wal.device(),
             Some(&self.cache as &dyn CachePort<BLOCK>),
             tref.id,
             scratch,
             footer,
-            tref.first_block,
         )
         .await?;
         // `tmp` (not `acc.stage`) receives the value: only a winning hit is
@@ -1256,6 +1277,7 @@ impl<
             first_key: plan.first_key.min(rdel_first),
             last_key: plan.last_key.max(rdel_last),
             max_seq: plan.max_seq.max(rdel_plan.max_seq),
+            min_seq: plan.min_seq.min(rdel_plan.min_seq),
             entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::NoSpace)?,
             rdel_blocks: rdel_plan.blocks,
         })
@@ -1337,34 +1359,37 @@ impl<
             Some(b) => b,
             None => self.tbl_bump.peek_run::<D::Error>(total)?,
         };
-        // Pass 2: stream the blocks — the rdel section first, then the data
-        // section at `base + rdel_blocks`. `data` doubles as the manifest
-        // scratch below; it is a plain stack local. `cs` is this flush's
-        // compression scratch: every data block is trial-compressed and
-        // the compressed form kept when it saves enough.
+        // Pass 2: stream the blocks — the data section at `base`, then the
+        // rdel section right after it, then bloom/index/footer. `data`
+        // doubles as the manifest scratch below; it is a plain stack local.
+        // `cs` is this flush's compression scratch: every data block is
+        // trial-compressed and the compressed form kept when it saves
+        // enough. The writer's block limit is the planned data-block
+        // count: plan and writer share one packing rule, so it is never
+        // reached — but a mismatch fails loudly instead of overrunning
+        // the reserved run.
         let mut data = [0u8; BLOCK];
         let mut cs = crate::compress::CompressScratch::<BLOCK>::new();
-        let rdel_written = Self::write_flush_rdel(self.wal.device_mut(), &self.table, base).await?;
-        debug_assert_eq!(rdel_written, rdel_plan.blocks);
-        let data_base = base
-            .checked_add(u64::from(rdel_plan.blocks))
-            .ok_or(Error::NoSpace)?;
-        let written = sstable::write_table::<D, BLOCK, BLOOM_BYTES, KEY_MAX>(
-            self.wal.device_mut(),
-            data_base,
-            k,
-            self.table
+        {
+            let device = self.wal.device_mut();
+            let table = &self.table;
+            let mut w = sstable::TableWriter::<BLOCK, BLOOM_BYTES, KEY_MAX>::new(base, k)
+                .with_block_limit(plan.data_blocks);
+            for e in table
                 .iter()
                 .filter(|e| !e.range_del)
-                .map(sstable::SstEntry::from),
-            Some(&mut cs),
-            rdel_plan.blocks,
-        )
-        .await?;
-        debug_assert_eq!(
-            written.checked_add(u64::from(rdel_plan.blocks)),
-            Some(total)
-        );
+                .map(sstable::SstEntry::from)
+            {
+                w.push(&mut *device, e, Some(&mut cs)).await?;
+            }
+            let data_blocks = w.seal_data(&mut *device, Some(&mut cs)).await?;
+            debug_assert_eq!(data_blocks, plan.data_blocks);
+            let rdel_base = base.checked_add(data_blocks).ok_or(Error::NoSpace)?;
+            let rdel_written = Self::write_flush_rdel(&mut *device, table, rdel_base).await?;
+            debug_assert_eq!(rdel_written, rdel_plan.blocks);
+            w.finish_meta(&mut *device, rdel_written, rdel_plan.min_seq)
+                .await?;
+        }
         // The manifest commit is the atomic visibility point. Stage the new
         // manifest in a copy and publish it only after the commit lands, so
         // a returned I/O error leaves the in-memory state exactly as it was
@@ -1634,15 +1659,16 @@ impl<
         // compact first (merging the tombstone into the overlapping
         // table), then archive.
         let mut raw = [0u8; BLOCK];
+        let rdel_first = candidate.rdel_first().ok_or(Error::CorruptBlock {
+            id: candidate.first_block,
+        })?;
         let mut b = 0u32;
         while b < candidate.rdel_blocks {
-            let id =
-                candidate
-                    .first_block
-                    .checked_add(u64::from(b))
-                    .ok_or(Error::CorruptBlock {
-                        id: candidate.first_block,
-                    })?;
+            let id = rdel_first
+                .checked_add(u64::from(b))
+                .ok_or(Error::CorruptBlock {
+                    id: candidate.first_block,
+                })?;
             poll_fn(|cx| self.wal.device().poll_read_block(cx, id, &mut raw))
                 .await
                 .map_err(Error::Device)?;
@@ -2038,42 +2064,20 @@ impl<
         c.n_snapshots = n;
         c.oldest_snapshot = oldest_snapshot;
         c.n_inputs = job.n_inputs;
-        // The output's range-tombstone section streams out now, before the
-        // data merge starts: a bounded k-way merge over the inputs'
-        // sorted rdel sections (see `RdelMerger`). Crash story matches the
-        // data blocks: invisible until the manifest commit, orphans swept
-        // on open.
-        let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(out_base);
-        let mut rdel_stats = crate::compact::RdelStats::<KEY_MAX>::new();
-        {
-            let device = self.wal.device_mut();
-            let mut merger = crate::compact::RdelMerger::<KEY_MAX>::new(
-                &c.inputs[..job.n_inputs],
-                bottommost,
-                c.oldest_snapshot,
-            );
-            while merger.next_merged(&*device, &mut c.raw).await? {
-                let e = merger.current_entry();
-                rdel_out.push(&mut *device, e).await?;
-                rdel_stats.observe::<D::Error>(&e, out_base)?;
-            }
-            c.rdel_blocks = rdel_out.finish(&mut *device).await?;
-        }
-        debug_assert_eq!(
-            c.rdel_blocks, rdel_budget,
-            "rdel merge replay diverged from its counted budget"
-        );
-        c.rdel_first = rdel_stats.first;
-        c.rdel_last = rdel_stats.last;
-        c.rdel_max_seq = rdel_stats.max_seq;
-        // The data section starts after the rdel section.
-        let data_base = out_base
-            .checked_add(u64::from(c.rdel_blocks))
+        c.rdel_blocks = rdel_budget;
+        // The data section leads the output run; the range-tombstone
+        // section follows it and is written at commit. The writer's block
+        // limit is the reserved data budget: a merge that would need more
+        // blocks fails with `NoSpace` instead of writing past the run.
+        let data_budget = out_blocks
+            .checked_sub(u64::from(rdel_budget))
+            .and_then(|n| n.checked_sub(3))
             .ok_or(Error::NoSpace)?;
         c.writer = sstable::TableWriter::new(
-            data_base,
+            out_base,
             sstable::bloom_k(BLOOM_BYTES * 8, job.total_entries),
-        );
+        )
+        .with_block_limit(data_budget);
         // Position one cursor per input on its first entry.
         let device = self.wal.device_mut();
         for i in 0..job.n_inputs {
@@ -2171,16 +2175,44 @@ impl<
     ) -> Result<(), Error<D::Error>> {
         let mut scratch = [0u8; BLOCK];
         let mut staged = self.manifest;
-        // Seal the output table first: finish flushes, so its blocks are
-        // durable before the manifest makes them visible. A merge that
-        // kept only range tombstones (no point entries) still seals a
-        // table — range-only tables are first-class (zero data blocks).
-        let out_ref = if c.writer.entry_count() > 0 || c.rdel_blocks > 0 {
+        // Seal the output table first: data, then the range-tombstone
+        // section (a bounded k-way merge over the inputs' sorted rdel
+        // sections, see `RdelMerger`), then bloom/index/footer. The meta
+        // write flushes, so the blocks are durable before the manifest makes
+        // them visible. A merge that kept only range tombstones (no point
+        // entries) still seals a table — range-only tables are first-class
+        // (zero data blocks).
+        let device = self.wal.device_mut();
+        let data_blocks = c
+            .writer
+            .seal_data(&mut *device, Some(&mut c.compress))
+            .await?;
+        let rdel_base = c.out_base.checked_add(data_blocks).ok_or(Error::NoSpace)?;
+        let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(rdel_base);
+        let mut rdel_stats = crate::compact::RdelStats::<KEY_MAX>::new();
+        {
+            let mut merger = crate::compact::RdelMerger::<KEY_MAX>::new(
+                &c.inputs[..c.n_inputs],
+                c.bottommost,
+                c.oldest_snapshot,
+            );
+            while merger.next_merged(&*device, &mut c.raw).await? {
+                let e = merger.current_entry();
+                rdel_out.push(&mut *device, e).await?;
+                rdel_stats.observe::<D::Error>(&e, rdel_base)?;
+            }
+        }
+        let rdel_blocks = rdel_out.finish(&mut *device).await?;
+        debug_assert_eq!(
+            rdel_blocks, c.rdel_blocks,
+            "rdel merge replay diverged from its counted budget"
+        );
+        let out_ref = if c.writer.entry_count() > 0 || rdel_blocks > 0 {
             let done: sstable::FinishedTable<KEY_MAX> = c
                 .writer
-                .finish(self.wal.device_mut(), Some(&mut c.compress), c.rdel_blocks)
+                .finish_meta(&mut *device, rdel_blocks, rdel_stats.min_seq)
                 .await?;
-            let total = u64::from(c.rdel_blocks)
+            let total = u64::from(rdel_blocks)
                 .checked_add(done.data_blocks)
                 .and_then(|n| n.checked_add(3))
                 .ok_or(Error::NoSpace)?;
@@ -2191,11 +2223,12 @@ impl<
                 block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
                 // `KeyBound::min/max` let `EMPTY` lose, so a missing
                 // section never corrupts the bounds.
-                first_key: done.first_key.min(c.rdel_first),
-                last_key: done.last_key.max(c.rdel_last),
-                max_seq: done.max_seq.max(c.rdel_max_seq),
+                first_key: done.first_key.min(rdel_stats.first),
+                last_key: done.last_key.max(rdel_stats.last),
+                max_seq: done.max_seq.max(rdel_stats.max_seq),
+                min_seq: done.min_seq,
                 entry_count: u32::try_from(done.entry_count).map_err(|_| Error::NoSpace)?,
-                rdel_blocks: c.rdel_blocks,
+                rdel_blocks,
             })
         } else {
             None

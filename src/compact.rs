@@ -482,6 +482,7 @@ pub(crate) struct RdelStats<const KEY_MAX: usize> {
     pub(crate) first: KeyBound<KEY_MAX>,
     pub(crate) last: KeyBound<KEY_MAX>,
     pub(crate) max_seq: u64,
+    pub(crate) min_seq: u64,
 }
 
 impl<const KEY_MAX: usize> RdelStats<KEY_MAX> {
@@ -490,6 +491,7 @@ impl<const KEY_MAX: usize> RdelStats<KEY_MAX> {
             first: KeyBound::EMPTY,
             last: KeyBound::EMPTY,
             max_seq: 0,
+            min_seq: u64::MAX,
         }
     }
 
@@ -509,6 +511,9 @@ impl<const KEY_MAX: usize> RdelStats<KEY_MAX> {
         self.last = self.last.max(end);
         if e.seq > self.max_seq {
             self.max_seq = e.seq;
+        }
+        if e.seq < self.min_seq {
+            self.min_seq = e.seq;
         }
         Ok(())
     }
@@ -699,7 +704,9 @@ impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
         let heads = core::array::from_fn(|i| {
             if i < inputs.len() {
                 let t = &inputs[i].tref;
-                RdelHead::new(t.first_block, t.rdel_blocks)
+                // A malformed ref (no room for its sections) reads from an
+                // impossible base, which surfaces as `CorruptBlock`.
+                RdelHead::new(t.rdel_first().unwrap_or(u64::MAX), t.rdel_blocks)
             } else {
                 RdelHead::new(0, 0)
             }
@@ -952,8 +959,9 @@ fn parse_head_at<E, const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usi
 /// Positions a cursor on its table's first entry. A table with no data
 /// blocks parks exhausted.
 ///
-/// The data section starts after the table's range-tombstone section
-/// (`rdel_blocks`), so the cursor's block window skips it.
+/// The data section leads the table (`[data]* [rdel]* [bloom] [index]
+/// [footer]`), so the cursor's block window is `[first_block, first_block +
+/// data_blocks)`.
 ///
 /// `raw` is the caller's shared physical-read scratch, lent to
 /// [`read_data_block`] for the fill.
@@ -969,18 +977,10 @@ pub(crate) async fn init_cursor<
     cur: &mut Cursor<BLOCK, KEY_MAX, VAL_MAX>,
 ) -> Result<(), Error<D::Error>> {
     *cur = Cursor::EMPTY;
-    cur.first_block = tref
-        .first_block
-        .checked_add(u64::from(tref.rdel_blocks))
-        .ok_or(Error::CorruptBlock {
-            id: tref.first_block,
-        })?;
-    let data_blocks = u64::from(tref.block_count)
-        .checked_sub(u64::from(tref.rdel_blocks))
-        .and_then(|n| n.checked_sub(3))
-        .ok_or(Error::CorruptBlock {
-            id: tref.first_block,
-        })?;
+    cur.first_block = tref.data_first();
+    let data_blocks = tref.data_blocks().ok_or(Error::CorruptBlock {
+        id: tref.first_block,
+    })?;
     cur.data_blocks = data_blocks;
     if data_blocks == 0 {
         return Ok(());
@@ -1185,9 +1185,12 @@ mod tests {
             }),
         ))
         .unwrap();
+        // A range-only table: no data blocks, so the rdel section starts at
+        // `base` (bloom, index, and footer would follow it).
         let mut t = TableRef::<256>::EMPTY;
         t.first_block = base;
         t.rdel_blocks = rdel_blocks;
+        t.block_count = rdel_blocks + 3;
         t
     }
 

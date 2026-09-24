@@ -24,6 +24,7 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         first_key: KeyBound::from_slice(b"a").unwrap(),
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     }
@@ -209,8 +210,8 @@ fn encode_crc_tail_is_bounds_checked() {
     // Regression: the trailing CRC write was not bounds-checked. A payload
     // leaving fewer than 4 bytes for the CRC panicked instead of failing
     // with `NoSpace` (production code must have no panic paths).
-    // Manifest<1, 1, 8> with a 2-byte first key: payload = 83, so the CRC
-    // would land at [95..99] in a 98-byte block.
+    // Manifest<1, 1, 8> with a 2-byte first key: payload = 91, so the CRC
+    // would land at [103..107] in a 106-byte block.
     let mut m = Manifest::<1, 1, 8>::new();
     m.add_l0_table::<DevError>(TableRef {
         id: 7,
@@ -219,12 +220,13 @@ fn encode_crc_tail_is_bounds_checked() {
         first_key: KeyBound::from_slice(b"ab").unwrap(),
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     })
     .unwrap();
-    let mut buf = [0u8; 98];
-    let res = m.encode::<DevError, 98>(&mut buf);
+    let mut buf = [0u8; 106];
+    let res = m.encode::<DevError, 106>(&mut buf);
     assert!(
         matches!(res, Err(Error::NoSpace)),
         "CRC without room must be NoSpace, not a panic"

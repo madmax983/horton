@@ -325,7 +325,6 @@ fn flush_leaves_random_data_raw() {
         k,
         entries.iter().copied(),
         Some(&mut cs),
-        0,
     ))
     .unwrap();
     assert_eq!(nblocks, plan.data_blocks + 3);
@@ -345,7 +344,6 @@ fn flush_leaves_random_data_raw() {
             &dev,
             &mut scratch,
             base + nblocks - 1,
-            base,
         ),
     )
     .unwrap();

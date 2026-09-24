@@ -1,10 +1,14 @@
 //! Immutable sorted-run tables: streaming writer and point-lookup reader.
 //!
-//! On-device layout:
+//! On-device layout (v0.17):
 //!
 //! ```text
-//! [data block]* [bloom block] [index block] [footer block]
+//! [data block]* [rdel block]* [bloom block] [index block] [footer block]
 //! ```
+//!
+//! The range-tombstone (rdel) section follows the data so a writer can
+//! decide it last: compaction clips each output table's tombstones to the
+//! key range the table ends up covering.
 //!
 //! Every block is `BLOCK` bytes; the last 4 bytes are the CRC32 of the
 //! preceding payload bytes. All integers are little-endian.
@@ -17,8 +21,12 @@
 //!   come from double hashing of a hand-rolled splitmix64-over-Fx-fold hash.
 //! - Index block: one entry per data block,
 //!   `first_key_len u16 | first_key | block_id u64 | max_seq u64`.
-//! - Footer block: `magic u64 = "lsmtable" | index_block u64 |
-//!   bloom_block u64 | entry_count u64 | k u8`.
+//! - Rdel block: range tombstones `start_len u16 | end_len u16 | seq u64 |
+//!   start | end`, sorted by `(start asc, seq desc)`, then `count u16`.
+//! - Footer block: `magic u64 = "hrtsst02" | index_block u64 |
+//!   bloom_block u64 | entry_count u64 | k u8 | rdel_blocks u32 |
+//!   min_seq u64`. The rdel section is `[bloom_block - rdel_blocks,
+//!   bloom_block)`.
 //!
 //! A failed CRC is [`Error::CorruptBlock`] for footer, index, data, and
 //! range-tombstone blocks: corruption is never silent, and never reads as
@@ -40,8 +48,14 @@ use crate::error::Error;
 use crate::manifest::KeyBound;
 use crate::wal::Op;
 
-/// Footer magic: ASCII "lsmtable".
-pub const SSTABLE_MAGIC: u64 = 0x6C73_6D74_6162_6C65;
+/// Footer magic: ASCII "hrtsst02" as stored on device.
+///
+/// Pre-1.0 format policy: the magic changes whenever the table layout
+/// does. "lsmtable" was the v0.2–v0.16 layout (rdel section first, no
+/// `min_seq`); "hrtsst02" is v0.17 (rdel section after the data, footer
+/// `min_seq`). A foreign magic is [`Error::CorruptBlock`], never a
+/// misparse.
+pub const SSTABLE_MAGIC: u64 = u64::from_le_bytes(*b"hrtsst02");
 
 /// One sorted-run entry: exactly one per key (the memtable already keeps
 /// only the newest version of each key).
@@ -87,6 +101,8 @@ pub struct TablePlan<const KEY_MAX: usize> {
     pub entry_count: u64,
     /// Highest sequence number.
     pub max_seq: u64,
+    /// Lowest sequence number (`u64::MAX` for an empty plan).
+    pub min_seq: u64,
     /// Smallest key.
     pub first_key: KeyBound<KEY_MAX>,
     /// Largest key.
@@ -252,6 +268,7 @@ pub fn plan_table<'a, E, const BLOCK: usize, const KEY_MAX: usize>(
     let mut n = 0u64;
     let mut count = 0u64;
     let mut max_seq = 0u64;
+    let mut min_seq = u64::MAX;
     let mut first: Option<&'a [u8]> = None;
     let mut last: Option<&'a [u8]> = None;
     for e in entries {
@@ -274,6 +291,9 @@ pub fn plan_table<'a, E, const BLOCK: usize, const KEY_MAX: usize>(
         if e.seq > max_seq {
             max_seq = e.seq;
         }
+        if e.seq < min_seq {
+            min_seq = e.seq;
+        }
         payload += elen;
         n += 1;
         count += 1;
@@ -293,6 +313,7 @@ pub fn plan_table<'a, E, const BLOCK: usize, const KEY_MAX: usize>(
         data_blocks,
         entry_count: count,
         max_seq,
+        min_seq,
         first_key: bound(first)?,
         last_key: bound(last)?,
     })
@@ -397,6 +418,9 @@ pub struct FinishedTable<const KEY_MAX: usize> {
     pub entry_count: u64,
     /// Highest sequence number written.
     pub max_seq: u64,
+    /// Lowest sequence number written, across entries and range
+    /// tombstones (`u64::MAX` when the table holds neither).
+    pub min_seq: u64,
     /// Smallest key written.
     pub first_key: KeyBound<KEY_MAX>,
     /// Largest key written.
@@ -439,6 +463,11 @@ pub struct TableWriter<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_M
     last_key: [u8; KEY_MAX],
     last_len: usize,
     max_seq: u64,
+    min_seq: u64,
+    /// Data blocks this table may occupy; `u64::MAX` when unbounded. A
+    /// seal past it is refused, so a table can never outgrow the run its
+    /// caller reserved (see [`with_block_limit`](Self::with_block_limit)).
+    data_limit: u64,
 }
 
 impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
@@ -468,7 +497,26 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             last_key: [0u8; KEY_MAX],
             last_len: 0,
             max_seq: 0,
+            min_seq: u64::MAX,
+            data_limit: u64::MAX,
         }
+    }
+
+    /// Caps the data blocks this table may seal. The caller reserved a
+    /// run for the table; sealing past it would overwrite whatever follows
+    /// the run, so [`push`](Self::push) and
+    /// [`seal_data`](Self::seal_data) refuse with
+    /// [`Error::NoSpace`] instead.
+    #[must_use]
+    pub const fn with_block_limit(mut self, data_blocks: u64) -> Self {
+        self.data_limit = data_blocks;
+        self
+    }
+
+    /// Entries buffered in the current (unsealed) data block.
+    #[must_use]
+    pub const fn pending_entries(&self) -> u64 {
+        self.n
     }
 
     /// Entries pushed so far.
@@ -517,33 +565,12 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             if self.n == 0 {
                 return Err(Error::NoSpace);
             }
-            let id = self
-                .base
-                .checked_add(self.data_blocks)
-                .ok_or(Error::NoSpace)?;
-            seal_block(
-                device,
-                id,
-                &mut self.data,
-                self.payload,
-                Some(&self.restarts[..self.nrestarts]),
-                compress,
-            )
-            .await?;
-            append_index::<D::Error, BLOCK>(
-                &mut self.index,
-                &mut self.index_len,
-                Some(&self.block_first[..self.block_first_len]),
-                id,
-                self.block_max_seq,
-            )?;
-            self.data_blocks += 1;
-            self.payload = 0;
-            self.n = 0;
-            self.nrestarts = 0;
-            self.block_first_len = 0;
-            self.block_max_seq = 0;
-            self.data.fill(0);
+            // The block being sealed plus the one this entry opens must
+            // both fit the reserved run.
+            if self.data_blocks.saturating_add(2) > self.data_limit {
+                return Err(Error::NoSpace);
+            }
+            self.seal_current(device, compress).await?;
             if !entry_fits::<BLOCK>(0, 0, elen) {
                 return Err(Error::NoSpace);
             }
@@ -594,6 +621,9 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         if e.seq > self.max_seq {
             self.max_seq = e.seq;
         }
+        if e.seq < self.min_seq {
+            self.min_seq = e.seq;
+        }
         bloom_add(&mut self.bloom, e.key, self.k);
         self.payload += elen;
         self.n += 1;
@@ -601,57 +631,90 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         Ok(sealed)
     }
 
-    /// Seals the trailing partial block (if any), then writes the bloom,
-    /// index, and footer blocks and flushes the device. Reports the table's
-    /// shape for the manifest's [`TableRef`](crate::manifest::TableRef).
-    ///
-    /// `rdel_blocks` is the table's range-tombstone section length,
-    /// written by the caller *before* this writer's `base` (see
-    /// [`write_rdel_blocks`]); the footer records it so readers can find
-    /// the section.
+    /// Seals the trailing partial data block, if any. Returns the table's
+    /// data-block count; the caller writes the range-tombstone section at
+    /// `base + data_blocks` (if any) before [`finish_meta`](Self::finish_meta).
+    /// Idempotent.
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the table outgrows its pre-allocated run, or
-    /// [`Error::Device`] on I/O failure.
-    ///
-    /// `compress` is the caller's compression scratch (`None` = store raw);
-    /// see [`push`](TableWriter::push).
-    pub async fn finish<D: BlockDevice>(
+    /// [`Error::NoSpace`] when the block would exceed the writer's block
+    /// limit, or [`Error::Device`] on I/O failure.
+    pub async fn seal_data<D: BlockDevice>(
         &mut self,
         device: &mut D,
         compress: Option<&mut CompressScratch<BLOCK>>,
-        rdel_blocks: u32,
-    ) -> Result<FinishedTable<KEY_MAX>, Error<D::Error>> {
+    ) -> Result<u64, Error<D::Error>> {
         if self.n > 0 {
-            let id = self
-                .base
-                .checked_add(self.data_blocks)
-                .ok_or(Error::NoSpace)?;
-            seal_block(
-                device,
-                id,
-                &mut self.data,
-                self.payload,
-                Some(&self.restarts[..self.nrestarts]),
-                compress,
-            )
-            .await?;
-            append_index::<D::Error, BLOCK>(
-                &mut self.index,
-                &mut self.index_len,
-                Some(&self.block_first[..self.block_first_len]),
-                id,
-                self.block_max_seq,
-            )?;
-            self.data_blocks += 1;
-            self.n = 0;
+            if self.data_blocks >= self.data_limit {
+                return Err(Error::NoSpace);
+            }
+            self.seal_current(device, compress).await?;
         }
+        Ok(self.data_blocks)
+    }
 
+    /// Seals the staging block at `base + data_blocks`, records its index
+    /// entry, and resets the staging state for the next block.
+    async fn seal_current<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        compress: Option<&mut CompressScratch<BLOCK>>,
+    ) -> Result<(), Error<D::Error>> {
+        let id = self
+            .base
+            .checked_add(self.data_blocks)
+            .ok_or(Error::NoSpace)?;
+        seal_block(
+            device,
+            id,
+            &mut self.data,
+            self.payload,
+            Some(&self.restarts[..self.nrestarts]),
+            compress,
+        )
+        .await?;
+        append_index::<D::Error, BLOCK>(
+            &mut self.index,
+            &mut self.index_len,
+            Some(&self.block_first[..self.block_first_len]),
+            id,
+            self.block_max_seq,
+        )?;
+        self.data_blocks += 1;
+        self.payload = 0;
+        self.n = 0;
+        self.nrestarts = 0;
+        self.block_first_len = 0;
+        self.block_max_seq = 0;
+        self.data.fill(0);
+        Ok(())
+    }
+
+    /// Writes the bloom, index, and footer blocks after the data section
+    /// and the `rdel_blocks`-block range-tombstone section the caller
+    /// wrote at `base + data_blocks`, then flushes the device so the table
+    /// is durable before the manifest commit that makes it visible.
+    /// `rdel_min_seq` is the lowest range-tombstone sequence (`u64::MAX`
+    /// when there are none). Call [`seal_data`](Self::seal_data) first.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] on block-id overflow, or [`Error::Device`] on I/O
+    /// failure.
+    pub async fn finish_meta<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        rdel_blocks: u32,
+        rdel_min_seq: u64,
+    ) -> Result<FinishedTable<KEY_MAX>, Error<D::Error>> {
+        debug_assert_eq!(self.n, 0, "seal_data must run before finish_meta");
+        let min_seq = self.min_seq.min(rdel_min_seq);
         // Bloom block: reuse the data staging buffer (it is free now).
         let bloom_id = self
             .base
             .checked_add(self.data_blocks)
+            .and_then(|b| b.checked_add(u64::from(rdel_blocks)))
             .ok_or(Error::NoSpace)?;
         self.data.fill(0);
         self.data[..self.bloom.len()].copy_from_slice(&self.bloom);
@@ -678,7 +741,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         .await?;
 
         // Footer block: magic | index | bloom | entry_count | k |
-        // rdel_blocks.
+        // rdel_blocks | min_seq.
         let footer_id = index_id.checked_add(1).ok_or(Error::NoSpace)?;
         self.data.fill(0);
         self.data[0..8].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
@@ -687,7 +750,8 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data[24..32].copy_from_slice(&self.entry_count.to_le_bytes());
         self.data[32] = self.k;
         self.data[33..37].copy_from_slice(&rdel_blocks.to_le_bytes());
-        seal_block(device, footer_id, &mut self.data, 37, None, None).await?;
+        self.data[37..45].copy_from_slice(&min_seq.to_le_bytes());
+        seal_block(device, footer_id, &mut self.data, 45, None, None).await?;
 
         // Table blocks are durable before the manifest commit makes them
         // visible.
@@ -695,21 +759,50 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             .await
             .map_err(Error::Device)?;
 
-        let first_key =
-            KeyBound::from_slice(&self.first_key[..self.first_len]).ok_or(Error::EmptyKey)?;
-        let last_key =
-            KeyBound::from_slice(&self.last_key[..self.last_len]).ok_or(Error::EmptyKey)?;
+        let first_key = if self.first_len == 0 {
+            KeyBound::EMPTY
+        } else {
+            KeyBound::from_slice(&self.first_key[..self.first_len]).ok_or(Error::EmptyKey)?
+        };
+        let last_key = if self.last_len == 0 {
+            KeyBound::EMPTY
+        } else {
+            KeyBound::from_slice(&self.last_key[..self.last_len]).ok_or(Error::EmptyKey)?
+        };
         Ok(FinishedTable {
             data_blocks: self.data_blocks,
             entry_count: self.entry_count,
             max_seq: self.max_seq,
+            min_seq,
             first_key,
             last_key,
         })
     }
+
+    /// Seals the trailing data block and writes the bloom, index, and
+    /// footer blocks for a table with no range-tombstone section, then
+    /// flushes the device. Reports the table's shape for the manifest's
+    /// [`TableRef`](crate::manifest::TableRef).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when the table outgrows its block limit, or
+    /// [`Error::Device`] on I/O failure.
+    ///
+    /// `compress` is the caller's compression scratch (`None` = store raw);
+    /// see [`push`](TableWriter::push).
+    pub async fn finish<D: BlockDevice>(
+        &mut self,
+        device: &mut D,
+        compress: Option<&mut CompressScratch<BLOCK>>,
+    ) -> Result<FinishedTable<KEY_MAX>, Error<D::Error>> {
+        self.seal_data(device, compress).await?;
+        self.finish_meta(device, 0, u64::MAX).await
+    }
 }
 
-/// Streams the table: the one-shot form of [`TableWriter`].
+/// Streams a table with no range tombstones: the one-shot form of
+/// [`TableWriter`].
 ///
 /// Entries must arrive in key-ascending order (the same order
 /// [`plan_table`] plans); `base` is a pre-allocated run of
@@ -739,7 +832,6 @@ pub async fn write_table<
     k: u8,
     entries: impl Iterator<Item = SstEntry<'a>>,
     compress: Option<&mut CompressScratch<BLOCK>>,
-    rdel_blocks: u32,
 ) -> Result<u64, Error<D::Error>>
 where
     D: BlockDevice,
@@ -751,7 +843,7 @@ where
     for e in entries {
         w.push(device, e, cs.as_deref_mut()).await?;
     }
-    let done = w.finish(device, cs, rdel_blocks).await?;
+    let done = w.finish(device, cs).await?;
     Ok(done.data_blocks + 3)
 }
 
@@ -780,6 +872,8 @@ pub(crate) struct RdelPlan<'a> {
     pub(crate) max_end: Option<&'a [u8]>,
     /// Highest tombstone sequence number (0 when empty).
     pub(crate) max_seq: u64,
+    /// Lowest tombstone sequence number (`u64::MAX` when empty).
+    pub(crate) min_seq: u64,
 }
 
 /// Plans a table's range-tombstone section: block count, smallest start,
@@ -795,6 +889,7 @@ pub(crate) fn plan_rdel_blocks<'a, E, const BLOCK: usize>(
         first: None,
         max_end: None,
         max_seq: 0,
+        min_seq: u64::MAX,
     };
     for r in rdels {
         if plan.first.is_none() {
@@ -805,6 +900,9 @@ pub(crate) fn plan_rdel_blocks<'a, E, const BLOCK: usize>(
         }
         if r.seq > plan.max_seq {
             plan.max_seq = r.seq;
+        }
+        if r.seq < plan.min_seq {
+            plan.min_seq = r.seq;
         }
         let el = rdel_entry_len::<E>(r.start.len(), r.end.len())?;
         if el + RDEL_TRAILER > BLOCK {
@@ -1241,7 +1339,6 @@ fn relocate_index_entries<E, const BLOCK: usize>(
     index_id: u64,
     payload_len: usize,
     old_base: u64,
-    rdel: u64,
     data_blocks: u64,
     dst_base: u64,
 ) -> Result<(), Error<E>> {
@@ -1255,14 +1352,9 @@ fn relocate_index_entries<E, const BLOCK: usize>(
         let tblock = block_id
             .checked_sub(old_base)
             .ok_or(Error::CorruptBlock { id: index_id })?;
-        // Data blocks sit after the rdel section: `tblock` is a
-        // table-relative index into `[rdel, rdel + data_blocks)`.
-        if tblock < rdel
-            || tblock
-                >= rdel
-                    .checked_add(data_blocks)
-                    .ok_or(Error::CorruptBlock { id: index_id })?
-        {
+        // Data blocks lead the table: `tblock` is a table-relative index
+        // into `[0, data_blocks)`.
+        if tblock >= data_blocks {
             return Err(Error::CorruptBlock { id: index_id });
         }
         let new_id = dst_base
@@ -1287,8 +1379,8 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
         .checked_sub(rdel)
         .and_then(|n| n.checked_sub(3))
         .ok_or(Error::CorruptBlock { id: dst_base })?;
-    // Data section starts after the rdel section: index and footer shift
-    // by the rdel count.
+    // Layout `[data]* [rdel]* [bloom] [index] [footer]`: the index and
+    // footer follow both sections.
     let index_id = dst_base
         .checked_add(rdel)
         .and_then(|b| b.checked_add(data_blocks))
@@ -1324,8 +1416,8 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
             .map_err(|_| Error::CorruptBlock { id: footer_id })?,
     );
     // Structural check: bloom, index, footer are consecutive, so the
-    // original base is the bloom id minus the data-block count and the
-    // rdel-block count.
+    // original base is the bloom id minus the rdel-block and data-block
+    // counts.
     if old_index
         != old_bloom
             .checked_add(1)
@@ -1349,7 +1441,6 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
         index_id,
         payload_len,
         old_base,
-        rdel,
         data_blocks,
         dst_base,
     )?;
@@ -1909,25 +2000,23 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
     bloom_block: u64,
     entry_count: u64,
     k: u8,
-    /// First block of the range-tombstone section (`first_block` of the
-    /// table; the section precedes the data blocks).
+    /// First block of the range-tombstone section: `bloom_block -
+    /// rdel_blocks` (the section follows the data blocks).
     rdel_first: u64,
     /// Range-tombstone blocks, from the verified footer.
     rdel_blocks: u32,
+    /// Lowest sequence number in the table, from the verified footer.
+    min_seq: u64,
 }
 
 impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     TableReader<'d, D, BLOCK, BLOOM_BYTES>
 {
-    /// Opens the table ending at `footer_block`: reads and verifies the
-    /// footer (magic + CRC). `rdel_first` is the table's first block: the
-    /// range-tombstone section precedes the data blocks. `table_id` is the
-    /// table's manifest id — the block-cache key's first half — and
-    /// `cache` (if any) serves the footer and every later block read.
-    /// Opens a table reader without a cache: every block is read from
-    /// the device. This is the original pre-v0.16 API, kept for
-    /// pre-visibility reads (ingest validation) that must not populate
-    /// the cache.
+    /// Opens the table ending at `footer_block` without a cache: reads and
+    /// verifies the footer (magic + CRC); every block is read from the
+    /// device. Used for pre-visibility reads (ingest validation) that must
+    /// not populate the cache. The range-tombstone section is located from
+    /// the footer.
     ///
     /// # Errors
     ///
@@ -1937,9 +2026,8 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         device: &'d D,
         scratch: &mut [u8; BLOCK],
         footer_block: u64,
-        rdel_first: u64,
     ) -> Result<Self, Error<D::Error>> {
-        Self::open_cached(device, None, 0, scratch, footer_block, rdel_first).await
+        Self::open_cached(device, None, 0, scratch, footer_block).await
     }
 
     /// Opens a table reader with an optional block cache. `Db` point
@@ -1956,7 +2044,6 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         table_id: u32,
         scratch: &mut [u8; BLOCK],
         footer_block: u64,
-        rdel_first: u64,
     ) -> Result<Self, Error<D::Error>> {
         read_block_cached(device, cache, table_id, footer_block, scratch, true).await?;
         check_block_crc::<D::Error, BLOCK>(scratch, footer_block)?;
@@ -1992,6 +2079,16 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
                 .try_into()
                 .map_err(|_| Error::CorruptBlock { id: footer_block })?,
         );
+        let min_seq = u64::from_le_bytes(
+            scratch[37..45]
+                .try_into()
+                .map_err(|_| Error::CorruptBlock { id: footer_block })?,
+        );
+        // The section sits right before the bloom block; a count reaching
+        // past block 0 is a corrupt footer, never a wrapped read.
+        let rdel_first = bloom_block
+            .checked_sub(u64::from(rdel_blocks))
+            .ok_or(Error::CorruptBlock { id: footer_block })?;
         Ok(Self {
             device,
             table_id,
@@ -2002,6 +2099,7 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             k,
             rdel_first,
             rdel_blocks,
+            min_seq,
         })
     }
 
@@ -2010,6 +2108,13 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     #[must_use]
     pub const fn rdel_blocks(&self) -> u32 {
         self.rdel_blocks
+    }
+
+    /// Lowest sequence number in the table (entries and range
+    /// tombstones), as recorded in the verified footer.
+    #[must_use]
+    pub const fn min_seq(&self) -> u64 {
+        self.min_seq
     }
 
     /// Highest sequence number at or below `max_seq` of a range tombstone

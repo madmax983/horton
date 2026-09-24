@@ -37,6 +37,7 @@ fn live_ref() -> TableRef<256> {
         first_key: KeyBound::from_slice(b"m").expect("bound"),
         last_key: KeyBound::from_slice(b"z").expect("bound"),
         max_seq: 0,
+        min_seq: 0,
         entry_count: 0,
         rdel_blocks: 0,
     }

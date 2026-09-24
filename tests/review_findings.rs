@@ -380,7 +380,6 @@ fn f12_seq0_entries_are_invisible_and_scans_terminate() {
         bloom_k(1024 * 8, 2),
         entries.into_iter(),
         None,
-        0,
     ))
     .unwrap();
     let sealed = SealedTable {
@@ -389,6 +388,7 @@ fn f12_seq0_entries_are_invisible_and_scans_terminate() {
         first_key: KeyBound::from_slice(b"a").unwrap(),
         last_key: KeyBound::from_slice(b"b").unwrap(),
         max_seq: 7,
+        min_seq: 0,
         entry_count: 2,
         rdel_blocks: 0,
     };

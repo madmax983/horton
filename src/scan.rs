@@ -554,20 +554,12 @@ impl<
         li: usize,
         start: &[u8],
     ) -> Result<(), Error<D::Error>> {
-        // The data section starts after the table's range-tombstone
-        // section; the scan cursor walks data blocks only.
-        let data_first = tref
-            .first_block
-            .checked_add(u64::from(tref.rdel_blocks))
-            .ok_or(Error::CorruptBlock {
-                id: tref.first_block,
-            })?;
-        let data_blocks = u64::from(tref.block_count)
-            .checked_sub(u64::from(tref.rdel_blocks))
-            .and_then(|n| n.checked_sub(3))
-            .ok_or(Error::CorruptBlock {
-                id: tref.first_block,
-            })?;
+        // The data section leads the table; the scan cursor walks data
+        // blocks only.
+        let data_first = tref.data_first();
+        let data_blocks = tref.data_blocks().ok_or(Error::CorruptBlock {
+            id: tref.first_block,
+        })?;
         if data_blocks == 0 {
             // Range-only table (flush or compaction carrying nothing but
             // range tombstones): no point cursor to add. Its rdel section
@@ -575,11 +567,7 @@ impl<
             // walk the manifest, not the cursors.
             return Ok(());
         }
-        let footer = tref
-            .first_block
-            .checked_add(u64::from(tref.block_count))
-            .and_then(|end| end.checked_sub(1))
-            .ok_or(Error::CorruptManifest)?;
+        let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
         let db = self.db;
         let index_id = sstable::footer_index_block(
             db.device(),
@@ -872,7 +860,7 @@ impl<
                     // callgrind (see PR), not decorative.
                     #[allow(clippy::unnecessary_lazy_evaluations)]
                     scratch.get_or_insert_with(|| [0u8; BLOCK]),
-                    tref.first_block,
+                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
                     tref.rdel_blocks,
                     key,
                     max_seq,
@@ -1516,20 +1504,12 @@ impl<
         li: usize,
         from: &[u8],
     ) -> Result<(), Error<D::Error>> {
-        // The data section starts after the table's range-tombstone
-        // section; the scan cursor walks data blocks only.
-        let data_first = tref
-            .first_block
-            .checked_add(u64::from(tref.rdel_blocks))
-            .ok_or(Error::CorruptBlock {
-                id: tref.first_block,
-            })?;
-        let data_blocks = u64::from(tref.block_count)
-            .checked_sub(u64::from(tref.rdel_blocks))
-            .and_then(|n| n.checked_sub(3))
-            .ok_or(Error::CorruptBlock {
-                id: tref.first_block,
-            })?;
+        // The data section leads the table; the scan cursor walks data
+        // blocks only.
+        let data_first = tref.data_first();
+        let data_blocks = tref.data_blocks().ok_or(Error::CorruptBlock {
+            id: tref.first_block,
+        })?;
         if data_blocks == 0 {
             // Range-only table (flush or compaction carrying nothing but
             // range tombstones): no point cursor to add. Its rdel section
@@ -1537,11 +1517,7 @@ impl<
             // walk the manifest, not the cursors.
             return Ok(());
         }
-        let footer = tref
-            .first_block
-            .checked_add(u64::from(tref.block_count))
-            .and_then(|end| end.checked_sub(1))
-            .ok_or(Error::CorruptManifest)?;
+        let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
         let db = self.db;
         let index_id = sstable::footer_index_block(
             db.device(),
@@ -2129,7 +2105,7 @@ impl<
                     Some(db.cache_port()),
                     tref.id,
                     &mut scratch,
-                    tref.first_block,
+                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
                     tref.rdel_blocks,
                     key,
                     max_seq,

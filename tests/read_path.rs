@@ -45,7 +45,6 @@ fn write_single(
         k,
         core::iter::once(entry()),
         None,
-        0,
     ))
     .expect("write table");
     let total = plan.data_blocks + 3;
@@ -57,6 +56,7 @@ fn write_single(
         first_key: plan.first_key,
         last_key: plan.last_key,
         max_seq: plan.max_seq,
+        min_seq: 0,
         entry_count: u32::try_from(plan.entry_count).expect("entry count fits"),
         rdel_blocks: 0,
     }

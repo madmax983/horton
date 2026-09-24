@@ -17,9 +17,9 @@
 //!     | flushed_seq: u64 | seq_high: u64 | nlevels: u32
 //! per level: count: u32 | count * tableref
 //! tableref: id: u32 | first_block: u64 | block_count: u32
-//!           | fk_len: u16 | fk_bytes[KEY_MAX]
-//!           | lk_len: u16 | lk_bytes[KEY_MAX]
-//!           | max_seq: u64 | entry_count: u32 | rdel_blocks: u32
+//!           | fk_len: u16 | fk_bytes[fk_len]
+//!           | lk_len: u16 | lk_bytes[lk_len]
+//!           | max_seq: u64 | min_seq: u64 | entry_count: u32 | rdel_blocks: u32
 //! ```
 //!
 //! `crc32` covers `magic` through the end of `payload`. The rest of the block
@@ -119,8 +119,10 @@ impl<const KEY_MAX: usize> KeyBound<KEY_MAX> {
 pub struct TableRef<const KEY_MAX: usize> {
     /// Table id, unique per database lifetime.
     pub id: u32,
-    /// First block id of the table: the range-tombstone section, then
-    /// data blocks, bloom, index, footer.
+    /// First block id of the table. On-device layout (v0.17):
+    /// `[data]* [rdel]* [bloom] [index] [footer]` — see
+    /// [`data_first`](Self::data_first), [`rdel_first`](Self::rdel_first),
+    /// and [`footer_block`](Self::footer_block).
     pub first_block: u64,
     /// Total blocks: rdel blocks + data blocks + bloom + index + footer.
     pub block_count: u32,
@@ -133,9 +135,16 @@ pub struct TableRef<const KEY_MAX: usize> {
     pub last_key: KeyBound<KEY_MAX>,
     /// Highest sequence number in the table (includes range tombstones).
     pub max_seq: u64,
+    /// Lowest sequence number in the table (includes range tombstones).
+    /// Compaction drops a tombstone only when no table outside the job
+    /// that overlaps it has `min_seq` at or below the tombstone's sequence
+    /// — such a table could hold an older version the tombstone hides
+    /// (an ingested table re-attached at L0, for instance).
+    pub min_seq: u64,
     /// Key/value entries (including tombstones).
     pub entry_count: u32,
-    /// Range-tombstone blocks at `[first_block, first_block + rdel_blocks)`.
+    /// Range-tombstone blocks, stored after the data blocks (see
+    /// [`rdel_first`](Self::rdel_first)).
     pub rdel_blocks: u32,
 }
 
@@ -148,9 +157,47 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
         first_key: KeyBound::EMPTY,
         last_key: KeyBound::EMPTY,
         max_seq: 0,
+        min_seq: 0,
         entry_count: 0,
         rdel_blocks: 0,
     };
+
+    /// Data blocks: `block_count - rdel_blocks - 3` (bloom, index,
+    /// footer), or `None` for a malformed ref.
+    #[must_use]
+    pub const fn data_blocks(&self) -> Option<u64> {
+        let total = self.block_count as u64;
+        let rdel = self.rdel_blocks as u64;
+        match total.checked_sub(rdel) {
+            Some(n) => n.checked_sub(3),
+            None => None,
+        }
+    }
+
+    /// First data block: the table starts with its data section.
+    #[must_use]
+    pub const fn data_first(&self) -> u64 {
+        self.first_block
+    }
+
+    /// First range-tombstone block: right after the data section, or
+    /// `None` for a malformed ref.
+    #[must_use]
+    pub const fn rdel_first(&self) -> Option<u64> {
+        match self.data_blocks() {
+            Some(d) => self.first_block.checked_add(d),
+            None => None,
+        }
+    }
+
+    /// The footer: the table's last block, or `None` for a malformed ref.
+    #[must_use]
+    pub const fn footer_block(&self) -> Option<u64> {
+        match self.first_block.checked_add(self.block_count as u64) {
+            Some(end) => end.checked_sub(1),
+            None => None,
+        }
+    }
 
     /// One past the last block id of the table.
     #[must_use]
@@ -485,6 +532,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 enc.u16(tref.last_key.len)?;
                 enc.bytes(&tref.last_key.bytes[..usize::from(tref.last_key.len)])?;
                 enc.u64(tref.max_seq)?;
+                enc.u64(tref.min_seq)?;
                 enc.u32(tref.entry_count)?;
                 enc.u32(tref.rdel_blocks)?;
             }
@@ -574,6 +622,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let first_key = Self::decode_bound(dec)?;
         let last_key = Self::decode_bound(dec)?;
         let max_seq = dec.u64().map_err(|()| corrupt())?;
+        let min_seq = dec.u64().map_err(|()| corrupt())?;
         let entry_count = dec.u32().map_err(|()| corrupt())?;
         let rdel_blocks = dec.u32().map_err(|()| corrupt())?;
         Ok(TableRef {
@@ -583,6 +632,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             first_key,
             last_key,
             max_seq,
+            min_seq,
             entry_count,
             rdel_blocks,
         })
