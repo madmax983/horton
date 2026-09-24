@@ -209,6 +209,18 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
     }
 
     /// Hashes 4 bytes at `p` into a bucket.
+    ///
+    /// `#[inline(always)]` is measured, not decorative — same story as
+    /// `crc32` (`src/crc.rs`): LLVM declines to inline this on its own at
+    /// either of its two call sites (`find_match`, `insert`), which leaves
+    /// each 4-byte little-endian load as four separate bounds-checked
+    /// slice indexes instead of one checked against the caller's
+    /// already-proven length. Confirmed with `callgrind` on
+    /// `benches/compaction.rs`: forcing the inline drops it from
+    /// 463,462,751 to 386,303,098 Ir (-16.65%). See the PR for the full
+    /// before/after.
+    #[allow(clippy::inline_always)] // measured with callgrind (see above), not decorative
+    #[inline(always)]
     const fn hash(src: &[u8], p: usize) -> usize {
         let v = u32::from_le_bytes([src[p], src[p + 1], src[p + 2], src[p + 3]]);
         (v.wrapping_mul(0x9E37_79B9) >> (32 - HASH_BITS)) as usize
