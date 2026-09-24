@@ -309,6 +309,13 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// [`write_stage`](WalWriter::write_stage) already re-zeroes.
     pub fn truncate_stage(&mut self, len: usize) {
         debug_assert!(len <= self.stage_len, "truncate past staged data");
+        // The discarded bytes stay in the buffer: keep them inside the
+        // dirty mark so the next `write_stage` zeroes them. Otherwise a
+        // shorter record staged next would be written with the discarded
+        // record's tail after it — a torn tail that ends recovery early.
+        if self.stage_len > self.dirty_to {
+            self.dirty_to = self.stage_len;
+        }
         self.stage_len = len;
     }
 
@@ -503,7 +510,12 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// `max_seq`; it is always a no-op when the WAL never wrapped, because
     /// live records all have `seq > max_seq`.
     ///
-    /// A torn tail is the expected crash boundary, not an error.
+    /// A torn tail is the expected crash boundary, not an error. So is the
+    /// first block holding only stale records: appends run sequentially
+    /// from `wal_head`, and a wrap moves `wal_head` back to `wal_start` in
+    /// the same commit that flushes everything, so stale blocks can only
+    /// follow the live tail. The writer resumes at that block, overwriting
+    /// dead records instead of treating the region as full.
     ///
     /// # Errors
     ///
@@ -538,6 +550,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
                 .map_err(Error::Device)?;
             let mut off = 0usize;
             let mut corrupt = false;
+            let mut live = 0u64;
             while off < BLOCK {
                 match scan_record(&block[off..]) {
                     Scan::Record(rec) => {
@@ -571,6 +584,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
                                 }
                             }
                             state.records += 1;
+                            live += 1;
                         }
                         off += rec.total_len;
                     }
@@ -588,6 +602,11 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             if off == 0 {
                 break; // Unwritten block: end of log.
             }
+            if live == 0 && !corrupt {
+                // Only stale (already flushed) records: the live log ended
+                // at the previous block. Resume appending here.
+                break;
+            }
             state.blocks_used += 1;
             if corrupt {
                 break; // Torn tail: expected crash boundary, not an error.
@@ -595,6 +614,9 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         }
         self.next_block = from + state.blocks_used;
         self.stage_len = 0;
+        // Recovery read blocks into `stage`: none of it is known to be zero
+        // any more, so the next `write_stage` must zero the whole tail.
+        self.dirty_to = BLOCK;
         self.max_seq = state.max_seq;
         Ok(state)
     }

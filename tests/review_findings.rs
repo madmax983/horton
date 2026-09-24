@@ -457,3 +457,36 @@ fn f13_corrupt_newer_block_is_an_error_not_a_stale_read() {
         Err(Error::CorruptBlock { .. })
     ));
 }
+
+/// F17 — found by the lifecycle fuzzer. WAL recovery reads blocks into the
+/// writer's staging buffer but left the writer's "bytes past `dirty_to`
+/// are zero" mark untouched. When recovery ends at the end of the WAL
+/// region — routine once the WAL has wrapped and stale blocks fill it —
+/// the buffer still holds a stale block, and the first block written
+/// after the reopen carries the new record followed by that garbage. The
+/// next recovery reads the garbage as a torn tail and stops there, losing
+/// every acknowledged write after it.
+#[test]
+fn f17_writes_after_a_reopen_survive_the_next_reopen() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    // Fill the WAL region so it wraps: stale pre-wrap blocks now fill it to
+    // the end, so the next recovery scans all the way to `wal_end`.
+    fill_and_wrap_wal(&mut db, &mut c);
+    let mut db = TestDb::new(db.into_device(), test_config());
+    block_on(db.open()).unwrap();
+    for i in 0..5u8 {
+        block_on(db.put(&[b'n', i], b"after-reopen")).unwrap();
+    }
+    let mut db = TestDb::new(db.into_device(), test_config());
+    block_on(db.open()).unwrap();
+    let mut val = [0u8; 16];
+    for i in 0..5u8 {
+        assert_eq!(
+            block_on(db.get(&[b'n', i], &mut val)),
+            Ok(Some(12)),
+            "acknowledged put n{i} lost across the second reopen"
+        );
+    }
+}
