@@ -408,7 +408,7 @@ fn revscan_matches_oracle_under_random_ops() {
         }
     };
 
-    for round in 0..30 {
+    for round in 0..120 {
         let op = rng.next() % 10;
         let key = vec![b'k', (rng.next() % 8) as u8];
         match op {
@@ -433,6 +433,10 @@ fn revscan_matches_oracle_under_random_ops() {
                 }
             }
         }
+        // Check every round, before any flush: the memtable path must
+        // agree with the oracle too (a flush-first check hid a reverse
+        // memtable bug that yielded a key's oldest version).
+        check(&db, &oracle, &live_snaps);
         if round % 5 == 4 {
             flush(&mut db);
             check(&db, &oracle, &live_snaps);

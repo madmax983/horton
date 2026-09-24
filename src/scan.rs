@@ -1195,19 +1195,23 @@ impl<
         self.max_seq = max_seq;
         self.now = now;
         let db = self.db;
-        // Memtable cursor: last slot at/below `from` (or the last slot
-        // when `from` is empty).
+        // Memtable cursor: the last slot at/below `from` (or the last slot
+        // when `from` is empty). When `from` is present that is the *end*
+        // of its version run: `advance_mem_rev` resolves the whole run, so
+        // starting at the run start would skip `from`'s older versions when
+        // the newest one sits above `max_seq`.
         let n = db.memtable().slot_len();
         self.mem_idx = if n == 0 {
             0
         } else if from.is_empty() {
             n - 1
         } else {
-            let lb = db.memtable().lower_bound(from);
-            if lb < n && db.memtable().slot_view(lb).is_some_and(|v| v.key == from) {
-                lb
-            } else if lb > 0 {
-                lb - 1
+            let mut ub = db.memtable().lower_bound(from);
+            while ub < n && db.memtable().slot_view(ub).is_some_and(|v| v.key == from) {
+                ub += 1;
+            }
+            if ub > 0 {
+                ub - 1
             } else {
                 n // every slot sorts above `from`
             }
@@ -1951,21 +1955,48 @@ impl<
         sstable::parse_data_entry::<D::Error, BLOCK>(&self.block, off, end, bid).map(|e| e.key)
     }
 
-    /// Parks the memtable head at the last live slot at/below the seek
-    /// ceiling with `seq <= max_seq`, walking downward from `mem_idx`.
-    /// The scan borrows the database, so no `put`/`flush` can shift slots
-    /// under this index walk.
+    /// Parks the memtable head on the greatest key at/below `mem_idx` that
+    /// has a point version visible at `max_seq`, choosing that key's
+    /// *newest* visible version.
+    ///
+    /// A key's versions sit in one run of slots ordered newest-first, so a
+    /// downward walk meets the oldest version first. The walk therefore
+    /// resolves the whole run — from the landing slot down to the run
+    /// start — and picks its lowest-index (newest) point slot with
+    /// `seq <= max_seq`, leaving `mem_idx` at the run start so the next
+    /// step moves to the previous key. Range-tombstone slots sort by their
+    /// start key but are not point versions: they bound the run and are
+    /// never yielded. The scan borrows the database, so no `put`/`flush`
+    /// can shift slots under this index walk.
     fn advance_mem_rev(&mut self) {
         let max_seq = self.max_seq;
         let db = self.db;
+        let mem = db.memtable();
         self.mem_live = false;
-        while self.mem_idx < db.memtable().slot_len() {
-            // Range-tombstone slots sort by their start key but are not
-            // point versions: the merge never yields them as entries.
-            if let Some(v) = db.memtable().slot_view(self.mem_idx)
-                && v.seq <= max_seq
-                && !v.range_del
-            {
+        while self.mem_idx < mem.slot_len() {
+            let Some(landing) = mem.slot_view(self.mem_idx) else {
+                return;
+            };
+            let key = landing.key;
+            let mut run_start = self.mem_idx;
+            let mut newest_visible: Option<usize> = None;
+            let mut j = self.mem_idx;
+            while let Some(w) = mem.slot_view(j) {
+                if w.key != key {
+                    break;
+                }
+                run_start = j;
+                // Lower index = newer: the last hit on the way down wins.
+                if !w.range_del && w.seq <= max_seq {
+                    newest_visible = Some(j);
+                }
+                if j == 0 {
+                    break;
+                }
+                j -= 1;
+            }
+            self.mem_idx = run_start;
+            if let Some(v) = newest_visible.and_then(|b| mem.slot_view(b)) {
                 self.mem_key[..v.key.len()].copy_from_slice(v.key);
                 self.mem_key_len = v.key.len();
                 self.mem_val[..v.val.len()].copy_from_slice(v.val);
@@ -1976,10 +2007,11 @@ impl<
                 self.mem_live = true;
                 return;
             }
-            if self.mem_idx == 0 {
+            // No visible point version of this key: the previous key.
+            if run_start == 0 {
                 return;
             }
-            self.mem_idx -= 1;
+            self.mem_idx = run_start - 1;
         }
     }
 

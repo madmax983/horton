@@ -294,7 +294,6 @@ fn scan_all(db: &TestDb<MemDevice<4096>>, reverse: bool) -> Vec<(Vec<u8>, Vec<u8
 /// reverse differential test flushes before every check, so it never
 /// exercises the memtable path.
 #[test]
-#[ignore = "F5: RevScan yields the oldest memtable version (stale values, deleted keys return)"]
 fn f5_reverse_scan_matches_forward_scan_over_the_memtable() {
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();
@@ -305,4 +304,41 @@ fn f5_reverse_scan_matches_forward_scan_over_the_memtable() {
     let forward = scan_all(&db, false);
     assert_eq!(forward, vec![(b"a".to_vec(), b"new".to_vec())]);
     assert_eq!(scan_all(&db, true), forward);
+}
+
+/// F5 (related cases from the scan sub-review): a newer put above a range
+/// tombstone must win, and a snapshot `seek_prev` at `from` must still find
+/// `from`'s older visible version when its newest one is above the
+/// snapshot — both over unflushed data.
+#[test]
+fn f5_reverse_scan_range_delete_and_snapshot_seek() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"k", b"v1")).unwrap();
+    block_on(db.delete_range(b"k", b"z")).unwrap();
+    block_on(db.put(b"k", b"v3")).unwrap();
+    assert_eq!(scan_all(&db, false), vec![(b"k".to_vec(), b"v3".to_vec())]);
+    assert_eq!(scan_all(&db, true), scan_all(&db, false));
+
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"a", b"a1")).unwrap();
+    block_on(db.put(b"k", b"k1")).unwrap();
+    let snap = db.snapshot().unwrap();
+    block_on(db.put(b"k", b"k2")).unwrap();
+    let mut s = Box::new(RevScan::new(&db));
+    block_on(s.seek_prev(b"k", None, snap)).unwrap();
+    let mut key = [0u8; 8];
+    let mut val = [0u8; 8];
+    let mut got = Vec::new();
+    while let Some((kl, vl)) = block_on(s.prev(&mut key, &mut val)).unwrap() {
+        got.push((key[..kl].to_vec(), val[..vl].to_vec()));
+    }
+    assert_eq!(
+        got,
+        vec![
+            (b"k".to_vec(), b"k1".to_vec()),
+            (b"a".to_vec(), b"a1".to_vec())
+        ]
+    );
 }
