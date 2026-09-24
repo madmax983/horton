@@ -245,6 +245,7 @@ impl<
         max_seq: u64,
         now: u64,
     ) -> Result<(), Error<D::Error>> {
+        self.db.ensure_open()?;
         if start.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
                 len: start.len(),
@@ -1171,6 +1172,7 @@ impl<
         max_seq: u64,
         now: u64,
     ) -> Result<(), Error<D::Error>> {
+        self.db.ensure_open()?;
         if from.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
                 len: from.len(),

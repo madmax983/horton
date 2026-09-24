@@ -251,14 +251,19 @@ fn f3_reopen_succeeds_after_compaction_with_small_freelist() {
 /// The WAL append position starts at `wal_start`, so the write lands on a
 /// live WAL block and an acknowledged, unflushed mutation is lost.
 #[test]
-#[ignore = "F4: writes before open() clobber the live WAL"]
 fn f4_write_before_open_cannot_destroy_acknowledged_data() {
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();
     block_on(db.put(b"acked", b"1")).unwrap(); // durable in the WAL, unflushed
 
     let mut db = TestDb::new(db.into_device(), test_config());
-    let _ = block_on(db.put(b"early", b"2")); // forgot open(): should be refused
+    // Forgot open(): every device-touching call is refused, nothing lands.
+    assert_eq!(block_on(db.put(b"early", b"2")), Err(Error::NotOpen));
+    assert_eq!(block_on(db.flush()), Err(Error::NotOpen));
+    let mut probe = [0u8; 4];
+    assert_eq!(block_on(db.get(b"acked", &mut probe)), Err(Error::NotOpen));
+    assert_eq!(db.snapshot(), Err(Error::NotOpen));
+    assert!(!db.is_open());
 
     let mut db = TestDb::new(db.into_device(), test_config());
     block_on(db.open()).unwrap();

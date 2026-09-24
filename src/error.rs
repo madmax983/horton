@@ -72,6 +72,11 @@ pub enum Error<E> {
         /// The conflicting table id.
         id: u32,
     },
+    /// The database handle was used before a successful
+    /// [`Db::open`](crate::Db::open). Nothing was read or written: call
+    /// `open()` first. (Writing before recovery would append over live WAL
+    /// blocks and destroy acknowledged mutations.)
+    NotOpen,
     /// The underlying block device reported an error.
     Device(E),
 }

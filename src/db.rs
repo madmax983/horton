@@ -242,6 +242,11 @@ pub struct Db<
     /// survive `open()`.
     snapshots: [u64; MAX_SNAPSHOTS],
     n_snapshots: usize,
+    /// True once [`Db::open`] has recovered the database. Every operation
+    /// that reads or writes the device checks it and returns
+    /// [`Error::NotOpen`] otherwise: before recovery the WAL append
+    /// position is `wal_start`, so a write would clobber live WAL blocks.
+    opened: bool,
     /// Block-read buffer for [`Db::get`]. A read fills every byte before
     /// `get` reads it. A zeroed buffer on each call would waste work.
     /// Calls reuse this buffer instead.
@@ -330,9 +335,25 @@ impl<
             next_seq: 0,
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
+            opened: false,
             get_scratch: RefCell::new([0u8; BLOCK]),
             decomp_scratch: RefCell::new([0u8; BLOCK]),
             cache: RefCell::new(BlockCache::new()),
+        }
+    }
+
+    /// Whether [`open`](Db::open) has completed successfully on this handle.
+    #[must_use]
+    pub const fn is_open(&self) -> bool {
+        self.opened
+    }
+
+    /// `Err(NotOpen)` unless [`open`](Db::open) has succeeded.
+    pub(crate) const fn ensure_open(&self) -> Result<(), Error<D::Error>> {
+        if self.opened {
+            Ok(())
+        } else {
+            Err(Error::NotOpen)
         }
     }
 
@@ -354,6 +375,9 @@ impl<
     ///
     /// [`Error::NoSpace`] when [`MAX_SNAPSHOTS`] snapshots are already live.
     pub const fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
+        if !self.opened {
+            return Err(Error::NotOpen);
+        }
         if self.n_snapshots >= MAX_SNAPSHOTS {
             return Err(Error::NoSpace);
         }
@@ -443,6 +467,8 @@ impl<
     /// [`Error::CorruptManifest`], [`Error::CorruptWal`], [`Error::NoSpace`]
     /// (undersized `FREELIST`), or [`Error::Device`].
     pub async fn open(&mut self) -> Result<OpenReport, Error<D::Error>> {
+        // A failed or interrupted open leaves the handle closed.
+        self.opened = false;
         self.table.clear();
         let mut scratch = [0u8; BLOCK];
         let (manifest, fresh) = Manifest::recover(
@@ -489,6 +515,7 @@ impl<
             .max_seq
             .max(self.manifest.seq_high())
             .max(self.manifest.max_seq());
+        self.opened = true;
         Ok(OpenReport {
             recovered_records: state.records,
             max_seq: self.next_seq,
@@ -528,6 +555,7 @@ impl<
     /// [`Error::TableFull`], [`Error::ArenaFull`], [`Error::NoSpace`], or
     /// [`Error::Device`].
     pub async fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, Error<D::Error>> {
+        self.ensure_open()?;
         self.table.check_insert::<D::Error>(key, val, false)?;
         let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
         let mark = self.stage_mark();
@@ -553,6 +581,7 @@ impl<
     ///
     /// Same as [`put`](Db::put).
     pub async fn delete(&mut self, key: &[u8]) -> Result<u64, Error<D::Error>> {
+        self.ensure_open()?;
         self.table.check_insert::<D::Error>(key, &[], true)?;
         let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
         let mark = self.stage_mark();
@@ -581,6 +610,7 @@ impl<
     ///
     /// Same as [`put`](Db::put).
     pub async fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<u64, Error<D::Error>> {
+        self.ensure_open()?;
         if start >= end {
             return Ok(self.next_seq);
         }
@@ -619,6 +649,7 @@ impl<
         val: &[u8],
         expire_at: u64,
     ) -> Result<u64, Error<D::Error>> {
+        self.ensure_open()?;
         self.table.check_insert::<D::Error>(key, val, false)?;
         let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
         let mark = self.stage_mark();
@@ -659,6 +690,7 @@ impl<
         &mut self,
         batch: &WriteBatch<KEY_MAX, VAL_MAX, OPS>,
     ) -> Result<u64, Error<D::Error>> {
+        self.ensure_open()?;
         let ops = batch.ops();
         let n = ops.len();
         if n == 0 {
@@ -826,6 +858,7 @@ impl<
         max_seq: u64,
         now: u64,
     ) -> Result<Option<usize>, Error<D::Error>> {
+        self.ensure_open()?;
         // The winning value's bytes are staged here; table lookups copy
         // into a per-table buffer first so a losing hit can never clobber
         // the winner. Values are at most VAL_MAX bytes (enforced on the
@@ -951,6 +984,7 @@ impl<
         R: BlockDevice,
         R::Error: Into<D::Error>,
     {
+        self.ensure_open()?;
         // The source device must speak the same block size: the copy
         // buffer is `BLOCK` bytes and the trait contract requires
         // `buf.len() == R::BLOCK` on every call.
@@ -1254,6 +1288,7 @@ impl<
     /// index would overflow one block, or level 0 is full (compaction is a
     /// v0.4 item), or [`Error::Device`] on I/O failure.
     pub async fn flush(&mut self) -> Result<(), Error<D::Error>> {
+        self.ensure_open()?;
         // Every acked mutation must be durable in the WAL or the new table.
         self.wal.commit().await?;
         let mut scratch = [0u8; BLOCK];
@@ -1487,6 +1522,7 @@ impl<
         level: usize,
         table_id: u32,
     ) -> Result<bool, Error<D::Error>> {
+        self.ensure_open()?;
         let Some(plan) = self.archive_plan(level, table_id) else {
             return Ok(false);
         };
@@ -1810,6 +1846,7 @@ impl<
         &mut self,
         scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<Progress, Error<D::Error>> {
+        self.ensure_open()?;
         if scratch.state == State::Idle && !self.compact_select(scratch).await? {
             return Ok(Progress::Done);
         }
