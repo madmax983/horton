@@ -412,31 +412,33 @@ fn compact_crash_never_mixes_state() {
 fn compact_reclaims_input_blocks_for_reuse() {
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
+    let slots = db.slot_stats().slots;
+    assert_eq!(slots, 28, "7 levels x 4 tables");
     for t in 0..4u8 {
         block_on(db.put(&[t], &[t])).unwrap();
         block_on(db.flush()).unwrap();
     }
-    // Record the L0 input runs before compaction.
-    let mut dev = db.into_device();
-    let man = read_manifest(&mut dev);
-    let l0 = man.level(0).unwrap();
-    assert_eq!(l0.len(), 4);
-    let b0 = l0[0].first_block;
-    let mut db = TestDb::new(dev, test_config());
-    open(&mut db);
+    assert_eq!(db.slot_stats().used, 4);
     drain(&mut db);
-    // A post-compaction flush must reuse the reclaimed input blocks
-    // (free-list-first allocation), not fresh bump blocks.
-    block_on(db.put(b"new", b"v")).unwrap();
-    block_on(db.flush()).unwrap();
-    let mut dev = db.into_device();
-    let man = read_manifest(&mut dev);
-    let l0 = man.level(0).unwrap();
-    assert_eq!(l0.len(), 1);
-    assert_eq!(
-        l0[0].first_block, b0,
-        "flushed table must reuse the first reclaimed input run"
-    );
+    // The four inputs' slots are free again; only the output holds one.
+    let s = db.slot_stats();
+    assert_eq!((s.used, s.reserved, s.free), (1, 0, slots - 1));
+    assert_eq!(db.check_invariants(), Ok(()));
+    // Reuse for real: overwriting the same keys, far more tables than the
+    // region has slots pass through it, so freed slots must be handed out
+    // again (each job merges L0 into the one L1 table).
+    for round in 0..40u8 {
+        for t in 0..4u8 {
+            block_on(db.put(&[b'r', t], &[round, t])).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        drain(&mut db);
+        assert_eq!(db.check_invariants(), Ok(()));
+    }
+    assert!(db.slot_stats().used < slots);
+    for t in 0..4u8 {
+        assert_eq!(get(&db, &[b'r', t]), Some(vec![39, t]));
+    }
 }
 
 #[test]
@@ -445,24 +447,18 @@ fn compact_reclaims_inputs_when_output_is_empty() {
     open(&mut db);
     // Four L0 tables of pure tombstones. L1 is the bottommost level holding
     // the range, so every tombstone is dropped: no output table is written,
-    // but the input blocks must still be reclaimed.
+    // and the reserved output slot is released along with the inputs'.
     for t in 0..4u8 {
         block_on(db.put(&[t], &[t])).unwrap();
         block_on(db.delete(&[t])).unwrap();
         block_on(db.flush()).unwrap();
     }
-    let mut dev = db.into_device();
-    let man = read_manifest(&mut dev);
-    let l0 = man.level(0).unwrap();
-    assert_eq!(l0.len(), 4);
-    let b0 = l0[0].first_block;
-    let mut db = TestDb::new(dev, test_config());
-    open(&mut db);
+    assert_eq!(db.slot_stats().used, 4);
     drain(&mut db);
-    // No reopen in between: the live session's free list must already hold
-    // the input runs. A fresh flush must land on the reclaimed blocks.
-    block_on(db.put(b"new", b"v")).unwrap();
-    block_on(db.flush()).unwrap();
+    let s = db.slot_stats();
+    assert_eq!((s.used, s.reserved), (0, 0), "no output, no inputs left");
+    assert_eq!(s.free, s.slots);
+    assert_eq!(db.check_invariants(), Ok(()));
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     assert_eq!(
@@ -470,12 +466,7 @@ fn compact_reclaims_inputs_when_output_is_empty() {
         0,
         "no output table was written"
     );
-    let l0 = man.level(0).unwrap();
-    assert_eq!(l0.len(), 1, "only the fresh table remains in L0");
-    assert_eq!(
-        l0[0].first_block, b0,
-        "flushed table must reuse the reclaimed input run"
-    );
+    assert_eq!(man.level(0).unwrap().len(), 0);
 }
 
 /// Differential: the compaction keep-set must preserve exactly what the
@@ -882,7 +873,7 @@ fn compact_l1_to_l2_crash_never_mixes_state() {
 /// A narrow database: 3 levels, 2 tables per level. The bottom level is
 /// reachable in a handful of flushes, so the true capacity ceiling — a
 /// full bottom level the merge cannot absorb into — is directly testable.
-type SmallDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 2, 1024, 4096, 8>;
+type SmallDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 2, 1024, 8>;
 
 fn read_small_manifest(dev: &mut MemDevice<4096>) -> Manifest<3, 2, 256> {
     let mut scratch = [0u8; 4096];

@@ -54,13 +54,13 @@ runs with `cargo run --example quickstart`:
 ```rust
 use horton::{BlockDevice, Compaction, Config, Db, Progress, Scan};
 
-//              device   BLOCK KEY VAL CAP ARENA LEVELS TABLES BLOOM FREE CACHE
-type MyDb = Db<RamDisk, 4096,  64, 256, 64, 8192, 4,     4,     256,  512, 4>;
+//              device   BLOCK KEY VAL CAP ARENA LEVELS TABLES BLOOM CACHE
+type MyDb = Db<RamDisk, 4096,  64, 256, 64, 8192, 4,     4,     256, 4>;
 
 // Block-id layout: manifest slots 0 and 1, WAL [2, 66), tables [66, 512).
 let config = Config::new(2, 66, 66, 512, 0, 1);
 let mut db = MyDb::new(RamDisk::new(512), config); // `const fn`: fine in a `static`
-db.open().await?; // recover manifest, sweep orphans, replay WAL
+db.open().await?; // recover manifest, rebuild table slots, replay WAL
 
 db.put(b"sensor/001", b"21.5C").await?; // durable when this returns
 db.delete(b"sensor/002").await?;
@@ -118,10 +118,12 @@ flowchart LR
 flushed to the device, and only then inserted into the memtable. A torn WAL
 tail is the expected crash boundary, and recovery replays up to it.
 
-**Flush.** The memtable is streamed into a new SSTable. Blocks come from the
-free list first, then from a bump pointer. They are only *reserved* until
-the manifest commit lands, so a failed or interrupted flush changes
-nothing.
+**Flush.** The memtable is streamed into a new SSTable in a free *table
+slot*. The table region is split into `LEVELS × TABLES` equal slots, one
+table per slot, so the manifest's table capacity and the region's space
+are one budget and a table can never grow into its neighbour. The slot is
+claimed only when the manifest commit lands, so a failed or interrupted
+flush changes nothing.
 
 **Read path.** Reads check the memtable, then level 0 newest-first, then
 deeper levels. Tables are pruned by key range and max sequence and gated by
@@ -137,8 +139,9 @@ plus the newest version visible to each live snapshot.
 **Crash model.** The manifest is double-buffered in two fixed slots, and
 recovery takes the valid slot with the higher sequence number. Every
 structural change (flush, compaction, archive, ingest, WAL wrap) becomes
-visible in exactly one manifest write. Blocks written before that point are
-invisible orphans that the next `open()` sweep reclaims.
+visible in exactly one manifest write. Blocks written before that point sit
+in a slot no manifest table references, which is simply free again after
+`open()` rebuilds the slot map from the manifest.
 
 ### On-device layout
 
@@ -167,9 +170,8 @@ Everything is a const generic on `Db`:
 | `BLOCK` | Device block size in bytes. Must equal `D::BLOCK`, and must be at least 512 and fit the largest WAL record |
 | `KEY_MAX`, `VAL_MAX` | Maximum key and value lengths |
 | `CAP`, `ARENA` | Memtable slots (versions) and key/value arena bytes |
-| `LEVELS`, `TABLES` | Level count and maximum tables per level |
+| `LEVELS`, `TABLES` | Level count and tables per level. `LEVELS × TABLES` (at most 64) is also the number of table slots the region is split into; each slot must hold a full memtable's table, which `open()` checks |
 | `BLOOM_BYTES` | Bloom filter size per table (bits = 8 × bytes) |
-| `FREELIST` | Free-list capacity in block ids. **Size it to the table region's block count** (see the review, F3) |
 | `CACHE` | Block cache slots. `0` disables the cache |
 
 `horton::profile` has a measured ESP32-S3 instantiation (4 KiB blocks,
@@ -228,7 +230,7 @@ What the suite covers:
 | `src/compact.rs` | Merge engine, cursors, range-tombstone merger |
 | `src/scan.rs` | `Scan` / `RevScan` merge iterators |
 | `src/manifest.rs` | Manifest encoding and double-buffered commit/recover |
-| `src/alloc.rs` | Bump allocator and free list for the table region |
+| `src/alloc.rs` | Table-slot allocator: one table per fixed slot, next-fit, reservations |
 | `src/cache.rs` | CLOCK block cache |
 | `src/compress.rs` | LZ77 block codec |
 | `src/batch.rs` | `WriteBatch` |

@@ -1,12 +1,12 @@
-//! RED tests for the confirmed defects in `docs/ARCHITECTURE_REVIEW.md`.
+//! Regression tests for the confirmed defects in
+//! `docs/ARCHITECTURE_REVIEW.md`, one per finding.
 //!
-//! Each test asserts the *correct* behavior and currently fails, so each
-//! one is `#[ignore]`d with the finding it pins. `cargo test` stays green;
-//! `cargo test --test review_findings -- --ignored` shows the failures.
-//! When a fix lands, drop its `#[ignore]` in the same commit: the test
-//! becomes the regression guard.
+//! Each test asserts the *correct* behavior. They were written first, as
+//! `#[ignore]`d RED tests pinning each defect; each fix dropped its
+//! `#[ignore]` in the same commit, so the test is now the finding's
+//! regression guard. CI fails if any test here is ignored again.
 
-use horton::{Compaction, Config, Error, Progress, RevScan, Scan};
+use horton::{Compaction, Error, Progress, RevScan, Scan};
 
 mod common;
 use common::{MemDevice, TestDb, block_on, noop_waker, test_config};
@@ -43,15 +43,14 @@ fn put_retrying(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction, k: &[u
     }
 }
 
-/// F1 — compaction's output-run reservation assumes a merge never needs
+/// F1 — compaction's output-run reservation assumed a merge never needs
 /// more data blocks than its inputs used. Greedy block packing breaks that:
 /// four inputs that each pack into one tight block (3 × 1041 B + 965 B =
-/// 4088 B) interleave into five output blocks. `TableWriter` never checks
-/// the reservation, and the bump advances by the reservation only, so the
-/// next allocation lands on the output table's footer and a live table is
-/// overwritten.
+/// 4088 B) interleave into five output blocks, and the output used to run
+/// past its reservation onto the next table. Every table now lives in its
+/// own fixed slot and the writer is capped at the slot, so an output can
+/// never reach another table's blocks.
 #[test]
-#[ignore = "F1: compaction output can outgrow its reserved run and overwrite a live table"]
 fn f1_compaction_output_never_outgrows_its_reservation() {
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();
@@ -222,16 +221,16 @@ fn f2_local_write_after_ingest_beats_the_ingested_version() {
     assert_eq!(&val[..5], b"local");
 }
 
-/// F3 — the open-time sweep inserts every unreferenced block below the
-/// highest live table into a `FREELIST`-entry list and fails on overflow.
-/// Compaction reclaims whole input tables, so ordinary operation produces
-/// a device that the same configuration can no longer open.
+/// F3 — the open-time sweep used to insert every unreferenced block below
+/// the highest live table into a `FREELIST`-entry list and fail on
+/// overflow, so ordinary compaction produced a device the same
+/// configuration could no longer open. Allocation is now one table per
+/// fixed slot: `open()` rebuilds the slot map from the manifest alone,
+/// with no capacity to exceed, and arrives at the same state the live
+/// session had.
 #[test]
-#[ignore = "F3: an undersized FREELIST makes open() fail after ordinary compaction"]
-fn f3_reopen_succeeds_after_compaction_with_small_freelist() {
-    type SmallFreeDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8, 8>;
-    let cfg = Config::new(8, 136, 136, 4224, 0, 1);
-    let mut db: SmallFreeDb<MemDevice<4096>> = SmallFreeDb::new(MemDevice::new(), cfg);
+fn f3_reopen_succeeds_after_compaction() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();
     for i in 0..4u8 {
         block_on(db.put(&[b'k', i], b"v")).unwrap();
@@ -239,10 +238,13 @@ fn f3_reopen_succeeds_after_compaction_with_small_freelist() {
     }
     let mut c = Box::new(TestCompaction::new());
     while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    let live = db.slot_stats();
 
-    let mut db = SmallFreeDb::new(db.into_device(), cfg);
+    let mut db = TestDb::new(db.into_device(), test_config());
     let opened = block_on(db.open());
     assert!(opened.is_ok(), "open failed: {opened:?}");
+    assert_eq!(db.slot_stats(), live, "reopen rebuilds the same slot map");
+    assert_eq!(db.check_invariants(), Ok(()));
     let mut buf = [0u8; 8];
     assert_eq!(block_on(db.get(&[b'k', 0], &mut buf)), Ok(Some(1)));
 }
@@ -491,12 +493,12 @@ fn f17_writes_after_a_reopen_survive_the_next_reopen() {
     }
 }
 
-/// F14 — a compaction job only *reserves* its output run; nothing stops a
-/// flush between two `compact_step` calls from allocating the same blocks.
-/// The flushed table and the job's output then overlap on device: a key
-/// written mid-job reads as `CorruptBlock` and compacted keys vanish.
+/// F14 — a compaction job used to only *peek* at its output run, so a
+/// flush between two `compact_step` calls could allocate the same blocks:
+/// the flushed table and the job's output overlapped on device, a key
+/// written mid-job read as `CorruptBlock`, and compacted keys vanished.
+/// The job now reserves its output slot, which flushes never take.
 #[test]
-#[ignore = "F14: a flush during an in-flight compaction job reuses the job's reserved blocks"]
 fn f14_flush_during_inflight_compaction_keeps_tables_disjoint() {
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();

@@ -138,7 +138,7 @@ fn make_val(buf: &mut [u8; 256], rng: &mut Lcg, len: usize) -> usize {
 
 /// 4 KiB blocks, 64 B keys, 256 B values, 512-slot / 64 KiB memtable (the
 /// spec's default RAM budget), 7 levels, 4 L0 tables, 1 KiB bloom filters.
-type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8192, 8>;
+type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8>;
 
 // Every `put`/`delete` commits synchronously (WAL-first durability), so the
 // WAL region must hold one block per mutation across the whole run — it

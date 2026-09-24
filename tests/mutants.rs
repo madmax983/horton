@@ -321,7 +321,7 @@ fn mut_db_write_arena_check_is_atomic() {
 /// -> None` empties it, `lower_bound -> 0/1` mispositions the seek.
 #[test]
 fn mut_memtable_scan_sees_resident_entries() {
-    type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+    type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
     block_on(db.put(b"a", b"1")).unwrap();
@@ -820,34 +820,18 @@ fn mut_manifest_decode_accepts_exact_fit() {
     assert_eq!(m.l0().len(), 1);
 }
 
-/// Kills `src/manifest.rs:369 replace < with <=` in
-/// `is_table_block_referenced`: block `first_block + block_count` is one
-/// past the table — treating it as referenced would leak the block in the
-/// open-time sweep.
+/// Slot boundary: a table ending exactly at its slot's end fits; one block
+/// more straddles into the next slot, which `open()` must treat as a
+/// corrupt manifest rather than hand the neighbour's blocks out twice.
 #[test]
-fn mut_manifest_block_ref_boundary() {
-    use horton::{KeyBound, Manifest, TableRef};
+fn mut_slot_of_end_boundary() {
+    use horton::SlotMap;
 
-    let mut m = Manifest::<2, 4, 32>::new();
-    m.add_l0_table::<Infallible>(TableRef {
-        id: 3,
-        first_block: 100,
-        block_count: 4,
-        first_key: KeyBound::from_slice(b"a").unwrap(),
-        last_key: KeyBound::from_slice(b"z").unwrap(),
-        max_seq: 10,
-        min_seq: 0,
-        entry_count: 5,
-        rdel_blocks: 0,
-    })
-    .unwrap();
-    assert!(m.is_table_block_referenced(100));
-    assert!(m.is_table_block_referenced(103));
-    assert!(
-        !m.is_table_block_referenced(104),
-        "one-past-the-end block is not part of the table"
-    );
-    assert!(!m.is_table_block_referenced(99));
+    let m = SlotMap::layout(100, 140, 4, 1).expect("layout"); // 10 blocks each
+    assert_eq!(m.slot_of(100, 10), Some(0), "ends exactly at the slot end");
+    assert_eq!(m.slot_of(100, 11), None, "one block into slot 1");
+    assert_eq!(m.slot_of(109, 1), Some(0));
+    assert_eq!(m.slot_of(110, 1), Some(1));
 }
 
 /// Kills `src/manifest.rs:537 replace > with >=` in `decode_bound`:

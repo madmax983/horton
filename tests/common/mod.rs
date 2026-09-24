@@ -251,7 +251,7 @@ impl<D: BlockDevice, const BLOCK: usize> BlockDevice for TornDevice<D, BLOCK> {
 /// 1 KiB values, 64 slots, 4 KiB arena, 7 levels, 4 L0 tables, 1024-byte
 /// bloom filters, and a 4096-entry free list (covers the whole table
 /// region).
-pub type TestDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+pub type TestDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 /// Standard region layout: manifest slots 0/1, WAL `[8, 136)`, tables
 /// `[136, 4224)`. The regions are disjoint by construction.

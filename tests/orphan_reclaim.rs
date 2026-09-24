@@ -1,11 +1,11 @@
-//! v0.3: the open-time sweep reclaims orphaned table blocks, and flush
-//! allocates from the free list first.
+//! Blocks orphaned by a torn write need no sweep: they sit in a table slot
+//! no manifest table references, which is simply free, and the next table
+//! written into that slot overwrites them.
 //!
-//! Geometry: WAL `[8, 16)`, tables `[16, 26)` — 10 blocks. A hand-committed
-//! manifest references a table at `[20, 25)`, leaving `[16, 20)` as
-//! unreferenced orphans below the sweep's bump resume point. Bump-only
-//! allocation would start at 25 and fail a 4-block table (`[25, 29)` past
-//! `tbl_end`); the free list must serve it instead.
+//! Geometry: 2 levels x 2 tables = 4 table slots of 8 blocks over
+//! `[16, 48)`, WAL `[8, 16)`. A hand-committed manifest references one
+//! table in slot 3 (`[40, 45)`, level 1), so next-fit wraps to slot 0 for
+//! the next table — the slot holding the orphans.
 //!
 //! Two tests: the first plants the orphans by hand; the second crashes a
 //! real flush between the table-block writes and the manifest commit, so
@@ -13,26 +13,30 @@
 
 mod common;
 
-use common::{CrashDevice, MemDevice, TestDb, block_on};
-use horton::{BlockDevice, Config, Error, KeyBound, Manifest, TableRef};
+use common::{CrashDevice, MemDevice, block_on};
+use horton::{BlockDevice, Config, KeyBound, Manifest, TableRef};
 
 use core::task::{Context, Poll};
 
 type DevError = core::convert::Infallible;
 
-/// Tiny geometry: manifest slots 0/1, WAL `[8, 16)`, tables `[16, 26)`.
+type TinyDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 2, 2, 1024, 8>;
+
+/// Manifest slots 0/1, WAL `[8, 16)`, tables `[16, 48)`: 4 slots of 8.
 const fn tiny_config() -> Config {
-    Config::new(8, 16, 16, 26, 0, 1)
+    Config::new(8, 16, 16, 48, 0, 1)
 }
 
-/// A live table at `[20, 25)` covering `m..=z`; blocks `[16, 20)` are
-/// unreferenced orphans. Its blocks were never written — no read path in
-/// this test may consult it (the test key sorts below `m`, so key-range
-/// pruning skips it).
+/// First block of table slot 0, where the orphans live.
+const SLOT0: u64 = 16;
+
+/// A live table in slot 3 (`[40, 45)`) covering `m..=z`. Its blocks were
+/// never written — no read path in these tests may consult it (the test
+/// keys sort below `m`, so key-range pruning skips it).
 fn live_ref() -> TableRef<256> {
     TableRef {
         id: 0,
-        first_block: 20,
+        first_block: 40,
         block_count: 5,
         first_key: KeyBound::from_slice(b"m").expect("bound"),
         last_key: KeyBound::from_slice(b"z").expect("bound"),
@@ -43,23 +47,36 @@ fn live_ref() -> TableRef<256> {
     }
 }
 
-fn get(db: &TestDb<MemDevice<4096>>, key: &[u8]) -> Option<Vec<u8>> {
+fn get<D: BlockDevice>(db: &TinyDb<D>, key: &[u8]) -> Option<Vec<u8>>
+where
+    D::Error: core::fmt::Debug,
+{
     let mut buf = [0u8; 1024];
     block_on(db.get(key, &mut buf))
         .expect("get")
         .map(|n| buf[..n].to_vec())
 }
 
-/// A fresh device whose manifest references only the live `[20, 25)` table.
+/// A fresh device whose manifest references only the live slot-3 table,
+/// with junk in every block of slots 0..3 (stand-ins for orphans).
 fn base_device() -> MemDevice<4096> {
     let mut dev = MemDevice::<4096>::new();
-    let mut manifest = Manifest::<7, 4, 256>::new();
+    let mut manifest = Manifest::<2, 2, 256>::new();
     manifest.set_wal_head(8);
     manifest
-        .add_table_to_level::<DevError>(0, live_ref())
+        .add_table_to_level::<DevError>(1, live_ref())
         .expect("place table");
     let mut scratch = [0u8; 4096];
     block_on(manifest.commit(&mut dev, &mut scratch, 0, 1)).expect("commit");
+    let junk = [0xA5u8; 4096];
+    let waker = common::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for id in SLOT0..40 {
+        assert!(matches!(
+            dev.poll_write_block(&mut cx, id, &junk),
+            Poll::Ready(Ok(()))
+        ));
+    }
     dev
 }
 
@@ -111,7 +128,7 @@ fn commit_write_index() -> usize {
         inner: base_device(),
         ids: Vec::new(),
     };
-    let mut db = TestDb::new(dev, tiny_config());
+    let mut db = TinyDb::new(dev, tiny_config());
     block_on(db.open()).expect("open");
     for (k, v) in PUTS {
         block_on(db.put(k, v)).expect("put");
@@ -133,11 +150,11 @@ fn commit_write_index() -> usize {
 
 #[test]
 fn crashed_flush_orphans_are_reclaimed_and_reused() {
-    // Crash the flush after its table blocks land but before the manifest
-    // commit: the 4 reserved blocks become genuine orphans of a torn flush.
+    // Crash the flush after its table blocks land in slot 0 but before the
+    // manifest commit: those blocks become genuine orphans of a torn flush.
     let crash_at = commit_write_index();
     let dev = CrashDevice::<MemDevice<4096>, 4096>::new(base_device(), crash_at);
-    let mut db = TestDb::new(dev, tiny_config());
+    let mut db = TinyDb::new(dev, tiny_config());
     block_on(db.open()).expect("open");
     for (k, v) in PUTS {
         block_on(db.put(k, v)).expect("put");
@@ -147,54 +164,70 @@ fn crashed_flush_orphans_are_reclaimed_and_reused() {
     block_on(db.flush()).expect("flush");
     let dev = db.into_device().into_inner();
 
-    // Reopen: the sweep reclaims the orphaned run, the WAL replay restores
-    // the puts (durable before the crash), and retrying the flush must reuse
-    // the reclaimed `[16, 20)` run — the bump at 25 cannot fit 4 blocks.
-    let mut db = TestDb::new(dev, tiny_config());
+    // Reopen: slot 0 holds no manifest table, so it is free; the WAL
+    // replay restores the puts (durable before the crash), and the retried
+    // flush lands in slot 0 again, over the orphans.
+    let mut db = TinyDb::new(dev, tiny_config());
     block_on(db.open()).expect("open");
+    assert_eq!(db.slot_stats().used, 1, "only the live table's slot");
     assert_eq!(get(&db, b"a"), Some(b"1".to_vec()));
-    block_on(db.flush()).expect("retry flush reuses the reclaimed run");
+    block_on(db.flush()).expect("retry flush reuses the orphaned slot");
+    assert_eq!(db.level_tables(0).unwrap()[0].first_block, SLOT0);
     assert_eq!(get(&db, b"d"), Some(b"4".to_vec()));
+    assert_eq!(db.check_invariants(), Ok(()));
 
-    // Allocator exhausted again afterwards, and the failed flush is harmless.
-    block_on(db.put(b"e", b"5")).expect("put");
-    let err = block_on(db.flush()).expect_err("flush must fail");
-    assert!(matches!(err, Error::NoSpace));
-    assert_eq!(get(&db, b"e"), Some(b"5".to_vec()));
-
-    // Reopening rebuilds the same allocator state.
+    // Reopening rebuilds the same slot state.
     let dev = db.into_device();
-    let mut db = TestDb::new(dev, tiny_config());
+    let mut db = TinyDb::new(dev, tiny_config());
     block_on(db.open()).expect("open");
+    assert_eq!(db.slot_stats().used, 2);
+    assert_eq!(db.check_invariants(), Ok(()));
     assert_eq!(get(&db, b"d"), Some(b"4".to_vec()));
 }
 
 #[test]
-fn sweep_reclaims_orphans_and_flush_reuses_them() {
-    let mut db = TestDb::new(base_device(), tiny_config());
+fn orphans_in_a_free_slot_are_overwritten() {
+    let mut db = TinyDb::new(base_device(), tiny_config());
     block_on(db.open()).expect("open");
+    let s = db.slot_stats();
+    assert_eq!((s.slots, s.slot_blocks, s.used, s.free), (4, 8, 1, 3));
 
-    // A 4-block table at the bump (25) would need `[25, 29)` — past
-    // `tbl_end`. The reclaimed `[16, 20)` run serves it instead.
+    // Next-fit resumes past the newest table (slot 3) and wraps to slot 0,
+    // straight over the junk.
     block_on(db.put(b"a", b"1")).expect("put");
     block_on(db.flush()).expect("flush");
+    assert_eq!(db.level_tables(0).unwrap()[0].first_block, SLOT0);
     assert_eq!(get(&db, b"a"), Some(b"1".to_vec()));
+    assert_eq!(db.check_invariants(), Ok(()));
 
-    // The free blocks are spent now: the next flush genuinely has nowhere
-    // to go, and the failed flush changes nothing — "b" is still served
-    // from the memtable.
-    block_on(db.put(b"b", b"2")).expect("put");
-    let err = block_on(db.flush()).expect_err("flush must fail");
-    assert!(matches!(err, Error::NoSpace));
-    assert_eq!(get(&db, b"b"), Some(b"2".to_vec()));
-
-    // Reopening rebuilds the same allocator state: the bump still resumes
-    // past the referenced table and the claimed blocks stay claimed.
+    // Reopening rebuilds the same slot state from the manifest alone.
     let dev = db.into_device();
-    let mut db = TestDb::new(dev, tiny_config());
+    let mut db = TinyDb::new(dev, tiny_config());
     block_on(db.open()).expect("open");
+    assert_eq!(db.slot_stats().used, 2);
     assert_eq!(get(&db, b"a"), Some(b"1".to_vec()));
-    block_on(db.put(b"c", b"3")).expect("put");
-    let err = block_on(db.flush()).expect_err("flush must still fail");
-    assert!(matches!(err, Error::NoSpace));
+    assert_eq!(db.check_invariants(), Ok(()));
+}
+
+#[test]
+fn a_table_outside_its_slot_is_a_corrupt_manifest() {
+    // A table straddling slots 0 and 1 cannot have been written under this
+    // layout: open() must refuse rather than hand either slot out.
+    let mut dev = MemDevice::<4096>::new();
+    let mut manifest = Manifest::<2, 2, 256>::new();
+    manifest.set_wal_head(8);
+    let mut straddler = live_ref();
+    straddler.first_block = 20;
+    straddler.block_count = 8; // [20, 28)
+    manifest
+        .add_table_to_level::<DevError>(1, straddler)
+        .expect("place table");
+    let mut scratch = [0u8; 4096];
+    block_on(manifest.commit(&mut dev, &mut scratch, 0, 1)).expect("commit");
+    let mut db = TinyDb::new(dev, tiny_config());
+    assert_eq!(
+        block_on(db.open()).map(|_| ()),
+        Err(horton::Error::CorruptManifest)
+    );
+    assert!(!db.is_open());
 }

@@ -139,7 +139,7 @@ fn make_val(buf: &mut [u8; 256], rng: &mut Lcg, len: usize) -> usize {
 /// Same shape as `write_path.rs` / `write_only.rs`: 4 KiB blocks, 64 B
 /// keys, 256 B values, 512-slot / 64 KiB memtable, 7 levels, 4 tables per
 /// level, 1 KiB bloom filters, 8192-slot free list.
-type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8192, 8>;
+type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8>;
 type BenchCompaction = Compaction<4096, 64, 256, 1024>;
 
 // Small batches (well under the 512-slot memtable cap) so L0 fills — and

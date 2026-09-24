@@ -19,10 +19,10 @@ use crate::{Db, Scan};
 /// `size_of` of [`Db`], [`Scan`], and [`Compaction`] for this profile and
 /// asserts their sum stays under [`ESP32S3_RAM_BUDGET`]. `BUDGET.md`
 /// records the current numbers and what each buffer is for.
-pub type Esp32S3Db<D> = Db<D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64, 2>;
+pub type Esp32S3Db<D> = Db<D, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>;
 
 /// [`Scan`] instantiated for the ESP32-S3 profile.
-pub type Esp32S3Scan<'d, D> = Scan<'d, D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64, 2>;
+pub type Esp32S3Scan<'d, D> = Scan<'d, D, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>;
 
 /// [`Compaction`] scratch instantiated for the ESP32-S3 profile.
 pub type Esp32S3Compaction = Compaction<4096, 32, 64, 64>;

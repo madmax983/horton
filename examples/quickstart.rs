@@ -21,8 +21,8 @@ const BLOCK: usize = 4096;
 /// is one fixed-size value with no heap behind it.
 ///
 /// `BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES,
-/// FREELIST, CACHE`
-type MyDb = Db<RamDisk, BLOCK, 64, 256, 64, 8192, 4, 4, 256, 512, 4>;
+/// CACHE`
+type MyDb = Db<RamDisk, BLOCK, 64, 256, 64, 8192, 4, 4, 256, 4>;
 
 /// A block device backed by a `Vec` of blocks. Unwritten blocks read as
 /// zeros. Every call completes immediately (`Poll::Ready`).

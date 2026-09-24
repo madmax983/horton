@@ -19,9 +19,9 @@ use horton::{
     BlockCache, BlockDevice, CacheStats, Compaction, Db, Progress, RevScan, Scan, SealedTable,
 };
 
-type NoCacheDb<D> = Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 0>;
-type TestScan<'d, D> = Scan<'d, D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
-type TestRevScan<'d, D> = RevScan<'d, D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type NoCacheDb<D> = Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 0>;
+type TestScan<'d, D> = Scan<'d, D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
+type TestRevScan<'d, D> = RevScan<'d, D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 type TestCompaction = Compaction<4096, 256, 1024, 1024>;
 
 /// In-memory device counting reads against the table region (`>= 136`).

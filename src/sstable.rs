@@ -165,6 +165,77 @@ fn entry_fits<const BLOCK: usize>(payload: usize, entries: u64, elen: usize) -> 
     payload.saturating_add(elen).saturating_add(tail) <= BLOCK
 }
 
+/// Largest restart tail a data block can carry: 128 restart offsets, the
+/// restart count, and the CRC.
+const MAX_DATA_TAIL: usize = 128 * 2 + 2 + CRC_LEN;
+
+/// Upper bound on the blocks greedy packing uses for `n` entries of at
+/// most `emax` bytes each and `total` bytes overall, when a block holds at
+/// most `room` payload bytes and `per_block` entries. Every block but the
+/// last was sealed because the next entry (at most `emax` bytes) no longer
+/// fit — so it holds more than `room - emax` bytes — or because it reached
+/// `per_block` entries.
+const fn packed_blocks_bound(
+    total: usize,
+    n: usize,
+    emax: usize,
+    room: usize,
+    per_block: usize,
+) -> u64 {
+    if n == 0 {
+        return 0;
+    }
+    let by_bytes = if room > emax {
+        total / (room - emax + 1)
+    } else {
+        n
+    };
+    let bound = by_bytes.saturating_add(n / per_block).saturating_add(1);
+    // Every block holds at least one entry.
+    let bound = if bound < n { bound } else { n };
+    bound as u64
+}
+
+/// Upper bound on the blocks one flush can occupy: a full memtable
+/// (`cap` entries over `arena` key and value bytes) packed into a data
+/// section and a range-tombstone section, plus bloom, index, and footer.
+/// Both sections are bounded as if the whole memtable went into each, so
+/// the bound holds for any mix. `Db::open` refuses a table-slot layout
+/// smaller than this: a memtable that could never flush would wedge the
+/// write path.
+#[must_use]
+pub(crate) const fn max_flush_blocks<const BLOCK: usize>(
+    cap: usize,
+    arena: usize,
+    key_max: usize,
+    val_max: usize,
+) -> u64 {
+    // Point entries: header, key, value, and an optional TTL expiry.
+    let emax = ENTRY_HEADER + key_max + val_max + 8;
+    let data_total = arena + cap * (ENTRY_HEADER + 8);
+    // 2048 entries per block: the conversion is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let per_block = MAX_ENTRIES_PER_BLOCK as usize;
+    let data = packed_blocks_bound(
+        data_total,
+        cap,
+        emax,
+        BLOCK.saturating_sub(MAX_DATA_TAIL),
+        per_block,
+    );
+    // Range tombstones: `start_len u16 | end_len u16 | seq u64 | start | end`.
+    let rmax = 12 + 2 * key_max;
+    let rdel_total = arena + cap * 12;
+    let rdel = packed_blocks_bound(
+        rdel_total,
+        cap,
+        rmax,
+        BLOCK.saturating_sub(RDEL_TRAILER),
+        usize::MAX,
+    );
+    data + rdel + 3
+}
+
 /// Number of bloom probes for `entries` keys in a `bloom_bits`-bit filter.
 ///
 /// Optimal `k ≈ (m/n)·ln 2`, clamped to `[1, 30]`; computed with integer

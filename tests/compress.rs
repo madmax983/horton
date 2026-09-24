@@ -17,8 +17,7 @@ use horton::{BlockDevice, Compaction, Progress, SealedTable};
 const BLOCK: usize = 4096;
 const BODY: usize = BLOCK - 4; // decompressed size is always the full logical block
 
-type TestScan<'d> =
-    horton::Scan<'d, MemDevice<BLOCK>, BLOCK, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type TestScan<'d> = horton::Scan<'d, MemDevice<BLOCK>, BLOCK, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 const fn scratch() -> CompressScratch<BLOCK> {
     CompressScratch::new()

@@ -137,19 +137,45 @@ fn l0_full_errors() {
 }
 
 #[test]
-fn table_region_exhaustion() {
-    // Table region [136, 140): exactly one 4-block table fits.
+fn table_region_too_small_for_the_slot_layout() {
+    // 7 x 4 = 28 table slots over a 4-block region: no slot could hold a
+    // full memtable's table, so open() refuses the layout up front.
     let cfg = Config::new(8, 136, 136, 140, 0, 1);
     let mut db = TestDb::new(MemDevice::<4096>::new(), cfg);
-    open(&mut db);
-    block_on(db.put(b"a", b"1")).unwrap();
+    assert!(matches!(block_on(db.open()), Err(Error::NoSpace)));
+    assert!(!db.is_open());
+}
+
+#[test]
+fn table_region_exhaustion() {
+    // 2 levels x 2 tables = 4 slots of 8 blocks. Compaction keeps one
+    // slot in reserve, so three tables fit; disjoint keys keep L1 from
+    // merging them away.
+    type TinyDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 2, 2, 1024, 8>;
+    let cfg = Config::new(8, 136, 136, 136 + 4 * 8, 0, 1);
+    let mut db = TinyDb::new(MemDevice::<4096>::new(), cfg);
+    block_on(db.open()).unwrap();
+    let mut c = horton::Compaction::<4096, 256, 1024, 1024>::new();
+    for pair in [*b"ab", *b"cd"] {
+        for k in pair {
+            block_on(db.put(&[k], b"v")).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        while block_on(db.compact_step(&mut c)).unwrap() == horton::Progress::More {}
+    }
+    assert_eq!(db.level_tables(1).unwrap().len(), 2);
+    block_on(db.put(b"e", b"v")).unwrap();
     block_on(db.flush()).unwrap();
-    block_on(db.put(b"b", b"2")).unwrap();
+    assert_eq!(db.slot_stats().free, 1, "only the compaction reserve left");
+    block_on(db.put(b"f", b"v")).unwrap();
     let err = block_on(db.flush()).unwrap_err();
     assert!(matches!(err, Error::NoSpace));
-    // State is intact: b from the memtable, a from the table.
-    assert_eq!(get(&db, b"a"), Some(b"1".to_vec()));
-    assert_eq!(get(&db, b"b"), Some(b"2".to_vec()));
+    // State is intact: f from the memtable, the rest from tables.
+    assert_eq!(db.check_invariants(), Ok(()));
+    let mut buf = [0u8; 8];
+    for k in *b"abcdef" {
+        assert_eq!(block_on(db.get(&[k], &mut buf)), Ok(Some(1)), "key {k}");
+    }
 }
 
 use std::task::{Context, Poll};

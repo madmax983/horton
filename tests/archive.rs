@@ -193,18 +193,18 @@ fn archive_roundtrip_bytes_verify_as_sstable() {
         assert_eq!(&buf[..n], &[b'v', b'b', b'0' + i]);
     }
 
-    // 5. The freed run is truly reused: the next flush first-fits at the
-    //    archived table's old base.
+    // 5. The archived table's slot is free again, and the next flush
+    //    takes a slot of its own.
+    assert_eq!(db.slot_stats().used, 1, "only the b-table's slot is used");
+    assert_eq!(db.check_invariants(), Ok(()));
     for i in 0..4u8 {
         block_on(db.put(&[b'c', b'0' + i], &[b'v', b'c', b'0' + i])).unwrap();
     }
     block_on(db.flush()).unwrap();
     let l0 = db.level_tables(0).expect("level 0 exists");
     assert_eq!(l0.len(), 2, "b-table plus the new c-table");
-    assert_eq!(
-        l0[1].first_block, first0,
-        "freed blocks handed back to the next flush"
-    );
+    assert_eq!(db.slot_stats().used, 2);
+    assert_eq!(db.check_invariants(), Ok(()));
 }
 
 /// Drives exactly one compaction job to completion (no-op when idle).

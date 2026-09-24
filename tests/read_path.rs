@@ -1,7 +1,7 @@
 //! v0.3: the full point-read path.
 //!
-//! Tables are hand-placed at chosen block offsets and levels (standing in
-//! for compaction output, which arrives in v0.4), then `Db::get` must honor
+//! Tables are hand-placed in chosen table slots and levels (standing in
+//! for compaction output), then `Db::get` must honor
 //! highest-sequence-wins across levels, tombstone shadowing, key-range
 //! pruning, and sequence pruning.
 
@@ -19,6 +19,13 @@ use horton::{BlockDevice, Config, Manifest, SstEntry, TableRef, bloom_k, plan_ta
 type DevError = core::convert::Infallible;
 type TestManifest = Manifest<7, 4, 256>;
 type TestTableRef = TableRef<256>;
+
+/// First block of table slot `i` under `test_config()`: the region
+/// `[136, 4224)` split into `7 * 4 = 28` slots of 146 blocks. `open()`
+/// rejects a manifest whose tables do not each sit inside one slot.
+const fn slot(i: u64) -> u64 {
+    136 + 146 * i
+}
 
 /// Writes a single-entry table at `base` and returns its `TableRef`.
 fn write_single(
@@ -121,8 +128,8 @@ impl BlockDevice for CountingDevice {
     }
 }
 
-type CountDb = horton::Db<CountingDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
-type MemDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type CountDb = horton::Db<CountingDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
+type MemDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 fn open_mem_db(dev: MemDevice<4096>, config: Config) -> MemDb {
     let mut db = MemDb::new(dev, config);
@@ -135,9 +142,9 @@ fn highest_seq_wins_across_levels() {
     // The newest version sits in the DEEPEST level: level order must not
     // dominate, the entry sequence decides.
     let mut dev = MemDevice::new();
-    let t0 = write_single(&mut dev, 136, b"k", b"v-old", 1, false, 0);
-    let t1 = write_single(&mut dev, 140, b"k", b"v-mid", 2, false, 1);
-    let t2 = write_single(&mut dev, 144, b"k", b"v-new", 3, false, 2);
+    let t0 = write_single(&mut dev, slot(0), b"k", b"v-old", 1, false, 0);
+    let t1 = write_single(&mut dev, slot(1), b"k", b"v-mid", 2, false, 1);
+    let t2 = write_single(&mut dev, slot(2), b"k", b"v-new", 3, false, 2);
     commit_tables(&mut dev, &[(0, t0), (1, t1), (2, t2)]);
 
     let db = open_mem_db(dev, test_config());
@@ -149,8 +156,8 @@ fn older_seq_in_newer_level_loses() {
     // Mirror image: the highest sequence lives in L0 while a deeper level
     // holds a stale version.
     let mut dev = MemDevice::new();
-    let t0 = write_single(&mut dev, 136, b"k", b"v-new", 5, false, 0);
-    let t2 = write_single(&mut dev, 140, b"k", b"v-stale", 3, false, 1);
+    let t0 = write_single(&mut dev, slot(0), b"k", b"v-new", 5, false, 0);
+    let t2 = write_single(&mut dev, slot(1), b"k", b"v-stale", 3, false, 1);
     commit_tables(&mut dev, &[(0, t0), (2, t2)]);
 
     let db = open_mem_db(dev, test_config());
@@ -160,9 +167,9 @@ fn older_seq_in_newer_level_loses() {
 #[test]
 fn tombstone_at_highest_seq_hides_older_values() {
     let mut dev = MemDevice::new();
-    let t0 = write_single(&mut dev, 136, b"k", b"v-old", 1, false, 0);
-    let t1 = write_single(&mut dev, 140, b"k", b"", 4, true, 1);
-    let t2 = write_single(&mut dev, 144, b"k", b"v-mid", 3, false, 2);
+    let t0 = write_single(&mut dev, slot(0), b"k", b"v-old", 1, false, 0);
+    let t1 = write_single(&mut dev, slot(1), b"k", b"", 4, true, 1);
+    let t2 = write_single(&mut dev, slot(2), b"k", b"v-mid", 3, false, 2);
     commit_tables(&mut dev, &[(0, t0), (1, t1), (2, t2)]);
 
     let db = open_mem_db(dev, test_config());
@@ -172,8 +179,8 @@ fn tombstone_at_highest_seq_hides_older_values() {
 #[test]
 fn older_tombstone_loses_to_newer_value() {
     let mut dev = MemDevice::new();
-    let t0 = write_single(&mut dev, 136, b"k", b"", 2, true, 0);
-    let t1 = write_single(&mut dev, 140, b"k", b"v-resurrected", 5, false, 1);
+    let t0 = write_single(&mut dev, slot(0), b"k", b"", 2, true, 0);
+    let t1 = write_single(&mut dev, slot(1), b"k", b"v-resurrected", 5, false, 1);
     commit_tables(&mut dev, &[(0, t0), (1, t1)]);
 
     let db = open_mem_db(dev, test_config());
@@ -185,8 +192,8 @@ fn range_prune_skips_out_of_range_tables() {
     // One table covers "b", the other covers "q". Each consulted table
     // costs exactly 4 block reads (footer, bloom, index, one data block).
     let mut dev = MemDevice::new();
-    let t1 = write_single(&mut dev, 136, b"b", b"vb", 1, false, 0);
-    let t2 = write_single(&mut dev, 140, b"q", b"vq", 2, false, 1);
+    let t1 = write_single(&mut dev, slot(0), b"b", b"vb", 1, false, 0);
+    let t2 = write_single(&mut dev, slot(1), b"q", b"vq", 2, false, 1);
     commit_tables(&mut dev, &[(0, t1), (0, t2)]);
 
     let reads = Rc::new(Cell::new(0u64));
@@ -267,9 +274,9 @@ fn concurrent_gets_do_not_panic_when_interleaved() {
     // The first `get` is still suspended. The second `get` is polled
     // during this time. It must fall back to its own buffer instead of
     // panicking. Both calls must still return the right value.
-    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+    type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
     let mut dev = MemDevice::new();
-    let t0 = write_single(&mut dev, 136, b"alpha", b"AAAA", 1, false, 0);
+    let t0 = write_single(&mut dev, slot(0), b"alpha", b"AAAA", 1, false, 0);
     commit_tables(&mut dev, &[(0, t0)]);
     let dev = PendingOnceDevice {
         inner: dev,
@@ -321,8 +328,8 @@ fn seq_prune_skips_shadowed_tables() {
     // L0 holds two versions; the newer table is consulted first and the
     // older one is sequence-pruned — it cannot beat the hit in hand.
     let mut dev = MemDevice::new();
-    let t_old = write_single(&mut dev, 136, b"k", b"v-old", 5, false, 0);
-    let t_new = write_single(&mut dev, 140, b"k", b"v-new", 10, false, 1);
+    let t_old = write_single(&mut dev, slot(0), b"k", b"v-old", 5, false, 0);
+    let t_new = write_single(&mut dev, slot(1), b"k", b"v-new", 10, false, 1);
     commit_tables(&mut dev, &[(0, t_old), (0, t_new)]);
 
     let reads = Rc::new(Cell::new(0u64));

@@ -94,22 +94,9 @@ pub struct Scan<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
 > {
-    db: &'d Db<
-        D,
-        BLOCK,
-        KEY_MAX,
-        VAL_MAX,
-        CAP,
-        ARENA,
-        LEVELS,
-        TABLES,
-        BLOOM_BYTES,
-        FREELIST,
-        CACHE,
-    >,
+    db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     start: [u8; KEY_MAX],
     start_len: usize,
     end: [u8; KEY_MAX],
@@ -157,27 +144,14 @@ impl<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
-> Scan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
+> Scan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
     /// Creates an unpositioned scan over `db`. Call [`seek`](Scan::seek)
     /// before [`next`](Scan::next).
     #[must_use]
     pub const fn new(
-        db: &'d Db<
-            D,
-            BLOCK,
-            KEY_MAX,
-            VAL_MAX,
-            CAP,
-            ARENA,
-            LEVELS,
-            TABLES,
-            BLOOM_BYTES,
-            FREELIST,
-            CACHE,
-        >,
+        db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     ) -> Self {
         Self {
             db,
@@ -991,22 +965,9 @@ pub struct RevScan<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
 > {
-    db: &'d Db<
-        D,
-        BLOCK,
-        KEY_MAX,
-        VAL_MAX,
-        CAP,
-        ARENA,
-        LEVELS,
-        TABLES,
-        BLOOM_BYTES,
-        FREELIST,
-        CACHE,
-    >,
+    db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     /// Inclusive ceiling: entries qualify when `key <= ceil`. Set when
     /// `seek_prev`'s `from` is non-empty; an empty `from` means no
     /// ceiling — the scan starts at the last key.
@@ -1059,41 +1020,14 @@ impl<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
->
-    RevScan<
-        'd,
-        D,
-        BLOCK,
-        KEY_MAX,
-        VAL_MAX,
-        CAP,
-        ARENA,
-        LEVELS,
-        TABLES,
-        BLOOM_BYTES,
-        FREELIST,
-        CACHE,
-    >
+> RevScan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
     /// Creates an unpositioned reverse scan over `db`. Call
     /// [`seek_prev`](RevScan::seek_prev) before [`prev`](RevScan::prev).
     #[must_use]
     pub const fn new(
-        db: &'d Db<
-            D,
-            BLOCK,
-            KEY_MAX,
-            VAL_MAX,
-            CAP,
-            ARENA,
-            LEVELS,
-            TABLES,
-            BLOOM_BYTES,
-            FREELIST,
-            CACHE,
-        >,
+        db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     ) -> Self {
         Self {
             db,

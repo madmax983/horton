@@ -26,7 +26,7 @@ const KEY_MAX: usize = 16;
 const VAL_MAX: usize = 300;
 const TABLES: usize = 4;
 
-type LDb = horton::Db<MemDevice<BLOCK>, BLOCK, KEY_MAX, VAL_MAX, 32, 2048, 4, TABLES, 256, 4096, 4>;
+type LDb = horton::Db<MemDevice<BLOCK>, BLOCK, KEY_MAX, VAL_MAX, 32, 2048, 4, TABLES, 256, 4>;
 type LComp = Compaction<BLOCK, KEY_MAX, VAL_MAX, 256>;
 
 /// Manifest slots 0/1, WAL `[2, 42)`, tables `[42, 1242)`.

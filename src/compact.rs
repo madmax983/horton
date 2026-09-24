@@ -12,9 +12,10 @@
 //! buffers plus one read cursor per input table, at most
 //! [`COMPACTION_KMAX`] tables per job. Nothing is allocated. Dropping the
 //! scratch mid-job is crash-safe: partial output tables are invisible until
-//! the manifest commit, so they become orphans reclaimed by the next
-//! `open()` sweep, while the input tables stay referenced; a fresh scratch
-//! simply selects the job again.
+//! the manifest commit, and their table slot stays reserved only until the
+//! next `compact_step` (with any scratch) aborts the stale job, while the
+//! input tables stay referenced; a fresh scratch simply selects the job
+//! again.
 //!
 //! Compaction preserves the read path's visibility rule: each key keeps
 //! the newest version (the live view) plus the newest version at or below
@@ -125,10 +126,14 @@ pub struct Compaction<
     pub(crate) rdel_first: KeyBound<KEY_MAX>,
     pub(crate) rdel_last: KeyBound<KEY_MAX>,
     pub(crate) rdel_max_seq: u64,
+    /// The output table's reserved slot and its first block.
+    pub(crate) out_slot: u32,
     pub(crate) out_base: u64,
-    pub(crate) out_blocks: u64,
-    pub(crate) out_len: usize,
-    pub(crate) from_free: bool,
+    /// The [`Db`](crate::db::Db)'s job generation when this scratch
+    /// selected its job. A mismatch means another scratch started a job,
+    /// or the job was aborted (archive, ingest, reopen): the scratch is
+    /// stale and resets instead of touching the device.
+    pub(crate) job_gen: u32,
     pub(crate) writer: TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>,
     /// Caller-owned compression scratch for the output table: every
     /// sealed data block is trial-compressed (see
@@ -265,10 +270,9 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             rdel_first: KeyBound::EMPTY,
             rdel_last: KeyBound::EMPTY,
             rdel_max_seq: 0,
+            out_slot: 0,
             out_base: 0,
-            out_blocks: 0,
-            out_len: 0,
-            from_free: false,
+            job_gen: 0,
             writer: TableWriter::new(0, 0),
             compress: CompressScratch::new(),
             raw: [0u8; BLOCK],
@@ -281,8 +285,9 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
     }
 
     /// Abandons any in-progress job. Partial output blocks were never
-    /// claimed or referenced, so they are simply free; the inputs are still
-    /// in the manifest and a later select will redo the job.
+    /// referenced, so their slot is simply free once the `Db` releases the
+    /// reservation; the inputs are still in the manifest and a later
+    /// select will redo the job.
     ///
     /// `purge_before` is sticky across jobs (it is a caller-owned clock
     /// cutoff, not per-job state); change it explicitly when the cutoff

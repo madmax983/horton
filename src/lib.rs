@@ -6,8 +6,8 @@
 //!
 //! v0.16 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
-//! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
-//! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
+//! [`manifest`] crash-safe root pointer, the [`alloc`] table-slot
+//! allocator (one table per fixed slot), the [`Db`] database (WAL + memtable +
 //! flush into `SSTables`, multi-level bloom-gated reads with key-range
 //! pruning and highest-sequence-wins), the [`Scan`] merge iterator with
 //! snapshot reads and reverse iteration, atomic multi-op [`WriteBatch`]
@@ -57,12 +57,12 @@ pub mod scan;
 pub mod sstable;
 pub mod wal;
 
-pub use alloc::{Bump, FreeList};
+pub use alloc::{MAX_SLOTS, SlotMap};
 pub use batch::WriteBatch;
 pub use cache::{BlockCache, CachePort, CacheStats};
 pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
-pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable};
+pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable, SlotStats};
 pub use device::BlockDevice;
 pub use error::Error;
 pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, TableRef};

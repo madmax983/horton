@@ -557,16 +557,6 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         Ok(())
     }
 
-    /// True when block `id` is referenced by some live table (the
-    /// open-time sweep's liveness query).
-    #[must_use]
-    pub fn is_table_block_referenced(&self, id: u64) -> bool {
-        self.tables().iter().any(|t| {
-            id.checked_sub(t.first_block)
-                .is_some_and(|d| d < u64::from(t.block_count))
-        })
-    }
-
     /// Highest sequence number across all live tables (0 when empty).
     ///
     /// Derived, so it can *fall* when compaction or archival removes the
@@ -576,13 +566,6 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     #[must_use]
     pub fn max_seq(&self) -> u64 {
         self.tables().iter().map(|t| t.max_seq).max().unwrap_or(0)
-    }
-
-    /// One past the highest block id referenced by any live table, or
-    /// `None` when the manifest holds no tables.
-    #[must_use]
-    pub fn table_region_end(&self) -> Option<u64> {
-        self.tables().iter().map(TableRef::end_block).max()
     }
 
     /// Serializes into `out` (zero-padded to a full block, CRC-terminated).

@@ -13,7 +13,7 @@
 use core::cell::RefCell;
 use core::future::poll_fn;
 
-use crate::alloc::{Bump, FreeList};
+use crate::alloc::{MAX_SLOTS, SlotMap};
 use crate::batch::WriteBatch;
 use crate::cache::{BlockCache, CachePort, CacheStats};
 use crate::compact::{
@@ -67,6 +67,24 @@ impl Config {
             manifest_b,
         }
     }
+}
+
+/// Table-region occupancy, from [`Db::slot_stats`].
+///
+/// The table region is `slots` fixed slots of `slot_blocks` blocks, one
+/// table per slot (see [`SlotMap`]). `used + reserved + free == slots`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotStats {
+    /// Total table slots (`LEVELS * TABLES`).
+    pub slots: u32,
+    /// Blocks per slot: the largest table the region holds.
+    pub slot_blocks: u64,
+    /// Slots holding a live table.
+    pub used: u32,
+    /// Slots reserved by the in-flight compaction job.
+    pub reserved: u32,
+    /// Slots available to the next flush, ingest, or compaction output.
+    pub free: u32,
 }
 
 /// Summary of a [`Db::open`] call.
@@ -216,8 +234,7 @@ struct JobInputs<const KEY_MAX: usize> {
 pub(crate) const MAX_SNAPSHOTS: usize = 8;
 
 /// The database handle. Owns the WAL writer (and through it, the device),
-/// the memtable, the manifest, and the table-region allocator (bump pointer
-/// plus free list of reclaimed blocks).
+/// the memtable, the manifest, and the table-region slot allocator.
 pub struct Db<
     D: BlockDevice,
     const BLOCK: usize,
@@ -228,15 +245,25 @@ pub struct Db<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     // Block-cache slots (cache::BlockCache). 0 disables the cache.
     const CACHE: usize,
 > {
     wal: WalWriter<D, BLOCK>,
     table: MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
     manifest: Manifest<LEVELS, TABLES, KEY_MAX>,
-    tbl_bump: Bump,
-    tbl_free: FreeList<FREELIST>,
+    /// The table region as `LEVELS * TABLES` fixed slots, one table each
+    /// (see [`SlotMap`]). Rebuilt from the manifest by `open()`.
+    slots: SlotMap,
+    /// Generation of the compaction job in flight, stamped into its
+    /// [`Compaction`] scratch at select time. A scratch whose stamp no
+    /// longer matches (another scratch started a job, or the job was
+    /// aborted) is stale and is reset before it can touch the device.
+    job_gen: u32,
+    /// True while a compaction job holds slot reservations.
+    job_active: bool,
+    /// Slots of the active job's input tables, one bit per slot. Archiving
+    /// one of them aborts the job (its merge still reads the table).
+    job_inputs: u64,
     cfg: Config,
     next_seq: u64,
     /// Live snapshot watermarks (sequence numbers). A snapshot pins reads
@@ -301,9 +328,8 @@ impl<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
-> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
+> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
     const ASSERT_BLOCK: () = assert!(BLOCK == D::BLOCK, "BLOCK must equal D::BLOCK");
     const ASSERT_KEY: () = assert!(
@@ -319,6 +345,23 @@ impl<
         BLOOM_BYTES >= 1 && BLOOM_BYTES + 4 <= BLOCK,
         "BLOOM_BYTES must be within 1..=BLOCK-4"
     );
+    const ASSERT_SLOTS: () = assert!(
+        LEVELS >= 1 && TABLES >= 1 && LEVELS * TABLES <= MAX_SLOTS,
+        "LEVELS * TABLES (one table slot per manifest entry) must be within 1..=64"
+    );
+
+    /// Table slots: one per manifest table ref.
+    const SLOTS: usize = LEVELS * TABLES;
+
+    /// Smallest usable slot: a full memtable's table must fit one, or the
+    /// write path could wedge on a flush that never fits.
+    const MIN_SLOT_BLOCKS: u64 = sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX);
+
+    /// Free slots flush and ingest leave untouched, so a compaction job can
+    /// always reserve its output slot: compaction is what frees slots
+    /// (several inputs become one output), so taking the last free slot
+    /// for a flush would wedge the database.
+    const COMPACTION_RESERVE: u32 = 1;
 
     /// Creates a closed database handle over `device`.
     #[must_use]
@@ -330,12 +373,15 @@ impl<
         let () = Self::ASSERT_VAL;
         let () = Self::ASSERT_REC;
         let () = Self::ASSERT_BLOOM;
+        let () = Self::ASSERT_SLOTS;
         Self {
             wal: WalWriter::new(device, config.wal_start, config.wal_end),
             table: MemTable::new(),
             manifest: Manifest::new(),
-            tbl_bump: Bump::new(config.tbl_start, config.tbl_end),
-            tbl_free: FreeList::new(),
+            slots: SlotMap::new(),
+            job_gen: 0,
+            job_active: false,
+            job_inputs: 0,
             cfg: config,
             next_seq: 0,
             snapshots: [0u64; MAX_SNAPSHOTS],
@@ -360,6 +406,42 @@ impl<
         } else {
             Err(Error::NotOpen)
         }
+    }
+
+    /// Picks the slot for a flushed or ingested table of `blocks` blocks.
+    /// Nothing is reserved: the caller holds `&mut self` from here to its
+    /// manifest commit and then [`claim`](SlotMap::claim)s the slot, so no
+    /// other operation can take it in between, and a future dropped
+    /// mid-write leaks nothing. The last [`COMPACTION_RESERVE`] free slots
+    /// are left for compaction.
+    ///
+    /// [`COMPACTION_RESERVE`]: Self::COMPACTION_RESERVE
+    fn free_slot_for(&self, blocks: u64) -> Result<u32, Error<D::Error>> {
+        if blocks > self.slots.slot_blocks() || self.slots.free_slots() <= Self::COMPACTION_RESERVE
+        {
+            return Err(Error::NoSpace);
+        }
+        self.slots.find_free().ok_or(Error::NoSpace)
+    }
+
+    /// Abandons the in-flight compaction job, if any: its reserved output
+    /// slot returns to the free set, its staged output refs are dropped,
+    /// and its scratch goes stale (reset on its next `compact_step`).
+    /// Committed state is untouched — the job's inputs are all still live,
+    /// so a later select simply redoes it.
+    fn abort_job(&mut self) {
+        if self.job_active {
+            self.slots.release_all();
+            self.manifest.clear_pending();
+            self.job_active = false;
+            self.job_inputs = 0;
+        }
+    }
+
+    /// The slot of live table `t` (`None` only for a ref the slot map
+    /// never accepted, which `open()` rules out).
+    fn slot_of(&self, t: &TableRef<KEY_MAX>) -> Option<u32> {
+        self.slots.slot_of(t.first_block, u64::from(t.block_count))
     }
 
     /// Consumes the handle and returns the underlying device.
@@ -445,6 +527,20 @@ impl<
         &self.cache
     }
 
+    /// Table-region occupancy: how many table slots are used, reserved by
+    /// an in-flight compaction job, or free. Zeroed before
+    /// [`open`](Db::open).
+    #[must_use]
+    pub const fn slot_stats(&self) -> SlotStats {
+        SlotStats {
+            slots: self.slots.slots(),
+            slot_blocks: self.slots.slot_blocks(),
+            used: self.slots.used_slots(),
+            reserved: self.slots.reserved_slots(),
+            free: self.slots.free_slots(),
+        }
+    }
+
     /// Test-visible block-cache counters: hits, misses, occupancy. Lets
     /// callers prove the cache is earning its RAM instead of trusting us.
     #[must_use]
@@ -452,29 +548,39 @@ impl<
         self.cache.stats()
     }
 
-    /// Opens the database: recovers the manifest, rebuilds the table-region
-    /// allocator with the open-time sweep, replays the WAL from the
-    /// manifest's `wal_head` into a fresh memtable, and resumes the sequence
-    /// counter and the WAL append position. Idempotent.
+    /// Opens the database: recovers the manifest, rebuilds the table-slot
+    /// map from it, replays the WAL from the manifest's `wal_head` into a
+    /// fresh memtable, and resumes the sequence counter and the WAL append
+    /// position. Idempotent.
     ///
-    /// The sweep re-derives "free" as "not referenced": the bump resumes
-    /// past the highest manifest-referenced table block, and unreferenced
-    /// blocks below that point (orphans of torn flushes) go on the free
-    /// list for true reuse. In v0.3 the write path cannot strand such
-    /// blocks — a torn flush's run always starts at or above the resume
-    /// point, where the bump simply overwrites it — so the list only holds
-    /// what the sweep finds here; v0.4 compaction will free whole tables
-    /// into it. Size `FREELIST` to hold the table region's block count: an
-    /// undersized list fails the open loudly instead of leaking silently.
+    /// The table region is laid out as `LEVELS * TABLES` equal slots (see
+    /// [`SlotMap`]); a slot is used exactly when a manifest table lives in
+    /// it. Blocks left behind by a torn flush or an abandoned compaction
+    /// need no sweep: they sit in a slot no table references, which is
+    /// simply free. Any in-flight compaction job is forgotten (its scratch
+    /// resets on its next step).
     ///
     /// # Errors
     ///
-    /// [`Error::CorruptManifest`], [`Error::CorruptWal`], [`Error::NoSpace`]
-    /// (undersized `FREELIST`), or [`Error::Device`].
+    /// [`Error::NoSpace`] when the table region is too small for the slot
+    /// layout (each slot must hold a full memtable's table),
+    /// [`Error::CorruptManifest`] (also when a live table does not sit
+    /// wholly inside its own slot), [`Error::CorruptWal`], or
+    /// [`Error::Device`].
     pub async fn open(&mut self) -> Result<OpenReport, Error<D::Error>> {
         // A failed or interrupted open leaves the handle closed.
         self.opened = false;
         self.table.clear();
+        self.job_active = false;
+        self.job_inputs = 0;
+        self.job_gen = self.job_gen.wrapping_add(1);
+        let mut slots = SlotMap::layout(
+            self.cfg.tbl_start,
+            self.cfg.tbl_end,
+            Self::SLOTS,
+            Self::MIN_SLOT_BLOCKS,
+        )
+        .ok_or(Error::NoSpace)?;
         let mut scratch = [0u8; BLOCK];
         let (manifest, fresh) = Manifest::recover(
             self.wal.device_mut(),
@@ -488,18 +594,28 @@ impl<
             // Nothing was ever committed: the whole WAL region is live.
             self.manifest.set_wal_head(self.cfg.wal_start);
         }
-        // Sweep: the bump resumes past the highest referenced table block;
-        // unreferenced blocks below it are reclaimed into the free list.
-        self.tbl_bump.set_next(self.cfg.tbl_start);
-        self.tbl_free = FreeList::new();
-        if let Some(end) = self.manifest.table_region_end() {
-            self.tbl_bump.set_next(end);
-            for id in self.cfg.tbl_start..end {
-                if !self.manifest.is_table_block_referenced(id) {
-                    self.tbl_free.insert::<D::Error>(id)?;
-                }
+        // Rebuild the used set: every live table must sit wholly inside its
+        // own slot. A table straddling a slot boundary, or two tables in
+        // one slot, cannot have been written under this layout — the
+        // manifest or the configuration is wrong, and guessing would hand
+        // out live blocks. Next-fit resumes past the newest table, so
+        // allocation keeps rotating across reboots.
+        let mut newest: Option<(u32, u32)> = None;
+        for t in self.manifest.tables() {
+            let slot = slots
+                .slot_of(t.first_block, u64::from(t.block_count))
+                .ok_or(Error::CorruptManifest)?;
+            if !slots.mark_used(slot) {
+                return Err(Error::CorruptManifest);
+            }
+            if newest.is_none_or(|(id, _)| t.id > id) {
+                newest = Some((t.id, slot));
             }
         }
+        if let Some((_, slot)) = newest {
+            slots.set_hint_after(slot);
+        }
+        self.slots = slots;
         // The persisted flush floor skips stale pre-wrap WAL records (see
         // `WalWriter::recover_from`). It must be the persisted value, not
         // one derived from live tables: compaction and archival can remove
@@ -953,7 +1069,7 @@ impl<
     /// `sealed` is the placement-free descriptor from
     /// [`ArchivePlan::sealed`](ArchivePlan::sealed); `remote` holds the
     /// table's blocks laid out contiguously starting at `src_base`. The
-    /// table is copied into a locally reserved run, its block CRCs are
+    /// table is copied into a free local table slot, its block CRCs are
     /// verified as they land, its index/footer block pointers are
     /// relocated to the destination layout, and the copy is validated
     /// (footer magic/CRC plus the descriptor's entry count) before it is
@@ -967,16 +1083,18 @@ impl<
     /// its former level: L0 tolerates overlap and highest-sequence-wins
     /// stays exact.
     ///
-    /// Crash safety: the run is reserved, not claimed, until the manifest
-    /// commit lands, so a crash before the commit leaves only orphaned,
-    /// invisible blocks; a crash after it leaves the table fully
-    /// attached. Retrying after any crash converges to exactly one copy.
+    /// Crash safety: the slot is claimed only once the manifest commit
+    /// lands, so a crash before the commit leaves only unreferenced blocks
+    /// in a free slot; a crash after it leaves the table fully attached.
+    /// Retrying after any crash converges to exactly one copy. A
+    /// successful ingest aborts any in-flight compaction job (the job's
+    /// tombstone-drop floor predates the ingested table).
     ///
     /// # Errors
     ///
     /// [`Error::IngestConflict`] when the id is already attached with a
     /// *different* descriptor, [`Error::NoSpace`] when L0 is full or the
-    /// table region has no room, [`Error::CorruptBlock`] when the source
+    /// table is larger than a slot or no slot is free, [`Error::CorruptBlock`] when the source
     /// bytes fail validation (the manifest is untouched), or
     /// [`Error::Device`] on I/O failure from either device.
     pub async fn ingest_table<R>(
@@ -1018,15 +1136,11 @@ impl<
             return Err(Error::NoSpace);
         }
         let blocks = u64::from(sealed.block_count);
-        let total = usize::try_from(blocks).map_err(|_| Error::CorruptManifest)?;
-        // Reserve the run without claiming it (mirrors flush): free list
-        // first, then the bump. Nothing moves until the manifest commit
-        // below lands, so a crash mid-copy leaves only orphans.
-        let free_base = self.tbl_free.find_run(total);
-        let base = match free_base {
-            Some(b) => b,
-            None => self.tbl_bump.peek_run::<D::Error>(blocks)?,
-        };
+        // Pick a free slot (mirrors flush). It is claimed only after the
+        // manifest commit below lands, so a crash mid-copy leaves nothing
+        // but unreferenced blocks in a free slot.
+        let slot = self.free_slot_for(blocks)?;
+        let base = self.slots.slot_base(slot);
         // Stream the blocks from the source device, verifying each
         // block's CRC as it lands so remote corruption fails fast,
         // before the manifest commit.
@@ -1062,6 +1176,10 @@ impl<
         {
             return Err(Error::CorruptBlock { id: footer });
         }
+        // The ingested table may hold versions older than tombstones an
+        // in-flight compaction job is about to drop (the job's drop floor
+        // predates it), so the job restarts from scratch.
+        self.abort_job();
         // Graft into L0 through the atomic manifest commit. Future local
         // tables must never collide with the ingested id, so the id floor
         // advances past it (monotone; never lowers the counter).
@@ -1087,23 +1205,10 @@ impl<
             .commit(self.wal.device_mut(), &mut buf, slot_a, slot_b)
             .await?;
         // Commit point passed: publish the staged state, then claim the
-        // reserved run — strictly after the visibility point.
+        // slot — strictly after the visibility point.
         self.manifest = staged;
         self.next_seq = self.next_seq.max(sealed.max_seq);
-        match free_base {
-            Some(b) => {
-                debug_assert_eq!(b, base);
-                // Must run unconditionally: `claim_run` removes the run
-                // from the free list, and `debug_assert!` does not
-                // evaluate its argument in release builds.
-                let claimed = self.tbl_free.claim_run(b, total);
-                debug_assert!(claimed, "find_run's own result must still claim");
-            }
-            None => {
-                self.tbl_bump
-                    .set_next(base.checked_add(blocks).ok_or(Error::NoSpace)?);
-            }
-        }
+        self.slots.claim(slot);
         Ok(true)
     }
 
@@ -1290,11 +1395,10 @@ impl<
     /// commit leaves the old manifest plus a replayable WAL; a crash after
     /// leaves the new state. Never a mix.
     ///
-    /// Table blocks come from the free list first (reclaimed orphans), then
-    /// the bump pointer. The run is only *reserved* until the manifest commit
-    /// lands — claimed from the free list or advanced on the bump afterwards —
-    /// so a returned I/O error leaves the in-memory state exactly as it was
-    /// and the flush can simply be retried.
+    /// The table goes into a free slot of the table region (see
+    /// [`SlotMap`]), claimed only once the manifest commit lands, so a
+    /// returned I/O error leaves the in-memory state exactly as it was and
+    /// the flush can simply be retried.
     ///
     /// When the WAL region is exhausted, the flush wraps it: every record is
     /// flushed at that point, so `wal_head` restarts at `wal_start` in the
@@ -1306,9 +1410,10 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the table region is exhausted, the table's
-    /// index would overflow one block, or level 0 is full (compaction is a
-    /// v0.4 item), or [`Error::Device`] on I/O failure.
+    /// [`Error::NoSpace`] when level 0 is full (run
+    /// [`compact_step`](Db::compact_step)), no table slot is free beyond
+    /// the compaction reserve, or the table's index would overflow one
+    /// block; or [`Error::Device`] on I/O failure.
     pub async fn flush(&mut self) -> Result<(), Error<D::Error>> {
         self.ensure_open()?;
         // Every acked mutation must be durable in the WAL or the new table.
@@ -1351,14 +1456,10 @@ impl<
             .checked_add(plan.data_blocks)
             .and_then(|n| n.checked_add(3))
             .ok_or(Error::NoSpace)?;
-        let total_usize = usize::try_from(total).map_err(|_| Error::NoSpace)?;
-        // Reserve the run without claiming it: free list first, then the
-        // bump. Neither moves until the manifest commit below has landed.
-        let free_base = self.tbl_free.find_run(total_usize);
-        let base = match free_base {
-            Some(b) => b,
-            None => self.tbl_bump.peek_run::<D::Error>(total)?,
-        };
+        // Pick a free slot; it is claimed only once the manifest commit
+        // below has landed.
+        let slot = self.free_slot_for(total)?;
+        let base = self.slots.slot_base(slot);
         // Pass 2: stream the blocks — the data section at `base`, then the
         // rdel section right after it, then bloom/index/footer. `data`
         // doubles as the manifest scratch below; it is a plain stack local.
@@ -1367,7 +1468,7 @@ impl<
         // enough. The writer's block limit is the planned data-block
         // count: plan and writer share one packing rule, so it is never
         // reached — but a mismatch fails loudly instead of overrunning
-        // the reserved run.
+        // the slot.
         let mut data = [0u8; BLOCK];
         let mut cs = crate::compress::CompressScratch::<BLOCK>::new();
         {
@@ -1414,24 +1515,9 @@ impl<
         staged
             .commit(self.wal.device_mut(), &mut data, slot_a, slot_b)
             .await?;
-        // Commit point passed: publish the staged state.
+        // Commit point passed: publish the staged state and claim the slot.
         self.manifest = staged;
-        match free_base {
-            Some(b) => {
-                debug_assert_eq!(b, base);
-                // Must run unconditionally: `claim_run` removes the run from
-                // the free list, and `debug_assert!` does not evaluate its
-                // argument in release builds. Wrapping the call itself in
-                // `debug_assert!` would silently skip that removal in
-                // release, leaving claimed blocks marked free forever.
-                let claimed = self.tbl_free.claim_run(b, total_usize);
-                debug_assert!(claimed, "find_run's own result must still claim");
-            }
-            None => {
-                self.tbl_bump
-                    .set_next(base.checked_add(total).ok_or(Error::NoSpace)?);
-            }
-        }
+        self.slots.claim(slot);
         // The flushed contents now live in the table; drop the memtable.
         self.table.clear();
         if wrap {
@@ -1451,16 +1537,17 @@ impl<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
-> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
+> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
     /// Structural self-check: verifies the invariants every operation must
     /// preserve and returns the first one violated, or `Ok(())`.
     ///
-    /// - Live tables lie inside the table region and no two share a block.
-    /// - No free-list block and no block at or past the bump pointer
-    ///   belongs to a live table.
+    /// - Every live table sits wholly inside its own table slot, and the
+    ///   slot map's used set is exactly those slots (so no two live tables
+    ///   share a block, and no free slot holds a live table).
+    /// - Reserved slots and staged output refs exist only while a
+    ///   compaction job is in flight.
     /// - Levels 1 and deeper hold pairwise disjoint key ranges.
     /// - Each table is well-formed (room for bloom, index, and footer after
     ///   its sections; `min_seq <= max_seq`), and the sequence counter
@@ -1468,7 +1555,7 @@ impl<
     /// - The manifest encodes into one block.
     ///
     /// Pure and synchronous: it reads only in-memory state (no device I/O),
-    /// in `O(tables² + free blocks · tables)`. Tests call it after every
+    /// in `O(tables²)`. Tests call it after every
     /// operation; firmware can call it after `open()` as a cheap sanity
     /// check.
     ///
@@ -1476,12 +1563,19 @@ impl<
     ///
     /// A static description of the first violated invariant.
     pub fn check_invariants(&self) -> Result<(), &'static str> {
-        let (lo, hi) = (self.cfg.tbl_start, self.cfg.tbl_end);
+        let mut seen = 0u64;
         for li in 0..LEVELS {
             let tables = self.manifest.level(li).unwrap_or(&[]);
             for (i, t) in tables.iter().enumerate() {
-                if t.first_block < lo || t.end_block() > hi {
-                    return Err("a live table lies outside the table region");
+                let Some(slot) = self.slot_of(t) else {
+                    return Err("a live table does not sit inside one table slot");
+                };
+                if seen & (1u64 << slot) != 0 {
+                    return Err("two live tables share a table slot");
+                }
+                seen |= 1u64 << slot;
+                if !self.slots.is_used(slot) {
+                    return Err("a live table's slot is not marked used");
                 }
                 if t.data_blocks().is_none() {
                     return Err("a table has no room for bloom, index, and footer");
@@ -1499,27 +1593,24 @@ impl<
                         }
                     }
                 }
-                for lj in li..LEVELS {
-                    let others = self.manifest.level(lj).unwrap_or(&[]);
-                    let from = if lj == li { i + 1 } else { 0 };
-                    for u in &others[from..] {
-                        if t.first_block < u.end_block() && u.first_block < t.end_block() {
-                            return Err("two live tables share a device block");
-                        }
-                    }
-                }
-                if t.end_block() > self.tbl_bump.next() {
-                    return Err("a live table extends past the bump pointer");
-                }
+            }
+        }
+        if self.slots.used_slots() != seen.count_ones() {
+            return Err("a slot is marked used but holds no live table");
+        }
+        if !self.job_active
+            && (self.slots.reserved_slots() != 0 || !self.manifest.pending().is_empty())
+        {
+            return Err("slots are reserved with no compaction job in flight");
+        }
+        for t in self.manifest.pending() {
+            match self.slot_of(t) {
+                Some(slot) if self.slots.is_reserved(slot) => {}
+                _ => return Err("a staged output ref is not in a reserved slot"),
             }
         }
         if self.manifest.flushed_seq() > self.next_seq || self.manifest.seq_high() > self.next_seq {
             return Err("a persisted sequence floor exceeds the counter");
-        }
-        for &id in self.tbl_free.ids() {
-            if self.manifest.is_table_block_referenced(id) {
-                return Err("a free-list block belongs to a live table");
-            }
         }
         let mut buf = [0u8; BLOCK];
         if self.manifest.encode::<D::Error, BLOCK>(&mut buf).is_err() {
@@ -1597,7 +1688,7 @@ impl<
     }
 
     /// Commits an archival: drops the table from the manifest in one
-    /// atomic manifest write and reclaims its blocks into the free list.
+    /// atomic manifest write and frees its table slot.
     ///
     /// Call only after the table's bytes are durably stored remotely —
     /// once this returns `Ok(true)` the data is gone locally by design.
@@ -1606,10 +1697,9 @@ impl<
     /// committed, or when a concurrent compaction already merged it away —
     /// the uploaded bytes are still a valid copy of that data).
     ///
-    /// Reclamation is best-effort after the visibility point, exactly like
-    /// compaction: a full free list cannot fail the commit, and
-    /// un-reclaimed blocks become orphans the next [`Db::open`] sweep
-    /// reclaims.
+    /// Archiving an input of the in-flight compaction job aborts the job
+    /// (its merge still reads the table); a later `compact_step` selects
+    /// afresh.
     ///
     /// # Errors
     ///
@@ -1632,6 +1722,10 @@ impl<
         // other table, not just deeper levels. Pure reads: the database
         // is untouched on refusal.
         self.check_no_resurrection(&plan.table).await?;
+        let slot = self.slot_of(&plan.table);
+        if slot.is_some_and(|s| self.job_inputs & (1u64 << s) != 0) {
+            self.abort_job();
+        }
         let mut scratch = [0u8; BLOCK];
         let mut staged = self.manifest;
         if !staged.remove_table_from_level::<D::Error>(level, table_id)? {
@@ -1642,22 +1736,15 @@ impl<
         staged
             .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
             .await?;
-        // Commit point passed: publish the staged state, then reclaim the
-        // table's run strictly after the visibility point.
+        // Commit point passed: publish the staged state, then free the
+        // table's slot strictly after the visibility point.
         self.manifest = staged;
         // The table's blocks are unreachable now; drop its cache entries
         // so their slots serve the hot set (hygiene — ids never repeat,
         // so stale entries could never be read).
         self.cache.invalidate_table(table_id);
-        let mut k = 0u64;
-        let blocks = u64::from(plan.table.block_count);
-        while k < blocks {
-            if let Some(id) = plan.table.first_block.checked_add(k)
-                && self.tbl_free.insert::<D::Error>(id).is_err()
-            {
-                break;
-            }
-            k += 1;
+        if let Some(slot) = slot {
+            self.slots.free(slot);
         }
         Ok(true)
     }
@@ -1928,13 +2015,16 @@ impl<
     /// pending job.
     ///
     /// The scratch is reusable across jobs and droppable mid-job: partial
-    /// output is invisible until the manifest commit, so abandoning it only
-    /// orphans blocks the next `open()` sweep reclaims.
+    /// output is invisible until the manifest commit, and its reserved
+    /// slot is released when the next `compact_step` (with any scratch)
+    /// abandons the stale job. One job runs at a time; a scratch whose job
+    /// was abandoned (another scratch started one, or an archive or ingest
+    /// aborted it) resets itself on its next step.
     ///
     /// # Errors
     ///
     /// [`Error::NoSpace`] when the job would exceed [`COMPACTION_KMAX`]
-    /// inputs, no output run can be reserved, or the target level cannot
+    /// inputs, no output slot is free (or the slot cannot fit the merge), or the target level cannot
     /// absorb the output table (a full bottommost level the merge does not
     /// drain into — raised at select time, before any merge I/O);
     /// [`Error::CorruptBlock`] on a torn input table (compaction never
@@ -1946,12 +2036,30 @@ impl<
         scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<Progress, Error<D::Error>> {
         self.ensure_open()?;
-        if scratch.state == State::Idle && !self.compact_select(scratch).await? {
-            return Ok(Progress::Done);
+        // A scratch whose job is no longer the active one (another scratch
+        // selected a job, or the job was aborted) must not touch the
+        // device: its reservation is gone.
+        if scratch.state != State::Idle && (!self.job_active || scratch.job_gen != self.job_gen) {
+            scratch.reset();
+        }
+        if scratch.state == State::Idle {
+            // One job at a time: a job some other scratch left behind
+            // is abandoned.
+            self.abort_job();
+            match self.compact_select(scratch).await {
+                Ok(true) => {}
+                Ok(false) => return Ok(Progress::Done),
+                Err(e) => {
+                    self.abort_job();
+                    scratch.reset();
+                    return Err(e);
+                }
+            }
         }
         let outcome = match scratch.merge_step(self.wal.device_mut()).await {
             Ok(o) => o,
             Err(e) => {
+                self.abort_job();
                 scratch.reset();
                 return Err(e);
             }
@@ -1960,6 +2068,7 @@ impl<
             MergeOutcome::More => Ok(Progress::More),
             MergeOutcome::Exhausted => {
                 if let Err(e) = self.compact_commit(scratch).await {
+                    self.abort_job();
                     scratch.reset();
                     return Err(e);
                 }
@@ -2128,27 +2237,30 @@ impl<
         let rdel_budget = self
             .count_output_rdel(c, &job, bottommost, oldest_snapshot)
             .await?;
-        // Reserve the output run: the data merge only shrinks the inputs
-        // (dedup plus tombstone drops), so their data blocks always
-        // suffice for the data section; the rdel section gets its exact
-        // counted budget; plus the 3 framing blocks. Free list first,
-        // then the bump — claimed only after the manifest commit, exactly
-        // like flush.
-        let out_blocks = job
-            .total_data
-            .checked_add(u64::from(rdel_budget))
-            .ok_or(Error::NoSpace)?
-            .checked_add(3)
+        // Reserve the output slot. The job spans many `compact_step`
+        // calls; the reservation keeps flushes in between from taking the
+        // slot. The rdel section gets its exact counted budget and the 3
+        // framing blocks theirs; the data section gets the rest of the
+        // slot, and the writer's block limit enforces it.
+        let data_budget = self
+            .slots
+            .slot_blocks()
+            .checked_sub(u64::from(rdel_budget))
+            .and_then(|n| n.checked_sub(3))
+            .filter(|&n| n > 0)
             .ok_or(Error::NoSpace)?;
-        let out_len = usize::try_from(out_blocks).map_err(|_| Error::NoSpace)?;
-        let (out_base, from_free) = match self.tbl_free.find_run(out_len) {
-            Some(b) => (b, true),
-            None => (self.tbl_bump.peek_run::<D::Error>(out_blocks)?, false),
-        };
-        c.out_base = out_base;
-        c.out_blocks = out_blocks;
-        c.out_len = out_len;
-        c.from_free = from_free;
+        let out_slot = self.slots.reserve().ok_or(Error::NoSpace)?;
+        self.job_active = true;
+        self.job_gen = self.job_gen.wrapping_add(1);
+        self.job_inputs = 0;
+        for input in &c.inputs[..job.n_inputs] {
+            if let Some(slot) = self.slot_of(&input.tref) {
+                self.job_inputs |= 1u64 << slot;
+            }
+        }
+        c.job_gen = self.job_gen;
+        c.out_slot = out_slot;
+        c.out_base = self.slots.slot_base(out_slot);
         c.target_level = tgt;
         c.bottommost = bottommost;
         c.outside_min_seq = outside_min_seq;
@@ -2164,16 +2276,12 @@ impl<
         c.oldest_snapshot = oldest_snapshot;
         c.n_inputs = job.n_inputs;
         c.rdel_blocks = rdel_budget;
-        // The data section leads the output run; the range-tombstone
+        // The data section leads the output slot; the range-tombstone
         // section follows it and is written at commit. The writer's block
-        // limit is the reserved data budget: a merge that would need more
-        // blocks fails with `NoSpace` instead of writing past the run.
-        let data_budget = out_blocks
-            .checked_sub(u64::from(rdel_budget))
-            .and_then(|n| n.checked_sub(3))
-            .ok_or(Error::NoSpace)?;
+        // limit is the slot's data budget: a merge that would need more
+        // blocks fails with `NoSpace` instead of writing past the slot.
         c.writer = sstable::TableWriter::new(
-            out_base,
+            c.out_base,
             sstable::bloom_k(BLOOM_BYTES * 8, job.total_entries),
         )
         .with_block_limit(data_budget);
@@ -2345,42 +2453,27 @@ impl<
         staged
             .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
             .await?;
-        // Commit point passed: publish the staged state, then claim the
-        // output run (free list or bump) exactly like flush does.
+        // Commit point passed: publish the staged state, then settle the
+        // slots: the output's reservation becomes a used slot (or is
+        // released when the merge emitted nothing), and the retired
+        // inputs' slots are free — strictly after the visibility point.
         self.manifest = staged;
         if out_ref.is_some() {
-            if c.from_free {
-                // Must run unconditionally: `claim_run` removes the run from
-                // the free list, and `debug_assert!` does not evaluate its
-                // argument in release builds. (Same fix as flush's claim.)
-                let claimed = self.tbl_free.claim_run(c.out_base, c.out_len);
-                debug_assert!(claimed, "merge's own reservation must still claim");
-            } else {
-                self.tbl_bump
-                    .set_next(c.out_base.checked_add(c.out_blocks).ok_or(Error::NoSpace)?);
-            }
+            self.slots.commit(c.out_slot);
+        } else {
+            self.slots.release(c.out_slot);
         }
-        // Reclaim the input runs strictly after the visibility point: the
-        // manifest no longer references them, so they are orphans.
-        // Best-effort — the commit already happened, so a full free list
-        // must not fail the compaction; un-reclaimed blocks stay orphans
-        // and the next open() sweep reclaims them.
         for input in c.inputs.iter().take(c.n_inputs) {
             // Drop the retired table's cache entries so their slots serve
             // the hot set (hygiene — ids never repeat, so stale entries
             // could never be read).
             self.cache.invalidate_table(input.tref.id);
-            let mut k = 0u64;
-            let blocks = u64::from(input.tref.block_count);
-            while k < blocks {
-                if let Some(id) = input.tref.first_block.checked_add(k)
-                    && self.tbl_free.insert::<D::Error>(id).is_err()
-                {
-                    break;
-                }
-                k += 1;
+            if let Some(slot) = self.slot_of(&input.tref) {
+                self.slots.free(slot);
             }
         }
+        self.job_active = false;
+        self.job_inputs = 0;
         c.reset();
         Ok(())
     }
