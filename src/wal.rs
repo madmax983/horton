@@ -306,7 +306,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// commit so a failed mutation can never resurrect through a later
     /// commit. Only valid when no block landed since the mark (`len` at
     /// most `stage_len`); shrinking is exactly the case
-    /// [`write_stage`](WalWriter::write_stage) already re-zeroes.
+    /// `write_stage` already re-zeroes.
     pub fn truncate_stage(&mut self, len: usize) {
         debug_assert!(len <= self.stage_len, "truncate past staged data");
         // The discarded bytes stay in the buffer: keep them inside the

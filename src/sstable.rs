@@ -22,7 +22,9 @@
 //! - Index block: one entry per data block,
 //!   `first_key_len u16 | first_key | block_id u64 | max_seq u64`.
 //! - Rdel block: range tombstones `start_len u16 | end_len u16 | seq u64 |
-//!   start | end`, sorted by `(start asc, seq desc)`, then `count u16`.
+//!   start | end`, sorted by `start` ascending (ties in any sequence
+//!   order: compaction clips pieces to its outputs' ranges), then
+//!   `count u16`.
 //! - Footer block: `magic u64 = "hrtsst02" | index_block u64 |
 //!   bloom_block u64 | entry_count u64 | k u8 | rdel_blocks u32 |
 //!   min_seq u64`. The rdel section is `[bloom_block - rdel_blocks,
@@ -110,7 +112,7 @@ pub struct TablePlan<const KEY_MAX: usize> {
 }
 
 /// Fixed entry header bytes: `key_len u16 | val_len u16 | seq u64 | op u8`.
-const ENTRY_HEADER: usize = 13;
+pub(crate) const ENTRY_HEADER: usize = 13;
 /// One restart offset every this many entries.
 const RESTART_INTERVAL: u64 = 16;
 /// Restart offsets live in a fixed array: the per-block entry cap.
@@ -167,7 +169,7 @@ fn entry_fits<const BLOCK: usize>(payload: usize, entries: u64, elen: usize) -> 
 
 /// Largest restart tail a data block can carry: 128 restart offsets, the
 /// restart count, and the CRC.
-const MAX_DATA_TAIL: usize = 128 * 2 + 2 + CRC_LEN;
+pub(crate) const MAX_DATA_TAIL: usize = 128 * 2 + 2 + CRC_LEN;
 
 /// Upper bound on the blocks greedy packing uses for `n` entries of at
 /// most `emax` bytes each and `total` bytes overall, when a block holds at
@@ -602,6 +604,20 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data_blocks
     }
 
+    /// Bytes of the index block used so far: one entry of
+    /// `18 + first_key_len` bytes per sealed data block. The index must fit
+    /// one block, so a caller splitting output checks the headroom.
+    #[must_use]
+    pub const fn index_len(&self) -> usize {
+        self.index_len
+    }
+
+    /// The last key pushed ([`KeyBound::EMPTY`] before the first push).
+    #[must_use]
+    pub fn last_key(&self) -> KeyBound<KEY_MAX> {
+        KeyBound::from_slice(&self.last_key[..self.last_len]).unwrap_or(KeyBound::EMPTY)
+    }
+
     /// Pushes one entry, sealing the staging block first when the entry no
     /// longer fits. Returns [`PushOutcome::BlockSealed`] exactly when a
     /// device write happened.
@@ -992,6 +1008,16 @@ pub(crate) fn plan_rdel_blocks<'a, E, const BLOCK: usize>(
     Ok(plan)
 }
 
+/// Range tombstones of maximal size (`12 + 2 * KEY_MAX` bytes) that fit
+/// one rdel block: the per-block floor behind
+/// [`rdel_blocks_bound`](crate::compact::rdel_blocks_bound). 0 when not
+/// even one fits (`Db` const-asserts it does).
+#[must_use]
+pub(crate) const fn rdel_entries_per_block<const BLOCK: usize, const KEY_MAX: usize>() -> u64 {
+    let max_entry = 12 + 2 * KEY_MAX;
+    (BLOCK.saturating_sub(RDEL_TRAILER) / max_entry) as u64
+}
+
 /// Wire length of one rdel entry: `start_len u16 | end_len u16 | seq u64 |
 /// start | end`.
 fn rdel_entry_len<E>(start_len: usize, end_len: usize) -> Result<usize, Error<E>> {
@@ -1037,6 +1063,8 @@ pub(crate) struct RdelWriter<const BLOCK: usize> {
     payload: usize,
     count: u32,
     blocks: u32,
+    /// Blocks the section may occupy; sealing past it is refused.
+    limit: u32,
 }
 
 impl<const BLOCK: usize> RdelWriter<BLOCK> {
@@ -1049,7 +1077,16 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
             payload: 0,
             count: 0,
             blocks: 0,
+            limit: u32::MAX,
         }
+    }
+
+    /// Caps the section at `blocks` blocks: a seal past it fails with
+    /// [`Error::NoSpace`] instead of writing beyond the caller's budget.
+    #[must_use]
+    pub(crate) const fn with_block_limit(mut self, blocks: u32) -> Self {
+        self.limit = blocks;
+        self
     }
 
     /// Appends one tombstone, sealing the current block first when the
@@ -1077,6 +1114,9 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
             return Err(Error::NoSpace);
         }
         if self.payload + el + RDEL_TRAILER > BLOCK {
+            if self.blocks >= self.limit {
+                return Err(Error::NoSpace);
+            }
             let id = self
                 .base
                 .checked_add(u64::from(self.blocks))
@@ -1110,6 +1150,9 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
         device: &mut D,
     ) -> Result<u32, Error<D::Error>> {
         if self.count > 0 {
+            if self.blocks >= self.limit {
+                return Err(Error::NoSpace);
+            }
             let id = self
                 .base
                 .checked_add(u64::from(self.blocks))
@@ -1123,65 +1166,8 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
     }
 }
 
-/// Exact block counter mirroring [`RdelWriter`]'s greedy packing: feed it
-/// the same entry sequence and [`finish`](RdelCounter::finish) returns the
-/// block count [`RdelWriter::finish`] would report. The compaction
-/// range-tombstone merge re-sorts entries across inputs, so its repacked
-/// block count is not bounded by the inputs' rdel block counts (a sorted
-/// merge is not a subsequence of the concatenation); the merge therefore
-/// counts exactly in a dry-run pass and reserves that many blocks.
-///
-/// The boundary logic here must stay identical to [`RdelWriter::push`]:
-/// a sealed block holds `payload` bytes with `payload + RDEL_TRAILER <=
-/// BLOCK`, sealing exactly when the next entry stops fitting.
-pub(crate) struct RdelCounter<const BLOCK: usize> {
-    payload: usize,
-    count: u32,
-    blocks: u32,
-}
-
-impl<const BLOCK: usize> RdelCounter<BLOCK> {
-    /// Counter for a section that would start at `base` (unused: counting
-    /// needs no I/O, but the shape mirrors [`RdelWriter::new`]).
-    #[must_use]
-    pub(crate) const fn new() -> Self {
-        Self {
-            payload: 0,
-            count: 0,
-            blocks: 0,
-        }
-    }
-
-    /// Accounts for one tombstone, sealing the current block first when
-    /// the entry no longer fits — exactly as [`RdelWriter::push`] does.
-    pub(crate) const fn push(&mut self, r: RdelEntry<'_>) {
-        // `RdelWriter::push` rejects an entry that cannot fit in an empty
-        // block with `NoSpace`; merged entries always came out of a valid
-        // block, so this cannot trigger and needs no error path.
-        let el = 12 + r.start.len() + r.end.len();
-        if self.payload + el + RDEL_TRAILER > BLOCK {
-            self.blocks += 1;
-            self.payload = 0;
-            self.count = 0;
-        }
-        self.payload += el;
-        self.count += 1;
-    }
-
-    /// Returns the total blocks the counted entries would occupy — 0 when
-    /// nothing was pushed, matching [`RdelWriter::finish`].
-    #[must_use]
-    pub(crate) const fn finish(&self) -> u32 {
-        if self.count > 0 {
-            self.blocks + 1
-        } else {
-            self.blocks
-        }
-    }
-}
-
 /// Writes a table's range-tombstone section at `[base, base+n)`: `rdels`
-/// in `(start asc, seq desc)` order, packed greedily into blocks. Returns
+/// in `start`-ascending order, packed greedily into blocks. Returns
 /// the block count — 0 when `rdels` is empty (no section is written).
 ///
 /// The blocks are durable only after the caller's commit-point flush: the

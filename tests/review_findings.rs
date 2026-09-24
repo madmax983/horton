@@ -9,7 +9,7 @@
 use horton::{Compaction, Error, Progress, RevScan, Scan};
 
 mod common;
-use common::{MemDevice, TestDb, block_on, noop_waker, test_config};
+use common::{Lcg, MemDevice, TestDb, block_on, noop_waker, test_config, tight_config};
 
 /// Caller scratch for `compact_step`, matching the test database shape.
 type TestCompaction = Compaction<4096, 256, 1024, 1024>;
@@ -424,6 +424,90 @@ fn f12_seq0_entries_are_invisible_and_scans_terminate() {
     }
 }
 
+/// Writes 1000-byte values under 8-byte keys — sequential or random —
+/// flushing and compacting whenever asked, until the database genuinely
+/// refuses (no flush fits and no compaction job can run). Returns the keys
+/// accepted, after reading a sample of them back.
+fn fill_until_full(cfg: horton::Config, random: bool) -> Vec<u64> {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), cfg);
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    let mut rng = Lcg::new(6);
+    let mut keys = Vec::new();
+    let mut i = 0u64;
+    'fill: loop {
+        let k = if random {
+            rng.next() ^ (rng.next() << 31)
+        } else {
+            i
+        };
+        i += 1;
+        loop {
+            match block_on(db.put(&k.to_be_bytes(), &[0x5A; 1000])) {
+                Ok(_) => break,
+                Err(Error::TableFull | Error::ArenaFull | Error::NoSpace) => loop {
+                    match block_on(db.flush()) {
+                        Ok(()) => break,
+                        Err(Error::NoSpace) if db.compaction_pending() => loop {
+                            match block_on(db.compact_step(&mut c)) {
+                                Ok(Progress::More) => {}
+                                Ok(Progress::Done) => break,
+                                Err(Error::NoSpace) => break 'fill,
+                                Err(e) => panic!("compact_step: {e:?}"),
+                            }
+                        },
+                        Err(Error::NoSpace) => break 'fill,
+                        Err(e) => panic!("flush: {e:?}"),
+                    }
+                },
+                Err(e) => panic!("put: {e:?}"),
+            }
+        }
+        keys.push(k);
+        assert!(keys.len() < 100_000, "never filled");
+    }
+    assert_eq!(db.check_invariants(), Ok(()));
+    let mut buf = [0u8; 1024];
+    for k in keys.iter().step_by(16) {
+        assert_eq!(
+            block_on(db.get(&k.to_be_bytes(), &mut buf)),
+            Ok(Some(1000)),
+            "key {k}"
+        );
+    }
+    keys
+}
+
+/// F6 — compaction never split its output, level capacity was a table
+/// count, and disjoint tables never merged, so writes stopped for good
+/// with the table region ~4% used (340 sequential or 644 random 1000-byte
+/// writes on `TestDb`'s 4,088-block region). Now outputs split at slot
+/// size, the bottom level grows into whatever slots are free, and small
+/// tables consolidate: both workloads fill most of the region before
+/// flush refuses — and everything written reads back.
+///
+/// Measured on the 28 × 30-block geometry: ~58% (sequential) and ~63%
+/// (random) of the region's bytes hold live values when writes stop; on
+/// `test_config` (28 × 146 blocks) the figures are ~63% and ~73%. The
+/// remainder is the two-slot compaction reserve, L0's partly filled
+/// flushes, and consolidation's three-quarters threshold. Debug builds use
+/// 16-block slots to keep the run short.
+#[test]
+fn f6_writes_continue_until_the_region_is_mostly_full() {
+    let slot = if cfg!(debug_assertions) { 16 } else { 30 };
+    let cfg = horton::Config::new(8, 136, 136, 136 + 28 * slot, 0, 1);
+    let region_bytes = 28 * usize::try_from(slot).unwrap() * 4096;
+    for random in [false, true] {
+        let n = fill_until_full(cfg, random).len();
+        let used = n * 1017; // key + value + entry header
+        assert!(
+            used * 2 >= region_bytes,
+            "random={random}: only {n} writes ({}% of the region)",
+            used * 100 / region_bytes
+        );
+    }
+}
+
 /// F13 — a data block failing its CRC read as "absent" on the point-read
 /// path, so `get` fell through to an older version in a deeper table (a
 /// silent stale read) while scans reported `CorruptBlock`. Both must
@@ -497,43 +581,93 @@ fn f17_writes_after_a_reopen_survive_the_next_reopen() {
 /// flush between two `compact_step` calls could allocate the same blocks:
 /// the flushed table and the job's output overlapped on device, a key
 /// written mid-job read as `CorruptBlock`, and compacted keys vanished.
-/// The job now reserves its output slot, which flushes never take.
+/// The job now reserves its output slots, which flushes never take.
+///
+/// Driven with overlapping keys (every level-to-level job is a real merge)
+/// under the tight slot geometry (outputs split every few blocks), one
+/// compaction step at a time, flushing whenever a job is mid-flight.
 #[test]
 fn f14_flush_during_inflight_compaction_keeps_tables_disjoint() {
-    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    use std::collections::BTreeMap;
+
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), tight_config());
     block_on(db.open()).unwrap();
     let mut c = Box::new(TestCompaction::new());
-    let v = [9u8; 1000];
-    // Four disjoint L1 tables, each several data blocks.
-    for round in 0..4u8 {
-        for f in 0..4u8 {
-            for i in 0..3u8 {
-                block_on(db.put(&[b'a' + round, f, i], &v)).unwrap();
+    let mut model = BTreeMap::new();
+    let mut rng = Lcg::new(14);
+    let mut mid_job_flushes = 0;
+    for i in 0..1500u32 {
+        let key = [b'k', u8::try_from(rng.next_bounded(160)).unwrap()];
+        let val = vec![u8::try_from(i % 251).unwrap(); 200 + rng.next_bounded(600)];
+        loop {
+            match block_on(db.put(&key, &val)) {
+                Ok(_) => break,
+                Err(Error::TableFull | Error::ArenaFull | Error::NoSpace) => {
+                    match block_on(db.flush()) {
+                        Ok(()) => {}
+                        Err(Error::NoSpace) => {
+                            // L0 full (or no slot): run a step and retry.
+                            let _ = block_on(db.compact_step(&mut c)).unwrap();
+                        }
+                        Err(e) => panic!("flush: {e:?}"),
+                    }
+                }
+                Err(e) => panic!("put: {e:?}"),
             }
-            block_on(db.flush()).unwrap();
         }
-        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+        model.insert(key, val);
+        // One compaction step per write; mid-job, try to flush.
+        if db.compaction_pending() || db.slot_stats().reserved > 0 {
+            let step = block_on(db.compact_step(&mut c)).unwrap();
+            if step == Progress::More
+                && db.slot_stats().reserved > 0
+                && block_on(db.flush()).is_ok()
+            {
+                mid_job_flushes += 1;
+            }
+        }
+        assert_eq!(db.check_invariants(), Ok(()), "after write {i}");
     }
-    assert!(db.compaction_pending(), "setup: L1 should be full");
-    // Start the L1 -> L2 job, then do real-time work mid-job.
-    assert_eq!(block_on(db.compact_step(&mut c)), Ok(Progress::More));
-    block_on(db.put(b"zz", b"mid-job")).unwrap();
-    block_on(db.flush()).unwrap();
-    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    assert!(
+        mid_job_flushes > 10,
+        "only {mid_job_flushes} mid-job flushes"
+    );
+    drain_compaction(&mut db, &mut c);
+    let mut db = TestDb::new(db.into_device(), tight_config());
+    block_on(db.open()).unwrap();
     assert_eq!(db.check_invariants(), Ok(()));
     let mut buf = [0u8; 1024];
-    assert_eq!(block_on(db.get(b"zz", &mut buf)), Ok(Some(7)));
-    for round in 0..4u8 {
-        for f in 0..4u8 {
-            for i in 0..3u8 {
-                assert_eq!(
-                    block_on(db.get(&[b'a' + round, f, i], &mut buf)),
-                    Ok(Some(1000)),
-                    "key {round}/{f}/{i} lost"
-                );
-            }
-        }
+    for (k, v) in &model {
+        let n = block_on(db.get(k, &mut buf)).unwrap().expect("key lost");
+        assert_eq!(&buf[..n], &v[..], "key {k:?}");
     }
+}
+
+/// 3 levels of 3 tables, 9 table slots of 8 blocks. A table with one data
+/// block (4 blocks) fills less than three quarters of a slot — compaction
+/// rewrites it rather than moving it down — while one with three data
+/// blocks (6 blocks) does not.
+type NarrowDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 3, 1024, 8>;
+
+const fn narrow_config() -> horton::Config {
+    horton::Config::new(8, 136, 136, 136 + 9 * 8, 0, 1)
+}
+
+/// One flush per key group, then the L0 -> L1 job they trigger.
+fn l0_job(
+    db: &mut NarrowDb<MemDevice<4096>>,
+    c: &mut TestCompaction,
+    groups: [&[&[u8]]; 3],
+    v: &[u8],
+) {
+    for keys in groups {
+        for k in keys {
+            block_on(db.put(k, v)).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    while block_on(db.compact_step(c)).unwrap() == Progress::More {}
+    assert_eq!(db.check_invariants(), Ok(()));
 }
 
 /// F15 — compaction dropped a bottommost tombstone whenever nothing *deeper*
@@ -545,10 +679,10 @@ fn f15_tombstone_drop_respects_older_ingested_tables() {
     use core::task::{Context, Poll};
     use horton::BlockDevice;
 
-    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    let mut db: NarrowDb<MemDevice<4096>> = NarrowDb::new(MemDevice::new(), narrow_config());
     block_on(db.open()).unwrap();
     let mut c = Box::new(TestCompaction::new());
-    // T1 holds b@1; archive it (upload, then forget locally).
+    // T1 holds b@old; archive it (upload, then forget locally).
     block_on(db.put(b"b", b"old")).unwrap();
     block_on(db.flush()).unwrap();
     let t1 = db.level_tables(0).unwrap()[0];
@@ -569,26 +703,42 @@ fn f15_tombstone_drop_respects_older_ingested_tables() {
     }
     assert_eq!(block_on(db.archive_commit(0, t1.id)), Ok(true));
 
-    // Delete b; a snapshot keeps the tombstone alive on its way into L1.
+    // Two L1 tables of three data blocks each (1000-byte values), well
+    // above b's range.
+    let big = [7u8; 1000];
+    let x: [&[u8]; 12] = [
+        b"x0", b"x1", b"x2", b"x3", b"x4", b"x5", b"x6", b"x7", b"x8", b"x9", b"xa", b"xb",
+    ];
+    let y: [&[u8]; 12] = [
+        b"y0", b"y1", b"y2", b"y3", b"y4", b"y5", b"y6", b"y7", b"y8", b"y9", b"ya", b"yb",
+    ];
+    l0_job(&mut db, &mut c, [&x[..4], &x[4..8], &x[8..]], &big);
+    l0_job(&mut db, &mut c, [&y[..4], &y[4..8], &y[8..]], &big);
+    // Delete b; a snapshot keeps the tombstone alive into L1, in a table
+    // S of one data block: small, and the lowest key in a now-full L1.
     block_on(db.delete(b"b")).unwrap();
     let snap = db.snapshot().unwrap();
-    // Four compaction rounds of disjoint key ranges fill L1 with four
-    // tables; the first (oldest) holds the tombstone.
-    for round in 0..4u8 {
-        for f in 0..4u8 {
-            block_on(db.put(&[b'b', b'0' + round, b'0' + f], b"x")).unwrap();
-            block_on(db.flush()).unwrap();
-        }
-        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
-    }
-    assert_eq!(db.level_tables(1).unwrap().len(), 4, "setup: L1 full");
-    // Re-attach T1 at L0, release the snapshot, and let the L1 -> L2 job
-    // (which does not include L0) run.
+    l0_job(&mut db, &mut c, [&[b"c"], &[b"d"], &[b"e"]], b"v");
+    assert_eq!(db.level_tables(1).unwrap().len(), 3, "setup: L1 full");
+    assert!(db.compaction_pending());
+
+    // Re-attach T1 at L0 and release the snapshot. The next job rewrites
+    // S alone into L2 — the bottom of b's range — without L0.
     assert_eq!(block_on(db.ingest_table(&sealed, &remote, 0)), Ok(true));
     db.release_snapshot(snap);
     let mut val = [0u8; 8];
     assert_eq!(block_on(db.get(b"b", &mut val)), Ok(None), "deleted before");
     while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    assert_eq!(
+        db.level_tables(2).unwrap().len(),
+        1,
+        "setup: S rewritten into L2"
+    );
+    assert_eq!(
+        db.level_tables(0).unwrap().len(),
+        1,
+        "setup: T1 untouched in L0"
+    );
     assert_eq!(
         block_on(db.get(b"b", &mut val)),
         Ok(None),

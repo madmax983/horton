@@ -248,15 +248,26 @@ impl<D: BlockDevice, const BLOCK: usize> BlockDevice for TornDevice<D, BLOCK> {
 }
 
 /// `Db` with the standard test geometry: 4 KiB blocks, 256 B keys,
-/// 1 KiB values, 64 slots, 4 KiB arena, 7 levels, 4 L0 tables, 1024-byte
-/// bloom filters, and a 4096-entry free list (covers the whole table
-/// region).
+/// 1 KiB values, a 64-entry memtable over a 4 KiB arena, 7 levels of 4
+/// tables (28 table slots), 1024-byte bloom filters, and an 8-slot block
+/// cache.
 pub type TestDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 /// Standard region layout: manifest slots 0/1, WAL `[8, 136)`, tables
-/// `[136, 4224)`. The regions are disjoint by construction.
+/// `[136, 4224)` — 28 slots of 146 blocks. The regions are disjoint by
+/// construction.
 pub const fn test_config() -> horton::Config {
     horton::Config::new(8, 136, 136, 4224, 0, 1)
+}
+
+/// [`test_config`] with the table region cut to 28 slots of 8 blocks
+/// (`[136, 360)`), the smallest `TestDb` accepts. Any table holding data
+/// fills at least half a slot, so compaction never consolidates small
+/// tables: every L0 job with disjoint keys lands as its own table, and a
+/// table that overlaps nothing below moves down whole. Tests that pin
+/// per-level table counts use it.
+pub const fn tight_config() -> horton::Config {
+    horton::Config::new(8, 136, 136, 136 + 28 * 8, 0, 1)
 }
 
 /// Tiny deterministic PRNG (LCG) — no `rand` dependency, even for tests.

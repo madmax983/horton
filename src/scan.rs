@@ -270,9 +270,13 @@ impl<
                 if self.has_end && tref.first_key.as_slice() >= &self.end[..self.end_len] {
                     continue;
                 }
+                // Entries below the table's live lower bound are dead (a
+                // compaction already merged them into a newer table): the
+                // cursor starts at the bound at the earliest.
+                let from = start.max(tref.first_key.as_slice());
                 // `level()` slices a `[TableRef; TABLES]`, so the row below
                 // cannot overflow.
-                self.add_cursor(tref, li, start).await?;
+                self.add_cursor(tref, li, from).await?;
             }
         }
         Ok(())
@@ -1574,6 +1578,18 @@ impl<
                 // run's first block need not share the first key).
                 // Following the run is what keeps a backward walker from
                 // settling on a stale version it met first.
+                // Below the table's live lower bound every entry is dead (a
+                // compaction already merged them into a newer table), and
+                // a backward walk only goes lower: the cursor is done.
+                let db = self.db;
+                if db
+                    .manifest_ref()
+                    .find_table(tid)
+                    .is_some_and(|t| key[..klen] < *t.first_key.as_slice())
+                {
+                    self.cursors[li][ti].live = false;
+                    return Ok(());
+                }
                 let fkey = self.block_first_key(end, bid)?;
                 let (key, klen, seq, tomb, vlen, exp, off, bid, end, idx) =
                     if idx > 0 && key[..klen] == *fkey {

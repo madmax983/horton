@@ -112,6 +112,45 @@ impl<const KEY_MAX: usize> KeyBound<KEY_MAX> {
             self
         }
     }
+
+    /// The smallest key bound strictly after this one with no key of at
+    /// most `KEY_MAX` bytes in between: every key `k` satisfies
+    /// `k <= self` exactly when `k < successor`. `None` when this is the
+    /// greatest possible key (`KEY_MAX` bytes of `0xFF`), or empty.
+    ///
+    /// Compaction splits its output at key boundaries and clips range
+    /// tombstones to `[.., successor(last key))`, so each output's range
+    /// ends exactly at its last key and the next output starts strictly
+    /// after it — the outputs stay disjoint.
+    #[must_use]
+    pub fn successor(&self) -> Option<Self> {
+        let len = usize::from(self.len);
+        if len == 0 {
+            return None;
+        }
+        let mut next = *self;
+        if len < KEY_MAX {
+            // `k || 0x00` is the immediate successor: nothing sorts between
+            // a key and itself extended by a zero byte.
+            next.bytes[len] = 0;
+            next.len += 1;
+            return Some(next);
+        }
+        // A full-length key has no longer extension: increment the last
+        // byte that is not 0xFF and drop everything after it.
+        let mut i = len;
+        while i > 0 {
+            i -= 1;
+            if next.bytes[i] != 0xFF {
+                next.bytes[i] += 1;
+                next.bytes[i + 1..].fill(0);
+                // `i < len <= 0xFFFF`: the narrowing is exact.
+                next.len = u16::try_from(i + 1).ok()?;
+                return Some(next);
+            }
+        }
+        None
+    }
 }
 
 /// One `SSTable` placement record.
@@ -126,7 +165,12 @@ pub struct TableRef<const KEY_MAX: usize> {
     pub first_block: u64,
     /// Total blocks: rdel blocks + data blocks + bloom + index + footer.
     pub block_count: u32,
-    /// Smallest key in the table (includes range-tombstone bounds).
+    /// Live lower bound: the smallest key the table answers for (includes
+    /// range-tombstone bounds). Normally the table's smallest key; a
+    /// compaction that has already moved the table's prefix into a newer
+    /// output raises it past that prefix (see
+    /// [`Manifest::narrow_table`]). Entries below it are dead: every
+    /// reader skips them.
     pub first_key: KeyBound<KEY_MAX>,
     /// Largest key in the table (includes range-tombstone bounds; a
     /// tombstone's exclusive end is stored as-is, so `last_key` may name
@@ -207,9 +251,9 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
 
     /// True when `key` lies within the table's key bounds (inclusive).
     ///
-    /// Exact: every key stored in the table is within
+    /// Exact: every *live* key in the table is within
     /// `[first_key, last_key]`, so a key outside the bounds is definitely
-    /// absent and the table can be skipped without any I/O.
+    /// absent (or dead) and the table can be skipped without any I/O.
     #[must_use]
     pub fn covers(&self, key: &[u8]) -> bool {
         self.first_key.as_slice() <= key && key <= self.last_key.as_slice()
@@ -226,10 +270,6 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
 /// level — is what limits the tree. Each level's refs are contiguous in
 /// the pool, so [`level`](Self::level) is a plain slice.
 ///
-/// Past the live refs the pool may hold *pending* refs: the output tables
-/// of the in-flight compaction job, staged until its manifest commit
-/// adopts them. Pending refs count against the capacity (their tables
-/// occupy real slots) but are invisible to every read, and never encoded.
 #[derive(Debug, Clone, Copy)]
 pub struct Manifest<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize> {
     seq: u64,
@@ -246,12 +286,10 @@ pub struct Manifest<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usi
     /// tables that held them.
     seq_high: u64,
     /// The table-ref pool, viewed flat: level 0's refs, then level 1's,
-    /// …, then the pending refs.
+    /// and so on.
     pool: [[TableRef<KEY_MAX>; TABLES]; LEVELS],
     /// Live refs per level.
     counts: [usize; LEVELS],
-    /// Pending refs after the live ones.
-    pending: usize,
 }
 
 impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
@@ -268,11 +306,10 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             seq_high: 0,
             pool: [[TableRef::EMPTY; TABLES]; LEVELS],
             counts: [0; LEVELS],
-            pending: 0,
         }
     }
 
-    /// Table refs the pool holds across all levels (live plus pending).
+    /// Table refs the pool holds across all levels.
     pub const CAPACITY: usize = LEVELS * TABLES;
 
     const fn flat(&self) -> &[TableRef<KEY_MAX>] {
@@ -299,28 +336,21 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         &self.flat()[..self.live()]
     }
 
-    /// The staged output refs of the in-flight compaction job.
-    #[must_use]
-    pub fn pending(&self) -> &[TableRef<KEY_MAX>] {
-        let live = self.live();
-        &self.flat()[live..live + self.pending]
-    }
-
-    /// Pool entries still free (neither live nor pending).
+    /// Pool entries still free.
     #[must_use]
     pub fn free_refs(&self) -> usize {
-        Self::CAPACITY - self.live() - self.pending
+        Self::CAPACITY - self.live()
     }
 
     /// Inserts `tref` into `level` at pool index `pos`, shifting every
-    /// later ref (later levels and the pending tail) up by one.
+    /// later level's refs up by one.
     fn insert_at<E>(
         &mut self,
         pos: usize,
         level: usize,
         tref: TableRef<KEY_MAX>,
     ) -> Result<(), Error<E>> {
-        let used = self.live() + self.pending;
+        let used = self.live();
         if used >= Self::CAPACITY {
             return Err(Error::NoSpace);
         }
@@ -507,7 +537,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         else {
             return Ok(false);
         };
-        let used = self.live() + self.pending;
+        let used = self.live();
         let flat = self.flat_mut();
         flat.copy_within(s + pos + 1..used, s + pos);
         flat[used - 1] = TableRef::EMPTY;
@@ -515,46 +545,40 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         Ok(true)
     }
 
-    /// Stages a compaction output ref as pending: it occupies a pool entry
-    /// but stays invisible until [`adopt_pending`](Self::adopt_pending).
+    /// Raises the live lower bound of table `id` at `level` to `first`:
+    /// every entry and range-tombstone piece below `first` becomes dead to
+    /// all readers. Compaction commits its outputs a table at a time; once
+    /// an output holding every input key up to some frontier is live, each
+    /// input still straddling the frontier is narrowed past it, so the
+    /// merged prefix is read only from the output. Returns `false` when
+    /// the table is not at `level`.
+    ///
+    /// `first` must not exceed the table's `last_key` (the caller narrows
+    /// only tables straddling the frontier), so a deeper level stays sorted
+    /// and disjoint.
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the pool is full.
-    pub fn push_pending<E>(&mut self, tref: TableRef<KEY_MAX>) -> Result<(), Error<E>> {
-        let used = self.live() + self.pending;
-        if used >= Self::CAPACITY {
+    /// [`Error::NoSpace`] when `level` is out of range.
+    pub fn narrow_table<E>(
+        &mut self,
+        level: usize,
+        id: u32,
+        first: KeyBound<KEY_MAX>,
+    ) -> Result<bool, Error<E>> {
+        if level >= LEVELS {
             return Err(Error::NoSpace);
         }
-        self.flat_mut()[used] = tref;
-        self.pending += 1;
-        Ok(())
-    }
-
-    /// Discards every pending ref (an abandoned compaction job).
-    pub fn clear_pending(&mut self) {
-        let live = self.live();
-        let used = live + self.pending;
-        self.flat_mut()[live..used].fill(TableRef::EMPTY);
-        self.pending = 0;
-    }
-
-    /// Moves every pending ref into `level` (in first-key order): the
-    /// compaction commit's staging step.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::NoSpace`] when `level` is out of range, or is level 0 and
-    /// cannot take them.
-    pub fn adopt_pending<E>(&mut self, level: usize) -> Result<(), Error<E>> {
-        while self.pending > 0 {
-            let used = self.live() + self.pending;
-            let tref = self.flat()[used - 1];
-            self.flat_mut()[used - 1] = TableRef::EMPTY;
-            self.pending -= 1;
-            self.add_table_to_level(level, tref)?;
+        let s = self.start(level);
+        let n = self.counts[level];
+        let Some(t) = self.flat_mut()[s..s + n].iter_mut().find(|t| t.id == id) else {
+            return Ok(false);
+        };
+        debug_assert!(first.as_slice() <= t.last_key.as_slice());
+        if first.as_slice() > t.first_key.as_slice() {
+            t.first_key = first;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Highest sequence number across all live tables (0 when empty).

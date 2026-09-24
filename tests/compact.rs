@@ -7,7 +7,7 @@
 use horton::{BlockDevice, Compaction, Error, Manifest, Progress};
 
 mod common;
-use common::{CrashDevice, MemDevice, TestDb, block_on, test_config};
+use common::{CrashDevice, MemDevice, TestDb, block_on, test_config, tight_config};
 
 /// Caller scratch for `compact_step`, matching the test database shape.
 type TestCompaction = Compaction<4096, 256, 1024, 1024>;
@@ -55,6 +55,30 @@ where
 {
     while db.compaction_pending() {
         drive_one(db);
+    }
+}
+
+/// A 1000-byte value tagged `tag`. Under `tight_config` four flushes of
+/// three such values make an L1 table of three data blocks: three quarters
+/// of an 8-block slot, so compaction keeps it whole instead of
+/// consolidating it with a neighbour.
+fn big(tag: u8) -> Vec<u8> {
+    vec![tag; 1000]
+}
+
+/// One L0 round under `tight_config`: four flushes of three 1000-byte
+/// values each, keys `prefix ++ [flush * 3 + j]`.
+fn big_round<D: BlockDevice>(db: &mut TestDb<D>, prefix: &[u8], tag: u8)
+where
+    D::Error: std::fmt::Debug,
+{
+    for f in 0..4u8 {
+        for j in 0..3u8 {
+            let mut k = prefix.to_vec();
+            k.push(f * 3 + j);
+            block_on(db.put(&k, &big(tag))).unwrap();
+        }
+        block_on(db.flush()).unwrap();
     }
 }
 
@@ -230,25 +254,23 @@ fn compact_merges_overlapping_l1() {
 
 #[test]
 fn compact_l1_full_drains_to_l2() {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<4096>::new(), tight_config());
     open(&mut db);
-    // Fill L1 to capacity: four L0->L1 rounds, each carrying one key per
-    // flush so every round emits exactly one L1 table.
+    // Fill L1 to capacity: four L0->L1 rounds of disjoint keys, each
+    // emitting exactly one L1 table.
     for round in 0..4u8 {
-        for t in 0..4u8 {
-            let base = round * 4 + t;
-            block_on(db.put(&[base], b"v")).unwrap();
-            block_on(db.flush()).unwrap();
-        }
+        big_round(&mut db, &[round], round);
         // Single jobs only: let L1 accumulate to full instead of draining it.
         drive_one(&mut db);
     }
     let mut dev = db.into_device();
     let man = read_manifest(&mut dev);
     assert_eq!(man.level(1).unwrap().len(), 4, "L1 is full");
-    let mut db = TestDb::new(dev, test_config());
+    let mut db = TestDb::new(dev, tight_config());
     open(&mut db);
     // One more full L0: deepest-first selection must pick L1->L2, not fail.
+    // Nothing in L2 overlaps the lowest L1 table and it fills three
+    // quarters of its slot, so it moves down whole.
     for t in 0..4u8 {
         block_on(db.put(&[0x80 + t], b"v")).unwrap();
         block_on(db.flush()).unwrap();
@@ -259,14 +281,14 @@ fn compact_l1_full_drains_to_l2() {
     assert_eq!(man.level(0).unwrap().len(), 4, "L0 untouched by L1->L2");
     assert_eq!(man.level(1).unwrap().len(), 3, "L1 drained by one table");
     let l2 = man.level(2).unwrap();
-    assert_eq!(l2.len(), 1, "L2 gained the merged table");
+    assert_eq!(l2.len(), 1, "L2 gained the moved table");
     assert_eq!(
         l2[0].first_key.as_slice(),
-        &[0],
-        "oldest L1 table drained first"
+        &[0, 0],
+        "lowest L1 table drained first"
     );
     // The remaining job still works: L0->L1 lands on the drained level.
-    let mut db = TestDb::new(dev, test_config());
+    let mut db = TestDb::new(dev, tight_config());
     open(&mut db);
     drain(&mut db);
     let mut dev = db.into_device();
@@ -275,10 +297,12 @@ fn compact_l1_full_drains_to_l2() {
     // Deepest-first keeps pulling: the refilled L1 drains straight into L2.
     assert_eq!(man.level(1).unwrap().len(), 3, "L1 drained again");
     assert_eq!(man.level(2).unwrap().len(), 2, "L2 keeps both tables");
-    let mut db = TestDb::new(dev, test_config());
+    let mut db = TestDb::new(dev, tight_config());
     open(&mut db);
-    for k in 0..16u8 {
-        assert_eq!(get(&db, &[k]), Some(b"v".to_vec()), "key {k} survives");
+    for round in 0..4u8 {
+        for k in 0..12u8 {
+            assert_eq!(get(&db, &[round, k]), Some(big(round)), "key {round}/{k}");
+        }
     }
     for t in 0..4u8 {
         assert_eq!(
@@ -708,16 +732,13 @@ fn compact_keep_set_no_snapshots_and_duplicate_watermarks() {
 
 #[test]
 fn compact_cascades_down_every_level() {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<4096>::new(), tight_config());
     open(&mut db);
-    // Nine rounds; each round fills L0 with four single-key flushes and
-    // drives. Rounds 0-3 fill L1, 4-6 fill L2, 7 fills L2 fully, and round
-    // 8 forces an L2->L3 job. Every table holds exactly one key.
+    // Nine rounds of disjoint keys, draining after each. Rounds 0-3 fill
+    // L1, 4-6 fill L2, 7 fills L2 fully, and round 8 forces an L2->L3
+    // job. Every round's table holds its twelve keys.
     for round in 0..9u8 {
-        for _ in 0..4u8 {
-            block_on(db.put(&[round], &[round, 3])).unwrap();
-            block_on(db.flush()).unwrap();
-        }
+        big_round(&mut db, &[round], round);
         drain(&mut db);
     }
     let mut dev = db.into_device();
@@ -735,10 +756,10 @@ fn compact_cascades_down_every_level() {
     assert!(!l3.is_empty(), "cascade reached L3 via L2->L3");
     assert_eq!(
         l3[0].first_key.as_slice(),
-        &[0],
-        "oldest drains first (FIFO)"
+        &[0, 0],
+        "lowest (here also oldest) drains first"
     );
-    assert_eq!(l3[0].entry_count, 1);
+    assert_eq!(l3[0].entry_count, 12);
     // Levels >= 1 never hold overlapping tables.
     for lvl in 1..4usize {
         let tables = man.level(lvl).unwrap();
@@ -750,40 +771,45 @@ fn compact_cascades_down_every_level() {
             }
         }
     }
-    let mut db = TestDb::new(dev, test_config());
+    let mut db = TestDb::new(dev, tight_config());
     open(&mut db);
-    for k in 0..9u8 {
-        assert_eq!(get(&db, &[k]), Some(vec![k, 3]), "key {k} reads back");
+    for round in 0..9u8 {
+        for k in 0..12u8 {
+            assert_eq!(get(&db, &[round, k]), Some(big(round)), "key {round}/{k}");
+        }
     }
 }
 
 #[test]
 fn compact_cascade_keeps_snapshot_versions() {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<4096>::new(), tight_config());
     open(&mut db);
-    // v0 of keys 0..4, then a snapshot pins them while v1 overwrites.
-    for _ in 0..4u8 {
-        for k in 0..4u8 {
-            block_on(db.put(&[k], &[k])).unwrap();
+    // v0 of keys 0..6, then a snapshot pins them while v1 overwrites: the
+    // L1 table ends up with twelve entries — each key's live and snapshot
+    // version — in three data blocks.
+    for _ in 0..2u8 {
+        for half in [0..3u8, 3..6u8] {
+            for k in half {
+                block_on(db.put(&[k], &big(k))).unwrap();
+            }
+            block_on(db.flush()).unwrap();
         }
-        block_on(db.flush()).unwrap();
     }
     drain(&mut db);
     let snap = db.snapshot().unwrap();
-    for _ in 0..4u8 {
-        for k in 0..4u8 {
-            block_on(db.put(&[k], &[k, 9])).unwrap();
+    for _ in 0..2u8 {
+        for half in [0..3u8, 3..6u8] {
+            for k in half {
+                block_on(db.put(&[k], &big(k + 100))).unwrap();
+            }
+            block_on(db.flush()).unwrap();
         }
-        block_on(db.flush()).unwrap();
     }
     drain(&mut db);
     // Three filler rounds push the versioned table down: L1 fills, so the
     // next drive must run L1->L2 on it.
     for r in 1..4u8 {
-        for _ in 0..4u8 {
-            block_on(db.put(&[10 * r], &[r])).unwrap();
-            block_on(db.flush()).unwrap();
-        }
+        big_round(&mut db, &[10 * r], r);
         drain(&mut db);
     }
     let mut dev = db.into_device();
@@ -791,30 +817,27 @@ fn compact_cascade_keeps_snapshot_versions() {
     assert_eq!(man.level(1).unwrap().len(), 3, "L1 drained one table");
     let l2 = man.level(2).unwrap();
     assert_eq!(l2.len(), 1, "L2 holds the cascaded table");
-    assert_eq!(l2[0].entry_count, 8, "live + snapshot version per key");
-    let mut db = TestDb::new(dev, test_config());
+    assert_eq!(l2[0].entry_count, 12, "live + snapshot version per key");
+    let mut db = TestDb::new(dev, tight_config());
     open(&mut db);
     let mut buf = [0u8; 2048];
-    for k in 0..4u8 {
+    for k in 0..6u8 {
         // Live view sees the newest version.
-        assert_eq!(get(&db, &[k]), Some(vec![k, 9]), "live newest wins");
+        assert_eq!(get(&db, &[k]), Some(big(k + 100)), "live newest wins");
         // The snapshot still sees the version it pinned.
         let n = block_on(db.get_at(&[k], &mut buf, snap)).unwrap().unwrap();
-        assert_eq!(&buf[..n], &[k], "snapshot version survives L1->L2");
+        assert_eq!(&buf[..n], &big(k)[..], "snapshot version survives L1->L2");
     }
 }
 
 #[test]
 fn compact_l1_to_l2_crash_never_mixes_state() {
     fn build() -> TestDb<CountDevice<MemDevice<4096>>> {
-        let mut db = TestDb::new(CountDevice::new(MemDevice::<4096>::new()), test_config());
+        let mut db = TestDb::new(CountDevice::new(MemDevice::<4096>::new()), tight_config());
         open(&mut db);
-        // Four L0->L1 rounds: L1 ends full, L0 empty, 16 keys total.
+        // Four L0->L1 rounds: L1 ends full, L0 empty, 48 keys total.
         for r in 0..4u8 {
-            for t in 0..4u8 {
-                block_on(db.put(&[r, t], &[r, t])).unwrap();
-                block_on(db.flush()).unwrap();
-            }
+            big_round(&mut db, &[r], r);
             // Single jobs only: L1 must sit full for the crash campaign.
             drive_one(&mut db);
         }
@@ -826,7 +849,8 @@ fn compact_l1_to_l2_crash_never_mixes_state() {
         let db = build();
         db.into_device().writes
     };
-    // Writes of a clean setup + the L1->L2 compaction.
+    // Writes of a clean setup + the L1->L2 compaction (here a move: the
+    // lowest L1 table overlaps nothing below, one manifest write).
     let total_writes = {
         let mut db = build();
         drain(&mut db);
@@ -839,13 +863,13 @@ fn compact_l1_to_l2_crash_never_mixes_state() {
         let db = build();
         let dev = db.into_device().inner;
         // Crash at write `crash_at` of the L1->L2 job (suffix-drop model).
-        let mut db = TestDb::new(CrashDevice::<_, 4096>::new(dev, crash_at), test_config());
+        let mut db = TestDb::new(CrashDevice::<_, 4096>::new(dev, crash_at), tight_config());
         open(&mut db);
         drain(&mut db);
         let dev = db.into_device().into_inner();
-        // Reopen on the bare device: orphans are swept, state is exactly
-        // pre- or post-compaction, and a clean compaction converges.
-        let mut db = TestDb::new(dev, test_config());
+        // Reopen on the bare device: state is exactly pre- or
+        // post-compaction, and a clean compaction converges.
+        let mut db = TestDb::new(dev, tight_config());
         block_on(db.open()).unwrap();
         let mut dev = db.into_device();
         let man = read_manifest(&mut dev);
@@ -855,12 +879,12 @@ fn compact_l1_to_l2_crash_never_mixes_state() {
             (l1, l2) == (4, 0) || (l1, l2) == (3, 1),
             "crash_at={crash_at}: exactly pre- or post-compaction"
         );
-        let mut db = TestDb::new(dev, test_config());
+        let mut db = TestDb::new(dev, tight_config());
         open(&mut db);
         drain(&mut db);
         for r in 0..4u8 {
-            for t in 0..4u8 {
-                assert_eq!(get(&db, &[r, t]), Some(vec![r, t]), "crash_at={crash_at}");
+            for k in 0..12u8 {
+                assert_eq!(get(&db, &[r, k]), Some(big(r)), "crash_at={crash_at}");
             }
         }
         let mut dev = db.into_device();
@@ -870,93 +894,78 @@ fn compact_l1_to_l2_crash_never_mixes_state() {
     }
 }
 
-/// A narrow database: 3 levels, 2 tables per level. The bottom level is
-/// reachable in a handful of flushes, so the true capacity ceiling — a
-/// full bottom level the merge cannot absorb into — is directly testable.
+/// A narrow database: 3 levels, 2 tables per level — 6 table slots.
 type SmallDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 2, 1024, 8>;
 
-fn read_small_manifest(dev: &mut MemDevice<4096>) -> Manifest<3, 2, 256> {
-    let mut scratch = [0u8; 4096];
-    block_on(Manifest::recover(dev, &mut scratch, 0, 1))
-        .unwrap()
-        .0
+/// 6 slots of 8 blocks: a handful of 1000-byte values fills one.
+const fn small_config() -> horton::Config {
+    horton::Config::new(8, 136, 136, 136 + 6 * 8, 0, 1)
 }
 
-fn small_drain<D: BlockDevice>(db: &mut SmallDb<D>)
-where
-    D::Error: std::fmt::Debug,
-{
-    while db.compaction_pending() {
-        let mut c = TestCompaction::new();
+/// Per-level table caps no longer bound the tree: the levels fill until
+/// the *region* is used up — every slot but the compaction reserve holds a
+/// table — and flush then refuses cleanly. (Before pooled levels and slot
+/// allocation, a bottom level holding `TABLES` disjoint tables was a
+/// permanent `NoSpace` at select time — the "honest ceiling" — reached
+/// after a handful of flushes, with most of the region unused.) Near the
+/// end flush reaches the reserve while L0 is only partly full; region
+/// pressure then selects an L0 merge, which is what lets the last slots
+/// fill.
+#[test]
+fn compact_fills_the_region_not_a_level() {
+    let mut db = SmallDb::new(MemDevice::<4096>::new(), small_config());
+    block_on(db.open()).unwrap();
+    let mut c = TestCompaction::new();
+    let mut written: Vec<u16> = Vec::new();
+    let mut refused = None;
+    'fill: for k in 0u16..2000 {
+        block_on(db.put(&k.to_be_bytes(), &big(u8::try_from(k % 251).unwrap()))).unwrap();
+        // Four values per flush.
+        if k % 4 != 3 {
+            written.push(k);
+            continue;
+        }
         loop {
-            match block_on(db.compact_step(&mut c)) {
-                Ok(Progress::More) => {}
-                Ok(Progress::Done) => break,
-                Err(e) => panic!("unexpected compaction error: {e:?}"),
+            match block_on(db.flush()) {
+                Ok(()) => break,
+                Err(Error::NoSpace) if db.compaction_pending() => {
+                    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+                }
+                Err(Error::NoSpace) => {
+                    refused = Some(k);
+                    break 'fill;
+                }
+                Err(e) => panic!("flush: {e:?}"),
             }
         }
-    }
-}
-
-#[test]
-fn compact_bottom_full_disjoint_nospace() {
-    let mut db = SmallDb::new(CountDevice::new(MemDevice::<4096>::new()), test_config());
-    block_on(db.open()).unwrap();
-    // Two flushes fill L0 (TABLES = 2); drain after each pair.
-    for keys in [[0u8, 1], [2, 3], [4, 5]] {
-        for k in keys {
-            block_on(db.put(&[k], &[k])).unwrap();
-            block_on(db.flush()).unwrap();
+        written.push(k);
+        while db.compaction_pending() {
+            while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
         }
-        small_drain(&mut db);
+        assert_eq!(db.check_invariants(), Ok(()));
     }
-    let count_dev = db.into_device();
-    let mut mem = count_dev.inner;
-    let man = read_small_manifest(&mut mem);
-    assert_eq!(man.level(2).unwrap().len(), 2, "bottom level is full");
-    assert_eq!(man.level(1).unwrap().len(), 1, "L1 holds one table");
-    let mut db = SmallDb::new(CountDevice::new(mem), test_config());
-    block_on(db.open()).unwrap();
-    // Disjoint keys: the next job drains L0->L1 (L1 has one free slot);
-    // the job after that tries L1->L2 and hits the honest ceiling.
-    for k in [0x80u8, 0x81] {
-        block_on(db.put(&[k], &[k])).unwrap();
-        block_on(db.flush()).unwrap();
-    }
-    let mut c = TestCompaction::new();
-    loop {
-        match block_on(db.compact_step(&mut c)) {
-            Ok(Progress::More) => {}
-            Ok(Progress::Done) => break,
-            Err(e) => panic!("unexpected compaction error: {e:?}"),
-        }
-    }
-    let count_dev = db.into_device();
-    let writes_before = count_dev.writes;
-    let mut db = SmallDb::new(count_dev, test_config());
-    block_on(db.open()).unwrap();
-    // The L1->L2 merge would absorb no bottom table, so the output
-    // genuinely does not fit — NoSpace at select time, before any merge I/O.
-    let mut c = TestCompaction::new();
-    assert!(
-        matches!(block_on(db.compact_step(&mut c)), Err(Error::NoSpace)),
-        "full bottom level with disjoint ranges must fail cleanly"
-    );
-    let count_dev = db.into_device();
+    let refused = refused.expect("the region never filled");
+    let s = db.slot_stats();
     assert_eq!(
-        count_dev.writes, writes_before,
-        "NoSpace must fire at select time, before any merge I/O"
+        s.used,
+        s.slots - 2,
+        "every slot but the reserve holds a table"
     );
-    let mut mem = count_dev.inner;
-    let man = read_small_manifest(&mut mem);
-    assert_eq!(man.level(0).unwrap().len(), 0);
-    assert_eq!(man.level(1).unwrap().len(), 2);
-    assert_eq!(man.level(2).unwrap().len(), 2);
-    let mut db = SmallDb::new(mem, test_config());
+    assert!(written.len() >= 40, "only {} values fit", written.len());
+    // Everything survives, across a reopen too — including the values
+    // whose flush was refused (they are still in the memtable and the WAL).
+    let mut db = SmallDb::new(db.into_device(), small_config());
     block_on(db.open()).unwrap();
+    assert_eq!(db.check_invariants(), Ok(()));
     let mut buf = [0u8; 2048];
-    for k in [0u8, 1, 2, 3, 4, 5, 0x80, 0x81] {
-        let n = block_on(db.get(&[k], &mut buf)).unwrap().unwrap();
-        assert_eq!(&buf[..n], &[k], "key {k} survives the failed job");
+    for k in written.into_iter().chain(core::iter::once(refused)) {
+        let n = block_on(db.get(&k.to_be_bytes(), &mut buf))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            &buf[..n],
+            &big(u8::try_from(k % 251).unwrap())[..],
+            "key {k}"
+        );
     }
 }

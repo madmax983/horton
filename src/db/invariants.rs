@@ -22,8 +22,8 @@ impl<
     /// - Every live table sits wholly inside its own table slot, and the
     ///   slot map's used set is exactly those slots (so no two live tables
     ///   share a block, and no free slot holds a live table).
-    /// - Reserved slots and staged output refs exist only while a
-    ///   compaction job is in flight.
+    /// - At most one slot is reserved, and only while a compaction job is
+    ///   in flight (the output it is writing).
     /// - Levels 1 and deeper hold pairwise disjoint key ranges.
     /// - Each table is well-formed (room for bloom, index, and footer after
     ///   its sections; `min_seq <= max_seq`), and the sequence counter
@@ -74,16 +74,10 @@ impl<
         if self.slots.used_slots() != seen.count_ones() {
             return Err("a slot is marked used but holds no live table");
         }
-        if !self.job_active
-            && (self.slots.reserved_slots() != 0 || !self.manifest.pending().is_empty())
-        {
-            return Err("slots are reserved with no compaction job in flight");
-        }
-        for t in self.manifest.pending() {
-            match self.slot_of(t) {
-                Some(slot) if self.slots.is_reserved(slot) => {}
-                _ => return Err("a staged output ref is not in a reserved slot"),
-            }
+        // A job reserves exactly the slot of the output it is writing:
+        // every sealed output commits before the next is reserved.
+        if self.slots.reserved_slots() > u32::from(self.job_active) {
+            return Err("more slots reserved than a compaction job holds");
         }
         if self.manifest.flushed_seq() > self.next_seq || self.manifest.seq_high() > self.next_seq {
             return Err("a persisted sequence floor exceeds the counter");

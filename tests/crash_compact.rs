@@ -394,3 +394,121 @@ fn crash_during_bottommost_point_tombstone_drop_is_atomic() {
         assert_eq!(live_map(&db), want, "crash_at={crash_at}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Multi-output jobs. Under 8-block slots (`tight_config`) an output holds a
+// few 1000-byte values, so one L0 job writes a string of outputs and commits
+// after each, retiring the inputs it has passed and narrowing the one it is
+// inside. Every one of those commits is a crash boundary: whatever write the
+// crash lands on, the reopened tree must be consistent (invariants hold),
+// read exactly the pre-job logical map, and finish the job cleanly.
+// ---------------------------------------------------------------------------
+
+/// Key `i` of the multi-output workload.
+fn mkey(i: u32) -> Vec<u8> {
+    format!("m{i:03}").into_bytes()
+}
+
+/// Builds a tree whose next job is a many-output L0 -> L1 merge: L1 holds
+/// several split tables of 1000-byte values, L0 four tables that overwrite
+/// and delete across all of them — a point delete and a range delete
+/// spanning several L1 tables among them.
+fn build_multi() -> MemDevice<BLOCK> {
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), common::tight_config());
+    block_on(db.open()).unwrap();
+    let mut c = TestCompaction::new();
+    let val = |i: u32, round: u32| vec![u8::try_from((i + round) % 251).unwrap(); 1000];
+    for round in 0..3u32 {
+        for flush in 0..4u32 {
+            for j in 0..3u32 {
+                let i = (flush * 3 + j) * 3 + round;
+                block_on(db.put(&mkey(i), &val(i, round))).unwrap();
+            }
+            block_on(db.flush()).unwrap();
+        }
+        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    }
+    assert!(db.level_tables(1).unwrap().len() >= 3, "setup: L1 split");
+    for flush in 0..4u32 {
+        let i = flush * 9;
+        block_on(db.put(&mkey(i), &val(i, 7))).unwrap();
+        block_on(db.put(&mkey(i + 4), &val(i + 4, 7))).unwrap();
+        if flush == 1 {
+            block_on(db.delete(&mkey(3))).unwrap();
+            block_on(db.delete_range(&mkey(10), &mkey(25))).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    assert!(db.compaction_pending(), "setup: L0 full");
+    db.into_device()
+}
+
+/// The live logical map of the multi-output workload's key space.
+fn multi_map<D: BlockDevice>(db: &TestDb<D>) -> BTreeMap<Vec<u8>, Vec<u8>>
+where
+    D::Error: std::fmt::Debug,
+{
+    let mut out = BTreeMap::new();
+    let mut buf = [0u8; 1024];
+    for i in 0..40u32 {
+        if let Some(n) = block_on(db.get(&mkey(i), &mut buf)).unwrap() {
+            out.insert(mkey(i), buf[..n].to_vec());
+        }
+    }
+    out
+}
+
+/// Drains every pending job.
+fn drain_all<D: BlockDevice>(db: &mut TestDb<D>)
+where
+    D::Error: std::fmt::Debug,
+{
+    let mut c = TestCompaction::new();
+    while db.compaction_pending() {
+        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    }
+}
+
+#[test]
+fn crash_during_multi_output_compaction_leaves_a_consistent_tree() {
+    let (want, job_writes, outputs) = {
+        let mut db = TestDb::new(
+            CountDevice {
+                inner: build_multi(),
+                writes: 0,
+            },
+            common::tight_config(),
+        );
+        block_on(db.open()).unwrap();
+        let want = multi_map(&db);
+        let before = db.into_device();
+        let mut db = TestDb::new(before, common::tight_config());
+        block_on(db.open()).unwrap();
+        let start = db.device().writes;
+        drain_all(&mut db);
+        assert_eq!(multi_map(&db), want, "clean run");
+        let outputs = db.level_tables(1).unwrap().len();
+        (want, db.into_device().writes - start, outputs)
+    };
+    assert!(outputs >= 3, "the job wrote {outputs} outputs");
+    assert!(job_writes > 20, "the job wrote only {job_writes} blocks");
+    for crash_at in 0..job_writes {
+        let mut db = TestDb::new(
+            CrashDevice::<_, BLOCK>::new(build_multi(), crash_at),
+            common::tight_config(),
+        );
+        block_on(db.open()).unwrap();
+        drain_all(&mut db);
+        let dev = db.into_device().into_inner();
+        // Reopen on the bare device: some prefix of the job's commits is
+        // durable, the rest never happened.
+        let mut db = TestDb::new(dev, common::tight_config());
+        block_on(db.open()).unwrap();
+        assert_eq!(db.check_invariants(), Ok(()), "crash_at={crash_at}");
+        assert_eq!(multi_map(&db), want, "crash_at={crash_at}: after the crash");
+        drain_all(&mut db);
+        assert_eq!(db.check_invariants(), Ok(()), "crash_at={crash_at}");
+        assert_eq!(multi_map(&db), want, "crash_at={crash_at}: after finishing");
+        assert_eq!(db.slot_stats().reserved, 0);
+    }
+}

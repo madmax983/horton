@@ -20,6 +20,7 @@ use core::cell::RefCell;
 use crate::alloc::{MAX_SLOTS, SlotMap};
 use crate::batch::WriteBatch;
 use crate::cache::{BlockCache, CachePort, CacheStats};
+use crate::compact::COMPACTION_KMAX;
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{Manifest, TableRef};
@@ -226,6 +227,15 @@ impl<
         LEVELS >= 1 && TABLES >= 1 && LEVELS * TABLES <= MAX_SLOTS,
         "LEVELS * TABLES (one table slot per manifest entry) must be within 1..=64"
     );
+    const ASSERT_JOB: () = assert!(
+        TABLES < COMPACTION_KMAX,
+        "TABLES must be below COMPACTION_KMAX: an L0 job reads every L0 table \
+         through its own cursor, plus one cursor for the level below"
+    );
+    const ASSERT_RDEL: () = assert!(
+        12 + 2 * KEY_MAX + 6 <= BLOCK,
+        "BLOCK must fit one maximal range tombstone (12 + 2 * KEY_MAX bytes) plus its trailer"
+    );
 
     /// Table slots: one per manifest table ref.
     const SLOTS: usize = LEVELS * TABLES;
@@ -233,12 +243,6 @@ impl<
     /// Smallest usable slot: a full memtable's table must fit one, or the
     /// write path could wedge on a flush that never fits.
     const MIN_SLOT_BLOCKS: u64 = sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX);
-
-    /// Free slots flush and ingest leave untouched, so a compaction job can
-    /// always reserve its output slot: compaction is what frees slots
-    /// (several inputs become one output), so taking the last free slot
-    /// for a flush would wedge the database.
-    const COMPACTION_RESERVE: u32 = 1;
 
     /// Creates a closed database handle over `device`.
     #[must_use]
@@ -251,6 +255,8 @@ impl<
         let () = Self::ASSERT_REC;
         let () = Self::ASSERT_BLOOM;
         let () = Self::ASSERT_SLOTS;
+        let () = Self::ASSERT_JOB;
+        let () = Self::ASSERT_RDEL;
         Self {
             wal: WalWriter::new(device, config.wal_start, config.wal_end),
             table: MemTable::new(),
@@ -289,31 +295,40 @@ impl<
     /// Nothing is reserved: the caller holds `&mut self` from here to its
     /// manifest commit and then [`claim`](SlotMap::claim)s the slot, so no
     /// other operation can take it in between, and a future dropped
-    /// mid-write leaks nothing. The last [`COMPACTION_RESERVE`] free slots
-    /// are left for compaction.
+    /// mid-write leaks nothing. Compaction keeps [`COMPACTION_RESERVE`]
+    /// slots of headroom — free, or already reserved by the running job —
+    /// that flush and ingest never take.
     ///
     /// [`COMPACTION_RESERVE`]: Self::COMPACTION_RESERVE
     fn free_slot_for(&self, blocks: u64) -> Result<u32, Error<D::Error>> {
-        if blocks > self.slots.slot_blocks() || self.slots.free_slots() <= Self::COMPACTION_RESERVE
-        {
+        let headroom = self.slots.free_slots() + self.slots.reserved_slots();
+        if blocks > self.slots.slot_blocks() || headroom <= Self::COMPACTION_RESERVE {
             return Err(Error::NoSpace);
         }
         self.slots.find_free().ok_or(Error::NoSpace)
     }
 
     /// Abandons the in-flight compaction job, if any: its reserved output
-    /// slot returns to the free set, its staged output refs are dropped,
-    /// and its scratch goes stale (reset on its next `compact_step`).
-    /// Committed state is untouched — the job's inputs are all still live,
-    /// so a later select simply redoes it.
-    fn abort_job(&mut self) {
+    /// slot returns to the free set and its scratch goes stale (reset on
+    /// its next `compact_step`). What the job already committed stays — a
+    /// consistent tree whose inputs were retired or narrowed past each
+    /// committed output — and a later select merges on from there.
+    const fn abort_job(&mut self) {
         if self.job_active {
             self.slots.release_all();
-            self.manifest.clear_pending();
             self.job_active = false;
             self.job_inputs = 0;
         }
     }
+
+    /// Slots of headroom compaction keeps for itself — free, or already
+    /// reserved by the running job — which flush and ingest never take:
+    /// the output slot a job writes into, plus one slot of room for the
+    /// sources' data, which drains into outputs before the sources retire.
+    /// Jobs are admitted against the actual free slots (see
+    /// `compact_select`), shrinking an L0 job to its oldest tables when
+    /// slots are short. A single-level tree never compacts.
+    const COMPACTION_RESERVE: u32 = if LEVELS >= 2 { 2 } else { 0 };
 
     /// The slot of live table `t` (`None` only for a ref the slot map
     /// never accepted, which `open()` rules out).
@@ -337,7 +352,8 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when [`MAX_SNAPSHOTS`] snapshots are already live.
+    /// [`Error::NoSpace`] when eight snapshots (the fixed limit) are
+    /// already live.
     pub const fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
         if !self.opened {
             return Err(Error::NotOpen);

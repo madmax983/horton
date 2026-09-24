@@ -1,21 +1,27 @@
 //! Bounded leveled compaction: the caller-driven merge engine.
 //!
-//! When a level fills (`TABLES` tables), [`Db::compact_step`] selects the
-//! deepest full level's job: all of L0, or the oldest table of a deeper
-//! level, plus the tables of the level below whose key ranges overlap, as
-//! one compaction job. The merge is incremental: one call pushes merged
-//! entries into the output table until an output block seals (or the merge
-//! exhausts), reporting [`Progress::More`] while work remains. A final
-//! manifest commit swaps the input tables for the output table atomically.
+//! When a level fills (`TABLES` tables), [`Db::compact_step`] selects a job
+//! draining the deepest full level into the one below: L0's tables (its
+//! oldest ones, when free slots are short), or one table of a deeper
+//! level, merged with every table of the level below whose key range
+//! overlaps. The job policy — selection, admission, trivial moves,
+//! consolidation, region pressure, and the commit protocol — lives in
+//! `db::compaction`; this module is the merge engine it drives.
+//!
+//! The merge is incremental: one call pushes merged entries into the
+//! current output table until an output block seals, the output fills at a
+//! key boundary (`MergeOutcome::Split`: the `Db` seals and commits it and
+//! opens the next), or the merge exhausts. Sources are read through one
+//! cursor each; the target level's tables are disjoint and sorted, so one
+//! concatenating cursor reads any number of them.
 //!
 //! The caller owns the [`Compaction`] scratch — the output table's staging
-//! buffers plus one read cursor per input table, at most
-//! [`COMPACTION_KMAX`] tables per job. Nothing is allocated. Dropping the
-//! scratch mid-job is crash-safe: partial output tables are invisible until
-//! the manifest commit, and their table slot stays reserved only until the
-//! next `compact_step` (with any scratch) aborts the stale job, while the
-//! input tables stay referenced; a fresh scratch simply selects the job
-//! again.
+//! buffers plus the read cursors, at most [`COMPACTION_KMAX`] of them.
+//! Nothing is allocated. Dropping the scratch mid-job is crash-safe: the
+//! output being written is invisible until its commit, and its table slot
+//! stays reserved only until the next `compact_step` (with any scratch)
+//! abandons the stale job; outputs already committed stay, and a fresh
+//! scratch merges on from there.
 //!
 //! Compaction preserves the read path's visibility rule: each key keeps
 //! the newest version (the live view) plus the newest version at or below
@@ -23,9 +29,12 @@
 //! and are not emitted. A bottommost tombstone older than every live
 //! snapshot drops the whole key: nothing below can hide an older version,
 //! and deletion is observationally identical to absence there.
+//!
+//! [`Db::compact_step`]: crate::db::Db::compact_step
 
 use core::future::poll_fn;
 
+use crate::alloc::MAX_SLOTS;
 use crate::compress::CompressScratch;
 use crate::db::MAX_SNAPSHOTS;
 use crate::device::BlockDevice;
@@ -65,8 +74,8 @@ enum KeyState {
 /// Create it once and hand it to every
 /// [`compact_step`](crate::db::Db::compact_step) call; it is reusable
 /// across jobs — a finished job leaves it idle, and the next call selects a
-/// fresh job when L0 is full again. The type parameters must match the
-/// [`Db`](crate::db::Db) it drives.
+/// fresh job when some level is full again. The type parameters must match
+/// the [`Db`](crate::db::Db) it drives.
 pub struct Compaction<
     const BLOCK: usize,
     const KEY_MAX: usize,
@@ -74,9 +83,28 @@ pub struct Compaction<
     const BLOOM_BYTES: usize,
 > {
     pub(crate) state: State,
+    /// The job's source tables — all of L0, or one table of a deeper
+    /// level — each read through its own cursor (`cursors[..n_src]`).
     pub(crate) inputs: [Input<KEY_MAX>; COMPACTION_KMAX],
-    pub(crate) n_inputs: usize,
+    pub(crate) n_src: usize,
+    /// Sources already retired by a progress commit (bit `i` for
+    /// `inputs[i]`): their whole range lies behind the committed outputs,
+    /// and their slots may already hold other tables.
+    pub(crate) src_retired: u8,
     pub(crate) target_level: usize,
+    /// Ids of the job's target-level tables, in key order. Target tables
+    /// are disjoint and sorted, so one concatenating cursor
+    /// (`cursors[n_src]`) reads them all in sequence: a job may span any
+    /// number of them.
+    pub(crate) tgt: [u32; MAX_SLOTS],
+    pub(crate) n_tgt: usize,
+    /// Targets opened by the concatenating cursor so far (the one it is
+    /// reading is `tgt[tgt_open - 1]`).
+    pub(crate) tgt_open: usize,
+    /// Targets whose whole key range lies behind the committed outputs
+    /// (`tgt[..tgt_retired]`): removed from the manifest, their data lives
+    /// in those outputs now.
+    pub(crate) tgt_retired: usize,
     /// True when the output level is the bottommost one holding the merged
     /// key range: a tombstone there shadows nothing below and may be
     /// dropped — unless a live snapshot could still observe it (see
@@ -118,24 +146,34 @@ pub struct Compaction<
     /// `compact_step` directly (and tests) can set it; `Db` leaves it
     /// `0` unless told otherwise.
     pub purge_before: u64,
-    /// Range-tombstone section of the output table, written by
-    /// `compact_select` before the data merge starts (the section sits
-    /// before the data blocks on device). Bounds and max sequence fold
-    /// into the output [`TableRef`](crate::manifest::TableRef) at commit.
-    pub(crate) rdel_blocks: u32,
-    pub(crate) rdel_first: KeyBound<KEY_MAX>,
-    pub(crate) rdel_last: KeyBound<KEY_MAX>,
-    pub(crate) rdel_max_seq: u64,
-    /// The output table's reserved slot and its first block.
+    /// Blocks reserved in every output for its range-tombstone section: an
+    /// upper bound on the blocks any output's clipped share of the merged
+    /// section can need (see `rdel_blocks_bound`).
+    pub(crate) rdel_budget: u32,
+    /// Data blocks every output may use: its slot minus the rdel budget
+    /// and the 3 framing blocks. The writer's block limit.
+    pub(crate) data_budget: u64,
+    /// Blocks one key's retained versions can still need, closing seal
+    /// included (see [`key_run_blocks`](Self::key_run_blocks)): an output
+    /// ends before a key when fewer than this many are left.
+    pub(crate) split_margin: u64,
+    /// Bloom probes per key for every output.
+    pub(crate) bloom_k: u8,
+    /// The current output's reserved slot and its first block.
     pub(crate) out_slot: u32,
     pub(crate) out_base: u64,
+    /// Left clip bound of the current output: the job range's lower bound
+    /// for the first output, then the successor of the previous output's
+    /// last key. Range tombstones are cut at output boundaries so the
+    /// outputs stay disjoint, and inside the job's range.
+    pub(crate) out_lo: KeyBound<KEY_MAX>,
     /// The [`Db`](crate::db::Db)'s job generation when this scratch
     /// selected its job. A mismatch means another scratch started a job,
     /// or the job was aborted (archive, ingest, reopen): the scratch is
     /// stale and resets instead of touching the device.
     pub(crate) job_gen: u32,
     pub(crate) writer: TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>,
-    /// Caller-owned compression scratch for the output table: every
+    /// Caller-owned compression scratch for the output tables: every
     /// sealed data block is trial-compressed (see
     /// [`TableWriter::push`](crate::sstable::TableWriter::push)). Lives
     /// for the job's duration; `const`-constructible so [`new`](Self::new)
@@ -143,9 +181,8 @@ pub struct Compaction<
     pub(crate) compress: CompressScratch<BLOCK>,
     /// Shared physical-read scratch: one block buffer lent to
     /// [`read_data_block`] on every cursor fill. The physical bytes are
-    /// dead once inflated into the cursor's `block`, so the eight merge
-    /// cursors share this instead of each owning one (saves 7 blocks of
-    /// RAM against the naive per-cursor layout).
+    /// dead once inflated into the cursor's `block`, so the merge cursors
+    /// share this instead of each owning one.
     pub(crate) raw: [u8; BLOCK],
     pub(crate) cursors: [Cursor<BLOCK, KEY_MAX, VAL_MAX>; COMPACTION_KMAX],
     /// The key currently being merged: a sealed output block may interrupt
@@ -237,7 +274,10 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize>
 pub(crate) enum MergeOutcome {
     /// One output block sealed; the merge has more entries.
     More,
-    /// Every input is exhausted; the caller should commit.
+    /// The current output is full at a key boundary: seal it, commit
+    /// progress, and open the next output before merging on.
+    Split,
+    /// Every input is exhausted; the caller should seal and commit.
     Exhausted,
 }
 
@@ -258,20 +298,26 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         Self {
             state: State::Idle,
             inputs: [Input::EMPTY; COMPACTION_KMAX],
-            n_inputs: 0,
+            n_src: 0,
+            src_retired: 0,
             target_level: 0,
+            tgt: [0u32; MAX_SLOTS],
+            n_tgt: 0,
+            tgt_open: 0,
+            tgt_retired: 0,
             bottommost: false,
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
             oldest_snapshot: u64::MAX,
             outside_min_seq: u64::MAX,
             purge_before: 0,
-            rdel_blocks: 0,
-            rdel_first: KeyBound::EMPTY,
-            rdel_last: KeyBound::EMPTY,
-            rdel_max_seq: 0,
+            rdel_budget: 0,
+            data_budget: 0,
+            split_margin: 0,
+            bloom_k: 1,
             out_slot: 0,
             out_base: 0,
+            out_lo: KeyBound::EMPTY,
             job_gen: 0,
             writer: TableWriter::new(0, 0),
             compress: CompressScratch::new(),
@@ -284,56 +330,135 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         }
     }
 
-    /// Abandons any in-progress job. Partial output blocks were never
-    /// referenced, so their slot is simply free once the `Db` releases the
-    /// reservation; the inputs are still in the manifest and a later
-    /// select will redo the job.
+    /// Abandons any in-progress job. Uncommitted output blocks were never
+    /// referenced, so their slots are simply free once the `Db` releases
+    /// the reservations; progress already committed stays, and a later
+    /// select redoes the rest.
     ///
     /// `purge_before` is sticky across jobs (it is a caller-owned clock
     /// cutoff, not per-job state); change it explicitly when the cutoff
     /// moves.
     pub(crate) const fn reset(&mut self) {
         self.state = State::Idle;
-        self.n_inputs = 0;
+        self.n_src = 0;
+        self.src_retired = 0;
+        self.n_tgt = 0;
+        self.tgt_open = 0;
+        self.tgt_retired = 0;
         self.key_state = KeyState::Idle;
-        self.rdel_blocks = 0;
-        self.rdel_first = KeyBound::EMPTY;
-        self.rdel_last = KeyBound::EMPTY;
-        self.rdel_max_seq = 0;
+        self.rdel_budget = 0;
+        self.out_lo = KeyBound::EMPTY;
     }
 
-    /// One bounded merge quantum: pushes merged entries into the output
-    /// table until one output block seals, or every input is exhausted.
+    /// Cursors the merge reads: one per source, plus the concatenating
+    /// target cursor when the job has targets.
+    const fn n_cursors(&self) -> usize {
+        self.n_src + if self.n_tgt > 0 { 1 } else { 0 }
+    }
+
+    /// Loads the next target that has point entries into the concatenating
+    /// cursor, or parks it exhausted after the last target. Range-only
+    /// targets have no data blocks and are skipped (their range tombstones
+    /// reach the outputs through the rdel merge).
     ///
-    /// Each key's versions surface newest-first, one per loop iteration:
-    /// the iteration's head (highest sequence among the cursors tied on
-    /// the minimum key) is emitted exactly when an unserved threshold —
-    /// the live view, then each snapshot, descending — covers it. That
-    /// emission then serves every threshold the version satisfies, which
-    /// is precisely the keep-set: the newest version plus the newest
-    /// version at or below each snapshot. A sealed block may interrupt a
-    /// key mid-versions; the per-key state resumes it exactly.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::CorruptBlock`] on a torn input block (compaction must never
-    /// silently drop entries), [`Error::NoSpace`] when an entry cannot fit
-    /// in an empty output block, or [`Error::Device`] on I/O failure.
+    /// `tgt_level` is the target level's live refs; the job's targets are
+    /// found in it by id.
+    pub(crate) async fn open_next_target<D: BlockDevice>(
+        &mut self,
+        device: &D,
+        tgt_level: &[TableRef<KEY_MAX>],
+    ) -> Result<(), Error<D::Error>> {
+        let ci = self.n_src;
+        loop {
+            if self.tgt_open >= self.n_tgt {
+                self.cursors[ci].live = false;
+                return Ok(());
+            }
+            let id = self.tgt[self.tgt_open];
+            let tref = tgt_level
+                .iter()
+                .find(|t| t.id == id)
+                .copied()
+                .ok_or(Error::CorruptManifest)?;
+            self.tgt_open += 1;
+            init_cursor(device, &mut self.raw, &tref, &mut self.cursors[ci]).await?;
+            if self.cursors[ci].live {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Advances input cursor `ci` past its head; the concatenating target
+    /// cursor rolls over to the next target when its table runs out.
+    async fn advance_input<D: BlockDevice>(
+        &mut self,
+        device: &D,
+        ci: usize,
+        tgt_level: &[TableRef<KEY_MAX>],
+    ) -> Result<(), Error<D::Error>> {
+        if !advance_cursor(device, &mut self.raw, &mut self.cursors[ci]).await? && ci == self.n_src
+        {
+            self.open_next_target(device, tgt_level).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether the current output should end before the next key starts.
+    /// Outputs end only at key boundaries, so every key's versions land in
+    /// one table and the outputs stay disjoint. A key emits at most one
+    /// version per threshold (live view plus each snapshot), each push
+    /// seals at most one block, and closing the output seals one more — so
+    /// the output ends while that worst case still fits both its data
+    /// budget and its one-block index.
+    const fn should_split(&self) -> bool {
+        if self.writer.entry_count() == 0 {
+            return false;
+        }
+        if self.writer.data_blocks() + self.split_margin > self.data_budget {
+            return true;
+        }
+        // Every seal adds one index entry of `18 + key` bytes.
+        let index_room = BLOCK.saturating_sub(sstable::CRC_LEN);
+        // `split_margin` is a handful of blocks: the narrowing is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let index_need = self.split_margin as usize * (18 + KEY_MAX);
+        self.writer.index_len() + index_need > index_room
+    }
+
+    /// Blocks one key can still need in the output, its closing seal
+    /// included. A key emits at most one version per threshold (the live
+    /// view plus each of `n_snapshots` snapshots), each at most
+    /// `ENTRY_HEADER + KEY_MAX + VAL_MAX + 8` bytes (the 8: a TTL expiry).
+    /// The first push may seal the block already in progress; after that a
+    /// block seals only once it holds more than a block's room minus one
+    /// entry, so `v` versions seal at most `1 + v * entry / min_fill`
+    /// blocks — then the output's closing seal.
+    pub(crate) const fn key_run_blocks(n_snapshots: usize) -> u64 {
+        let versions = 1 + n_snapshots;
+        let entry = sstable::ENTRY_HEADER + KEY_MAX + VAL_MAX + 8;
+        let room = BLOCK.saturating_sub(sstable::MAX_DATA_TAIL);
+        let seals = if room > entry {
+            1 + versions * entry / (room - entry + 1)
+        } else {
+            versions
+        };
+        // A handful of blocks: the widening is exact.
+        (seals + 1) as u64
+    }
+
     /// Index of the live cursor on the minimum key, or `COMPACTION_KMAX`
-    /// when every cursor is exhausted. KMAX = 8, so a linear scan is
-    /// trivially bounded — and unlike a heap it cannot hold stale entries
-    /// for exhausted cursors.
-    fn min_key_cursor(cursors: &[Cursor<BLOCK, KEY_MAX, VAL_MAX>], n_inputs: usize) -> usize {
+    /// when every cursor is exhausted. At most `COMPACTION_KMAX` cursors,
+    /// so a linear scan is trivially bounded — and unlike a heap it cannot
+    /// hold stale entries for exhausted cursors.
+    fn min_key_cursor(cursors: &[Cursor<BLOCK, KEY_MAX, VAL_MAX>]) -> usize {
         let mut best = COMPACTION_KMAX;
-        for ci in 0..n_inputs {
-            if !cursors[ci].live {
+        for (ci, c) in cursors.iter().enumerate() {
+            if !c.live {
                 continue;
             }
-            if best == COMPACTION_KMAX {
-                best = ci;
-                continue;
-            }
-            if cursors[ci].key[..cursors[ci].key_len] < cursors[best].key[..cursors[best].key_len] {
+            if best == COMPACTION_KMAX
+                || c.key[..c.key_len] < cursors[best].key[..cursors[best].key_len]
+            {
                 best = ci;
             }
         }
@@ -344,36 +469,54 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
     /// cursor sits at its table's version-run start and runs are
     /// newest-first, so the head is the newest version not yet processed
     /// for this key.
-    fn head_cursor(
-        cursors: &[Cursor<BLOCK, KEY_MAX, VAL_MAX>],
-        n_inputs: usize,
-        best: usize,
-    ) -> usize {
+    fn head_cursor(cursors: &[Cursor<BLOCK, KEY_MAX, VAL_MAX>], best: usize) -> usize {
         let mut head = best;
-        for ci in 0..n_inputs {
-            if !cursors[ci].live || ci == best {
-                continue;
-            }
-            let tied = cursors[ci].key[..cursors[ci].key_len]
-                == cursors[best].key[..cursors[best].key_len];
-            if tied && cursors[ci].seq > cursors[head].seq {
+        let bkey = &cursors[best].key[..cursors[best].key_len];
+        for (ci, c) in cursors.iter().enumerate() {
+            if c.live && ci != best && &c.key[..c.key_len] == bkey && c.seq > cursors[head].seq {
                 head = ci;
             }
         }
         head
     }
 
+    /// One bounded merge quantum: pushes merged entries into the current
+    /// output table until one output block seals ([`MergeOutcome::More`]),
+    /// the output is full at a key boundary ([`MergeOutcome::Split`]: the
+    /// caller seals it, commits progress, and opens the next output; the
+    /// next key is not consumed), or every input is exhausted
+    /// ([`MergeOutcome::Exhausted`]).
+    ///
+    /// Each key's versions surface newest-first, one per loop iteration:
+    /// the iteration's head (highest sequence among the cursors tied on
+    /// the minimum key) is emitted exactly when an unserved threshold —
+    /// the live view, then each snapshot, descending — covers it. That
+    /// emission then serves every threshold the version satisfies, which
+    /// is precisely the keep-set: the newest version plus the newest
+    /// version at or below each snapshot. A sealed block may interrupt a
+    /// key mid-versions; the per-key state resumes it exactly.
+    ///
+    /// `tgt_level` is the target level's live refs, for the concatenating
+    /// target cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptBlock`] on a torn input block (compaction must never
+    /// silently drop entries), [`Error::NoSpace`] when an entry cannot fit
+    /// in an empty output block, or [`Error::Device`] on I/O failure.
     pub(crate) async fn merge_step<D: BlockDevice>(
         &mut self,
         device: &mut D,
+        tgt_level: &[TableRef<KEY_MAX>],
     ) -> Result<MergeOutcome, Error<D::Error>> {
+        let n = self.n_cursors();
         loop {
-            let best = Self::min_key_cursor(&self.cursors[..self.n_inputs], self.n_inputs);
+            let best = Self::min_key_cursor(&self.cursors[..n]);
             if best == COMPACTION_KMAX {
                 self.key_state = KeyState::Idle;
                 return Ok(MergeOutcome::Exhausted);
             }
-            let head = Self::head_cursor(&self.cursors[..self.n_inputs], self.n_inputs, best);
+            let head = Self::head_cursor(&self.cursors[..n], best);
             // New key: (re)start the per-key threshold state. After a
             // mid-key seal the bytes match and the served flags resume the
             // key exactly where it stopped.
@@ -382,27 +525,17 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                 || self.key_len != hkey_len
                 || self.key[..hkey_len] != self.cursors[best].key[..hkey_len]
             {
+                if self.should_split() {
+                    // Nothing of the new key was consumed; the next call
+                    // starts it afresh in the next output.
+                    self.key_state = KeyState::Idle;
+                    return Ok(MergeOutcome::Split);
+                }
                 self.key[..hkey_len].copy_from_slice(&self.cursors[best].key[..hkey_len]);
                 self.key_len = hkey_len;
                 self.key_state = KeyState::Merging;
                 self.served = [false; MAX_SNAPSHOTS + 1];
-                // Bottommost tombstone drop: the head is the key's newest
-                // version. Dropping the whole key is safe exactly when the
-                // tombstone predates every live snapshot — then each
-                // snapshot's visible version is the tombstone itself, the
-                // keep-set is just it, and deletion is observationally
-                // identical to absence — and nothing outside the job can
-                // hold an older version it hides (`outside_min_seq`). A value the TTL purge will convert
-                // to a tombstone counts as one here, so the drop matches a
-                // caller-issued delete exactly.
-                let c = &self.cursors[head];
-                let effective_tombstone =
-                    c.tombstone || (c.expire_at != 0 && c.expire_at <= self.purge_before);
-                if self.bottommost
-                    && effective_tombstone
-                    && c.seq < self.oldest_snapshot
-                    && c.seq < self.outside_min_seq
-                {
+                if self.may_drop_key(head) {
                     self.key_state = KeyState::Dropping;
                 }
             }
@@ -416,12 +549,12 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             // resurrect the older version beneath it at snapshot reads
             // (the expired version can be some snapshot's newest visible
             // version, and only its presence — or a tombstone at its
-            // sequence — keeps that read at absent). The bottommost drop
-            // check above already treated it as a tombstone, so the
-            // existing threshold/bottommost machinery keeps or drops it
-            // exactly as if the caller had deleted the key.
-            // `purge_before == 0` disables the purge. Surviving values
-            // carry their `expire_at` through to the output table.
+            // sequence — keeps that read at absent). The drop check above
+            // already treated it as a tombstone, so the existing
+            // threshold/bottommost machinery keeps or drops it exactly as
+            // if the caller had deleted the key. `purge_before == 0`
+            // disables the purge. Surviving values carry their `expire_at`
+            // through to the output table.
             let purged = !tombstone && expire_at != 0 && expire_at <= self.purge_before;
             // The head is emitted when some unserved threshold covers it:
             // threshold 0 is the live view, the rest are the snapshots.
@@ -470,7 +603,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                     }
                     ti += 1;
                 }
-                advance_cursor(&*device, &mut self.raw, &mut self.cursors[head]).await?;
+                self.advance_input(&*device, head, tgt_level).await?;
                 if sealed == PushOutcome::BlockSealed {
                     return Ok(MergeOutcome::More);
                 }
@@ -479,9 +612,34 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                 // threshold. Only the head advances — a tied cursor parked
                 // on an older version may still serve a smaller threshold
                 // on a later iteration.
-                advance_cursor(&*device, &mut self.raw, &mut self.cursors[head]).await?;
+                self.advance_input(&*device, head, tgt_level).await?;
             }
         }
+    }
+
+    /// The bottommost tombstone drop, decided on a key's newest version
+    /// (the `head` cursor). Dropping the whole key is safe exactly when:
+    ///
+    /// - the output is bottommost for the job's range and the head is a
+    ///   tombstone (or a value the TTL purge will turn into one, so the
+    ///   drop matches a caller-issued delete exactly);
+    /// - the tombstone predates every live snapshot — then each
+    ///   snapshot's visible version is the tombstone itself, the keep-set
+    ///   is just it, and deletion is observationally identical to absence;
+    /// - nothing outside the job can hold an older version it hides
+    ///   (`outside_min_seq`).
+    ///
+    /// Inputs holding older versions of the key are no hazard: the
+    /// progress commit that makes this output live also retires, or
+    /// narrows past the key, every input that reaches it.
+    const fn may_drop_key(&self, head: usize) -> bool {
+        let c = &self.cursors[head];
+        let effective_tombstone =
+            c.tombstone || (c.expire_at != 0 && c.expire_at <= self.purge_before);
+        self.bottommost
+            && effective_tombstone
+            && c.seq < self.oldest_snapshot
+            && c.seq < self.outside_min_seq
     }
 }
 
@@ -493,6 +651,33 @@ pub(crate) fn ranges_overlap<const KEY_MAX: usize>(
     b_last: KeyBound<KEY_MAX>,
 ) -> bool {
     a_first.as_slice() <= b_last.as_slice() && b_first.as_slice() <= a_last.as_slice()
+}
+
+/// The job's remaining target tables for a range-tombstone merge pass: the
+/// target level's live refs plus the ids to read, in key order. Targets
+/// are disjoint and sorted, so their rdel sections concatenate into one
+/// sorted stream (every start in one table precedes every start in the
+/// next) and one merge head reads them all.
+pub(crate) struct TargetView<'a, const KEY_MAX: usize> {
+    pub(crate) level: &'a [TableRef<KEY_MAX>],
+    pub(crate) ids: &'a [u32],
+}
+
+impl<const KEY_MAX: usize> TargetView<'_, KEY_MAX> {
+    /// The rdel section `(first block, blocks)` of target `i`, `None` past
+    /// the last target. A target missing from the level, or too short for
+    /// its sections, is a corrupt manifest.
+    fn section<E>(&self, i: usize) -> Option<Result<(u64, u32), Error<E>>> {
+        let id = *self.ids.get(i)?;
+        let Some(t) = self.level.iter().find(|t| t.id == id) else {
+            return Some(Err(Error::CorruptManifest));
+        };
+        Some(
+            t.rdel_first()
+                .map(|first| (first, t.rdel_blocks))
+                .ok_or(Error::CorruptManifest),
+        )
+    }
 }
 
 /// Folded bounds of one compaction's output range-tombstone section, for
@@ -540,7 +725,11 @@ impl<const KEY_MAX: usize> RdelStats<KEY_MAX> {
 
 /// Streams the compaction inputs' range-tombstone sections into one sorted
 /// output section: a bounded k-way merge over the inputs' stored rdel
-/// sections, each already sorted by `(start asc, seq desc)`.
+/// sections, each sorted by `start` ascending. Ties on `start` may come in
+/// any sequence order: a flush writes them newest first, but compaction
+/// clips pieces to its outputs' ranges, and raising several starts to the
+/// same lower bound keeps their original, start-ordered sequence. Nothing
+/// here relies on the order of ties.
 ///
 /// Per input the merge keeps a read position plus one copied head entry
 /// (the shared `raw` block buffer is reused across inputs, so borrowed
@@ -583,10 +772,13 @@ pub(crate) struct RdelMerger<const KEY_MAX: usize> {
 }
 
 /// One merge input: its section location, read position, and copied head
-/// entry.
+/// entry. The concatenating head reads the targets' sections one after
+/// another (`next_target` is the next one to open).
 struct RdelHead<const KEY_MAX: usize> {
     first_block: u64,
     rdel_blocks: u32,
+    concat: bool,
+    next_target: usize,
     /// Index of the block holding the next entry to parse.
     block: u32,
     /// Byte offset of that entry within its block.
@@ -647,6 +839,8 @@ impl<const KEY_MAX: usize> RdelHead<KEY_MAX> {
         Self {
             first_block,
             rdel_blocks,
+            concat: false,
+            next_target: 0,
             block: 0,
             off: 0,
             remaining: 0,
@@ -673,13 +867,29 @@ async fn fill_rdel_head<D: BlockDevice, const BLOCK: usize, const KEY_MAX: usize
     device: &D,
     head: &mut RdelHead<KEY_MAX>,
     raw: &mut [u8; BLOCK],
+    targets: &TargetView<'_, KEY_MAX>,
 ) -> Result<(), Error<D::Error>> {
     if head.has_head {
         return Ok(());
     }
     loop {
         if head.block >= head.rdel_blocks {
-            return Ok(());
+            // Section exhausted: the concatenating head moves on to the
+            // next target's section; a single-table head is done.
+            if !head.concat {
+                return Ok(());
+            }
+            let Some(section) = targets.section(head.next_target) else {
+                return Ok(());
+            };
+            let (first, blocks) = section?;
+            head.next_target += 1;
+            head.first_block = first;
+            head.rdel_blocks = blocks;
+            head.block = 0;
+            head.off = 0;
+            head.remaining = 0;
+            continue;
         }
         let id =
             head.first_block
@@ -717,22 +927,36 @@ async fn fill_rdel_head<D: BlockDevice, const BLOCK: usize, const KEY_MAX: usize
 }
 
 impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
-    /// Merges `inputs`' range-tombstone sections. `bottommost` and
-    /// `oldest_snapshot` gate the tombstone drop rule.
-    pub(crate) fn new(inputs: &[Input<KEY_MAX>], bottommost: bool, oldest_snapshot: u64) -> Self {
+    /// Merges the range-tombstone sections of `sources` (one head each,
+    /// skipping those whose bit is set in `retired`) and, when
+    /// `with_targets`, of the targets passed to every
+    /// [`next_merged`](Self::next_merged) call (one concatenating head).
+    /// `bottommost` and `oldest_snapshot` gate the tombstone drop rule.
+    pub(crate) fn new(
+        sources: &[Input<KEY_MAX>],
+        retired: u8,
+        with_targets: bool,
+        bottommost: bool,
+        oldest_snapshot: u64,
+    ) -> Self {
+        let n_src = sources.len().min(COMPACTION_KMAX - 1);
         let heads = core::array::from_fn(|i| {
-            if i < inputs.len() {
-                let t = &inputs[i].tref;
+            if i < n_src && retired & (1u8 << i) == 0 {
+                let t = &sources[i].tref;
                 // A malformed ref (no room for its sections) reads from an
                 // impossible base, which surfaces as `CorruptBlock`.
                 RdelHead::new(t.rdel_first().unwrap_or(u64::MAX), t.rdel_blocks)
             } else {
-                RdelHead::new(0, 0)
+                // A retired source's blocks may already hold another
+                // table: its head reads nothing.
+                let mut h = RdelHead::new(0, 0);
+                h.concat = i == n_src && with_targets;
+                h
             }
         });
         Self {
             heads,
-            n: inputs.len(),
+            n: n_src + usize::from(with_targets),
             pending: OwnedRdel::empty(),
             has_pending: false,
             current: OwnedRdel::empty(),
@@ -761,17 +985,27 @@ impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
     /// Moves head `mi` into the pending slot, applying the bottommost drop
     /// rule (a dropped head simply never becomes pending). A tombstone is
     /// droppable only when it is shadowed by the last emitted tombstone:
-    /// identical `(start, end)` with `seq <= oldest_snapshot`. Then every
-    /// live snapshot sees the shadowing tombstone (or a newer one), so the
-    /// dropped one was never decisive. Without the shadow gate, dropping a
-    /// tombstone below the oldest snapshot would resurrect covered keys
-    /// at any live snapshot sitting between the two sequences.
+    /// identical `(start, end)`, a *newer* sequence, and
+    /// `seq <= oldest_snapshot`. Then every live snapshot sees the
+    /// shadowing tombstone (or a newer one), so the dropped one was never
+    /// decisive. Without the shadow gate, dropping a tombstone below the
+    /// oldest snapshot would resurrect covered keys at any live snapshot
+    /// sitting between the two sequences. The *newer* check matters
+    /// because ties on `start` can arrive oldest first (see
+    /// [`RdelMerger`]): an identical range emitted earlier is not
+    /// necessarily the newer one, and dropping the newer would expose
+    /// every version between the two sequences.
     fn set_pending_from_head(&mut self, mi: usize) {
         let e = &self.heads[mi].entry;
         // The shadow gate: the last emitted tombstone must name the
-        // identical range and be visible to every live snapshot.
+        // identical range, be newer, and be visible to every live
+        // snapshot.
         let shadowed = match &self.last_emitted {
-            Some(p) => p.seq <= self.oldest_snapshot && p.same_range(e),
+            Some(p) => {
+                let newer = p.seq > e.seq;
+                let visible_to_all = p.seq <= self.oldest_snapshot;
+                newer && visible_to_all && p.same_range(e)
+            }
             None => false,
         };
         if self.bottommost && e.seq < self.oldest_snapshot && shadowed {
@@ -794,11 +1028,12 @@ impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
         &mut self,
         device: &D,
         raw: &mut [u8; BLOCK],
+        targets: &TargetView<'_, KEY_MAX>,
     ) -> Result<bool, Error<D::Error>> {
         loop {
             for i in 0..self.n {
                 if !self.heads[i].has_head {
-                    fill_rdel_head(device, &mut self.heads[i], raw).await?;
+                    fill_rdel_head(device, &mut self.heads[i], raw, targets).await?;
                 }
             }
             let Some(mi) = self.min_head() else {
@@ -848,31 +1083,57 @@ impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
     }
 }
 
-/// Dry-run pass of the range-tombstone merge: returns the exact block
-/// count the merged section will occupy, so compaction can reserve it.
-/// The write pass replays the same deterministic merge over the immutable
-/// input sections, so the counted budget always matches.
+/// Dry-run pass of the range-tombstone merge over a whole job: returns how
+/// many merged entries it yields. Every output's clipped share of the
+/// merged section is at most that many entries (clipping only cuts
+/// entries to the output's range), each at most `12 + 2 * KEY_MAX` bytes,
+/// so [`rdel_blocks_bound`] of it bounds every output's rdel section.
 ///
 /// # Errors
 ///
-/// [`Error::CorruptBlock`] on CRC failure or malformed entries, or
+/// [`Error::CorruptBlock`] on CRC failure or malformed entries,
+/// [`Error::CorruptManifest`] when a target is missing, or
 /// [`Error::Device`] on I/O failure.
 pub(crate) async fn count_rdel_merge<D, const BLOCK: usize, const KEY_MAX: usize>(
     device: &D,
-    inputs: &[Input<KEY_MAX>],
+    sources: &[Input<KEY_MAX>],
+    targets: &TargetView<'_, KEY_MAX>,
     raw: &mut [u8; BLOCK],
     bottommost: bool,
     oldest_snapshot: u64,
-) -> Result<u32, Error<D::Error>>
+) -> Result<u64, Error<D::Error>>
 where
     D: BlockDevice,
 {
-    let mut merger = RdelMerger::new(inputs, bottommost, oldest_snapshot);
-    let mut counter = sstable::RdelCounter::<BLOCK>::new();
-    while merger.next_merged(device, raw).await? {
-        counter.push(merger.current_entry());
+    let mut merger = RdelMerger::new(
+        sources,
+        0,
+        !targets.ids.is_empty(),
+        bottommost,
+        oldest_snapshot,
+    );
+    let mut n = 0u64;
+    while merger.next_merged(device, raw, targets).await? {
+        n += 1;
     }
-    Ok(counter.finish())
+    Ok(n)
+}
+
+/// Upper bound on the blocks `entries` range tombstones occupy, each at
+/// most `12 + 2 * KEY_MAX` bytes. The rdel writer seals a block only when
+/// the next entry no longer fits, so every block but the last holds at
+/// least `(BLOCK - trailer) / max_entry` entries.
+pub(crate) const fn rdel_blocks_bound<const BLOCK: usize, const KEY_MAX: usize>(
+    entries: u64,
+) -> u64 {
+    if entries == 0 {
+        return 0;
+    }
+    let per_block = sstable::rdel_entries_per_block::<BLOCK, KEY_MAX>();
+    if per_block == 0 {
+        return u64::MAX;
+    }
+    entries.div_ceil(per_block)
 }
 
 /// Reads one block; the closure-free form keeps the borrow checker happy
@@ -975,12 +1236,16 @@ fn parse_head_at<E, const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usi
     Ok(true)
 }
 
-/// Positions a cursor on its table's first entry. A table with no data
-/// blocks parks exhausted.
+/// Positions a cursor on its table's first *live* entry: the first entry
+/// at or above the table's `first_key`, which a compaction commit may have
+/// raised past a prefix it already merged (see
+/// [`Manifest::narrow_table`](crate::manifest::Manifest::narrow_table)). A
+/// table with no data blocks, or none at or above the bound, parks
+/// exhausted.
 ///
 /// The data section leads the table (`[data]* [rdel]* [bloom] [index]
 /// [footer]`), so the cursor's block window is `[first_block, first_block +
-/// data_blocks)`.
+/// data_blocks)`. The starting block comes from the table's index.
 ///
 /// `raw` is the caller's shared physical-read scratch, lent to
 /// [`read_data_block`] for the fill.
@@ -1004,12 +1269,31 @@ pub(crate) async fn init_cursor<
     if data_blocks == 0 {
         return Ok(());
     }
-    read_data_block(device, raw, cur, 0).await?;
+    // The first data block whose key range can reach the bound.
+    let floor = tref.first_key.as_slice();
+    let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
+    let index_id = sstable::footer_index_block(device, None, tref.id, raw, footer).await?;
+    read_block_into(device, index_id, raw).await?;
+    sstable::check_block_crc(raw, index_id)?;
+    let payload_end = BLOCK - sstable::CRC_LEN;
+    let start = match sstable::index_lookup::<D::Error>(&raw[..payload_end], floor, index_id)? {
+        Some((id, _)) => id
+            .checked_sub(cur.first_block)
+            .filter(|&i| i < data_blocks)
+            .ok_or(Error::CorruptBlock { id: index_id })?,
+        None => 0,
+    };
+    read_data_block(device, raw, cur, start).await?;
     if !parse_head_at(cur, 0)? {
         // The writer never emits an empty data block.
         return Err(Error::CorruptBlock {
             id: cur.first_block,
         });
+    }
+    // Skip the dead prefix below the bound (at most the rest of the
+    // starting block plus whatever the index could not rule out).
+    while cur.live && &cur.key[..cur.key_len] < floor {
+        advance_cursor(device, raw, cur).await?;
     }
     Ok(())
 }
@@ -1220,10 +1504,14 @@ mod tests {
         bottommost: bool,
         oldest_snapshot: u64,
     ) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
-        let mut merger = RdelMerger::<256>::new(inputs, bottommost, oldest_snapshot);
+        let mut merger = RdelMerger::<256>::new(inputs, 0, false, bottommost, oldest_snapshot);
         let mut raw = [0u8; BLOCK];
         let mut out = Vec::new();
-        while block_on(merger.next_merged(dev, &mut raw)).unwrap() {
+        let none = TargetView {
+            level: &[],
+            ids: &[],
+        };
+        while block_on(merger.next_merged(dev, &mut raw, &none)).unwrap() {
             let e = merger.current_entry();
             out.push((e.start.to_vec(), e.end.to_vec(), e.seq));
         }
@@ -1256,6 +1544,29 @@ mod tests {
                 (b"m".to_vec(), b"t".to_vec(), 5),
             ]
         );
+    }
+
+    #[test]
+    fn rdel_merge_never_drops_the_newer_of_identical_ranges_arriving_oldest_first() {
+        // A compaction output whose pieces were clipped up to its lower
+        // bound holds ties on `start` in the order of their original
+        // starts, which can be oldest first: here [k,p)@285 then [k,p)@355.
+        // Bottommost with every snapshot newer, identical ranges may fold —
+        // but only the *older* may go. Dropping @355 as "shadowed" by the
+        // earlier-emitted @285 resurrected every version between the two
+        // sequences (found by the tight-slot lifecycle fuzzer).
+        let mut dev = TestDevice::<4096>::new();
+        let t = write_section(&mut dev, 10, &[(b"k", b"p", 285), (b"k", b"p", 355)]);
+        let got = run_merge(&dev, &[input(&t)], true, 474);
+        assert!(
+            got.iter()
+                .any(|(s, e, q)| s == b"k" && e == b"p" && *q == 355),
+            "the newer tombstone was dropped: {got:?}"
+        );
+        // In the usual order (newest first) the older one does fold away.
+        let t = write_section(&mut dev, 30, &[(b"k", b"p", 355), (b"k", b"p", 285)]);
+        let got = run_merge(&dev, &[input(&t)], true, 474);
+        assert_eq!(got, vec![(b"k".to_vec(), b"p".to_vec(), 355)]);
     }
 
     #[test]
@@ -1387,37 +1698,73 @@ mod tests {
     }
 
     #[test]
-    fn rdel_counter_matches_writer_block_for_block() {
-        // The dry-run budget must equal the real writer's block count on
-        // the same entry sequence, including multi-block packing.
-        let mut dev = TestDevice::<64>::new();
-        let entries: Vec<(Vec<u8>, Vec<u8>, u64)> = (0u8..25)
-            .map(|i| (vec![b'a' + i % 26, b'0' + i / 26], vec![b'z'], u64::from(i)))
-            .collect();
-        let mut counter = sstable::RdelCounter::<64>::new();
-        for (s, e, q) in &entries {
-            counter.push(sstable::RdelEntry {
-                start: s,
-                end: e,
-                seq: *q,
-            });
+    fn rdel_blocks_bound_covers_the_writer() {
+        // `rdel_blocks_bound` must never undercount what the writer packs,
+        // for any mix of entry sizes up to the maximum (12 + 2 * KEY_MAX).
+        // 64-byte blocks and KEY_MAX = 8: at most 28-byte entries, two per
+        // block.
+        assert_eq!(sstable::rdel_entries_per_block::<64, 8>(), 2);
+        let mut rng = 7u64;
+        for n in 0u8..30 {
+            let mut dev = TestDevice::<64>::new();
+            let mut w = sstable::RdelWriter::<64>::new(200);
+            for i in 0..n {
+                rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let sl = 1 + usize::try_from(rng >> 61).unwrap(); // 1..=8
+                let el = 1 + usize::try_from((rng >> 58) & 7).unwrap();
+                let start = vec![b'a'.wrapping_add(i); sl];
+                let end = vec![b'z'; el];
+                block_on(w.push(
+                    &mut dev,
+                    sstable::RdelEntry {
+                        start: &start,
+                        end: &end,
+                        seq: u64::from(i),
+                    },
+                ))
+                .unwrap();
+            }
+            let written = block_on(w.finish(&mut dev)).unwrap();
+            let bound = rdel_blocks_bound::<64, 8>(u64::from(n));
+            assert!(
+                u64::from(written) <= bound,
+                "{n} entries: {written} > {bound}"
+            );
         }
-        let budgeted = counter.finish();
+        // Maximum-size entries meet the bound exactly.
+        let mut dev = TestDevice::<64>::new();
         let mut w = sstable::RdelWriter::<64>::new(200);
-        for (s, e, q) in &entries {
+        for i in 0..5u8 {
             block_on(w.push(
                 &mut dev,
                 sstable::RdelEntry {
-                    start: s,
-                    end: e,
-                    seq: *q,
+                    start: &[i; 8],
+                    end: &[0xFF; 8],
+                    seq: u64::from(i),
                 },
             ))
             .unwrap();
         }
-        let written = block_on(w.finish(&mut dev)).unwrap();
-        assert_eq!(budgeted, written);
-        assert!(written > 1);
+        assert_eq!(u64::from(block_on(w.finish(&mut dev)).unwrap()), 3);
+        assert_eq!(rdel_blocks_bound::<64, 8>(5), 3);
+        assert_eq!(rdel_blocks_bound::<64, 8>(0), 0);
+    }
+
+    #[test]
+    fn rdel_writer_refuses_to_pass_its_block_limit() {
+        let mut dev = TestDevice::<64>::new();
+        let mut w = sstable::RdelWriter::<64>::new(200).with_block_limit(1);
+        let e = |i: u8| sstable::RdelEntry {
+            start: &[b'a'; 8],
+            end: &[b'z'; 8],
+            seq: u64::from(i),
+        };
+        block_on(w.push(&mut dev, e(0))).unwrap();
+        block_on(w.push(&mut dev, e(1))).unwrap();
+        // The third entry would seal block 0 and open block 1: allowed.
+        block_on(w.push(&mut dev, e(2))).unwrap();
+        // Sealing block 1 would pass the limit.
+        assert!(matches!(block_on(w.finish(&mut dev)), Err(Error::NoSpace)));
     }
 
     #[test]

@@ -1,30 +1,73 @@
-//! Compaction: job selection, the bounded merge step, and its commit.
+//! Compaction: job selection, the bounded merge step, and its commits.
+//!
+//! A job moves data from a *source* level down to the *target* level below
+//! it: all of L0, or one table of a deeper level, merged with every target
+//! table its key range overlaps. The target tables are disjoint and sorted,
+//! so one concatenating cursor reads any number of them; the sources get a
+//! cursor each (L0 holds at most `TABLES < COMPACTION_KMAX` tables).
+//!
+//! The merge writes a *sequence* of output tables, each in its own table
+//! slot, ending each at a key boundary when the next key might not fit
+//! (see `Compaction::should_split`). Each output commits as soon as it is
+//! sealed, in one manifest write that also settles every input against the
+//! output's last key `k`: an input whose whole range lies at or below `k`
+//! retires (its slot is freed), and an input straddling `k` has its live
+//! lower bound raised past `k` ([`Manifest::narrow_table`]), so the prefix
+//! it shares with the committed outputs is read only from them. Every
+//! commit therefore leaves a consistent, disjoint, readable tree; a job
+//! needs only the slot of the output it is writing plus room for the
+//! sources' data, and a job cut short (crash, abort, no slot left) keeps
+//! what it committed — the next select merges on from there.
+//!
+//! A source table that overlaps nothing below and fills at least three
+//! quarters of a slot is *moved* down by a manifest edit instead of being
+//! rewritten. A smaller table merges instead, absorbing a small neighbour at either edge
+//! of its range, so appends consolidate into full tables rather than
+//! filling the tree with one tiny table per flush.
+//!
+//! [`Manifest::narrow_table`]: crate::manifest::Manifest::narrow_table
 
 use super::{Db, MAX_SNAPSHOTS};
 use crate::cache::CachePort;
 use crate::compact::{
-    COMPACTION_KMAX, Compaction, Input, MergeOutcome, Progress, State, init_cursor, ranges_overlap,
+    Compaction, Input, MergeOutcome, Progress, RdelMerger, RdelStats, State, TargetView,
+    count_rdel_merge, init_cursor, ranges_overlap, rdel_blocks_bound,
 };
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, TableRef};
-use crate::sstable;
-/// The tables one compaction job merges, chosen by `compact_select`.
-struct JobInputs<const KEY_MAX: usize> {
-    /// Total input tables pushed into the scratch.
-    n_inputs: usize,
-    /// Of those, how many came from the target level.
-    n_tgt_inputs: usize,
-    /// Merged key-range closure over all inputs.
-    first: KeyBound<KEY_MAX>,
-    last: KeyBound<KEY_MAX>,
-    /// Summed entry counts (for the bloom filter sizing).
-    total_entries: u64,
-    /// Summed data blocks, excluding each table's rdel blocks and the 3
-    /// framing blocks (for the output run reservation). The merged rdel
-    /// section gets its own exact budget from a dry-run pass; see
-    /// `count_rdel_merge`.
-    total_data: u64,
+use crate::sstable::{self, RdelEntry};
+
+/// What `compact_select` decided.
+enum Selected {
+    /// No level is full: nothing to do.
+    Idle,
+    /// A table moved down a level by a manifest edit alone.
+    Moved,
+    /// A merge job is set up in the scratch.
+    Merging,
+}
+
+/// Clips a merged range tombstone to an output's key range `[lo, hi)`
+/// (either side open when `None`); `None` when nothing is left.
+fn clip<'a, const KEY_MAX: usize>(
+    e: RdelEntry<'a>,
+    lo: Option<&'a KeyBound<KEY_MAX>>,
+    hi: Option<&'a KeyBound<KEY_MAX>>,
+) -> Option<RdelEntry<'a>> {
+    let start = match lo {
+        Some(lo) if lo.as_slice() > e.start => lo.as_slice(),
+        _ => e.start,
+    };
+    let end = match hi {
+        Some(hi) if hi.as_slice() < e.end => hi.as_slice(),
+        _ => e.end,
+    };
+    (start < end).then_some(RdelEntry {
+        start,
+        end,
+        seq: e.seq,
+    })
 }
 
 impl<
@@ -41,58 +84,91 @@ impl<
 > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
     /// Reports whether [`compact_step`](Db::compact_step) would select a
-    /// compaction job right now: some level below the top holds `>= TABLES`
-    /// tables. Unlike [`Progress::Done`], which a finished job also
+    /// compaction job right now: some level above the bottom holds
+    /// `>= TABLES` tables, or the table region is down to its compaction
+    /// reserve while L0 holds two or more tables (merging them frees
+    /// slots). Unlike [`Progress::Done`], which a finished job also
     /// returns, this distinguishes "a job just finished, more may be
     /// pending" from "nothing to do" — firmware idle loops and test
     /// drivers use it to decide whether another `compact_step` is
     /// worthwhile.
     #[must_use]
     pub fn compaction_pending(&self) -> bool {
-        if LEVELS < 2 || TABLES == 0 {
-            return false;
+        self.full_level().is_some()
+    }
+
+    /// True when flush and ingest are down to the compaction reserve: the
+    /// next table would eat into the headroom compaction keeps.
+    const fn under_pressure(&self) -> bool {
+        self.slots.free_slots() + self.slots.reserved_slots() <= Self::COMPACTION_RESERVE
+    }
+
+    /// Whether level `l` (above the bottom) wants a job: it is full, or the
+    /// region is under pressure and the level has something to push down —
+    /// any table of an intermediate level (merging it into the level below
+    /// collapses overwritten versions and frees slots), or two L0 tables.
+    fn wants_job(&self, l: usize, pressure: bool) -> bool {
+        let n = self.manifest.level(l).map_or(0, <[_]>::len);
+        n >= TABLES || (pressure && n >= if l == 0 { 2 } else { 1 })
+    }
+
+    /// The level the next job drains: the deepest level above the bottom
+    /// holding `>= TABLES` tables. The bottom level has no table cap: it
+    /// grows into whatever slots the levels above leave free.
+    ///
+    /// Region pressure also selects a level: once flush is down to the
+    /// compaction reserve, levels below their trigger would otherwise hold
+    /// stale versions (and L0 its partial fill) forever while every flush
+    /// is refused. Under pressure the deepest intermediate level with a
+    /// table is pushed down, then L0 once it holds two tables. Every such
+    /// job moves data strictly deeper, so the chain ends.
+    fn full_level(&self) -> Option<usize> {
+        if LEVELS < 2 {
+            return None;
         }
-        for lvl in (0..LEVELS - 1).rev() {
-            if let Some(tables) = self.manifest.level(lvl)
-                && tables.len() >= TABLES
-            {
-                return true;
-            }
-        }
-        false
+        (0..LEVELS - 1)
+            .rev()
+            .find(|&l| self.wants_job(l, false))
+            .or_else(|| {
+                let pressure = self.under_pressure();
+                (0..LEVELS - 1).rev().find(|&l| self.wants_job(l, pressure))
+            })
     }
 
     /// Runs one bounded compaction step using the caller's `scratch`.
     ///
     /// When some level is full, the first call selects a job for the
-    /// deepest full level — all of L0, or the oldest table of a deeper
-    /// level — plus the overlapping tables of the level below, and merges
-    /// them one output block per call ([`Progress::More`]); the call that
-    /// exhausts the merge seals the output table and commits the manifest
-    /// atomically, returning [`Progress::Done`]. With no full level this
+    /// deepest full level — all of L0, or one table of a deeper level (the
+    /// one overlapping the fewest tables below) — plus the overlapping
+    /// tables of the level below. A table that overlaps nothing below and
+    /// fills at least three quarters of a slot moves down without being
+    /// rewritten, and the call returns [`Progress::Done`]. Otherwise each call merges
+    /// until one output block seals ([`Progress::More`]); a full output
+    /// ends at a key boundary and the next one begins in a fresh slot,
+    /// with progress committed whenever the outputs so far cover a whole
+    /// target table. The call that exhausts the merge commits the rest
+    /// atomically and returns [`Progress::Done`]. With no full level this
     /// is a no-op returning [`Progress::Done`]. Note `Done` is returned in
-    /// both cases, so `while db.compact_step(&mut scratch).await? ==
+    /// every case, so `while db.compact_step(&mut scratch).await? ==
     /// Progress::More {}` drives exactly one job; loop on
     /// [`compaction_pending`](Db::compaction_pending) to drain every
     /// pending job.
     ///
-    /// The scratch is reusable across jobs and droppable mid-job: partial
-    /// output is invisible until the manifest commit, and its reserved
-    /// slot is released when the next `compact_step` (with any scratch)
-    /// abandons the stale job. One job runs at a time; a scratch whose job
-    /// was abandoned (another scratch started one, or an archive or ingest
-    /// aborted it) resets itself on its next step.
+    /// The scratch is reusable across jobs and droppable mid-job: output
+    /// not yet committed is invisible, and its reserved slots are released
+    /// when the next `compact_step` (with any scratch) abandons the stale
+    /// job. One job runs at a time; a scratch whose job was abandoned
+    /// (another scratch started one, or an archive or ingest aborted it)
+    /// resets itself on its next step.
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the job would exceed [`COMPACTION_KMAX`]
-    /// inputs, no output slot is free (or the slot cannot fit the merge), or the target level cannot
-    /// absorb the output table (a full bottommost level the merge does not
-    /// drain into — raised at select time, before any merge I/O);
-    /// [`Error::CorruptBlock`] on a torn input table (compaction never
-    /// silently drops entries); [`Error::Device`] on I/O failure. A failed
-    /// step resets the scratch; the device manifest is untouched, so the
-    /// job can be reselected later.
+    /// [`Error::NoSpace`] when no table slot is free for the next output,
+    /// or a slot cannot hold the job's range-tombstone budget plus one
+    /// key's versions; [`Error::CorruptBlock`] on a torn input table
+    /// (compaction never silently drops entries); [`Error::Device`] on I/O
+    /// failure. A failed step abandons the job: progress already committed
+    /// stays, and the next step selects afresh.
     pub async fn compact_step(
         &mut self,
         scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -100,40 +176,57 @@ impl<
         self.ensure_open()?;
         // A scratch whose job is no longer the active one (another scratch
         // selected a job, or the job was aborted) must not touch the
-        // device: its reservation is gone.
+        // device: its reservations are gone.
         if scratch.state != State::Idle && (!self.job_active || scratch.job_gen != self.job_gen) {
             scratch.reset();
         }
-        if scratch.state == State::Idle {
+        let step = if scratch.state == State::Idle {
             // One job at a time: a job some other scratch left behind
             // is abandoned.
             self.abort_job();
             match self.compact_select(scratch).await {
-                Ok(true) => {}
-                Ok(false) => return Ok(Progress::Done),
-                Err(e) => {
-                    self.abort_job();
-                    scratch.reset();
-                    return Err(e);
-                }
+                Ok(Selected::Idle | Selected::Moved) => return Ok(Progress::Done),
+                Ok(Selected::Merging) => self.compact_advance(scratch).await,
+                Err(e) => Err(e),
             }
-        }
-        let outcome = match scratch.merge_step(self.wal.device_mut()).await {
-            Ok(o) => o,
-            Err(e) => {
-                self.abort_job();
-                scratch.reset();
-                return Err(e);
-            }
+        } else {
+            self.compact_advance(scratch).await
         };
+        if step.is_err() {
+            self.abort_job();
+            scratch.reset();
+        }
+        step
+    }
+
+    /// One merge quantum of the active job, plus whatever it triggers: a
+    /// full output is sealed, progress committed, and the next output
+    /// opened; an exhausted merge is sealed and committed in full.
+    async fn compact_advance(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<Progress, Error<D::Error>> {
+        let tgt_level = self.manifest.level(c.target_level).unwrap_or(&[]);
+        let outcome = c.merge_step(self.wal.device_mut(), tgt_level).await?;
         match outcome {
             MergeOutcome::More => Ok(Progress::More),
-            MergeOutcome::Exhausted => {
-                if let Err(e) = self.compact_commit(scratch).await {
-                    self.abort_job();
-                    scratch.reset();
-                    return Err(e);
+            MergeOutcome::Split => {
+                let out = self.compact_seal_output(c, false).await?;
+                self.compact_commit(c, out, false).await?;
+                if self.compact_open_output(c).is_err() {
+                    // No slot for the next output: the job ends here, with
+                    // everything up to the last output committed. The next
+                    // select merges on from the narrowed inputs.
+                    self.job_active = false;
+                    self.job_inputs = 0;
+                    c.reset();
+                    return Ok(Progress::Done);
                 }
+                Ok(Progress::More)
+            }
+            MergeOutcome::Exhausted => {
+                let out = self.compact_seal_output(c, true).await?;
+                self.compact_commit(c, out, true).await?;
                 Ok(Progress::Done)
             }
         }
@@ -159,37 +252,6 @@ impl<
         (sorted, n)
     }
 
-    /// Selects the next compaction job into `scratch`: the deepest full
-    /// level's tables (all of L0, or the oldest table of a deeper level)
-    /// plus the target level's overlapping tables. Returns `false` when no
-    /// level is full and there is no work.
-    /// Counts the output table's range-tombstone section with a dry-run of
-    /// the rdel merge. A sorted cross-input merge is not a subsequence of
-    /// the concatenation, so greedy repacking can use a different block
-    /// count than the inputs' rdel blocks (more or fewer); only an exact
-    /// count is reservation-safe. The write pass replays the same
-    /// deterministic merge over the immutable input sections, so the
-    /// budget always matches. The select-time oldest snapshot pins both
-    /// passes: a snapshot taken mid-compaction always has a seq above
-    /// every version being merged.
-    async fn count_output_rdel(
-        &mut self,
-        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
-        job: &JobInputs<KEY_MAX>,
-        bottommost: bool,
-        oldest_snapshot: u64,
-    ) -> Result<u32, Error<D::Error>> {
-        let device = self.wal.device_mut();
-        crate::compact::count_rdel_merge(
-            &*device,
-            &c.inputs[..job.n_inputs],
-            &mut c.raw,
-            bottommost,
-            oldest_snapshot,
-        )
-        .await
-    }
-
     /// Reports whether a compaction output at `tgt` covering
     /// `[first, last]` is bottommost: tombstones drop only when the output
     /// reaches the bottommost level holding the merged range, because
@@ -213,330 +275,528 @@ impl<
         true
     }
 
-    /// Lowest sequence that a table outside the job's first `n_inputs`
-    /// inputs, or the memtable, could hold for a key in `[first, last]`:
-    /// the floor below which the job may drop a tombstone. Tables at every
-    /// level count — a re-ingested table at L0 can be older than
-    /// tombstones below it.
+    /// Lowest sequence that a table outside the job, or the memtable, could
+    /// hold for a key in `[first, last]`: the floor below which the job may
+    /// drop a tombstone. Tables at every level count — a re-ingested table
+    /// at L0 can be older than tombstones below it.
     fn outside_min_seq(
         &self,
         c: &Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
-        n_inputs: usize,
         first: KeyBound<KEY_MAX>,
         last: KeyBound<KEY_MAX>,
     ) -> u64 {
         let mut floor = self.table.min_seq();
-        for lvl in 0..LEVELS {
-            for t in self.manifest.level(lvl).unwrap_or(&[]) {
-                let in_job = c.inputs[..n_inputs].iter().any(|i| i.tref.id == t.id);
-                if !in_job && ranges_overlap(first, last, t.first_key, t.last_key) {
-                    floor = floor.min(t.min_seq);
-                }
+        for t in self.manifest.tables() {
+            let in_job = c.inputs[..c.n_src].iter().any(|i| i.tref.id == t.id)
+                || c.tgt[..c.n_tgt].contains(&t.id);
+            if !in_job && ranges_overlap(first, last, t.first_key, t.last_key) {
+                floor = floor.min(t.min_seq);
             }
         }
         floor
     }
 
+    /// Whether table `t` fills less than three quarters of a slot: worth
+    /// consolidating with a neighbour rather than moving down as is. The
+    /// threshold trades rewriting for density: appends grow their newest
+    /// table until it crosses it, so slots end up at least three quarters
+    /// full, at the cost of rewriting that table once per L0 job.
+    fn is_small(&self, t: &TableRef<KEY_MAX>) -> bool {
+        u64::from(t.block_count).saturating_mul(4) < self.slots.slot_blocks().saturating_mul(3)
+    }
+
+    /// The target-level run `[a, b)` of tables overlapping `[first, last]`.
+    /// Target tables are disjoint and sorted, so the overlapping ones are
+    /// contiguous, and widening the range to cover them cannot reach any
+    /// further table.
+    fn overlap_run(
+        tables: &[TableRef<KEY_MAX>],
+        first: KeyBound<KEY_MAX>,
+        last: KeyBound<KEY_MAX>,
+    ) -> (usize, usize) {
+        let a = tables.partition_point(|t| t.last_key.as_slice() < first.as_slice());
+        let mut b = a;
+        while b < tables.len()
+            && ranges_overlap(first, last, tables[b].first_key, tables[b].last_key)
+        {
+            b += 1;
+        }
+        (a, b)
+    }
+
+    /// Data an output table holds, in blocks: its slot minus bloom, index,
+    /// and footer, minus the split margin (a key may need a block more).
+    fn output_capacity(&self) -> u64 {
+        self.slots.slot_blocks().saturating_sub(5).max(1)
+    }
+
+    /// Free slots a merge over sources holding `src_data` blocks needs: the
+    /// output it writes, plus room for the sources' data, which drains
+    /// into committed outputs before the sources retire (targets retire as
+    /// the merge passes them, freeing a slot per slot they fill).
+    fn job_need(&self, src_data: u64) -> u64 {
+        1 + src_data.div_ceil(self.output_capacity())
+    }
+
+    /// Selects the next compaction job into `c`, or moves a table down
+    /// outright. See [`compact_step`](Db::compact_step) for the policy.
+    ///
+    /// Candidates are the full levels, deepest first, then the levels
+    /// region pressure wants (see `full_level`). A merge is admitted only
+    /// when the free slots cover its need (`job_need`); an L0 job shrinks
+    /// to its oldest tables to fit, and a level whose job does not fit
+    /// yields to the next candidate.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when some level wants compaction but no job fits
+    /// the free slots: the region is full.
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
-    ) -> Result<bool, Error<D::Error>> {
-        // v0.8: every level compacts. The deepest full level is selected
-        // first, so a job's target always has room: a full non-bottom
-        // target would have been selected itself.
-        if LEVELS < 2 || TABLES == 0 {
-            return Ok(false);
+    ) -> Result<Selected, Error<D::Error>> {
+        if LEVELS < 2 {
+            return Ok(Selected::Idle);
         }
-        let mut src = LEVELS;
-        for lvl in (0..LEVELS - 1).rev() {
-            let tables = self.manifest.level(lvl).ok_or(Error::NoSpace)?;
-            if tables.len() >= TABLES {
-                src = lvl;
+        let pressure = self.under_pressure();
+        let mut wanted = false;
+        // Full levels first, deepest first; then, under pressure, the
+        // levels pressure wants.
+        for pass in [false, true] {
+            if pass && !pressure {
                 break;
             }
-        }
-        if src >= LEVELS - 1 {
-            return Ok(false);
-        }
-        let tgt = src + 1;
-        // Copy the refs so the manifest borrow ends before the scratch and
-        // the device are touched.
-        let mut src_refs = [TableRef::EMPTY; TABLES];
-        let mut tgt_refs = [TableRef::EMPTY; TABLES];
-        let (src_take, tgt_len, tgt_take) = {
-            let manifest = &self.manifest;
-            let s = manifest.level(src).ok_or(Error::NoSpace)?;
-            let t = manifest.level(tgt).ok_or(Error::NoSpace)?;
-            let st = s.len().min(TABLES);
-            let tt = t.len().min(TABLES);
-            src_refs[..st].copy_from_slice(&s[..st]);
-            tgt_refs[..tt].copy_from_slice(&t[..tt]);
-            (st, t.len(), tt)
-        };
-
-        let job =
-            Self::select_job_inputs(c, src, &src_refs[..src_take], tgt, &tgt_refs[..tgt_take])?;
-        // The target absorbs the output table: it must fit once the
-        // overlapping inputs leave. Checked here — before any merge I/O —
-        // instead of failing at commit.
-        if tgt_len - job.n_tgt_inputs + 1 > TABLES {
-            return Err(Error::NoSpace);
-        }
-        let bottommost = self.is_bottommost_output(tgt, job.first, job.last);
-        let outside_min_seq = self.outside_min_seq(c, job.n_inputs, job.first, job.last);
-        // The output's range-tombstone section is fully determined by the
-        // inputs, so its exact block budget is counted first with a
-        // dry-run of the merge. A sorted cross-input merge is not a
-        // subsequence of the concatenation, so greedy repacking can use a
-        // different block count than the inputs' rdel blocks (more or
-        // fewer); only an exact count is reservation-safe. The write pass
-        // replays the same deterministic merge over the immutable input
-        // sections, so the budget always matches (debug-asserted below).
-        // The select-time oldest snapshot pins both passes: a snapshot
-        // taken mid-compaction always has a seq above every version being
-        // merged.
-        let oldest_snapshot = self.oldest_snapshot_seq();
-        let rdel_budget = self
-            .count_output_rdel(c, &job, bottommost, oldest_snapshot)
-            .await?;
-        // Reserve the output slot. The job spans many `compact_step`
-        // calls; the reservation keeps flushes in between from taking the
-        // slot. The rdel section gets its exact counted budget and the 3
-        // framing blocks theirs; the data section gets the rest of the
-        // slot, and the writer's block limit enforces it.
-        let data_budget = self
-            .slots
-            .slot_blocks()
-            .checked_sub(u64::from(rdel_budget))
-            .and_then(|n| n.checked_sub(3))
-            .filter(|&n| n > 0)
-            .ok_or(Error::NoSpace)?;
-        let out_slot = self.slots.reserve().ok_or(Error::NoSpace)?;
-        self.job_active = true;
-        self.job_gen = self.job_gen.wrapping_add(1);
-        self.job_inputs = 0;
-        for input in &c.inputs[..job.n_inputs] {
-            if let Some(slot) = self.slot_of(&input.tref) {
-                self.job_inputs |= 1u64 << slot;
+            for src in (0..LEVELS - 1).rev() {
+                if !self.wants_job(src, pass) || (pass && self.wants_job(src, false)) {
+                    continue;
+                }
+                wanted = true;
+                if let Some(sel) = self.try_select(c, src).await? {
+                    return Ok(sel);
+                }
             }
         }
-        c.job_gen = self.job_gen;
-        c.out_slot = out_slot;
-        c.out_base = self.slots.slot_base(out_slot);
+        if wanted {
+            Err(Error::NoSpace)
+        } else {
+            Ok(Selected::Idle)
+        }
+    }
+
+    /// Selects a job draining level `src` into `c`, or moves a table down
+    /// outright; `None` when the merge would not fit the free slots.
+    async fn try_select(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        src: usize,
+    ) -> Result<Option<Selected>, Error<D::Error>> {
+        let tgt = src + 1;
+        let free = u64::from(self.slots.free_slots());
+        let (src_tables, tgt_tables) = (
+            self.manifest.level(src).unwrap_or(&[]),
+            self.manifest.level(tgt).unwrap_or(&[]),
+        );
+        let data = |t: &TableRef<KEY_MAX>| u64::from(t.block_count).saturating_sub(3);
+        // Sources: L0's oldest tables — all of them when the slots allow —
+        // or the one table of a deeper level whose range overlaps the
+        // fewest target tables (ties to the lowest key), the cheapest to
+        // push down.
+        c.reset();
+        let mut src_data = 0u64;
+        if src == 0 {
+            for t in src_tables {
+                let d = src_data + data(t);
+                if c.n_src > 0 && self.job_need(d) > free {
+                    break;
+                }
+                c.inputs[c.n_src] = Input { level: 0, tref: *t };
+                c.n_src += 1;
+                src_data = d;
+            }
+        } else {
+            let pick = src_tables
+                .iter()
+                .min_by_key(|t| {
+                    let (a, b) = Self::overlap_run(tgt_tables, t.first_key, t.last_key);
+                    b - a
+                })
+                .copied()
+                .ok_or(Error::CorruptManifest)?;
+            c.inputs[0] = Input {
+                level: src,
+                tref: pick,
+            };
+            c.n_src = 1;
+            src_data = data(&pick);
+        }
+        let mut first = c.inputs[0].tref.first_key;
+        let mut last = c.inputs[0].tref.last_key;
+        for input in &c.inputs[1..c.n_src] {
+            first = first.min(input.tref.first_key);
+            last = last.max(input.tref.last_key);
+        }
+        let (mut a, mut b) = Self::overlap_run(tgt_tables, first, last);
+        if src > 0 && a == b && !self.is_small(&c.inputs[0].tref) {
+            // Nothing below overlaps and the table is worth keeping whole:
+            // re-parent it with one manifest edit, no data rewritten.
+            let tref = c.inputs[0].tref;
+            c.reset();
+            let mut staged = self.manifest;
+            staged.remove_table_from_level::<D::Error>(src, tref.id)?;
+            staged.add_table_to_level::<D::Error>(tgt, tref)?;
+            staged.raise_seq_high(self.next_seq);
+            let mut scratch = [0u8; BLOCK];
+            let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+            staged
+                .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
+                .await?;
+            self.manifest = staged;
+            return Ok(Some(Selected::Moved));
+        }
+        if self.job_need(src_data) > free {
+            c.reset();
+            return Ok(None);
+        }
+        // Consolidation: a small neighbour just outside either edge of
+        // the run joins the job, so small tables merge into full ones
+        // instead of each holding a slot forever. The neighbour is
+        // adjacent in key order, so the widened range swallows no other
+        // table.
+        if a > 0 && self.is_small(&tgt_tables[a - 1]) {
+            a -= 1;
+        }
+        if b < tgt_tables.len() && self.is_small(&tgt_tables[b]) {
+            b += 1;
+        }
+        for (k, t) in tgt_tables[a..b].iter().enumerate() {
+            c.tgt[k] = t.id;
+            first = first.min(t.first_key);
+            last = last.max(t.last_key);
+        }
+        c.n_tgt = b - a;
+        self.compact_start(c, tgt, first, last).await?;
+        Ok(Some(Selected::Merging))
+    }
+
+    /// Sets up the merge for the inputs `compact_select` chose: the
+    /// tombstone-drop gates, the snapshot keep-set, the per-output budgets,
+    /// the first output's slot, and the input cursors.
+    async fn compact_start(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        tgt: usize,
+        first: KeyBound<KEY_MAX>,
+        last: KeyBound<KEY_MAX>,
+    ) -> Result<(), Error<D::Error>> {
         c.target_level = tgt;
-        c.bottommost = bottommost;
-        c.outside_min_seq = outside_min_seq;
+        // The first output's range tombstones are clipped to the job's
+        // range: an input's range-tombstone section can reach below its
+        // live lower bound (the part a past job already merged).
+        c.out_lo = first;
+        c.bottommost = self.is_bottommost_output(tgt, first, last);
+        c.outside_min_seq = self.outside_min_seq(c, first, last);
         // The version-retention set: snapshots live at select time pin this
-        // compaction's keep-set. Watermarks are stored descending so the
-        // merge can walk its thresholds (live view, then each snapshot) in
+        // job's keep-set. Watermarks are stored descending so the merge
+        // can walk its thresholds (live view, then each snapshot) in
         // order. A snapshot taken mid-compaction always has a seq above
-        // every version being merged, so the select-time set is exactly the
-        // history that needs protection.
+        // every version being merged, so the select-time set is exactly
+        // the history that needs protection.
         let (sorted, n) = self.sorted_snapshot_watermarks();
         c.snapshots = sorted;
         c.n_snapshots = n;
-        c.oldest_snapshot = oldest_snapshot;
-        c.n_inputs = job.n_inputs;
-        c.rdel_blocks = rdel_budget;
-        // The data section leads the output slot; the range-tombstone
-        // section follows it and is written at commit. The writer's block
-        // limit is the slot's data budget: a merge that would need more
-        // blocks fails with `NoSpace` instead of writing past the slot.
-        c.writer = sstable::TableWriter::new(
-            c.out_base,
-            sstable::bloom_k(BLOOM_BYTES * 8, job.total_entries),
-        )
-        .with_block_limit(data_budget);
-        // Position one cursor per input on its first entry.
-        let device = self.wal.device_mut();
-        for i in 0..job.n_inputs {
+        c.oldest_snapshot = self.oldest_snapshot_seq();
+        // Every output reserves room for its share of the merged
+        // range-tombstone section. A dry run counts the merged entries;
+        // an output's clipped share is at most that many, which bounds its
+        // blocks (`rdel_blocks_bound`).
+        let rdel_entries = {
+            let targets = TargetView {
+                level: self.manifest.level(tgt).unwrap_or(&[]),
+                ids: &c.tgt[..c.n_tgt],
+            };
+            count_rdel_merge(
+                self.wal.device(),
+                &c.inputs[..c.n_src],
+                &targets,
+                &mut c.raw,
+                c.bottommost,
+                c.oldest_snapshot,
+            )
+            .await?
+        };
+        let rdel_budget = rdel_blocks_bound::<BLOCK, KEY_MAX>(rdel_entries);
+        // The data section gets the rest of the slot. It must hold at
+        // least one key's worst case or no output could end.
+        let margin = Compaction::<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>::key_run_blocks(n);
+        let data_budget = self
+            .slots
+            .slot_blocks()
+            .checked_sub(rdel_budget)
+            .and_then(|d| d.checked_sub(3))
+            .filter(|&d| d >= margin)
+            .ok_or(Error::NoSpace)?;
+        c.split_margin = margin;
+        c.rdel_budget = u32::try_from(rdel_budget).map_err(|_| Error::NoSpace)?;
+        c.data_budget = data_budget;
+        // Bloom probes sized for one output's expected share of the
+        // entries.
+        let (mut entries, mut data) = (0u64, 0u64);
+        for t in c.inputs[..c.n_src].iter().map(|i| &i.tref).chain(
+            self.manifest
+                .level(tgt)
+                .unwrap_or(&[])
+                .iter()
+                .filter(|t| c.tgt[..c.n_tgt].contains(&t.id)),
+        ) {
+            entries = entries.saturating_add(u64::from(t.entry_count));
+            data = data.saturating_add(t.data_blocks().unwrap_or(0));
+        }
+        let per_output = entries.saturating_mul(data_budget) / data.max(1) + 1;
+        c.bloom_k = sstable::bloom_k(BLOOM_BYTES * 8, per_output.min(entries.max(1)));
+        // The job is live from here: its first output slot is reserved,
+        // and archiving any of its inputs aborts it.
+        self.job_active = true;
+        self.job_gen = self.job_gen.wrapping_add(1);
+        c.job_gen = self.job_gen;
+        self.job_inputs = 0;
+        for i in 0..c.n_src {
+            if let Some(slot) = self.slot_of(&c.inputs[i].tref) {
+                self.job_inputs |= 1u64 << slot;
+            }
+        }
+        for t in self.manifest.level(tgt).unwrap_or(&[]) {
+            if c.tgt[..c.n_tgt].contains(&t.id)
+                && let Some(slot) = self.slot_of(t)
+            {
+                self.job_inputs |= 1u64 << slot;
+            }
+        }
+        self.compact_open_output(c)?;
+        // Position one cursor per source, and the concatenating cursor on
+        // the first target with entries.
+        let device = self.wal.device();
+        for i in 0..c.n_src {
             let tref = c.inputs[i].tref;
-            init_cursor(&*device, &mut c.raw, &tref, &mut c.cursors[i]).await?;
+            init_cursor(device, &mut c.raw, &tref, &mut c.cursors[i]).await?;
         }
+        let tgt_level = self.manifest.level(tgt).unwrap_or(&[]);
+        c.open_next_target(device, tgt_level).await?;
         c.state = State::Merging;
-        Ok(true)
+        Ok(())
     }
 
-    /// Pushes one compaction job's input tables into the scratch: all of a
-    /// full L0, or the oldest table of a full deeper level, plus the target
-    /// level's tables overlapping the merged range. The merged range starts
-    /// as the source span and widens as overlapping target tables join, so
-    /// the output span can never swallow a surviving target table.
-    ///
-    /// `src_tables` is never empty: the caller only selects levels holding
-    /// `>= TABLES >= 1` tables.
-    fn select_job_inputs(
-        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
-        src: usize,
-        src_tables: &[TableRef<KEY_MAX>],
-        tgt: usize,
-        tgt_tables: &[TableRef<KEY_MAX>],
-    ) -> Result<JobInputs<KEY_MAX>, Error<D::Error>> {
-        let mut job = JobInputs {
-            n_inputs: 0,
-            n_tgt_inputs: 0,
-            first: src_tables[0].first_key,
-            last: src_tables[0].last_key,
-            total_entries: 0,
-            total_data: 0,
-        };
-        // Pushes one input table, widening the merged range and totals.
-        let mut push = |level: usize, t: &TableRef<KEY_MAX>| -> Result<(), Error<D::Error>> {
-            if job.n_inputs >= COMPACTION_KMAX {
-                return Err(Error::NoSpace);
-            }
-            c.inputs[job.n_inputs] = Input { level, tref: *t };
-            job.n_inputs += 1;
-            job.total_entries = job
-                .total_entries
-                .checked_add(u64::from(t.entry_count))
-                .ok_or(Error::NoSpace)?;
-            let rdel = u64::from(t.rdel_blocks);
-            let data = u64::from(t.block_count)
-                .checked_sub(rdel)
-                .ok_or(Error::CorruptBlock { id: t.first_block })?
-                .checked_sub(3)
-                .ok_or(Error::CorruptBlock { id: t.first_block })?;
-            job.total_data = job.total_data.checked_add(data).ok_or(Error::NoSpace)?;
-            Ok(())
-        };
-        if src == 0 {
-            // L0 tables may overlap each other, so the whole level joins.
-            for t in src_tables {
-                push(0, t)?;
-                if t.first_key.as_slice() < job.first.as_slice() {
-                    job.first = t.first_key;
-                }
-                if t.last_key.as_slice() > job.last.as_slice() {
-                    job.last = t.last_key;
-                }
-            }
-        } else {
-            // Deeper levels never overlap within themselves: compact the
-            // oldest table. Index 0 is FIFO with no extra state, because
-            // the picked table leaves the level.
-            push(src, &src_tables[0])?;
-        }
-        // Overlapping target tables join the merge (target runs never
-        // overlap each other, so range overlap is the exact join
-        // condition).
-        for t in tgt_tables {
-            if ranges_overlap(job.first, job.last, t.first_key, t.last_key) {
-                push(tgt, t)?;
-                job.n_tgt_inputs += 1;
-                if t.first_key.as_slice() < job.first.as_slice() {
-                    job.first = t.first_key;
-                }
-                if t.last_key.as_slice() > job.last.as_slice() {
-                    job.last = t.last_key;
-                }
-            }
-        }
-        Ok(job)
-    }
-
-    /// Commits the finished merge: seals the output table (unless the merge
-    /// produced no entries), swaps the input tables for it in a staged
-    /// manifest, and claims the output run after the commit lands.
-    async fn compact_commit(
+    /// Reserves a slot for the next output and points a fresh writer at it.
+    fn compact_open_output(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<(), Error<D::Error>> {
-        let mut scratch = [0u8; BLOCK];
-        let mut staged = self.manifest;
-        // Seal the output table first: data, then the range-tombstone
-        // section (a bounded k-way merge over the inputs' sorted rdel
-        // sections, see `RdelMerger`), then bloom/index/footer. The meta
-        // write flushes, so the blocks are durable before the manifest makes
-        // them visible. A merge that kept only range tombstones (no point
-        // entries) still seals a table — range-only tables are first-class
-        // (zero data blocks).
+        let slot = self.slots.reserve().ok_or(Error::NoSpace)?;
+        c.out_slot = slot;
+        c.out_base = self.slots.slot_base(slot);
+        // The writer's block limit is the data budget: a merge that would
+        // need more blocks fails with `NoSpace` instead of writing past
+        // the slot.
+        c.writer = sstable::TableWriter::new(c.out_base, c.bloom_k).with_block_limit(c.data_budget);
+        Ok(())
+    }
+
+    /// Seals the current output: its data section, then its share of the
+    /// merged range-tombstone section, then bloom, index, and footer (the
+    /// meta write flushes, so the blocks are durable before the commit
+    /// makes them visible). Returns the output's ref, or `None` — with its
+    /// slot released — when it ended up with neither entries nor range
+    /// tombstones.
+    ///
+    /// Range tombstones are clipped to the output's key range: from the
+    /// successor of the previous output's last key (the job's lower bound
+    /// for the first output) to the successor of this one's (unbounded for
+    /// the last output), so the outputs stay disjoint and every covered key
+    /// is covered by exactly the output holding it. A non-final output's
+    /// range therefore ends exactly at its last key.
+    async fn compact_seal_output(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        last_output: bool,
+    ) -> Result<Option<TableRef<KEY_MAX>>, Error<D::Error>> {
         let device = self.wal.device_mut();
         let data_blocks = c
             .writer
             .seal_data(&mut *device, Some(&mut c.compress))
             .await?;
+        let last_key = c.writer.last_key();
+        let hi = if last_output {
+            None
+        } else {
+            last_key.successor()
+        };
+        let lo = c.out_lo;
         let rdel_base = c.out_base.checked_add(data_blocks).ok_or(Error::NoSpace)?;
-        let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(rdel_base);
-        let mut rdel_stats = crate::compact::RdelStats::<KEY_MAX>::new();
+        let mut rdel_out =
+            sstable::RdelWriter::<BLOCK>::new(rdel_base).with_block_limit(c.rdel_budget);
+        let mut rdel_stats = RdelStats::<KEY_MAX>::new();
         {
-            let mut merger = crate::compact::RdelMerger::<KEY_MAX>::new(
-                &c.inputs[..c.n_inputs],
+            // Retired inputs lie behind this output's range (and their
+            // blocks may already hold other tables): only the live ones
+            // can reach it.
+            let targets = TargetView {
+                level: self.manifest.level(c.target_level).unwrap_or(&[]),
+                ids: &c.tgt[c.tgt_retired..c.n_tgt],
+            };
+            let mut merger = RdelMerger::<KEY_MAX>::new(
+                &c.inputs[..c.n_src],
+                c.src_retired,
+                !targets.ids.is_empty(),
                 c.bottommost,
                 c.oldest_snapshot,
             );
-            while merger.next_merged(&*device, &mut c.raw).await? {
-                let e = merger.current_entry();
-                rdel_out.push(&mut *device, e).await?;
-                rdel_stats.observe::<D::Error>(&e, rdel_base)?;
+            while merger.next_merged(&*device, &mut c.raw, &targets).await? {
+                if let Some(piece) = clip(merger.current_entry(), Some(&lo), hi.as_ref()) {
+                    rdel_out.push(&mut *device, piece).await?;
+                    rdel_stats.observe::<D::Error>(&piece, rdel_base)?;
+                }
             }
         }
         let rdel_blocks = rdel_out.finish(&mut *device).await?;
-        debug_assert_eq!(
-            rdel_blocks, c.rdel_blocks,
-            "rdel merge replay diverged from its counted budget"
-        );
-        let out_ref = if c.writer.entry_count() > 0 || rdel_blocks > 0 {
-            let done: sstable::FinishedTable<KEY_MAX> = c
-                .writer
-                .finish_meta(&mut *device, rdel_blocks, rdel_stats.min_seq)
-                .await?;
-            let total = u64::from(rdel_blocks)
-                .checked_add(done.data_blocks)
-                .and_then(|n| n.checked_add(3))
-                .ok_or(Error::NoSpace)?;
-            let id = staged.alloc_table_id::<D::Error>()?;
-            Some(TableRef {
-                id,
-                first_block: c.out_base,
-                block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
-                // `KeyBound::min/max` let `EMPTY` lose, so a missing
-                // section never corrupts the bounds.
-                first_key: done.first_key.min(rdel_stats.first),
-                last_key: done.last_key.max(rdel_stats.last),
-                max_seq: done.max_seq.max(rdel_stats.max_seq),
-                min_seq: done.min_seq,
-                entry_count: u32::try_from(done.entry_count).map_err(|_| Error::NoSpace)?,
-                rdel_blocks,
-            })
-        } else {
-            None
-        };
-        for input in c.inputs.iter().take(c.n_inputs) {
-            staged.remove_table_from_level::<D::Error>(input.level, input.tref.id)?;
+        if let Some(hi) = hi {
+            c.out_lo = hi;
         }
-        if let Some(tref) = out_ref {
-            staged.add_table_to_level::<D::Error>(c.target_level, tref)?;
+        if c.writer.entry_count() == 0 && rdel_blocks == 0 {
+            self.slots.release(c.out_slot);
+            return Ok(None);
+        }
+        let done = c
+            .writer
+            .finish_meta(&mut *device, rdel_blocks, rdel_stats.min_seq)
+            .await?;
+        let total = u64::from(rdel_blocks)
+            .checked_add(done.data_blocks)
+            .and_then(|n| n.checked_add(3))
+            .ok_or(Error::NoSpace)?;
+        let id = self.manifest.alloc_table_id::<D::Error>()?;
+        Ok(Some(TableRef {
+            id,
+            first_block: c.out_base,
+            block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
+            // `KeyBound::min/max` let `EMPTY` lose, so a missing section
+            // never corrupts the bounds. A non-final output's pieces end
+            // at the successor of its last key, so its last key bounds
+            // them exactly; the final output keeps the conservative
+            // (exclusive) piece end.
+            first_key: done.first_key.min(rdel_stats.first),
+            last_key: if hi.is_some() {
+                done.last_key
+            } else {
+                done.last_key.max(rdel_stats.last)
+            },
+            max_seq: done.max_seq.max(rdel_stats.max_seq),
+            min_seq: done.min_seq,
+            entry_count: u32::try_from(done.entry_count).map_err(|_| Error::NoSpace)?,
+            rdel_blocks,
+        }))
+    }
+
+    /// Commits one output (if any) in one manifest write, settling every
+    /// live input against the output's last key `k`: an input whose range
+    /// ends at or below `k` retires, and one straddling `k` is narrowed to
+    /// start just past it. Every key at or below `k` then reads from the
+    /// committed outputs alone, so the target level stays disjoint and a
+    /// tombstone the merge dropped can expose nothing. The final commit
+    /// retires every remaining input and ends the job.
+    ///
+    /// Slots settle strictly after the visibility point: the output's
+    /// reservation becomes a used slot, and retired inputs' slots are free.
+    async fn compact_commit(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        out: Option<TableRef<KEY_MAX>>,
+        last_commit: bool,
+    ) -> Result<(), Error<D::Error>> {
+        // The frontier: everything at or below `k` is in the outputs.
+        let k = match out {
+            Some(t) if !last_commit => t.last_key,
+            _ => KeyBound::EMPTY,
+        };
+        let past_k = k.successor();
+        let mut staged = self.manifest;
+        let mut freed = 0u64;
+        let mut retired_src = 0u8;
+        let mut retired_tgt = c.tgt_retired;
+        // Settles input `id` at `level`: retire it, or narrow it past `k`.
+        // Returns whether it retired.
+        let mut settle = |staged: &mut crate::manifest::Manifest<LEVELS, TABLES, KEY_MAX>,
+                          level: usize,
+                          id: u32|
+         -> Result<bool, Error<D::Error>> {
+            let Some(t) = self.manifest.find_table(id).copied() else {
+                return Err(Error::CorruptManifest);
+            };
+            let retire = last_commit || t.last_key.as_slice() <= k.as_slice();
+            if retire {
+                if let Some(slot) = self.slots.slot_of(t.first_block, u64::from(t.block_count)) {
+                    freed |= 1u64 << slot;
+                }
+                staged.remove_table_from_level::<D::Error>(level, id)?;
+            } else if t.first_key.as_slice() <= k.as_slice()
+                && let Some(first) = past_k
+            {
+                staged.narrow_table::<D::Error>(level, id, first)?;
+            }
+            Ok(retire)
+        };
+        for i in 0..c.n_src {
+            if c.src_retired & (1u8 << i) == 0
+                && settle(&mut staged, c.inputs[i].level, c.inputs[i].tref.id)?
+            {
+                retired_src |= 1u8 << i;
+            }
+        }
+        for j in c.tgt_retired..c.n_tgt {
+            // Targets are sorted and disjoint: the retired ones are a prefix.
+            if settle(&mut staged, c.target_level, c.tgt[j])? {
+                retired_tgt = j + 1;
+            }
+        }
+        // Retire and narrow first, then insert the output: its first key
+        // must sort against the inputs' raised bounds.
+        if let Some(t) = out {
+            staged.add_table_to_level::<D::Error>(c.target_level, t)?;
         }
         // Compaction may drop the tables holding the newest sequences
         // (bottommost tombstones): persist the counter so it never regresses.
         staged.raise_seq_high(self.next_seq);
+        let mut scratch = [0u8; BLOCK];
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
         staged
             .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
             .await?;
-        // Commit point passed: publish the staged state, then settle the
-        // slots: the output's reservation becomes a used slot (or is
-        // released when the merge emitted nothing), and the retired
-        // inputs' slots are free — strictly after the visibility point.
+        // Commit point passed: publish, then settle the slots and drop the
+        // retired tables' cache entries (hygiene — ids never repeat, so
+        // stale entries could never be read).
         self.manifest = staged;
-        if out_ref.is_some() {
+        if out.is_some() {
             self.slots.commit(c.out_slot);
-        } else {
-            self.slots.release(c.out_slot);
         }
-        for input in c.inputs.iter().take(c.n_inputs) {
-            // Drop the retired table's cache entries so their slots serve
-            // the hot set (hygiene — ids never repeat, so stale entries
-            // could never be read).
-            self.cache.invalidate_table(input.tref.id);
-            if let Some(slot) = self.slot_of(&input.tref) {
+        for slot in 0..64u32 {
+            if freed & (1u64 << slot) != 0 {
                 self.slots.free(slot);
             }
         }
-        self.job_active = false;
-        self.job_inputs = 0;
-        c.reset();
+        for i in 0..c.n_src {
+            if retired_src & (1u8 << i) != 0 {
+                self.cache.invalidate_table(c.inputs[i].tref.id);
+            }
+        }
+        for &id in &c.tgt[c.tgt_retired..retired_tgt] {
+            self.cache.invalidate_table(id);
+        }
+        self.job_inputs &= !freed;
+        c.src_retired |= retired_src;
+        c.tgt_retired = retired_tgt;
+        if last_commit {
+            self.job_active = false;
+            self.job_inputs = 0;
+            c.reset();
+        }
         Ok(())
     }
 }

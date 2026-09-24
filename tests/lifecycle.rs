@@ -11,7 +11,11 @@
 //! mutations, the memtable flushes often, and values range up to the
 //! maximum size, so allocator reuse, compaction interleaving, and the
 //! recovery floors are exercised together — the combinations the
-//! single-feature suites never reach.
+//! single-feature suites never reach. A second geometry cuts the table
+//! region to slots of 8 blocks, so compaction splits every output, commits
+//! and narrows as it goes, and runs under region pressure.
+//!
+//! `LIFECYCLE_SEEDS=n` sweeps `n` seeds per geometry (default 8).
 
 mod common;
 
@@ -29,9 +33,18 @@ const TABLES: usize = 4;
 type LDb = horton::Db<MemDevice<BLOCK>, BLOCK, KEY_MAX, VAL_MAX, 32, 2048, 4, TABLES, 256, 4>;
 type LComp = Compaction<BLOCK, KEY_MAX, VAL_MAX, 256>;
 
-/// Manifest slots 0/1, WAL `[2, 42)`, tables `[42, 1242)`.
+/// Manifest slots 0/1, WAL `[2, 42)`, tables `[42, 1242)`: 16 table
+/// slots of 75 blocks, roomy enough that outputs rarely split.
 const fn cfg() -> Config {
     Config::new(2, 42, 42, 1242, 0, 1)
+}
+
+/// The same WAL with the table region cut to 16 slots of 8 blocks: every
+/// compaction output splits after a few blocks, jobs commit output by
+/// output and narrow their inputs, and region pressure and job admission
+/// decide what runs. The database may fill up for real here.
+const fn tight_cfg() -> Config {
+    Config::new(2, 42, 42, 42 + 16 * 8, 0, 1)
 }
 
 /// One version of a key in the oracle.
@@ -99,6 +112,7 @@ enum Keys {
 
 struct Harness {
     keys: Keys,
+    cfg: Config,
     counter: u64,
     db: Box<LDb>,
     c: Box<LComp>,
@@ -136,11 +150,12 @@ macro_rules! retrying {
 }
 
 impl Harness {
-    fn new(seed: u64, keys: Keys) -> Self {
-        let mut db = Box::new(LDb::new(MemDevice::new(), cfg()));
+    fn new(seed: u64, keys: Keys, cfg: Config) -> Self {
+        let mut db = Box::new(LDb::new(MemDevice::new(), cfg));
         block_on(db.open()).unwrap();
         Self {
             keys,
+            cfg,
             counter: 0,
             db,
             c: Box::new(LComp::new()),
@@ -379,9 +394,9 @@ impl Harness {
     }
 
     fn reopen(&mut self) {
-        let db = core::mem::replace(&mut self.db, Box::new(LDb::new(MemDevice::new(), cfg())));
+        let db = core::mem::replace(&mut self.db, Box::new(LDb::new(MemDevice::new(), self.cfg)));
         let dev = (*db).into_device();
-        let mut db = Box::new(LDb::new(dev, cfg()));
+        let mut db = Box::new(LDb::new(dev, self.cfg));
         block_on(db.open()).unwrap_or_else(|e| panic!("op {}: reopen failed {e:?}", self.op));
         self.db = db;
         // Snapshots are in-memory only; a mid-job scratch belongs to the
@@ -548,8 +563,26 @@ impl Harness {
     }
 }
 
-fn run(seed: u64, keys: Keys, ops: usize) -> usize {
-    let mut h = Harness::new(seed, keys);
+/// Seeds per run: 8 by default; `LIFECYCLE_SEEDS=n` sweeps wider.
+fn seeds() -> u64 {
+    std::env::var("LIFECYCLE_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+
+/// One seeded run. The seed goes to stderr first, which the test harness
+/// shows only for a failing test, so a failure names its seed;
+/// `LIFECYCLE_ONLY=<seed in hex>` then replays just that run (with
+/// `LIFECYCLE_SEEDS` high enough to reach it).
+fn run(seed: u64, keys: Keys, ops: usize, cfg: Config) -> usize {
+    if let Ok(only) = std::env::var("LIFECYCLE_ONLY")
+        && u64::from_str_radix(only.trim_start_matches("0x"), 16).ok() != Some(seed)
+    {
+        return ops;
+    }
+    eprintln!("lifecycle run: seed {seed:#x} {keys:?}, {ops} ops");
+    let mut h = Harness::new(seed, keys, cfg);
     for op in 0..ops {
         h.op = op;
         h.step();
@@ -565,6 +598,7 @@ fn run(seed: u64, keys: Keys, ops: usize) -> usize {
         }
         if h.full {
             eprintln!("seed {seed:#x} {keys:?}: database full after {op} ops");
+            eprintln!("  {:?}", h.db.slot_stats());
             return op;
         }
         if op % 50 == 49 {
@@ -592,8 +626,8 @@ fn lifecycle_fuzz_hot_keys() {
     } else {
         700
     };
-    for seed in 0..8u64 {
-        let done = run(0x5eed_0000 + seed, Keys::Hot, ops);
+    for seed in 0..seeds() {
+        let done = run(0x5eed_0000 + seed, Keys::Hot, ops, cfg());
         assert_eq!(done, ops, "seed {seed}: stopped early (database full)");
     }
 }
@@ -607,8 +641,30 @@ fn lifecycle_fuzz_append_keys() {
     } else {
         1500
     };
-    for seed in 0..8u64 {
-        let done = run(0xa99e_0000 + seed, Keys::Append, ops);
+    for seed in 0..seeds() {
+        let done = run(0xa99e_0000 + seed, Keys::Append, ops, cfg());
         assert_eq!(done, ops, "seed {seed}: stopped early (database full)");
+    }
+}
+
+#[test]
+fn lifecycle_fuzz_tight_slots() {
+    // Hot keys never outgrow the region (48 keys); appends eventually may,
+    // which is a clean stop, checked like any other state on the way.
+    let ops = if cfg!(miri) {
+        60
+    } else if cfg!(debug_assertions) {
+        300
+    } else {
+        1200
+    };
+    for seed in 0..seeds() {
+        let done = run(0x7167_0000 + seed, Keys::Hot, ops, tight_cfg());
+        assert_eq!(done, ops, "seed {seed}: hot keys filled the region");
+        let done = run(0x7167_a000 + seed, Keys::Append, ops, tight_cfg());
+        assert!(
+            done >= ops.min(250),
+            "seed {seed}: appends full after {done} ops"
+        );
     }
 }

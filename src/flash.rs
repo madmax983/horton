@@ -1,4 +1,4 @@
-//! SPI-flash-backed [`BlockDevice`](crate::device::BlockDevice) support.
+//! SPI-flash-backed [`BlockDevice`] support.
 //!
 //! NOR flash cannot overwrite in place: a sector must be erased (all bits
 //! to 1) before programming (which only clears bits, 1 → 0). [`Flash`] is

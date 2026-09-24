@@ -15,7 +15,7 @@
 //!
 //! Each token starts with one tag byte: the high nibble is the
 //! literal-run length (0–15), the low nibble is the match length minus
-//! [`MIN_MATCH`] (0–15, so matches are 4–19 bytes before extension). A
+//! `MIN_MATCH` (0–15, so matches are 4–19 bytes before extension). A
 //! nibble value of 15 means "15, then extension bytes follow": each
 //! `0xFF` extension byte adds 255, and the first non-`0xFF` byte adds
 //! its value (LZ4-style). The match offset is 1–32768, a distance back
