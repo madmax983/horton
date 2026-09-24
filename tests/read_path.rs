@@ -79,7 +79,7 @@ fn commit_tables(dev: &mut MemDevice<4096>, tables: &[(usize, TestTableRef)]) {
             .expect("place table");
     }
     let mut scratch = [0u8; 4096];
-    block_on(manifest.commit(dev, &mut scratch, 0, 1)).expect("commit manifest");
+    block_on(manifest.commit(dev, &mut scratch, 0, 4)).expect("commit manifest");
 }
 
 fn get_str(db: &MemDb, key: &[u8]) -> Option<Vec<u8>> {

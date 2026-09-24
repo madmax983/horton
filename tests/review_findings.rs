@@ -495,7 +495,7 @@ fn fill_until_full(cfg: horton::Config, random: bool) -> Vec<u64> {
 #[test]
 fn f6_writes_continue_until_the_region_is_mostly_full() {
     let slot = if cfg!(debug_assertions) { 16 } else { 30 };
-    let cfg = horton::Config::new(8, 136, 136, 136 + 28 * slot, 0, 1);
+    let cfg = horton::Config::new(8, 136, 136, 136 + 28 * slot, 0, 4);
     let region_bytes = 28 * usize::try_from(slot).unwrap() * 4096;
     for random in [false, true] {
         let n = fill_until_full(cfg, random).len();
@@ -650,7 +650,7 @@ fn f14_flush_during_inflight_compaction_keeps_tables_disjoint() {
 type NarrowDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 3, 3, 1024, 8>;
 
 const fn narrow_config() -> horton::Config {
-    horton::Config::new(8, 136, 136, 136 + 9 * 8, 0, 1)
+    horton::Config::new(8, 136, 136, 136 + 9 * 8, 0, 2)
 }
 
 /// One flush per key group, then the L0 -> L1 job they trigger.
@@ -744,4 +744,97 @@ fn f15_tombstone_drop_respects_older_ingested_tables() {
         Ok(None),
         "the delete must still hide the older ingested version"
     );
+}
+
+/// F7 — the manifest had to fit one block. With 256-byte keys each
+/// `TableRef` costs up to 556 bytes, so `TestDb` failed every flush with
+/// `NoSpace` once 7 tables were live, out of the 28 its shape allows. A
+/// manifest copy now spans `Manifest::max_blocks` blocks (4 for `TestDb`),
+/// sized at compile time for the worst case, so the table count is bound
+/// by slots again — and a multi-block manifest survives reopen.
+#[test]
+fn f7_long_keys_keep_committing_past_one_manifest_block() {
+    use horton::manifest::Manifest;
+
+    let cfg = horton::Config::new(8, 136, 136, 136 + 28 * 16, 0, 4);
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), cfg);
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    let mut rng = Lcg::new(7);
+    let key = |r: u64| {
+        let mut k = [b'k'; 256];
+        k[..8].copy_from_slice(&r.to_be_bytes());
+        k
+    };
+    let mut keys = Vec::new();
+    let mut most_tables = 0;
+    while most_tables < 16 {
+        let k = key(rng.next());
+        put_retrying(&mut db, &mut c, &k, &[0x3C; 600]);
+        keys.push(k);
+        let live: usize = (0..7).map(|l| db.level_tables(l).unwrap().len()).sum();
+        most_tables = most_tables.max(live);
+        assert!(keys.len() < 20_000, "never reached 16 live tables");
+    }
+    assert_eq!(Manifest::<7, 4, 256>::max_blocks::<4096>(), 4);
+    assert_eq!(db.check_invariants(), Ok(()));
+    flush_retrying(&mut db, &mut c);
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(db.into_device(), cfg);
+    block_on(db.open()).unwrap();
+    assert_eq!(db.check_invariants(), Ok(()));
+    // The recovered manifest's table refs alone outgrow one block.
+    let refs: Vec<_> = (0..7)
+        .flat_map(|l| db.level_tables(l).unwrap().to_vec())
+        .collect();
+    let bytes: usize = refs
+        .iter()
+        .map(|t| 44 + t.first_key.as_slice().len() + t.last_key.as_slice().len())
+        .sum();
+    assert!(refs.len() > 7, "only {} tables after reopen", refs.len());
+    assert!(bytes > 4096, "setup: manifest body {bytes} fits one block");
+    let mut buf = [0u8; 1024];
+    for k in &keys {
+        assert_eq!(block_on(db.get(k, &mut buf)), Ok(Some(600)));
+    }
+}
+
+/// F7 (config) — the manifest copies, the WAL, and the table region must
+/// not overlap; with multi-block copies that is easy to get wrong, so
+/// `open` checks it before any I/O.
+#[test]
+fn f7_overlapping_regions_are_rejected_at_open() {
+    // TestDb copies are 4 blocks: a copy at 0 and one at 2 collide.
+    let bad = [
+        horton::Config::new(8, 136, 136, 4224, 0, 2),
+        // The second copy runs into the WAL.
+        horton::Config::new(8, 136, 136, 4224, 0, 5),
+        // WAL and table region overlap.
+        horton::Config::new(8, 140, 136, 4224, 0, 4),
+        // Empty WAL.
+        horton::Config::new(8, 8, 136, 4224, 0, 4),
+        // A ring of 3 copies (12 blocks) runs into the WAL at 8.
+        horton::Config::new(8, 136, 136, 4224, 0, 4).with_manifest_ring(3),
+    ];
+    for cfg in bad {
+        let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), cfg);
+        assert!(
+            matches!(block_on(db.open()), Err(Error::BadConfig)),
+            "{cfg:?}"
+        );
+    }
+    // A two-copy ring at 0 is the pair layout; a 4-copy ring fits when
+    // the WAL starts after it.
+    for cfg in [
+        horton::Config::new(8, 136, 136, 4224, 0, 4).with_manifest_ring(2),
+        horton::Config::new(16, 136, 136, 4224, 0, 4).with_manifest_ring(4),
+    ] {
+        let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), cfg);
+        assert!(block_on(db.open()).is_ok(), "{cfg:?}");
+        block_on(db.put(b"k", b"v")).unwrap();
+        block_on(db.flush()).unwrap();
+        let mut db: TestDb<MemDevice<4096>> = TestDb::new(db.into_device(), cfg);
+        block_on(db.open()).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(block_on(db.get(b"k", &mut buf)), Ok(Some(1)));
+    }
 }

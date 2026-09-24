@@ -446,9 +446,9 @@ impl<
             staged.add_table_to_level::<D::Error>(tgt, tref)?;
             staged.raise_seq_high(self.next_seq);
             let mut scratch = [0u8; BLOCK];
-            let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+            let layout = self.manifest_layout();
             staged
-                .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
+                .commit_to(self.wal.device_mut(), &mut scratch, layout)
                 .await?;
             self.manifest = staged;
             return Ok(Some(Selected::Moved));
@@ -765,9 +765,9 @@ impl<
         // (bottommost tombstones): persist the counter so it never regresses.
         staged.raise_seq_high(self.next_seq);
         let mut scratch = [0u8; BLOCK];
-        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        let layout = self.manifest_layout();
         staged
-            .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
+            .commit_to(self.wal.device_mut(), &mut scratch, layout)
             .await?;
         // Commit point passed: publish, then settle the slots and drop the
         // retired tables' cache entries (hygiene — ids never repeat, so

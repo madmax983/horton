@@ -229,9 +229,9 @@ impl<
             entry_count: sealed.entry_count,
             rdel_blocks: sealed.rdel_blocks,
         })?;
-        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        let layout = self.manifest_layout();
         staged
-            .commit(self.wal.device_mut(), &mut buf, slot_a, slot_b)
+            .commit_to(self.wal.device_mut(), &mut buf, layout)
             .await?;
         // Commit point passed: publish the staged state, then claim the
         // slot — strictly after the visibility point.
@@ -357,9 +357,9 @@ impl<
             return Ok(false);
         }
         staged.raise_seq_high(self.next_seq);
-        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        let layout = self.manifest_layout();
         staged
-            .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
+            .commit_to(self.wal.device_mut(), &mut scratch, layout)
             .await?;
         // Commit point passed: publish the staged state, then free the
         // table's slot strictly after the visibility point.

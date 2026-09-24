@@ -37,9 +37,9 @@ impl<
         staged.set_wal_head(self.cfg.wal_start);
         // Every issued mutation has left the WAL: the memtable is empty.
         staged.note_flushed(self.next_seq);
-        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        let layout = self.manifest_layout();
         staged
-            .commit(self.wal.device_mut(), scratch, slot_a, slot_b)
+            .commit_to(self.wal.device_mut(), scratch, layout)
             .await?;
         self.manifest = staged;
         self.wal.reset_to(self.cfg.wal_start);
@@ -226,9 +226,9 @@ impl<
         // Every issued mutation is now in a table or behind `wal_head`:
         // raise the persisted replay floor with this same commit.
         staged.note_flushed(self.next_seq);
-        let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
+        let layout = self.manifest_layout();
         staged
-            .commit(self.wal.device_mut(), &mut data, slot_a, slot_b)
+            .commit_to(self.wal.device_mut(), &mut data, layout)
             .await?;
         // Commit point passed: publish the staged state and claim the slot.
         self.manifest = staged;

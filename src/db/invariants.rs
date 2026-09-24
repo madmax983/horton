@@ -3,6 +3,7 @@
 use super::Db;
 use crate::compact::ranges_overlap;
 use crate::device::BlockDevice;
+use crate::manifest::Manifest;
 impl<
     D: BlockDevice,
     const BLOCK: usize,
@@ -28,7 +29,7 @@ impl<
     /// - Each table is well-formed (room for bloom, index, and footer after
     ///   its sections; `min_seq <= max_seq`), and the sequence counter
     ///   dominates every stored sequence and both persisted floors.
-    /// - The manifest encodes into one block.
+    /// - The manifest fits its copies (`Manifest::max_blocks` blocks).
     ///
     /// Pure and synchronous: it reads only in-memory state (no device I/O),
     /// in `O(tables²)`. Tests call it after every
@@ -82,9 +83,10 @@ impl<
         if self.manifest.flushed_seq() > self.next_seq || self.manifest.seq_high() > self.next_seq {
             return Err("a persisted sequence floor exceeds the counter");
         }
-        let mut buf = [0u8; BLOCK];
-        if self.manifest.encode::<D::Error, BLOCK>(&mut buf).is_err() {
-            return Err("the manifest no longer fits one block");
+        if self.manifest.encoded_blocks::<BLOCK>() as u64
+            > Manifest::<LEVELS, TABLES, KEY_MAX>::max_blocks::<BLOCK>()
+        {
+            return Err("the manifest outgrew its copies");
         }
         Ok(())
     }

@@ -46,7 +46,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
 /// In-memory block device: a growable vector of zeroed blocks. Reads of
 /// never-written blocks return zeros (sparse). Always `Ready`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemDevice<const BLOCK: usize> {
     blocks: Vec<[u8; BLOCK]>,
 }
@@ -253,11 +253,12 @@ impl<D: BlockDevice, const BLOCK: usize> BlockDevice for TornDevice<D, BLOCK> {
 /// cache.
 pub type TestDb<D> = horton::Db<D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
-/// Standard region layout: manifest slots 0/1, WAL `[8, 136)`, tables
+/// Standard region layout: manifest copies at 0 and 4 (4 blocks each for
+/// this shape), WAL `[8, 136)`, tables
 /// `[136, 4224)` — 28 slots of 146 blocks. The regions are disjoint by
 /// construction.
 pub const fn test_config() -> horton::Config {
-    horton::Config::new(8, 136, 136, 4224, 0, 1)
+    horton::Config::new(8, 136, 136, 4224, 0, 4)
 }
 
 /// [`test_config`] with the table region cut to 28 slots of 8 blocks
@@ -267,7 +268,7 @@ pub const fn test_config() -> horton::Config {
 /// table that overlaps nothing below moves down whole. Tests that pin
 /// per-level table counts use it.
 pub const fn tight_config() -> horton::Config {
-    horton::Config::new(8, 136, 136, 136 + 28 * 8, 0, 1)
+    horton::Config::new(8, 136, 136, 136 + 28 * 8, 0, 4)
 }
 
 /// Tiny deterministic PRNG (LCG) — no `rand` dependency, even for tests.

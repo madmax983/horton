@@ -760,9 +760,9 @@ fn mut_manifest_decode_rejects_oversized_total() {
     );
 }
 
-/// Kills `src/manifest.rs:468 replace > with >=` in `Manifest::decode`:
-/// a manifest that fills its block exactly (`total == BLOCK`) is valid and
-/// must decode — the mutant wrongly rejects it as corrupt.
+/// Boundary of the block length check in `check_block`: a manifest block
+/// whose body and CRC fill it exactly (`24 + len + 4 == BLOCK`) is valid
+/// and must decode — an off-by-one (`>=`) would reject it as corrupt.
 #[test]
 fn mut_manifest_decode_accepts_exact_fit() {
     use horton::crc::crc32;
@@ -781,16 +781,19 @@ fn mut_manifest_decode_accepts_exact_fit() {
         *off += 2;
     }
 
-    // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys:
-    // payload = 8 + 8 + 4 + 8 + 8 + 4 + (4 + 46) = 90,
-    // total = 12 + 90 + 4 = 106.
-    const BLOCK: usize = 106;
-    const CRC_END: usize = 102;
+    // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys, as a
+    // one-block copy: header 24 (magic, seq, index, count, len), body
+    // 8 + 4 + 8 + 8 + 4 (fixed fields) + 4 (level count) + 46 (the ref)
+    // = 82, total = 24 + 82 + 4 = 110.
+    const BLOCK: usize = 110;
+    const CRC_END: usize = 106;
     let mut buf = [0u8; BLOCK];
     buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-    buf[8..12].copy_from_slice(&90u32.to_le_bytes());
-    let mut off = 12;
-    w64(&mut buf, &mut off, 7); // seq
+    buf[8..16].copy_from_slice(&7u64.to_le_bytes()); // seq
+    buf[16..18].copy_from_slice(&0u16.to_le_bytes()); // block index
+    buf[18..20].copy_from_slice(&1u16.to_le_bytes()); // block count
+    buf[20..24].copy_from_slice(&82u32.to_le_bytes()); // body bytes
+    let mut off = 24;
     w64(&mut buf, &mut off, 0); // wal_head
     w32(&mut buf, &mut off, 0); // next_table_id
     w64(&mut buf, &mut off, 0); // flushed_seq
@@ -903,14 +906,14 @@ fn mut_manifest_decode_bound_rejects_overlong() {
     );
 }
 
-/// Kills `src/manifest.rs:687 replace > with >=` in `Encoder::bytes`:
-/// a manifest that fills its block exactly must encode — the mutant
-/// wrongly reports `NoSpace` on the final exact-fit write.
+/// A manifest that fills its block exactly must encode as a one-block
+/// copy — an off-by-one in the chunk arithmetic would report `NoSpace` or
+/// spill into a second block.
 #[test]
 fn mut_manifest_encode_accepts_exact_fit() {
     use horton::{KeyBound, Manifest, TableRef};
 
-    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 106.
+    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 110.
     let mut m = Manifest::<1, 1, 8>::new();
     m.add_l0_table::<Infallible>(TableRef {
         id: 7,
@@ -924,19 +927,21 @@ fn mut_manifest_encode_accepts_exact_fit() {
         rdel_blocks: 0,
     })
     .unwrap();
-    let mut buf = [0u8; 106];
-    m.encode::<Infallible, 106>(&mut buf)
+    let mut buf = [0u8; 110];
+    m.encode::<Infallible, 110>(&mut buf)
         .expect("exact-fit manifest must encode");
+    assert_eq!(m.encoded_blocks::<110>(), 1, "exactly one block");
+    assert_eq!(m.encoded_blocks::<109>(), 2, "one byte short spills over");
     // And it must round-trip through decode.
-    let back = Manifest::<1, 1, 8>::decode::<Infallible, 106>(&buf)
+    let back = Manifest::<1, 1, 8>::decode::<Infallible, 110>(&buf)
         .expect("exact-fit manifest must decode");
     assert_eq!(back.seq(), 0);
     assert_eq!(back.l0().len(), 1);
 }
 
-/// Kills `src/manifest.rs:687 replace > with ==` in `Encoder::bytes`:
-/// a manifest larger than the block must fail with `NoSpace` — never
-/// write out of bounds (the mutant turns the guard into a panic).
+/// A manifest larger than one block must fail the one-block `encode`
+/// with `NoSpace` — never write out of bounds (multi-block copies go
+/// through `commit_to`).
 #[test]
 fn mut_manifest_encode_rejects_oversized() {
     use horton::{KeyBound, Manifest, TableRef};

@@ -150,7 +150,7 @@ const TBL_START: u64 = WAL_END;
 const TBL_END: u64 = TBL_START + 8000;
 
 const fn config() -> Config {
-    Config::new(WAL_START, WAL_END, TBL_START, TBL_END, 0, 1)
+    Config::new(WAL_START, WAL_END, TBL_START, TBL_END, 0, 2)
 }
 
 /// Unique puts per batch, flushed after each. Well under the 512-slot /

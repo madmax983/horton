@@ -140,7 +140,7 @@ fn l0_full_errors() {
 fn table_region_too_small_for_the_slot_layout() {
     // 7 x 4 = 28 table slots over a 4-block region: no slot could hold a
     // full memtable's table, so open() refuses the layout up front.
-    let cfg = Config::new(8, 136, 136, 140, 0, 1);
+    let cfg = Config::new(8, 136, 136, 140, 0, 4);
     let mut db = TestDb::new(MemDevice::<4096>::new(), cfg);
     assert!(matches!(block_on(db.open()), Err(Error::NoSpace)));
     assert!(!db.is_open());

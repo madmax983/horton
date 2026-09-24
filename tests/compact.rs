@@ -85,7 +85,7 @@ where
 /// Recovers the manifest straight from the device for level inspection.
 fn read_manifest(dev: &mut MemDevice<4096>) -> Manifest<7, 4, 256> {
     let mut scratch = [0u8; 4096];
-    block_on(Manifest::recover(dev, &mut scratch, 0, 1))
+    block_on(Manifest::recover(dev, &mut scratch, 0, 4))
         .unwrap()
         .0
 }

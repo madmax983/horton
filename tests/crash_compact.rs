@@ -152,7 +152,7 @@ fn post_compaction_state_is_coherent() {
     let dev = run_crashed(count_compaction_writes());
     let mut dev2 = dev;
     let mut scratch = [0u8; BLOCK];
-    let m2 = block_on(TestManifest::recover(&mut dev2, &mut scratch, 0, 1))
+    let m2 = block_on(TestManifest::recover(&mut dev2, &mut scratch, 0, 4))
         .unwrap()
         .0;
     let l1 = m2.level(1).unwrap();

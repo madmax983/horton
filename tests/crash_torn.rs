@@ -266,7 +266,7 @@ fn torn_manifest_slot_during_flush() {
         // Both manifest slots decode now: the torn bytes are gone.
         let mut dev = db.into_device();
         let mut scratch = [0u8; BLOCK];
-        let (m, fresh) = block_on(TestManifest::recover(&mut dev, &mut scratch, 0, 1)).unwrap();
+        let (m, fresh) = block_on(TestManifest::recover(&mut dev, &mut scratch, 0, 4)).unwrap();
         assert!(!fresh, "torn_len={torn_len}");
         assert_eq!(m.seq(), if landed { 2 } else { 1 }, "torn_len={torn_len}");
         assert_eq!(

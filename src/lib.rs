@@ -65,7 +65,7 @@ pub use crc::crc32;
 pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable, SlotStats};
 pub use device::BlockDevice;
 pub use error::Error;
-pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, TableRef};
+pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestLayout, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
 pub use scan::{RevScan, Scan};
 pub use sstable::{

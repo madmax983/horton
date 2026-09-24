@@ -23,7 +23,7 @@ use crate::cache::{BlockCache, CachePort, CacheStats};
 use crate::compact::COMPACTION_KMAX;
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::{Manifest, TableRef};
+use crate::manifest::{Manifest, ManifestLayout, TableRef};
 use crate::memtable::MemTable;
 use crate::sstable;
 use crate::wal::{Op, RecoverState, WAL_RECORD_OVERHEAD, WalWriter};
@@ -38,9 +38,14 @@ pub use archive::{ArchivePlan, SealedTable};
 
 /// Placement of the database regions on the device.
 ///
-/// Three disjoint regions plus two fixed single-block manifest slots.
-/// Region overlap is a caller bug.
-#[derive(Debug, Clone, Copy)]
+/// Three disjoint regions: the WAL, the table region, and the manifest's
+/// copies. Each manifest copy spans `Manifest::max_blocks` blocks (a
+/// compile-time function of the `Db` shape — one block for small shapes):
+/// by default two copies, starting at `manifest_a` and `manifest_b`; with
+/// [`with_manifest_ring`](Config::with_manifest_ring), `n` copies back to
+/// back from `manifest_a`. [`Db::open`] refuses overlapping regions with
+/// [`Error::BadConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     /// First block id of the WAL region.
     pub wal_start: u64,
@@ -50,10 +55,12 @@ pub struct Config {
     pub tbl_start: u64,
     /// One past the last block id of the `SSTable` region.
     pub tbl_end: u64,
-    /// First manifest slot (one block).
+    /// First block of the first manifest copy.
     pub manifest_a: u64,
-    /// Second manifest slot (one block).
+    /// First block of the second manifest copy (unused by a ring).
     pub manifest_b: u64,
+    /// Manifest copies in a ring from `manifest_a`; 0 for the default pair.
+    pub manifest_ring: u32,
 }
 
 impl Config {
@@ -74,7 +81,20 @@ impl Config {
             tbl_end,
             manifest_a,
             manifest_b,
+            manifest_ring: 0,
         }
+    }
+
+    /// Keeps `copies` manifest copies back to back from `manifest_a`
+    /// instead of the pair at `manifest_a` and `manifest_b`. Commits
+    /// rotate through the copies, so each copy's blocks are erased once
+    /// per `copies` commits: on NOR flash, where the manifest is the most
+    /// frequently erased region, this multiplies its life. Fewer than two
+    /// copies are treated as two.
+    #[must_use]
+    pub const fn with_manifest_ring(mut self, copies: u32) -> Self {
+        self.manifest_ring = if copies < 2 { 2 } else { copies };
+        self
     }
 }
 
@@ -330,6 +350,44 @@ impl<
     /// slots are short. A single-level tree never compacts.
     const COMPACTION_RESERVE: u32 = if LEVELS >= 2 { 2 } else { 0 };
 
+    /// Where the manifest's copies live.
+    const fn manifest_layout(&self) -> ManifestLayout {
+        if self.cfg.manifest_ring == 0 {
+            ManifestLayout::pair(self.cfg.manifest_a, self.cfg.manifest_b)
+        } else {
+            ManifestLayout::ring(self.cfg.manifest_a, self.cfg.manifest_ring)
+        }
+    }
+
+    /// Refuses a configuration whose regions are empty or overlap: the
+    /// WAL, the table region, and every manifest copy
+    /// (`Manifest::max_blocks` blocks each) must be pairwise disjoint.
+    fn check_regions(&self) -> Result<(), Error<D::Error>> {
+        let c = &self.cfg;
+        let stride = Manifest::<LEVELS, TABLES, KEY_MAX>::max_blocks::<BLOCK>();
+        let layout = self.manifest_layout();
+        let disjoint = |a: (u64, u64), b: (u64, u64)| a.1 <= b.0 || b.1 <= a.0;
+        let wal = (c.wal_start, c.wal_end);
+        let tbl = (c.tbl_start, c.tbl_end);
+        if wal.0 >= wal.1 || tbl.0 >= tbl.1 || !disjoint(wal, tbl) {
+            return Err(Error::BadConfig);
+        }
+        for k in 0..layout.copies() {
+            let start = layout.copy_start(k, stride);
+            let copy = (start, start.checked_add(stride).ok_or(Error::BadConfig)?);
+            if !disjoint(copy, wal) || !disjoint(copy, tbl) {
+                return Err(Error::BadConfig);
+            }
+            for j in 0..k {
+                let other = layout.copy_start(j, stride);
+                if !disjoint(copy, (other, other + stride)) {
+                    return Err(Error::BadConfig);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The slot of live table `t` (`None` only for a ref the slot map
     /// never accepted, which `open()` rules out).
     fn slot_of(&self, t: &TableRef<KEY_MAX>) -> Option<u32> {
@@ -467,6 +525,7 @@ impl<
         self.job_active = false;
         self.job_inputs = 0;
         self.job_gen = self.job_gen.wrapping_add(1);
+        self.check_regions()?;
         let mut slots = SlotMap::layout(
             self.cfg.tbl_start,
             self.cfg.tbl_end,
@@ -475,13 +534,9 @@ impl<
         )
         .ok_or(Error::NoSpace)?;
         let mut scratch = [0u8; BLOCK];
-        let (manifest, fresh) = Manifest::recover(
-            self.wal.device_mut(),
-            &mut scratch,
-            self.cfg.manifest_a,
-            self.cfg.manifest_b,
-        )
-        .await?;
+        let layout = self.manifest_layout();
+        let (manifest, fresh) =
+            Manifest::recover_from(self.wal.device_mut(), &mut scratch, layout).await?;
         self.manifest = manifest;
         if fresh {
             // Nothing was ever committed: the whole WAL region is live.
