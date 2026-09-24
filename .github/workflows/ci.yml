@@ -85,7 +85,9 @@ jobs:
           components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly miri setup
-      # A fast subset. The full suite under miri takes too long for every push.
+      # A fast subset (about 35 s of miri test time). The full suite under
+      # miri takes too long for every push; tests/compress.rs alone takes
+      # about 6 minutes because of its decoder fuzz, so it is left out.
       - run: >-
           cargo +nightly miri test
           --test crc
@@ -93,7 +95,7 @@ jobs:
           --test memtable
           --test manifest
           --test write_batch
-          --test compress
+          --test alloc
 
   bench-build:
     name: bench-build
