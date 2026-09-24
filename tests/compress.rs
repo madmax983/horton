@@ -209,7 +209,7 @@ fn decoder_fuzz_no_panic() {
 fn put_flushing(db: &mut TestDb<MemDevice<BLOCK>>, k: &[u8], v: &[u8]) {
     match block_on(db.put(k, v)) {
         Ok(_) => {}
-        Err(horton::Error::ArenaFull | horton::Error::NoSpace) => {
+        Err(horton::Error::ArenaFull | horton::Error::WalFull) => {
             block_on(db.flush()).unwrap();
             block_on(db.put(k, v)).unwrap();
         }

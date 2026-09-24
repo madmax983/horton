@@ -122,8 +122,11 @@ impl<
     /// # Errors
     ///
     /// [`Error::IngestConflict`] when the id is already attached with a
-    /// *different* descriptor, [`Error::NoSpace`] when L0 is full or the
-    /// table is larger than a slot or no slot is free, [`Error::CorruptBlock`] when the source
+    /// *different* descriptor, [`Error::NeedsCompaction`] when L0 is full
+    /// (or no slot is free until compaction frees one),
+    /// [`Error::RegionFull`] when no slot is free at all,
+    /// [`Error::TableTooLarge`] when the table is larger than a slot,
+    /// [`Error::CorruptBlock`] when the source
     /// bytes fail validation (the manifest is untouched), or
     /// [`Error::Device`] on I/O failure from either device.
     pub async fn ingest_table<R>(
@@ -162,7 +165,7 @@ impl<
         // L0 must have room: like flush, a full L0 is the caller's signal
         // to compact first.
         if self.manifest.l0_is_full() {
-            return Err(Error::NoSpace);
+            return Err(self.no_room());
         }
         let blocks = u64::from(sealed.block_count);
         // Pick a free slot (mirrors flush). It is claimed only after the
@@ -503,7 +506,10 @@ impl<
             id: candidate.first_block,
         })?;
         for lvl in 0..LEVELS {
-            let tables = self.manifest.level(lvl).ok_or(Error::NoSpace)?;
+            let tables = self
+                .manifest
+                .level(lvl)
+                .ok_or(Error::BadLevel { level: lvl })?;
             for t in tables {
                 if t.id != candidate.id && ranges_overlap(t.first_key, t.last_key, start_b, end_b) {
                     return Err(refuse());

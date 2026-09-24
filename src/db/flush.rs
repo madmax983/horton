@@ -92,12 +92,12 @@ impl<
         Ok(TableRef {
             id,
             first_block: base,
-            block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
+            block_count: u32::try_from(total).map_err(|_| Error::TableTooLarge)?,
             first_key: plan.first_key.min(rdel_first),
             last_key: plan.last_key.max(rdel_last),
             max_seq: plan.max_seq.max(rdel_plan.max_seq),
             min_seq: plan.min_seq.min(rdel_plan.min_seq),
-            entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::NoSpace)?,
+            entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks: rdel_plan.blocks,
         })
     }
@@ -125,10 +125,14 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when level 0 is full (run
-    /// [`compact_step`](Db::compact_step)), no table slot is free beyond
-    /// the compaction reserve, or the table's index would overflow one
-    /// block; or [`Error::Device`] on I/O failure.
+    /// [`Error::NeedsCompaction`] when level 0 is full, or no table slot
+    /// is free beyond the compaction reserve and compaction can free one:
+    /// run [`compact_step`](Db::compact_step) until
+    /// [`Progress::Done`](crate::Progress::Done), then retry.
+    /// [`Error::RegionFull`] when no slot is free and compaction has
+    /// nothing to do. [`Error::TableTooLarge`] when the table's index or
+    /// range-tombstone section would overflow its budget.
+    /// [`Error::Device`] on I/O failure.
     pub async fn flush(&mut self) -> Result<(), Error<D::Error>> {
         self.ensure_open()?;
         // Every acked mutation must be durable in the WAL or the new table.
@@ -143,7 +147,7 @@ impl<
         // Fail before doing I/O when level 0 cannot take another table;
         // `add_l0_table` re-checks authoritatively below.
         if self.manifest.l0_is_full() {
-            return Err(Error::NoSpace);
+            return Err(self.no_room());
         }
         // Pass 1: pure computation of the table shape. Point entries and
         // range tombstones are planned separately: the rdel section sits
@@ -170,7 +174,7 @@ impl<
         let total = u64::from(rdel_plan.blocks)
             .checked_add(plan.data_blocks)
             .and_then(|n| n.checked_add(3))
-            .ok_or(Error::NoSpace)?;
+            .ok_or(Error::TableTooLarge)?;
         // Pick a free slot; it is claimed only once the manifest commit
         // below has landed.
         let slot = self.free_slot_for(total)?;
@@ -200,7 +204,7 @@ impl<
             }
             let data_blocks = w.seal_data(&mut *device, Some(&mut cs)).await?;
             debug_assert_eq!(data_blocks, plan.data_blocks);
-            let rdel_base = base.checked_add(data_blocks).ok_or(Error::NoSpace)?;
+            let rdel_base = base.checked_add(data_blocks).ok_or(Error::TableTooLarge)?;
             let rdel_written = Self::write_flush_rdel(&mut *device, table, rdel_base).await?;
             debug_assert_eq!(rdel_written, rdel_plan.blocks);
             w.finish_meta(&mut *device, rdel_written, rdel_plan.min_seq)

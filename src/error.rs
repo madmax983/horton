@@ -46,14 +46,53 @@ pub enum Error<E> {
     },
     /// No manifest slot carried a valid CRC.
     CorruptManifest,
-    /// Out of addressable blocks (WAL region exhausted, oversize record, …).
-    NoSpace,
+    /// The WAL region has no block left for the next commit. Nothing was
+    /// written. **Remedy:** [`Db::flush`](crate::Db::flush), which moves
+    /// the memtable into a table and wraps the WAL, then retry.
+    WalFull,
+    /// Level 0 is full, or no table slot is free until compaction merges
+    /// tables. Nothing was written. **Remedy:** run
+    /// [`Db::compact_step`](crate::Db::compact_step) until it returns
+    /// [`Progress::Done`](crate::Progress::Done), then retry.
+    NeedsCompaction,
+    /// The table region is full: no slot is free and compaction cannot
+    /// free one (`compact_step` reports this when a level wants a job but
+    /// no job fits the free slots). Nothing was written. **Remedy:** delete
+    /// data and compact, archive tables, or configure a larger table
+    /// region. Reads keep working.
+    RegionFull,
+    /// All eight snapshot slots are in use. **Remedy:** release a snapshot
+    /// with [`Db::release_snapshot`](crate::Db::release_snapshot).
+    SnapshotLimit,
+    /// A [`Manifest`](crate::Manifest) has no room for the change: its
+    /// level or table pool is full, or a one-block encode was asked of a
+    /// manifest that spans several blocks. [`Db`](crate::Db) checks
+    /// capacity before it changes the manifest, so through `Db` this is an
+    /// internal invariant violation.
+    ManifestFull,
+    /// A table does not fit where it must go: one entry is larger than a
+    /// data block, the index or range-tombstone section outgrows its
+    /// budget, the table (for example an ingested one) is larger than a
+    /// table slot, or a writer reached its block limit. Nothing became
+    /// visible. **Remedy:** smaller entries, fewer range tombstones per
+    /// table, or larger blocks or slots.
+    TableTooLarge,
+    /// A counter overflowed: the write sequence, a table id, or the
+    /// manifest sequence. Unreachable in practice (it takes 2^32 tables
+    /// or 2^64 writes).
+    CounterExhausted,
+    /// A level index is out of range: it must be below `LEVELS`.
+    BadLevel {
+        /// The rejected level.
+        level: usize,
+    },
     /// A [`WriteBatch`](crate::WriteBatch) already holds `OPS` operations.
     BatchFull,
-    /// A [`WriteBatch`](crate::WriteBatch) does not fit one WAL block, so
-    /// it cannot commit atomically. Split it into smaller batches.
+    /// A [`WriteBatch`](crate::WriteBatch), or a single WAL record, does
+    /// not fit one WAL block, so it cannot commit atomically. Split it into
+    /// smaller batches.
     BatchTooLarge {
-        /// Total encoded size of the batch in bytes.
+        /// Total encoded size of the batch or record in bytes.
         bytes: usize,
         /// The WAL block size: the atomicity ceiling.
         max: usize,

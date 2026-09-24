@@ -47,3 +47,47 @@ fn esp32s3_profile_fits_ram_budget() {
         "profile grew past the {ESP32S3_RAM_BUDGET}-byte budget: re-tune consciously"
     );
 }
+
+/// F11 — the profile aliases come from `db_types!`, whose named
+/// parameters must land in the right positional slots: each alias is the
+/// exact type the positional spelling names.
+#[test]
+fn db_types_aliases_match_the_positional_spelling() {
+    use horton::profile::Esp32S3RevScan;
+
+    fn db(x: horton::Db<Dummy, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>) -> Esp32S3Db<Dummy> {
+        x
+    }
+    fn scan(
+        x: horton::Scan<'static, Dummy, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>,
+    ) -> Esp32S3Scan<'static, Dummy> {
+        x
+    }
+    fn rev(
+        x: horton::RevScan<'static, Dummy, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>,
+    ) -> Esp32S3RevScan<'static, Dummy> {
+        x
+    }
+    fn comp(x: horton::Compaction<4096, 32, 64, 64>) -> Esp32S3Compaction {
+        x
+    }
+    // The identity functions type-check only if the types are equal.
+    let _ = (db, scan, rev, comp);
+
+    // A shape declared with the macro elsewhere behaves like any `Db`.
+    horton::db_types! {
+        block: 4096,
+        key_max: 16,
+        val_max: 32,
+        memtable_entries: 8,
+        memtable_arena: 512,
+        levels: 2,
+        tables_per_level: 2,
+        bloom_bytes: 32,
+        cache_blocks: 0;
+        type Db = TinyDb;
+        type Compaction = TinyCompaction;
+    }
+    assert!(core::mem::size_of::<TinyDb<Dummy>>() < core::mem::size_of::<Esp32S3Db<Dummy>>());
+    let _ = TinyCompaction::new();
+}

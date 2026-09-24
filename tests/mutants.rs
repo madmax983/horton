@@ -714,7 +714,7 @@ fn mut_manifest_advance_next_table_id_noop_on_tie() {
 
 /// Kills `src/manifest.rs:282 replace l0_is_full -> bool with false`:
 /// level 0 holding `TABLES` tables must report full — flush and ingest
-/// rely on this to fail fast with `NoSpace` before doing I/O.
+/// rely on this to fail fast with `NeedsCompaction` before doing I/O.
 #[test]
 fn mut_manifest_l0_is_full_reports_full() {
     use horton::{KeyBound, Manifest, TableRef};
@@ -907,7 +907,7 @@ fn mut_manifest_decode_bound_rejects_overlong() {
 }
 
 /// A manifest that fills its block exactly must encode as a one-block
-/// copy — an off-by-one in the chunk arithmetic would report `NoSpace` or
+/// copy — an off-by-one in the chunk arithmetic would report `ManifestFull` or
 /// spill into a second block.
 #[test]
 fn mut_manifest_encode_accepts_exact_fit() {
@@ -940,7 +940,7 @@ fn mut_manifest_encode_accepts_exact_fit() {
 }
 
 /// A manifest larger than one block must fail the one-block `encode`
-/// with `NoSpace` — never write out of bounds (multi-block copies go
+/// with `ManifestFull` — never write out of bounds (multi-block copies go
 /// through `commit_to`).
 #[test]
 fn mut_manifest_encode_rejects_oversized() {
@@ -962,7 +962,7 @@ fn mut_manifest_encode_rejects_oversized() {
     let mut buf = [0u8; 128];
     let res = m.encode::<Infallible, 128>(&mut buf);
     assert!(
-        res.is_err(),
-        "oversized manifest must be NoSpace, never a panic"
+        matches!(res, Err(horton::Error::ManifestFull)),
+        "oversized manifest must be ManifestFull, never a panic"
     );
 }

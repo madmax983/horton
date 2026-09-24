@@ -33,7 +33,7 @@ where
 fn flush(db: &mut TestDb<MemDevice<4096>>) {
     match block_on(db.flush()) {
         Ok(()) => {}
-        Err(horton::Error::NoSpace) => {
+        Err(horton::Error::NeedsCompaction) => {
             drive(db);
             block_on(db.flush()).unwrap();
         }

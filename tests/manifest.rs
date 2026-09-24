@@ -210,7 +210,7 @@ fn old_magic_is_rejected_not_misparsed() {
 fn encode_crc_tail_is_bounds_checked() {
     // Regression: the trailing CRC write was not bounds-checked. A payload
     // leaving fewer than 4 bytes for the CRC panicked instead of failing
-    // with `NoSpace` (production code must have no panic paths).
+    // with an error (production code must have no panic paths).
     // Manifest<1, 1, 8> with a 2-byte first key: payload = 91, so the CRC
     // would land at [103..107] in a 106-byte block.
     let mut m = Manifest::<1, 1, 8>::new();
@@ -229,8 +229,8 @@ fn encode_crc_tail_is_bounds_checked() {
     let mut buf = [0u8; 106];
     let res = m.encode::<DevError, 106>(&mut buf);
     assert!(
-        matches!(res, Err(Error::NoSpace)),
-        "CRC without room must be NoSpace, not a panic"
+        matches!(res, Err(Error::ManifestFull)),
+        "CRC without room must be ManifestFull, not a panic"
     );
 }
 

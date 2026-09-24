@@ -11,18 +11,31 @@ use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
-use horton::{BlockDevice, Compaction, Config, Db, Error, Progress, Scan};
+use horton::{BlockDevice, Config, Error, Progress, Scan};
 
 /// Block size shared by the device and the database (`D::BLOCK == BLOCK`
 /// is a compile-time check).
 const BLOCK: usize = 4096;
 
-/// The database type: every size is a const generic, so the whole thing
-/// is one fixed-size value with no heap behind it.
-///
-/// `BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES,
-/// CACHE`
-type MyDb = Db<RamDisk, BLOCK, 64, 256, 64, 8192, 4, 4, 256, 4>;
+// The database types: every size is a const generic, so the whole thing
+// is one fixed-size value with no heap behind it. `db_types!` names each
+// parameter, so two swapped sizes cannot compile.
+horton::db_types! {
+    block: BLOCK,
+    key_max: 64,
+    val_max: 256,
+    memtable_entries: 64,
+    memtable_arena: 8192,
+    levels: 4,
+    tables_per_level: 4,
+    bloom_bytes: 256,
+    cache_blocks: 4;
+
+    /// The database (`MyDb<D>` for any device `D`).
+    type Db = MyDb;
+    /// Caller-owned compaction scratch for `MyDb`.
+    type Compaction = MyCompaction;
+}
 
 /// A block device backed by a `Vec` of blocks. Unwritten blocks read as
 /// zeros. Every call completes immediately (`Poll::Ready`).
@@ -145,7 +158,7 @@ fn main() -> Result<(), Error<OutOfRange>> {
 
     // Compaction is caller-driven and bounded: each step seals at most one
     // output block, so firmware can interleave it with real-time work.
-    let mut scratch = Box::new(Compaction::<BLOCK, 64, 256, 256>::new());
+    let mut scratch = Box::new(MyCompaction::new());
     while db.compaction_pending() {
         while block_on(db.compact_step(&mut scratch))? == Progress::More {}
     }

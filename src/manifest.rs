@@ -57,6 +57,10 @@ const BLOCK_HEADER: usize = 24;
 /// Bytes of a block's trailing CRC32.
 const BLOCK_CRC: usize = 4;
 
+/// Framing bytes per manifest block (header plus CRC): a block carries
+/// `BLOCK - BLOCK_FRAME` body bytes.
+pub(crate) const BLOCK_FRAME: usize = BLOCK_HEADER + BLOCK_CRC;
+
 /// Where the manifest's copies live. Each copy is a run of
 /// [`Manifest::max_blocks`] blocks; commits rotate through the copies, so
 /// every copy's blocks are erased once per `copies` commits.
@@ -103,7 +107,11 @@ impl ManifestLayout {
     #[must_use]
     pub const fn copy_start(&self, k: u32, stride: u64) -> u64 {
         if self.ring == 0 {
-            if k.is_multiple_of(2) { self.first } else { self.second }
+            if k.is_multiple_of(2) {
+                self.first
+            } else {
+                self.second
+            }
         } else {
             self.first + (k % self.ring) as u64 * stride
         }
@@ -418,7 +426,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ) -> Result<(), Error<E>> {
         let used = self.live();
         if used >= Self::CAPACITY {
-            return Err(Error::NoSpace);
+            return Err(Error::ManifestFull);
         }
         let flat = self.flat_mut();
         flat.copy_within(pos..used, pos + 1);
@@ -484,9 +492,13 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] on counter overflow (unreachable in practice).
+    /// [`Error::CounterExhausted`] on counter overflow (unreachable in
+    /// practice).
     pub fn bump_table_id<E>(&mut self) -> Result<(), Error<E>> {
-        self.next_table_id = self.next_table_id.checked_add(1).ok_or(Error::NoSpace)?;
+        self.next_table_id = self
+            .next_table_id
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
         Ok(())
     }
 
@@ -494,7 +506,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] on counter overflow (unreachable in practice).
+    /// [`Error::CounterExhausted`] on counter overflow (unreachable in
+    /// practice).
     pub fn alloc_table_id<E>(&mut self) -> Result<u32, Error<E>> {
         let id = self.next_table_id;
         self.bump_table_id()?;
@@ -530,11 +543,11 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when level 0 already holds `TABLES` tables or the
-    /// pool is full.
+    /// [`Error::ManifestFull`] when level 0 already holds `TABLES` tables
+    /// or the pool is full.
     pub fn add_l0_table<E>(&mut self, tref: TableRef<KEY_MAX>) -> Result<(), Error<E>> {
         if self.counts[0] >= TABLES {
-            return Err(Error::NoSpace);
+            return Err(Error::ManifestFull);
         }
         self.insert_at(self.counts[0], 0, tref)
     }
@@ -563,15 +576,15 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when `level` is out of range, level 0 is full,
-    /// or the pool is full.
+    /// [`Error::BadLevel`] when `level` is out of range, or
+    /// [`Error::ManifestFull`] when level 0 or the pool is full.
     pub fn add_table_to_level<E>(
         &mut self,
         level: usize,
         tref: TableRef<KEY_MAX>,
     ) -> Result<(), Error<E>> {
         if level >= LEVELS {
-            return Err(Error::NoSpace);
+            return Err(Error::BadLevel { level });
         }
         if level == 0 {
             return self.add_l0_table(tref);
@@ -591,10 +604,10 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when `level` is out of range.
+    /// [`Error::BadLevel`] when `level` is out of range.
     pub fn remove_table_from_level<E>(&mut self, level: usize, id: u32) -> Result<bool, Error<E>> {
         if level >= LEVELS {
-            return Err(Error::NoSpace);
+            return Err(Error::BadLevel { level });
         }
         let s = self.start(level);
         let Some(pos) = self.flat()[s..s + self.counts[level]]
@@ -625,7 +638,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when `level` is out of range.
+    /// [`Error::BadLevel`] when `level` is out of range.
     pub fn narrow_table<E>(
         &mut self,
         level: usize,
@@ -633,7 +646,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         first: KeyBound<KEY_MAX>,
     ) -> Result<bool, Error<E>> {
         if level >= LEVELS {
-            return Err(Error::NoSpace);
+            return Err(Error::BadLevel { level });
         }
         let s = self.start(level);
         let n = self.counts[level];
@@ -728,7 +741,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when `index` is past the copy's last block.
+    /// [`Error::ManifestFull`] when `index` is past the copy's last block.
     pub fn encode_block<E, const BLOCK: usize>(
         &self,
         index: usize,
@@ -737,7 +750,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let chunk = Self::chunk::<BLOCK>();
         let count = self.encoded_blocks::<BLOCK>();
         if index >= count {
-            return Err(Error::NoSpace);
+            return Err(Error::ManifestFull);
         }
         let lo = index * chunk;
         let len = self.body_len().saturating_sub(lo).min(chunk);
@@ -753,9 +766,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         out[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
         out[8..16].copy_from_slice(&self.seq.to_le_bytes());
         let (i16, c16, l32) = (
-            u16::try_from(index).map_err(|_| Error::NoSpace)?,
-            u16::try_from(count).map_err(|_| Error::NoSpace)?,
-            u32::try_from(len).map_err(|_| Error::NoSpace)?,
+            u16::try_from(index).map_err(|_| Error::ManifestFull)?,
+            u16::try_from(count).map_err(|_| Error::ManifestFull)?,
+            u32::try_from(len).map_err(|_| Error::ManifestFull)?,
         );
         out[16..18].copy_from_slice(&i16.to_le_bytes());
         out[18..20].copy_from_slice(&c16.to_le_bytes());
@@ -773,10 +786,11 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the manifest needs more than one block.
+    /// [`Error::ManifestFull`] when the manifest needs more than one
+    /// block.
     pub fn encode<E, const BLOCK: usize>(&self, out: &mut [u8; BLOCK]) -> Result<(), Error<E>> {
         if self.encoded_blocks::<BLOCK>() > 1 {
-            return Err(Error::NoSpace);
+            return Err(Error::ManifestFull);
         }
         self.encode_block(0, out)
     }
@@ -1010,7 +1024,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the sequence counter overflows, or
+    /// [`Error::CounterExhausted`] when the sequence counter overflows, or
     /// [`Error::Device`] on I/O failure.
     pub async fn commit_to<D: BlockDevice, const BLOCK: usize>(
         &mut self,
@@ -1018,7 +1032,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         scratch: &mut [u8; BLOCK],
         layout: ManifestLayout,
     ) -> Result<(), Error<D::Error>> {
-        self.seq = self.seq.checked_add(1).ok_or(Error::NoSpace)?;
+        self.seq = self.seq.checked_add(1).ok_or(Error::CounterExhausted)?;
         let copies = u64::from(layout.copies());
         // `seq % copies < copies <= u32::MAX`: the narrowing is exact.
         #[allow(clippy::cast_possible_truncation)]

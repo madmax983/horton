@@ -38,7 +38,7 @@
 //! Bounds: restart offsets are `u16`, so a data block effectively tops out
 //! at 64 KiB, and at most 2048 entries share one data block (restart offsets
 //! live in a fixed `[u16; 128]`). A table whose index would overflow one
-//! block fails cleanly with [`Error::NoSpace`].
+//! block fails cleanly with [`Error::TableTooLarge`].
 
 use core::future::poll_fn;
 
@@ -332,7 +332,7 @@ pub fn bloom_maybe_contains(bloom: &[u8], key: &[u8], k: u8) -> bool {
 /// # Errors
 ///
 /// [`Error::KeyTooLarge`] / [`Error::ValueTooLarge`] for oversize entries,
-/// [`Error::NoSpace`] when an entry cannot fit any data block.
+/// [`Error::TableTooLarge`] when an entry cannot fit any data block.
 pub fn plan_table<'a, E, const BLOCK: usize, const KEY_MAX: usize>(
     entries: impl Iterator<Item = SstEntry<'a>>,
 ) -> Result<TablePlan<KEY_MAX>, Error<E>> {
@@ -348,13 +348,13 @@ pub fn plan_table<'a, E, const BLOCK: usize, const KEY_MAX: usize>(
         let (elen, _, _) = entry_sizes::<E>(&e)?;
         if !entry_fits::<BLOCK>(payload, n, elen) {
             if n == 0 {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             data_blocks += 1;
             payload = 0;
             n = 0;
             if !entry_fits::<BLOCK>(0, 0, elen) {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
         }
         if first.is_none() {
@@ -422,12 +422,12 @@ async fn seal_block<D: BlockDevice, const BLOCK: usize>(
             .len()
             .checked_mul(2)
             .and_then(|n| n.checked_add(2))
-            .ok_or(Error::NoSpace)?;
-        let rstart = body_end.checked_sub(tail_len).ok_or(Error::NoSpace)?;
+            .ok_or(Error::TableTooLarge)?;
+        let rstart = body_end.checked_sub(tail_len).ok_or(Error::TableTooLarge)?;
         // `entry_fits` reserves the worst-case tail, so this cannot trigger
         // for writer-produced blocks.
         if payload_len > rstart {
-            return Err(Error::NoSpace);
+            return Err(Error::TableTooLarge);
         }
         buf[payload_len..rstart].fill(0);
         let mut off = rstart;
@@ -436,7 +436,7 @@ async fn seal_block<D: BlockDevice, const BLOCK: usize>(
             off += 2;
         }
         // `entry_fits` caps entries per block, so this always fits.
-        let rc = u16::try_from(rs.len()).map_err(|_| Error::NoSpace)?;
+        let rc = u16::try_from(rs.len()).map_err(|_| Error::TableTooLarge)?;
         buf[off..off + 2].copy_from_slice(&rc.to_le_bytes());
         debug_assert_eq!(off + 2, body_end);
     } else {
@@ -579,7 +579,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// run for the table; sealing past it would overwrite whatever follows
     /// the run, so [`push`](Self::push) and
     /// [`seal_data`](Self::seal_data) refuse with
-    /// [`Error::NoSpace`] instead.
+    /// [`Error::TableTooLarge`] instead.
     #[must_use]
     pub const fn with_block_limit(mut self, data_blocks: u64) -> Self {
         self.data_limit = data_blocks;
@@ -630,7 +630,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// # Errors
     ///
     /// [`Error::KeyTooLarge`] / [`Error::ValueTooLarge`] for oversize
-    /// entries, [`Error::NoSpace`] when a single entry cannot fit in an
+    /// entries, [`Error::TableTooLarge`] when a single entry cannot fit in an
     /// empty block, the table outgrows its pre-allocated run, or the index
     /// would overflow one block, or [`Error::Device`] on I/O failure.
     pub async fn push<D: BlockDevice>(
@@ -650,16 +650,16 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             PushOutcome::Buffered
         } else {
             if self.n == 0 {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             // The block being sealed plus the one this entry opens must
             // both fit the reserved run.
             if self.data_blocks.saturating_add(2) > self.data_limit {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             self.seal_current(device, compress).await?;
             if !entry_fits::<BLOCK>(0, 0, elen) {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             PushOutcome::BlockSealed
         };
@@ -667,7 +667,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             // `entry_fits` guarantees this never overflows the array.
             debug_assert!(self.nrestarts < self.restarts.len());
             self.restarts[self.nrestarts] =
-                u16::try_from(self.payload).map_err(|_| Error::NoSpace)?;
+                u16::try_from(self.payload).map_err(|_| Error::TableTooLarge)?;
             self.nrestarts += 1;
         }
         let p = self.payload;
@@ -725,7 +725,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the block would exceed the writer's block
+    /// [`Error::TableTooLarge`] when the block would exceed the writer's block
     /// limit, or [`Error::Device`] on I/O failure.
     pub async fn seal_data<D: BlockDevice>(
         &mut self,
@@ -734,7 +734,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     ) -> Result<u64, Error<D::Error>> {
         if self.n > 0 {
             if self.data_blocks >= self.data_limit {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             self.seal_current(device, compress).await?;
         }
@@ -751,7 +751,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         let id = self
             .base
             .checked_add(self.data_blocks)
-            .ok_or(Error::NoSpace)?;
+            .ok_or(Error::TableTooLarge)?;
         seal_block(
             device,
             id,
@@ -787,7 +787,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] on block-id overflow, or [`Error::Device`] on I/O
+    /// [`Error::TableTooLarge`] on block-id overflow, or [`Error::Device`] on I/O
     /// failure.
     pub async fn finish_meta<D: BlockDevice>(
         &mut self,
@@ -802,7 +802,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             .base
             .checked_add(self.data_blocks)
             .and_then(|b| b.checked_add(u64::from(rdel_blocks)))
-            .ok_or(Error::NoSpace)?;
+            .ok_or(Error::TableTooLarge)?;
         self.data.fill(0);
         self.data[..self.bloom.len()].copy_from_slice(&self.bloom);
         seal_block(
@@ -816,7 +816,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         .await?;
 
         // Index block.
-        let index_id = bloom_id.checked_add(1).ok_or(Error::NoSpace)?;
+        let index_id = bloom_id.checked_add(1).ok_or(Error::TableTooLarge)?;
         seal_block(
             device,
             index_id,
@@ -829,7 +829,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
 
         // Footer block: magic | index | bloom | entry_count | k |
         // rdel_blocks | min_seq.
-        let footer_id = index_id.checked_add(1).ok_or(Error::NoSpace)?;
+        let footer_id = index_id.checked_add(1).ok_or(Error::TableTooLarge)?;
         self.data.fill(0);
         self.data[0..8].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
         self.data[8..16].copy_from_slice(&index_id.to_le_bytes());
@@ -873,7 +873,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the table outgrows its block limit, or
+    /// [`Error::TableTooLarge`] when the table outgrows its block limit, or
     /// [`Error::Device`] on I/O failure.
     ///
     /// `compress` is the caller's compression scratch (`None` = store raw);
@@ -905,7 +905,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
 /// # Errors
 ///
 /// [`Error::KeyTooLarge`] / [`Error::ValueTooLarge`] for oversize entries,
-/// [`Error::NoSpace`] when the table outgrows its pre-allocated run or the
+/// [`Error::TableTooLarge`] when the table outgrows its pre-allocated run or the
 /// index would overflow one block, or [`Error::Device`] on I/O failure.
 pub async fn write_table<
     'a,
@@ -993,7 +993,7 @@ pub(crate) fn plan_rdel_blocks<'a, E, const BLOCK: usize>(
         }
         let el = rdel_entry_len::<E>(r.start.len(), r.end.len())?;
         if el + RDEL_TRAILER > BLOCK {
-            return Err(Error::NoSpace);
+            return Err(Error::TableTooLarge);
         }
         if payload + el + RDEL_TRAILER > BLOCK {
             blocks += 1;
@@ -1024,7 +1024,7 @@ fn rdel_entry_len<E>(start_len: usize, end_len: usize) -> Result<usize, Error<E>
     start_len
         .checked_add(end_len)
         .and_then(|n| n.checked_add(12))
-        .ok_or(Error::NoSpace)
+        .ok_or(Error::TableTooLarge)
 }
 
 /// Seals one rdel block: entries at `[0..payload]`, `count u16` at
@@ -1039,7 +1039,7 @@ async fn seal_rdel_block<D: BlockDevice, const BLOCK: usize>(
 ) -> Result<(), Error<D::Error>> {
     let body_end = BLOCK - CRC_LEN;
     buf[payload..body_end - 2].fill(0);
-    let count16 = u16::try_from(count).map_err(|_| Error::NoSpace)?;
+    let count16 = u16::try_from(count).map_err(|_| Error::TableTooLarge)?;
     buf[body_end - 2..body_end].copy_from_slice(&count16.to_le_bytes());
     let crc = crc32(&buf[..body_end]);
     buf[body_end..BLOCK].copy_from_slice(&crc.to_le_bytes());
@@ -1082,7 +1082,7 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
     }
 
     /// Caps the section at `blocks` blocks: a seal past it fails with
-    /// [`Error::NoSpace`] instead of writing beyond the caller's budget.
+    /// [`Error::TableTooLarge`] instead of writing beyond the caller's budget.
     #[must_use]
     pub(crate) const fn with_block_limit(mut self, blocks: u32) -> Self {
         self.limit = blocks;
@@ -1094,7 +1094,7 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the tombstone cannot fit in an empty
+    /// [`Error::TableTooLarge`] when the tombstone cannot fit in an empty
     /// block, or [`Error::Device`] on I/O failure.
     pub(crate) async fn push<D: BlockDevice>(
         &mut self,
@@ -1111,16 +1111,16 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
         })?;
         let el = rdel_entry_len::<D::Error>(usize::from(slen), usize::from(elen))?;
         if el + RDEL_TRAILER > BLOCK {
-            return Err(Error::NoSpace);
+            return Err(Error::TableTooLarge);
         }
         if self.payload + el + RDEL_TRAILER > BLOCK {
             if self.blocks >= self.limit {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             let id = self
                 .base
                 .checked_add(u64::from(self.blocks))
-                .ok_or(Error::NoSpace)?;
+                .ok_or(Error::TableTooLarge)?;
             seal_rdel_block(device, id, &mut self.buf, self.payload, self.count).await?;
             self.blocks += 1;
             self.payload = 0;
@@ -1151,12 +1151,12 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
     ) -> Result<u32, Error<D::Error>> {
         if self.count > 0 {
             if self.blocks >= self.limit {
-                return Err(Error::NoSpace);
+                return Err(Error::TableTooLarge);
             }
             let id = self
                 .base
                 .checked_add(u64::from(self.blocks))
-                .ok_or(Error::NoSpace)?;
+                .ok_or(Error::TableTooLarge)?;
             seal_rdel_block(device, id, &mut self.buf, self.payload, self.count).await?;
             self.blocks += 1;
             self.count = 0;
@@ -1176,7 +1176,7 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
 ///
 /// # Errors
 ///
-/// [`Error::NoSpace`] when a single tombstone cannot fit in an empty
+/// [`Error::TableTooLarge`] when a single tombstone cannot fit in an empty
 /// block, or [`Error::Device`] on I/O failure.
 pub(crate) async fn write_rdel_blocks<D, const BLOCK: usize>(
     device: &mut D,
@@ -1356,11 +1356,11 @@ fn append_index<E, const BLOCK: usize>(
     block_id: u64,
     max_seq: u64,
 ) -> Result<(), Error<E>> {
-    let fk = first_key.ok_or(Error::NoSpace)?;
-    let kl = u16::try_from(fk.len()).map_err(|_| Error::NoSpace)?;
+    let fk = first_key.ok_or(Error::TableTooLarge)?;
+    let kl = u16::try_from(fk.len()).map_err(|_| Error::TableTooLarge)?;
     let elen = 2 + fk.len() + 8 + 8;
     if *index_len + elen > BLOCK - CRC_LEN {
-        return Err(Error::NoSpace);
+        return Err(Error::TableTooLarge);
     }
     let o = *index_len;
     index[o..o + 2].copy_from_slice(&kl.to_le_bytes());

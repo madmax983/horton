@@ -502,7 +502,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
     /// # Errors
     ///
     /// [`Error::CorruptBlock`] on a torn input block (compaction must never
-    /// silently drop entries), [`Error::NoSpace`] when an entry cannot fit
+    /// silently drop entries), [`Error::TableTooLarge`] when an entry cannot fit
     /// in an empty output block, or [`Error::Device`] on I/O failure.
     pub(crate) async fn merge_step<D: BlockDevice>(
         &mut self,
@@ -1764,7 +1764,10 @@ mod tests {
         // The third entry would seal block 0 and open block 1: allowed.
         block_on(w.push(&mut dev, e(2))).unwrap();
         // Sealing block 1 would pass the limit.
-        assert!(matches!(block_on(w.finish(&mut dev)), Err(Error::NoSpace)));
+        assert!(matches!(
+            block_on(w.finish(&mut dev)),
+            Err(Error::TableTooLarge)
+        ));
     }
 
     #[test]

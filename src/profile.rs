@@ -5,31 +5,46 @@
 //! layout on xtensa; see `BUDGET.md` for the accounting). The device's own
 //! storage (e.g. a RAM disk or flash region) is extra.
 
-use crate::compact::Compaction;
-use crate::{Db, Scan};
+crate::db_types! {
+    block: 4096,
+    key_max: 32,
+    val_max: 64,
+    memtable_entries: 16,
+    memtable_arena: 2048,
+    levels: 4,
+    tables_per_level: 4,
+    bloom_bytes: 64,
+    cache_blocks: 2;
 
-/// ESP32-S3 profile: the [`Db`] instantiation for 4 KiB SPI-flash sectors.
-///
-/// Keys to 32 bytes, values to 64, a 16-entry memtable over a 2 KiB arena,
-/// 4 levels of up to 4 tables each, a 2-slot block cache. `BLOCK = 4096`
-/// is the SPI flash sector size, required by
-/// [`FlashBlockDevice`](crate::flash::FlashBlockDevice).
-///
-/// Static RAM is measured, not estimated: `tests/profile.rs` prints the
-/// `size_of` of [`Db`], [`Scan`], and [`Compaction`] for this profile and
-/// asserts their sum stays under [`ESP32S3_RAM_BUDGET`]. `BUDGET.md`
-/// records the current numbers and what each buffer is for.
-pub type Esp32S3Db<D> = Db<D, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>;
+    /// ESP32-S3 profile: the [`Db`](crate::Db) instantiation for 4 KiB SPI-flash sectors.
+    ///
+    /// Keys to 32 bytes, values to 64, a 16-entry memtable over a 2 KiB arena,
+    /// 4 levels of up to 4 tables each, a 2-slot block cache. `BLOCK = 4096`
+    /// is the SPI flash sector size, required by
+    /// [`FlashBlockDevice`](crate::flash::FlashBlockDevice).
+    ///
+    /// Static RAM is measured, not estimated: `tests/profile.rs` prints the
+    /// `size_of` of [`Db`](crate::Db), [`Scan`](crate::Scan), and
+    /// [`Compaction`](crate::Compaction) for this profile and
+    /// asserts their sum stays under [`ESP32S3_RAM_BUDGET`]. `BUDGET.md`
+    /// records the current numbers and what each buffer is for.
+    pub type Db = Esp32S3Db;
 
-/// [`Scan`] instantiated for the ESP32-S3 profile.
-pub type Esp32S3Scan<'d, D> = Scan<'d, D, 4096, 32, 64, 16, 2048, 4, 4, 64, 2>;
+    /// [`Scan`](crate::Scan) instantiated for the ESP32-S3 profile.
+    pub type Scan = Esp32S3Scan;
 
-/// [`Compaction`] scratch instantiated for the ESP32-S3 profile.
-pub type Esp32S3Compaction = Compaction<4096, 32, 64, 64>;
+    /// [`RevScan`](crate::RevScan) instantiated for the ESP32-S3 profile.
+    pub type RevScan = Esp32S3RevScan;
+
+    /// [`Compaction`](crate::Compaction) scratch instantiated for the
+    /// ESP32-S3 profile.
+    pub type Compaction = Esp32S3Compaction;
+}
 
 /// Static RAM budget for the ESP32-S3 profile.
 ///
-/// Covers one [`Db`], one [`Scan`], and one [`Compaction`] scratch.
+/// Covers one [`Db`](crate::Db), one [`Scan`](crate::Scan), and one
+/// [`Compaction`](crate::Compaction) scratch.
 /// `tests/profile.rs` asserts the measured total stays under this; growth
 /// past it fails loudly so the re-tune is a conscious decision, not
 /// silent bloat.

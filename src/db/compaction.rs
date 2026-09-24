@@ -83,18 +83,19 @@ impl<
     const CACHE: usize,
 > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
-    /// Reports whether [`compact_step`](Db::compact_step) would select a
-    /// compaction job right now: some level above the bottom holds
-    /// `>= TABLES` tables, or the table region is down to its compaction
-    /// reserve while L0 holds two or more tables (merging them frees
-    /// slots). Unlike [`Progress::Done`], which a finished job also
-    /// returns, this distinguishes "a job just finished, more may be
+    /// Reports whether [`compact_step`](Db::compact_step) has work: a job
+    /// is in flight, or it would select one right now — some level above
+    /// the bottom holds `>= TABLES` tables, or the table region is down to
+    /// its compaction reserve while L0 holds two or more tables (merging
+    /// them frees slots). Unlike [`Progress::Done`], which a finished job
+    /// also returns, this distinguishes "a job just finished, more may be
     /// pending" from "nothing to do" — firmware idle loops and test
     /// drivers use it to decide whether another `compact_step` is
-    /// worthwhile.
+    /// worthwhile. [`Error::NeedsCompaction`] is returned only while this
+    /// is true.
     #[must_use]
     pub fn compaction_pending(&self) -> bool {
-        self.full_level().is_some()
+        self.job_active || self.full_level().is_some()
     }
 
     /// True when flush and ingest are down to the compaction reserve: the
@@ -163,9 +164,10 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when no table slot is free for the next output,
-    /// or a slot cannot hold the job's range-tombstone budget plus one
-    /// key's versions; [`Error::CorruptBlock`] on a torn input table
+    /// [`Error::RegionFull`] when a level wants a job but none fits the
+    /// free slots (delete data, archive, or grow the region);
+    /// [`Error::TableTooLarge`] when a slot cannot hold the job's
+    /// range-tombstone budget plus one key's versions; [`Error::CorruptBlock`] on a torn input table
     /// (compaction never silently drops entries); [`Error::Device`] on I/O
     /// failure. A failed step abandons the job: progress already committed
     /// stays, and the next step selects afresh.
@@ -349,8 +351,8 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when some level wants compaction but no job fits
-    /// the free slots: the region is full.
+    /// [`Error::RegionFull`] when some level wants compaction but no job
+    /// fits the free slots.
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -377,7 +379,7 @@ impl<
             }
         }
         if wanted {
-            Err(Error::NoSpace)
+            Err(Error::RegionFull)
         } else {
             Ok(Selected::Idle)
         }
@@ -534,9 +536,9 @@ impl<
             .checked_sub(rdel_budget)
             .and_then(|d| d.checked_sub(3))
             .filter(|&d| d >= margin)
-            .ok_or(Error::NoSpace)?;
+            .ok_or(Error::TableTooLarge)?;
         c.split_margin = margin;
-        c.rdel_budget = u32::try_from(rdel_budget).map_err(|_| Error::NoSpace)?;
+        c.rdel_budget = u32::try_from(rdel_budget).map_err(|_| Error::TableTooLarge)?;
         c.data_budget = data_budget;
         // Bloom probes sized for one output's expected share of the
         // entries.
@@ -590,11 +592,11 @@ impl<
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<(), Error<D::Error>> {
-        let slot = self.slots.reserve().ok_or(Error::NoSpace)?;
+        let slot = self.slots.reserve().ok_or(Error::RegionFull)?;
         c.out_slot = slot;
         c.out_base = self.slots.slot_base(slot);
         // The writer's block limit is the data budget: a merge that would
-        // need more blocks fails with `NoSpace` instead of writing past
+        // need more blocks fails with `TableTooLarge` instead of writing past
         // the slot.
         c.writer = sstable::TableWriter::new(c.out_base, c.bloom_k).with_block_limit(c.data_budget);
         Ok(())
@@ -630,7 +632,10 @@ impl<
             last_key.successor()
         };
         let lo = c.out_lo;
-        let rdel_base = c.out_base.checked_add(data_blocks).ok_or(Error::NoSpace)?;
+        let rdel_base = c
+            .out_base
+            .checked_add(data_blocks)
+            .ok_or(Error::TableTooLarge)?;
         let mut rdel_out =
             sstable::RdelWriter::<BLOCK>::new(rdel_base).with_block_limit(c.rdel_budget);
         let mut rdel_stats = RdelStats::<KEY_MAX>::new();
@@ -671,12 +676,12 @@ impl<
         let total = u64::from(rdel_blocks)
             .checked_add(done.data_blocks)
             .and_then(|n| n.checked_add(3))
-            .ok_or(Error::NoSpace)?;
+            .ok_or(Error::TableTooLarge)?;
         let id = self.manifest.alloc_table_id::<D::Error>()?;
         Ok(Some(TableRef {
             id,
             first_block: c.out_base,
-            block_count: u32::try_from(total).map_err(|_| Error::NoSpace)?,
+            block_count: u32::try_from(total).map_err(|_| Error::TableTooLarge)?,
             // `KeyBound::min/max` let `EMPTY` lose, so a missing section
             // never corrupts the bounds. A non-final output's pieces end
             // at the successor of its last key, so its last key bounds
@@ -690,7 +695,7 @@ impl<
             },
             max_seq: done.max_seq.max(rdel_stats.max_seq),
             min_seq: done.min_seq,
-            entry_count: u32::try_from(done.entry_count).map_err(|_| Error::NoSpace)?,
+            entry_count: u32::try_from(done.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks,
         }))
     }

@@ -133,6 +133,26 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 
 /// The database handle. Owns the WAL writer (and through it, the device),
 /// the memtable, the manifest, and the table-region slot allocator.
+///
+/// # Type parameters
+///
+/// Prefer [`db_types!`](crate::db_types), which takes these by name.
+///
+/// | Parameter | Meaning | Checked at compile time |
+/// |---|---|---|
+/// | `D` | the [`BlockDevice`] | `D::BLOCK == BLOCK` |
+/// | `BLOCK` | device block size in bytes | fits the largest WAL record, range tombstone, and bloom filter; exceeds the 28-byte manifest block frame |
+/// | `KEY_MAX` | longest key | `1..=65535` |
+/// | `VAL_MAX` | longest value | `..=65535` |
+/// | `CAP` | memtable entry slots | |
+/// | `ARENA` | memtable key/value bytes | |
+/// | `LEVELS` | LSM levels. `1` disables compaction: level 0 fills, then flush reports [`Error::RegionFull`] | `LEVELS * TABLES` within `1..=64` |
+/// | `TABLES` | tables per level (L0's limit; deeper levels share the pool) | below [`COMPACTION_KMAX`] |
+/// | `BLOOM_BYTES` | bloom filter bytes per table | `1..=BLOCK-4` |
+/// | `CACHE` | block-cache slots; `0` disables the cache | |
+///
+/// The region layout in [`Config`] is checked by [`open`](Db::open)
+/// ([`Error::BadConfig`]).
 pub struct Db<
     D: BlockDevice,
     const BLOCK: usize,
@@ -168,7 +188,7 @@ pub struct Db<
     /// to mutations with `seq <= watermark`; while any snapshot is live,
     /// compaction must not drop a tombstone at or above the oldest
     /// watermark. Bounded: [`MAX_SNAPSHOTS`] live snapshots, then
-    /// [`Error::NoSpace`]. Snapshots are in-memory only — they do not
+    /// [`Error::SnapshotLimit`]. Snapshots are in-memory only — they do not
     /// survive `open()`.
     snapshots: [u64; MAX_SNAPSHOTS],
     n_snapshots: usize,
@@ -256,6 +276,14 @@ impl<
         12 + 2 * KEY_MAX + 6 <= BLOCK,
         "BLOCK must fit one maximal range tombstone (12 + 2 * KEY_MAX bytes) plus its trailer"
     );
+    // `&&` short-circuits in const evaluation: `max_blocks` (which divides
+    // by the body bytes per block) is only evaluated when a block has any.
+    const ASSERT_MANIFEST: () = assert!(
+        BLOCK > crate::manifest::BLOCK_FRAME
+            && Manifest::<LEVELS, TABLES, KEY_MAX>::max_blocks::<BLOCK>() <= 0xFFFF,
+        "BLOCK must exceed the 28-byte manifest block frame, and one manifest copy \
+         (Manifest::max_blocks) must span at most 65535 blocks"
+    );
 
     /// Table slots: one per manifest table ref.
     const SLOTS: usize = LEVELS * TABLES;
@@ -277,6 +305,7 @@ impl<
         let () = Self::ASSERT_SLOTS;
         let () = Self::ASSERT_JOB;
         let () = Self::ASSERT_RDEL;
+        let () = Self::ASSERT_MANIFEST;
         Self {
             wal: WalWriter::new(device, config.wal_start, config.wal_end),
             table: MemTable::new(),
@@ -319,13 +348,38 @@ impl<
     /// slots of headroom — free, or already reserved by the running job —
     /// that flush and ingest never take.
     ///
+    /// # Errors
+    ///
+    /// [`Error::TableTooLarge`] when the table is larger than a slot;
+    /// [`Error::NeedsCompaction`] when no slot is free beyond the reserve
+    /// but compaction has work that frees slots (a pending or in-flight
+    /// job); [`Error::RegionFull`] when it has none.
+    ///
     /// [`COMPACTION_RESERVE`]: Self::COMPACTION_RESERVE
     fn free_slot_for(&self, blocks: u64) -> Result<u32, Error<D::Error>> {
-        let headroom = self.slots.free_slots() + self.slots.reserved_slots();
-        if blocks > self.slots.slot_blocks() || headroom <= Self::COMPACTION_RESERVE {
-            return Err(Error::NoSpace);
+        if blocks > self.slots.slot_blocks() {
+            return Err(Error::TableTooLarge);
         }
-        self.slots.find_free().ok_or(Error::NoSpace)
+        let headroom = self.slots.free_slots() + self.slots.reserved_slots();
+        let slot = if headroom > Self::COMPACTION_RESERVE {
+            self.slots.find_free()
+        } else {
+            None
+        };
+        slot.ok_or_else(|| self.no_room())
+    }
+
+    /// The error for "no room for another table": [`Error::NeedsCompaction`]
+    /// while compaction has work that frees room, else
+    /// [`Error::RegionFull`]. Callers that retry after compacting therefore
+    /// never spin: `NeedsCompaction` implies
+    /// [`compaction_pending`](Self::compaction_pending).
+    fn no_room(&self) -> Error<D::Error> {
+        if self.compaction_pending() {
+            Error::NeedsCompaction
+        } else {
+            Error::RegionFull
+        }
     }
 
     /// Abandons the in-flight compaction job, if any: its reserved output
@@ -410,14 +464,14 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when eight snapshots (the fixed limit) are
+    /// [`Error::SnapshotLimit`] when eight snapshots (the fixed limit) are
     /// already live.
     pub const fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
         if !self.opened {
             return Err(Error::NotOpen);
         }
         if self.n_snapshots >= MAX_SNAPSHOTS {
-            return Err(Error::NoSpace);
+            return Err(Error::SnapshotLimit);
         }
         let snap = self.next_seq;
         self.snapshots[self.n_snapshots] = snap;
@@ -513,8 +567,9 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the table region is too small for the slot
-    /// layout (each slot must hold a full memtable's table),
+    /// [`Error::BadConfig`] when the regions overlap or are empty, or the
+    /// table region is too small for the slot layout (each slot must hold
+    /// a full memtable's table),
     /// [`Error::CorruptManifest`] (also when a live table does not sit
     /// wholly inside its own slot), [`Error::CorruptWal`], or
     /// [`Error::Device`].
@@ -532,7 +587,7 @@ impl<
             Self::SLOTS,
             Self::MIN_SLOT_BLOCKS,
         )
-        .ok_or(Error::NoSpace)?;
+        .ok_or(Error::BadConfig)?;
         let mut scratch = [0u8; BLOCK];
         let layout = self.manifest_layout();
         let (manifest, fresh) =
@@ -610,7 +665,10 @@ impl<
         if self.wal.next_block() == mark.next_block {
             self.wal.truncate_stage(mark.stage_len);
         } else {
-            self.next_seq = self.next_seq.checked_add(seqs).ok_or(Error::NoSpace)?;
+            self.next_seq = self
+                .next_seq
+                .checked_add(seqs)
+                .ok_or(Error::CounterExhausted)?;
         }
         Ok(())
     }
@@ -621,12 +679,16 @@ impl<
     /// # Errors
     ///
     /// [`Error::EmptyKey`], [`Error::KeyTooLarge`], [`Error::ValueTooLarge`],
-    /// [`Error::TableFull`], [`Error::ArenaFull`], [`Error::NoSpace`], or
-    /// [`Error::Device`].
+    /// [`Error::TableFull`] or [`Error::ArenaFull`] (flush, then retry),
+    /// [`Error::WalFull`] (flush, then retry), [`Error::CounterExhausted`],
+    /// or [`Error::Device`].
     pub async fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, Error<D::Error>> {
         self.ensure_open()?;
         self.table.check_insert::<D::Error>(key, val, false)?;
-        let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
         let mark = self.stage_mark();
         if let Err(e) = self.wal.append(seq, Op::Put, key, val).await {
             self.rollback_commit(mark, 0)?;
@@ -652,7 +714,10 @@ impl<
     pub async fn delete(&mut self, key: &[u8]) -> Result<u64, Error<D::Error>> {
         self.ensure_open()?;
         self.table.check_insert::<D::Error>(key, &[], true)?;
-        let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
         let mark = self.stage_mark();
         if let Err(e) = self.wal.append(seq, Op::Delete, key, &[]).await {
             self.rollback_commit(mark, 0)?;
@@ -684,7 +749,10 @@ impl<
             return Ok(self.next_seq);
         }
         self.table.check_insert_range_del::<D::Error>(start, end)?;
-        let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
         let mark = self.stage_mark();
         if let Err(e) = self.wal.append(seq, Op::RangeDelete, start, end).await {
             self.rollback_commit(mark, 0)?;
@@ -720,7 +788,10 @@ impl<
     ) -> Result<u64, Error<D::Error>> {
         self.ensure_open()?;
         self.table.check_insert::<D::Error>(key, val, false)?;
-        let seq = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
         let mark = self.stage_mark();
         if let Err(e) = self.wal.append_ttl(seq, key, val, expire_at).await {
             self.rollback_commit(mark, 0)?;
@@ -752,8 +823,8 @@ impl<
     /// # Errors
     ///
     /// [`Error::BatchTooLarge`], [`Error::TableFull`],
-    /// [`Error::ArenaFull`], [`Error::NoSpace`], or [`Error::Device`].
-    /// A rejected batch leaves no trace: no WAL records, no staged bytes,
+    /// [`Error::ArenaFull`], [`Error::WalFull`], [`Error::CounterExhausted`],
+    /// or [`Error::Device`]. A rejected batch leaves no trace: no WAL records, no staged bytes,
     /// no consumed sequence numbers.
     pub async fn write<const OPS: usize>(
         &mut self,
@@ -775,7 +846,10 @@ impl<
                 .ok_or(Error::ArenaFull)?;
             need_wal = need_wal
                 .checked_add(WAL_RECORD_OVERHEAD + op.key().len() + op.val().len())
-                .ok_or(Error::NoSpace)?;
+                .ok_or(Error::BatchTooLarge {
+                    bytes: usize::MAX,
+                    max: BLOCK,
+                })?;
         }
         if need_wal > BLOCK {
             return Err(Error::BatchTooLarge {
@@ -797,15 +871,18 @@ impl<
         }
         debug_assert_eq!(self.wal.staged_bytes(), 0);
 
-        let base = self.next_seq.checked_add(1).ok_or(Error::NoSpace)?;
-        let nu64 = u64::try_from(n).map_err(|_| Error::NoSpace)?;
-        let last = base.checked_add(nu64 - 1).ok_or(Error::NoSpace)?;
+        let base = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
+        let nu64 = u64::try_from(n).map_err(|_| Error::CounterExhausted)?;
+        let last = base.checked_add(nu64 - 1).ok_or(Error::CounterExhausted)?;
 
         let mark = self.stage_mark();
         for (i, op) in ops.iter().enumerate() {
             let seq = base
-                .checked_add(u64::try_from(i).map_err(|_| Error::NoSpace)?)
-                .ok_or(Error::NoSpace)?;
+                .checked_add(u64::try_from(i).map_err(|_| Error::CounterExhausted)?)
+                .ok_or(Error::CounterExhausted)?;
             // Unreachable in practice: sizes were validated when the batch
             // was built and the block fit was checked above. Roll back
             // anyway — atomicity is never best-effort here.
@@ -823,8 +900,8 @@ impl<
         // The table is unchanged since the capacity check, so this cannot fail.
         for (i, op) in ops.iter().enumerate() {
             let seq = base
-                .checked_add(u64::try_from(i).map_err(|_| Error::NoSpace)?)
-                .ok_or(Error::NoSpace)?;
+                .checked_add(u64::try_from(i).map_err(|_| Error::CounterExhausted)?)
+                .ok_or(Error::CounterExhausted)?;
             self.table
                 .insert::<D::Error>(op.key(), op.val(), seq, op.kind() == Op::Delete)?;
         }

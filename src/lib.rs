@@ -49,6 +49,7 @@ pub mod device;
 pub mod error;
 pub mod esp32s3;
 pub mod flash;
+mod macros;
 pub mod manifest;
 pub mod memtable;
 pub mod model;

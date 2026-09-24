@@ -143,7 +143,7 @@ type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8>;
 // Every `put`/`delete` commits synchronously (WAL-first durability), so the
 // WAL region must hold one block per mutation across the whole run — it
 // only wraps at an explicit `flush()`, and the update/delete passes below
-// run without one. Sized generously so the run never hits `NoSpace`.
+// run without one. Sized generously so the run never hits `WalFull`.
 const WAL_START: u64 = 8;
 const WAL_END: u64 = 8 + 4000;
 const TBL_START: u64 = WAL_END;
@@ -158,7 +158,7 @@ const fn config() -> Config {
 /// averages well under 64 KiB / 400).
 const PUT_BATCH: usize = 400;
 /// v0.3 has no compaction yet: L0 holds at most `TABLES` (4) tables, so a
-/// 5th `flush()` would return `NoSpace`. Three fresh-put batches plus one
+/// 5th `flush()` would return `NeedsCompaction`. Three fresh-put batches plus one
 /// update batch below use all four.
 const PUT_BATCHES: usize = 3;
 const UPDATES: usize = 400; // overwrite existing keys, then the 4th flush

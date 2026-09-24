@@ -2,7 +2,8 @@
 //!
 //! v0.4 RED: `Compaction`, `Progress`, and `Db::compact_step` did not exist.
 //! v0.8 RED: `compact_select` only compacts L0 -> L1; deeper levels are not
-//! selected, so a full L1 fails the job with `Error::NoSpace`.
+//! selected, so a full L1 fails the job (then `Error::NoSpace`, now
+//! `Error::RegionFull`).
 
 use horton::{BlockDevice, Compaction, Error, Manifest, Progress};
 
@@ -322,7 +323,10 @@ fn compact_unblocks_flush() {
         block_on(db.flush()).unwrap();
     }
     block_on(db.put(b"x", b"v")).unwrap();
-    assert!(matches!(block_on(db.flush()).unwrap_err(), Error::NoSpace));
+    assert!(matches!(
+        block_on(db.flush()).unwrap_err(),
+        Error::NeedsCompaction
+    ));
     drain(&mut db);
     block_on(db.flush()).unwrap();
     assert_eq!(get(&db, b"x"), Some(b"v".to_vec()));
@@ -906,7 +910,7 @@ const fn small_config() -> horton::Config {
 /// the *region* is used up — every slot but the compaction reserve holds a
 /// table — and flush then refuses cleanly. (Before pooled levels and slot
 /// allocation, a bottom level holding `TABLES` disjoint tables was a
-/// permanent `NoSpace` at select time — the "honest ceiling" — reached
+/// permanent refusal at select time — the "honest ceiling" — reached
 /// after a handful of flushes, with most of the region unused.) Near the
 /// end flush reaches the reserve while L0 is only partly full; region
 /// pressure then selects an L0 merge, which is what lets the last slots
@@ -928,10 +932,10 @@ fn compact_fills_the_region_not_a_level() {
         loop {
             match block_on(db.flush()) {
                 Ok(()) => break,
-                Err(Error::NoSpace) if db.compaction_pending() => {
+                Err(Error::NeedsCompaction) => {
                     while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
                 }
-                Err(Error::NoSpace) => {
+                Err(Error::RegionFull) => {
                     refused = Some(k);
                     break 'fill;
                 }

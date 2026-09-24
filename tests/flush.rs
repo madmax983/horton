@@ -127,7 +127,7 @@ fn l0_full_errors() {
     }
     block_on(db.put(b"x", b"v")).unwrap();
     let err = block_on(db.flush()).unwrap_err();
-    assert!(matches!(err, Error::NoSpace));
+    assert!(matches!(err, Error::NeedsCompaction));
     // The failed flush changed nothing: the key is still served from the
     // memtable and the four tables are intact.
     assert_eq!(get(&db, b"x"), Some(b"v".to_vec()));
@@ -142,7 +142,7 @@ fn table_region_too_small_for_the_slot_layout() {
     // full memtable's table, so open() refuses the layout up front.
     let cfg = Config::new(8, 136, 136, 140, 0, 4);
     let mut db = TestDb::new(MemDevice::<4096>::new(), cfg);
-    assert!(matches!(block_on(db.open()), Err(Error::NoSpace)));
+    assert!(matches!(block_on(db.open()), Err(Error::BadConfig)));
     assert!(!db.is_open());
 }
 
@@ -161,14 +161,14 @@ fn table_region_exhaustion() {
     }
     // L0 is full: the flush of c must wait for compaction.
     block_on(db.put(b"c", b"v")).unwrap();
-    assert!(matches!(block_on(db.flush()), Err(Error::NoSpace)));
+    assert!(matches!(block_on(db.flush()), Err(Error::NeedsCompaction)));
     while block_on(db.compact_step(&mut c)).unwrap() == horton::Progress::More {}
     assert_eq!(db.level_tables(1).unwrap().len(), 1);
     block_on(db.flush()).unwrap();
     assert_eq!(db.slot_stats().free, 2, "only the compaction reserve left");
     block_on(db.put(b"d", b"v")).unwrap();
     let err = block_on(db.flush()).unwrap_err();
-    assert!(matches!(err, Error::NoSpace));
+    assert!(matches!(err, Error::RegionFull));
     // One L0 table is nothing to merge: the region is genuinely full.
     assert!(!db.compaction_pending());
     // State is intact: d from the memtable, the rest from tables.

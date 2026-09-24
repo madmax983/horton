@@ -346,8 +346,9 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// # Errors
     ///
     /// [`Error::KeyTooLarge`] / [`Error::ValueTooLarge`] when the key/value
-    /// do not fit the u16 wire fields, [`Error::NoSpace`] when a single
-    /// record exceeds `BLOCK` or the WAL region is exhausted, or
+    /// do not fit the u16 wire fields, [`Error::BatchTooLarge`] when a
+    /// single record exceeds `BLOCK`, [`Error::WalFull`] when the WAL
+    /// region is exhausted, or
     /// [`Error::Device`] on I/O failure.
     pub async fn append(
         &mut self,
@@ -403,7 +404,10 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             record_len(key.len(), vlen)
         };
         if rlen > BLOCK {
-            return Err(Error::NoSpace);
+            return Err(Error::BatchTooLarge {
+                bytes: rlen,
+                max: BLOCK,
+            });
         }
         if self.stage_len + rlen > BLOCK {
             self.write_stage().await?;
@@ -433,7 +437,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when the WAL region is exhausted, or
+    /// [`Error::WalFull`] when the WAL region is exhausted, or
     /// [`Error::Device`] on I/O failure.
     pub async fn commit(&mut self) -> Result<(), Error<D::Error>> {
         if self.stage_len > 0 {
@@ -460,7 +464,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// that work even when this batch is the same size or grew.
     async fn write_stage(&mut self) -> Result<(), Error<D::Error>> {
         if self.next_block >= self.wal_end {
-            return Err(Error::NoSpace);
+            return Err(Error::WalFull);
         }
         if self.stage_len < self.dirty_to {
             self.stage[self.stage_len..self.dirty_to].fill(0);

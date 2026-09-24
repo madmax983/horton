@@ -26,7 +26,7 @@ fn flush_retrying(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction) {
     loop {
         match block_on(db.flush()) {
             Ok(()) => return,
-            Err(Error::NoSpace) if db.compaction_pending() => drain_compaction(db, c),
+            Err(Error::NeedsCompaction) => drain_compaction(db, c),
             Err(e) => panic!("flush: {e:?}"),
         }
     }
@@ -37,7 +37,7 @@ fn put_retrying(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction, k: &[u
     loop {
         match block_on(db.put(k, v)) {
             Ok(_) => return,
-            Err(Error::TableFull | Error::ArenaFull | Error::NoSpace) => flush_retrying(db, c),
+            Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => flush_retrying(db, c),
             Err(e) => panic!("put: {e:?}"),
         }
     }
@@ -445,18 +445,18 @@ fn fill_until_full(cfg: horton::Config, random: bool) -> Vec<u64> {
         loop {
             match block_on(db.put(&k.to_be_bytes(), &[0x5A; 1000])) {
                 Ok(_) => break,
-                Err(Error::TableFull | Error::ArenaFull | Error::NoSpace) => loop {
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => loop {
                     match block_on(db.flush()) {
                         Ok(()) => break,
-                        Err(Error::NoSpace) if db.compaction_pending() => loop {
+                        Err(Error::NeedsCompaction) => loop {
                             match block_on(db.compact_step(&mut c)) {
                                 Ok(Progress::More) => {}
                                 Ok(Progress::Done) => break,
-                                Err(Error::NoSpace) => break 'fill,
+                                Err(Error::RegionFull) => break 'fill,
                                 Err(e) => panic!("compact_step: {e:?}"),
                             }
                         },
-                        Err(Error::NoSpace) => break 'fill,
+                        Err(Error::RegionFull) => break 'fill,
                         Err(e) => panic!("flush: {e:?}"),
                     }
                 },
@@ -602,10 +602,10 @@ fn f14_flush_during_inflight_compaction_keeps_tables_disjoint() {
         loop {
             match block_on(db.put(&key, &val)) {
                 Ok(_) => break,
-                Err(Error::TableFull | Error::ArenaFull | Error::NoSpace) => {
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
                     match block_on(db.flush()) {
                         Ok(()) => {}
-                        Err(Error::NoSpace) => {
+                        Err(Error::NeedsCompaction) => {
                             // L0 full (or no slot): run a step and retry.
                             let _ = block_on(db.compact_step(&mut c)).unwrap();
                         }
@@ -837,4 +837,77 @@ fn f7_overlapping_regions_are_rejected_at_open() {
         let mut buf = [0u8; 4];
         assert_eq!(block_on(db.get(b"k", &mut buf)), Ok(Some(1)));
     }
+}
+
+/// F10 — `Error::NoSpace` covered about ten conditions with different
+/// remedies, so callers guessed with `compaction_pending()`. Each capacity
+/// condition now has its own variant, and the documented remedy for each
+/// is exactly what clears it. `NeedsCompaction` is returned only while
+/// `compaction_pending()` holds, so a compact-then-retry loop cannot spin.
+#[test]
+fn f10_capacity_errors_name_their_remedy() {
+    type TinyDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 2, 2, 1024, 8>;
+    type FlatDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 1, 2, 1024, 8>;
+
+    // WalFull: a 4-block WAL takes four durable puts; flush frees it.
+    let cfg = horton::Config::new(8, 12, 136, 4224, 0, 4);
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), cfg);
+    block_on(db.open()).unwrap();
+    for k in 0..4u8 {
+        block_on(db.put(&[k], b"v")).unwrap();
+    }
+    assert_eq!(block_on(db.put(b"x", b"v")), Err(Error::WalFull));
+    block_on(db.flush()).unwrap();
+    block_on(db.put(b"x", b"v")).unwrap();
+
+    // NeedsCompaction: L0 full; compacting clears it.
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    for k in 0..4u8 {
+        block_on(db.put(&[k], b"v")).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    block_on(db.put(b"x", b"v")).unwrap();
+    assert_eq!(block_on(db.flush()), Err(Error::NeedsCompaction));
+    assert!(db.compaction_pending());
+    drain_compaction(&mut db, &mut c);
+    block_on(db.flush()).unwrap();
+
+    // SnapshotLimit: releasing one clears it.
+    let snaps: Vec<u64> = (0..8).map(|_| db.snapshot().unwrap()).collect();
+    assert_eq!(db.snapshot(), Err(Error::SnapshotLimit));
+    db.release_snapshot(snaps[0]);
+    assert!(db.snapshot().is_ok());
+
+    // RegionFull: 4 slots, 2 of them the compaction reserve, and nothing
+    // left to merge. Compaction is not pending, so no retry loop runs.
+    let cfg = horton::Config::new(8, 136, 136, 136 + 4 * 8, 0, 1);
+    let mut db = TinyDb::new(MemDevice::new(), cfg);
+    block_on(db.open()).unwrap();
+    for k in *b"ab" {
+        block_on(db.put(&[k], b"v")).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    block_on(db.put(b"c", b"v")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.put(b"d", b"v")).unwrap();
+    assert_eq!(block_on(db.flush()), Err(Error::RegionFull));
+    assert!(!db.compaction_pending());
+    let mut buf = [0u8; 4];
+    assert_eq!(block_on(db.get(b"d", &mut buf)), Ok(Some(1)), "reads work");
+
+    // With one level there is no compaction: a full L0 is RegionFull, not
+    // a NeedsCompaction that no compaction could clear.
+    let cfg = horton::Config::new(8, 136, 136, 136 + 2 * 8, 0, 1);
+    let mut db = FlatDb::new(MemDevice::new(), cfg);
+    block_on(db.open()).unwrap();
+    for k in *b"ab" {
+        block_on(db.put(&[k], b"v")).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    block_on(db.put(b"c", b"v")).unwrap();
+    assert_eq!(block_on(db.flush()), Err(Error::RegionFull));
+    assert!(!db.compaction_pending());
 }

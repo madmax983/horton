@@ -52,10 +52,22 @@ futures with your executor. Condensed from
 runs with `cargo run --example quickstart`:
 
 ```rust
-use horton::{BlockDevice, Compaction, Config, Db, Progress, Scan};
+use horton::{BlockDevice, Config, Progress, Scan};
 
-//              device   BLOCK KEY VAL CAP ARENA LEVELS TABLES BLOOM CACHE
-type MyDb = Db<RamDisk, 4096,  64, 256, 64, 8192, 4,     4,     256, 4>;
+// Every size is a named const generic; `MyDb<D>` works over any device.
+horton::db_types! {
+    block: 4096,           // device block size
+    key_max: 64,           // longest key
+    val_max: 256,          // longest value
+    memtable_entries: 64,  // memtable slots
+    memtable_arena: 8192,  // memtable key+value bytes
+    levels: 4,
+    tables_per_level: 4,
+    bloom_bytes: 256,      // per-table bloom filter
+    cache_blocks: 4;       // block cache (0 = off)
+    type Db = MyDb;
+    type Compaction = MyCompaction;
+}
 
 // Block-id layout: manifest slots 0 and 1, WAL [2, 66), tables [66, 512).
 let config = Config::new(2, 66, 66, 512, 0, 1);
@@ -79,16 +91,27 @@ while let Some((kl, vl)) = scan.next(&mut key, &mut val).await? {
     // (&key[..kl], &val[..vl])
 }
 
-let mut scratch = Compaction::<4096, 64, 256, 256>::new(); // caller-owned
+let mut scratch = MyCompaction::new(); // caller-owned
 while db.compaction_pending() {
     while db.compact_step(&mut scratch).await? == Progress::More {}
 }
 ```
 
-Capacity errors tell you to make room. `TableFull` or `ArenaFull` from a
-write means *flush*. `NoSpace` from `flush` usually means *compact first*
-(level 0 is full), and from a write it can mean the WAL region is exhausted,
-in which case *flush*. See the review for why `NoSpace` covers too much.
+Capacity errors name their remedy:
+
+| Error | Meaning | Do this |
+|---|---|---|
+| `TableFull`, `ArenaFull` | the memtable is full | `flush()`, retry |
+| `WalFull` | the WAL region is exhausted | `flush()` (it wraps the WAL), retry |
+| `NeedsCompaction` | level 0 is full, or no slot is free until tables merge | `compact_step` until `Done`, retry |
+| `RegionFull` | no slot is free and compaction cannot free one | delete and compact, archive, or grow the region |
+| `SnapshotLimit` | eight snapshots are live | release one |
+| `TableTooLarge` | an entry, index, or range-tombstone section does not fit | smaller entries, bigger blocks or slots |
+| `BatchTooLarge` | a batch does not fit one WAL block | split it |
+| `BadConfig` | regions overlap or are too small (from `open`) | fix the `Config` |
+
+`NeedsCompaction` is only returned while `compaction_pending()` is true, so
+a compact-then-retry loop always makes progress.
 
 ## Architecture
 

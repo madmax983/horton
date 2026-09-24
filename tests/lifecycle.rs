@@ -136,7 +136,7 @@ macro_rules! retrying {
         loop {
             match block_on($call) {
                 Ok(v) => break Some(v),
-                Err(Error::TableFull | Error::ArenaFull | Error::NoSpace) if attempt == 0 => {
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) if attempt == 0 => {
                     attempt += 1;
                     if $h.flush_all().is_err() {
                         $h.full = true;
@@ -206,7 +206,7 @@ impl Harness {
                 match block_on(self.db.compact_step(&mut self.c)) {
                     Ok(Progress::More) => {}
                     Ok(Progress::Done) => break,
-                    Err(Error::NoSpace) => return Err(()),
+                    Err(Error::RegionFull) => return Err(()),
                     Err(e) => panic!("op {} ({}): compaction error {e:?}", self.op, self.name),
                 }
             }
@@ -221,8 +221,8 @@ impl Harness {
         loop {
             match block_on(self.db.flush()) {
                 Ok(()) => return Ok(()),
-                Err(Error::NoSpace) if self.db.compaction_pending() => self.drain()?,
-                Err(Error::NoSpace) => return Err(()),
+                Err(Error::NeedsCompaction) => self.drain()?,
+                Err(Error::RegionFull) => return Err(()),
                 Err(e) => panic!("op {} ({}): flush error {e:?}", self.op, self.name),
             }
         }
@@ -519,7 +519,7 @@ impl Harness {
                 self.c.purge_before = self.now;
                 match block_on(self.db.compact_step(&mut self.c)) {
                     Ok(_) => {}
-                    Err(Error::NoSpace) => self.full = true,
+                    Err(Error::RegionFull) => self.full = true,
                     Err(e) => panic!("op {}: compact_step error {e:?}", self.op),
                 }
             }
