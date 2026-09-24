@@ -60,4 +60,4 @@ that the compaction scratch is caller-owned, not `Db` RAM.
 ## References
 
 - SPEC §1, §4.6 (Compaction), §5
-- SPEC §9: v0.4, v0.4.1, v0.5, v0.8, v0.12, v0.15, v0.16
+- [Milestone log](../history/milestones-v0.1-v0.16.md): v0.4, v0.4.1, v0.5, v0.8, v0.12, v0.15, v0.16

@@ -244,33 +244,42 @@ impl<
         }
     }
 
-    /// Highest range-tombstone sequence at/below `max_seq` covering `key`,
-    /// across the memtable and every table with a range-tombstone section —
-    /// or `None` when no range tombstone covers `key`. Tables without an
-    /// rdel section, and tables whose `[first_key, last_key]` cannot contain
-    /// `key`, are skipped without I/O. (`last_key` carries the greatest
-    /// exclusive rdel end inclusively, so the bound prune is a conservative
-    /// superset: it may probe a table whose rdels miss, never skip one
-    /// whose rdels hit.) Both scan directions use it; `scratch` is the
-    /// scan's physical-read buffer, dead between block reads, so the scan
+    /// Whether a range tombstone at/below `max_seq` and newer than `above`
+    /// covers `key`, across the memtable and every table with a
+    /// range-tombstone section — the scans' "is the winning version
+    /// (`seq == above`) hidden?" test. Tables that cannot hold such a
+    /// tombstone are skipped without I/O: no rdel section, `max_seq <=
+    /// above` (nothing in them is newer than the winner), or bounds that
+    /// cannot contain `key` (`last_key` carries the greatest exclusive
+    /// rdel end inclusively, so that prune is a conservative superset).
+    /// The search stops at the first hit. `scratch` is the scan's
+    /// physical-read buffer, dead between block reads, so the scan
     /// futures hold no block buffer for it.
-    pub(crate) async fn covering_rdel_seq(
+    pub(crate) async fn rdel_hides(
         &self,
         key: &[u8],
         max_seq: u64,
+        above: u64,
         scratch: &mut [u8; BLOCK],
-    ) -> Result<Option<u64>, Error<D::Error>> {
-        let mut best: Option<u64> = self.table.max_covering_rdel(key, max_seq);
+    ) -> Result<bool, Error<D::Error>> {
+        if self
+            .table
+            .max_covering_rdel(key, max_seq)
+            .is_some_and(|q| q > above)
+        {
+            return Ok(true);
+        }
         for li in 0..LEVELS {
             let tables = self.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
-                if tref.rdel_blocks == 0 {
+                if tref.rdel_blocks == 0
+                    || tref.max_seq <= above
+                    || tref.first_key.as_slice() > key
+                    || tref.last_key.as_slice() < key
+                {
                     continue;
                 }
-                if tref.first_key.as_slice() > key || tref.last_key.as_slice() < key {
-                    continue;
-                }
-                if let Some(q) = sstable::covering_rdel_seq_in(
+                if sstable::covering_rdel_seq_in(
                     self.device(),
                     Some(self.cache_port()),
                     tref.id,
@@ -281,13 +290,13 @@ impl<
                     max_seq,
                 )
                 .await?
-                    && best.is_none_or(|b| q > b)
+                .is_some_and(|q| q > above)
                 {
-                    best = Some(q);
+                    return Ok(true);
                 }
             }
         }
-        Ok(best)
+        Ok(false)
     }
 
     /// Considers one table for [`Db::get_at`]: key-range prune, sequence prune,

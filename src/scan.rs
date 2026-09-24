@@ -387,9 +387,8 @@ impl<
             // expired winner never falls through to an older version.
             let covered = self
                 .db
-                .covering_rdel_seq(wkey, self.max_seq, &mut self.raw)
-                .await?
-                .is_some_and(|q| q > winner_seq);
+                .rdel_hides(wkey, self.max_seq, winner_seq, &mut self.raw)
+                .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
             // Sequence 0 is reserved (the counter issues 1 and up): a
@@ -1217,9 +1216,8 @@ impl<
             // expired winner never falls through to an older version.
             let covered = self
                 .db
-                .covering_rdel_seq(wkey, self.max_seq, &mut self.raw)
-                .await?
-                .is_some_and(|q| q > winner_seq);
+                .rdel_hides(wkey, self.max_seq, winner_seq, &mut self.raw)
+                .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
             // Sequence 0 is reserved (the counter issues 1 and up): a

@@ -67,6 +67,8 @@ misread.
   named parameters.
 - `Db::slot_stats`, `Db::check_invariants` (the lifecycle fuzzer checks
   it after every operation).
+- `Error::widen`: converts a `WriteBatch` or `MemTable` error
+  (`Error<Infallible>`) to any device's error type.
 - Errors `WalFull`, `NeedsCompaction`, `RegionFull`, `SnapshotLimit`,
   `ManifestFull`, `TableTooLarge`, `CounterExhausted`, `BadLevel`,
   `BadConfig`, `NotOpen`, `Busy`.
@@ -85,15 +87,26 @@ misread.
   overlapping regions with `BadConfig`.
 - **Breaking:** two `get` futures polled concurrently on one `Db`: the
   second returns `Error::Busy` instead of using fallback buffers.
+- **Breaking:** `horton::alloc` is renamed `horton::slots` (it shadowed
+  the `alloc` crate). `model` and the low-level table builders
+  (`plan_table`, `write_table`, …) are `#[doc(hidden)]`.
 - `compaction_pending()` also reports an in-flight job.
 - The table region is `LEVELS × TABLES` fixed slots (at most 64).
 - Futures shrank: `flush` 29.8 → 17.6 KiB, `get` 9.1 → 1.1 KiB,
-  `compact_step` 6.6 → 2.1 KiB, `ingest_table` 6.3 → 0.6 KiB. Manifest
+  `compact_step` 6.6 → 2.1 KiB, `ingest_table` 6.3 → 0.6 KiB,
+  `Scan::next` 4.6 → 0.7 KiB, `RevScan::prev` 4.6 → 1.1 KiB. Manifest
   commits stage a small edit instead of a manifest copy.
+- Scans' range-tombstone check skips tables whose `max_seq` cannot beat
+  the winning version and stops at the first hit.
 - The ESP32-S3 budget is 112 KiB and now covers structs plus peak
   futures (112,200 bytes measured).
 - `db.rs` is split into `db/{mod,read,flush,archive,compaction,invariants}.rs`;
-  point reads and the archive resurrection review share one read rule.
+  point reads and the archive resurrection review share one read rule,
+  the single-op writes share one path, every data-block read goes
+  through `sstable::read_data_block`, and both scan directions share one
+  range-tombstone lookup.
+- `SPEC.md` is now the normative spec only (rewritten for v0.17); its
+  milestone log moved to `docs/history/milestones-v0.1-v0.16.md`.
 
 ## [0.16.0] - 2026-09-23
 

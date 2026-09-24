@@ -51,4 +51,4 @@ whether the device should be sync or async.
 ## References
 
 - SPEC §4.3 (BlockDevice trait), §4.2, §4.5, §6, §10 question 3
-- SPEC §9: v0.6, v0.7, v0.10, v0.11, v0.12
+- [Milestone log](../history/milestones-v0.1-v0.16.md): v0.6, v0.7, v0.10, v0.11, v0.12

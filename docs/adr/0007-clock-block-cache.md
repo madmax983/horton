@@ -60,7 +60,7 @@ in the RAM budget.
 
 ## References
 
-- SPEC §9 v0.16 (Scope, Cache key, Invalidation protocol, Eviction
+- [Milestone log](../history/milestones-v0.1-v0.16.md) v0.16 (Scope, Cache key, Invalidation protocol, Eviction
   policy, Byte-identity rule, Concurrency, Crash model, Measured,
   Honest limits)
-- SPEC §9 v0.15 (range-tombstone scan cost), §1
+- [Milestone log](../history/milestones-v0.1-v0.16.md) v0.15 (range-tombstone scan cost), §1

@@ -47,6 +47,6 @@ model "the one load-bearing decision" of v0.15.
 
 ## References
 
-- SPEC §9 v0.15 (Scope, Time model, Durable formats, Visibility
+- [Milestone log](../history/milestones-v0.1-v0.16.md) v0.15 (Scope, Time model, Durable formats, Visibility
   ordering, Compaction, Crash model, Honest limits)
 - SPEC §1

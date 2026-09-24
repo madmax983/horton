@@ -17,21 +17,21 @@ doesn't exist: firmware, kernels, bootloaders.
   [`BlockDevice`](src/device.rs) trait. The API is `async fn`s that allocate
   nothing, and horton ships no executor: use embassy, RTIC, or a poll loop.
 
-> **Status: pre-1.0 (v0.16), experimental.** The on-disk format changes
+> **Status: pre-1.0 (v0.17), experimental.** The on-disk format changes
 > between minor versions, and old images are rejected rather than misread.
-> Read [the architecture review](docs/ARCHITECTURE_REVIEW.md) before relying
-> on it. It lists confirmed correctness and capacity issues that are not
-> yet fixed.
+> v0.17 fixes every finding of [the architecture review](docs/ARCHITECTURE_REVIEW.md)
+> (each has a regression test in `tests/review_findings.rs`). It is not yet
+> verified on ESP32-S3 silicon.
 
 ## Features
 
 | Area | What you get |
 |---|---|
-| Writes | `put`, `delete`, `delete_range` (range tombstones), `put_with_ttl` (caller-clock expiry), atomic multi-op `WriteBatch` (up to one WAL block) |
+| Writes | `put`, `delete`, `delete_range` (range tombstones), `put_with_ttl` (caller-clock expiry), atomic multi-op `WriteBatch` (up to one WAL block; also the group-commit path) |
 | Reads | `get`, snapshot reads (`snapshot` / `get_at`), forward `Scan` and reverse `RevScan` merge iterators with prefix/range bounds |
-| Durability | WAL-first. Every mutation's CRC-framed record is on the device before the call returns. A double-buffered manifest is the single atomic commit point for flushes, compactions and archive operations |
+| Durability | WAL-first. Every mutation's CRC-framed record is on the device before the call returns. The manifest (two copies, or a ring of `n` for flash endurance) is the single atomic commit point for flushes, compactions and archive operations |
 | Tables | Immutable SSTables with restart-point data blocks, a per-table bloom filter, one index block, a range-tombstone section, and optional hand-rolled LZ77 block compression |
-| Compaction | Leveled and caller-driven: `compact_step` seals at most one output block per call, so firmware can interleave it with real-time work. Snapshot-aware version retention and tombstone dropping |
+| Compaction | Leveled and caller-driven: `compact_step` does bounded work per call, so firmware can interleave it with real-time work. Outputs split at slot size and commit one by one; trivial moves, small-table consolidation, and region-pressure push-down keep the region usable until it is mostly full. Snapshot-aware version retention; point and range deletes give their space back |
 | Caching | Optional fixed-slot CLOCK block cache inside `Db` (`CACHE = 0` turns it off) |
 | Cold storage | Archive API: seal a table, stream its blocks to your own remote sink, then forget it locally (`archive_plan` / `archive_commit`). `ingest_table` re-attaches it later. The archive commit refuses any removal that would bring deleted data back |
 | Hardware | `FlashBlockDevice` (erase-aware NOR adapter) and an ESP32-S3 SPI1 flash driver over a pluggable register bus |
@@ -108,6 +108,7 @@ Capacity errors name their remedy:
 | `SnapshotLimit` | eight snapshots are live | release one |
 | `TableTooLarge` | an entry, index, or range-tombstone section does not fit | smaller entries, bigger blocks or slots |
 | `BatchTooLarge` | a batch does not fit one WAL block | split it |
+| `Busy` | another `get` on this handle holds the read buffers | finish it, retry |
 | `BadConfig` | regions overlap or are too small (from `open`) | fix the `Config` |
 
 `NeedsCompaction` is only returned while `compaction_pending()` is true, so
@@ -124,7 +125,7 @@ flowchart LR
         BC["BlockCache<br/>CLOCK, CACHE slots"]
     end
     subgraph DEV["BlockDevice"]
-        MS["Manifest slots A/B"]
+        MS["Manifest copies<br/>pair or ring"]
         WAL["WAL region<br/>CRC-framed records"]
         TBL["Table region<br/>SSTables"]
     end
@@ -153,36 +154,42 @@ deeper levels. Tables are pruned by key range and max sequence and gated by
 the bloom filter. The highest sequence number wins, and range tombstones
 and TTL expiry are applied afterwards.
 
-**Compaction.** When a level holds `TABLES` tables, the deepest full level
-is compacted into the next one. The input is all of L0, or the oldest table
-of a deeper level, plus the overlapping target tables. It is a linear-scan
-k-way merge (at most 8 inputs) that keeps the newest version of each key
-plus the newest version visible to each live snapshot.
+**Compaction.** Full levels compact first, deepest first; when the region
+runs short, pressure pushes tables down too. A job merges L0 (or its oldest
+tables), or one table of a deeper level, with the overlapping tables below
+in a linear-scan k-way merge (at most 8 cursors) that keeps the newest
+version of each key plus the newest version visible to each live snapshot.
+Outputs split at slot size and commit one at a time: inputs the output has
+passed retire, the one it is inside is narrowed past it. Tombstones — point
+and range — are dropped once no reader can see what they hide
+([ADR-0010](docs/adr/0010-split-output-compaction.md)).
 
-**Crash model.** The manifest is double-buffered in two fixed slots, and
-recovery takes the valid slot with the higher sequence number. Every
-structural change (flush, compaction, archive, ingest, WAL wrap) becomes
-visible in exactly one manifest write. Blocks written before that point sit
-in a slot no manifest table references, which is simply free again after
-`open()` rebuilds the slot map from the manifest.
+**Crash model.** The manifest is stored as whole copies (a pair, or a ring
+of `n`), each spanning as many blocks as the worst case needs; every block
+carries the commit's sequence number and CRC, and recovery takes the
+newest copy whose blocks all agree. Every structural change (flush,
+compaction output, archive, ingest, WAL wrap) becomes visible in exactly
+one manifest commit. Blocks written before that point sit in a slot no
+manifest table references, which is simply free again after `open()`
+rebuilds the slot map from the manifest.
 
 ### On-device layout
 
 ```text
-block ids:  [manifest A] [manifest B] ... [ WAL region ) ... [ table region )
-                 └ Config::manifest_a/b     └ wal_start..wal_end   └ tbl_start..tbl_end
+block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
+             └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
+               blocks, magic "hrtman05"
 
-SSTable:    [rdel]* [data]* [bloom] [index] [footer]
-             │       │        │       │       └ magic "lsmtable", ids, entry count, k, rdel count
+SSTable:    [data]* [rdel]* [bloom] [index] [footer]
+             │       │        │       │       └ magic "hrtsst02", ids, entry count, k, rdel count, min seq
              │       │        │       └ per data block: first key, block id, max seq
              │       │        └ BLOOM_BYTES bit array
-             │       └ entries + restart points; optionally LZ77-compressed (flag bit in trailer)
-             └ range tombstones sorted by (start asc, seq desc)
+             │       └ range tombstones sorted by start
+             └ entries + restart points; optionally LZ77-compressed (flag bit in trailer)
 every block ends in a CRC32 of its payload
 ```
 
-The full format and protocol spec is [`SPEC.md`](SPEC.md) §4. Its §9 is the
-per-version design log.
+The full format and protocol spec is [`SPEC.md`](SPEC.md) §4.
 
 ## Sizing
 
@@ -197,12 +204,33 @@ Everything is a const generic on `Db`:
 | `BLOOM_BYTES` | Bloom filter size per table (bits = 8 × bytes) |
 | `CACHE` | Block cache slots. `0` disables the cache |
 
+Declare a shape with `horton::db_types!` (named parameters, as in the
+quick start) rather than spelling ten positional const generics.
+
 `horton::profile` has a measured ESP32-S3 instantiation (4 KiB blocks,
 32-byte keys, 64-byte values, 16-entry memtable, 4 × 4 levels, 2-slot
-cache): `Db` 25,576 + `Scan` 10,536 + `Compaction` 56,408 = 92,520 bytes
-of static RAM, asserted under a 96 KiB budget by `tests/profile.rs`. See
-[`BUDGET.md`](BUDGET.md). The async futures themselves are not in that
-budget yet. `flush()`'s future is about 25 KiB on that profile.
+cache): `Db` 25,248 + `Scan` 10,536 + `Compaction` 58,840 = 94,624 bytes
+of structs, plus at most 17.6 KiB of live futures (`flush()`), for a
+measured peak of 112,200 bytes under a 112 KiB budget asserted by
+`tests/profile.rs`. See [`BUDGET.md`](BUDGET.md).
+
+Region sizing (checked by `open()`, `BadConfig` otherwise):
+
+- **Manifest:** each copy is `Manifest::max_blocks::<BLOCK>()` blocks, the
+  worst case for `LEVELS × TABLES` tables with `KEY_MAX` bounds (1 block
+  for the ESP32 profile, 4 for 256-byte keys × 28 tables).
+- **Tables:** the region splits into `LEVELS × TABLES` equal slots, and a
+  slot must hold a full memtable's table. A table never outgrows its slot,
+  so the region holds `LEVELS × TABLES × slot_blocks` blocks of tables.
+- **WAL:** one block per durable commit between flushes.
+
+### Flash endurance
+
+On NOR flash every block write is a sector erase. Batch writes that arrive
+together into one `WriteBatch` (one erase instead of one per op), and use
+`Config::with_manifest_ring(n)` to spread manifest erases over `n` copies.
+Table slots are allocated next-fit, so table erases spread across the
+region. See [ADR-0012](docs/adr/0012-nor-flash-endurance.md).
 
 ## Platforms
 
@@ -219,7 +247,8 @@ budget yet. `flush()`'s future is about 25 KiB on that profile.
 ## Testing
 
 ```sh
-cargo test                        # ~300 tests: unit, integration, crash injection, fuzz
+cargo test                        # ~350 tests: unit, integration, crash injection, fuzz
+LIFECYCLE_SEEDS=300 cargo test --release --test lifecycle   # wider fuzz sweep
 cargo test --release              # same suite, optimized
 cargo run --example quickstart
 cargo +nightly miri test --test <name>          # UB check (the crate has no unsafe)
@@ -230,9 +259,16 @@ cargo build --release --benches                 # callgrind instruction-count ha
 What the suite covers:
 
 - **Crash injection.** Every block write is enumerated as a crash point over
-  flush, compaction, TTL purge, batches, archive and ingest. The recovered
-  state must be exactly the pre-commit or post-commit state. A torn-write
-  variant models partially written blocks.
+  flush, compaction (multi-output jobs included), TTL purge, batches,
+  archive and ingest. The recovered state must be one of the committed
+  states. A torn-write variant models partially written blocks, including
+  torn multi-block manifest commits.
+- **Lifecycle fuzzer** (`tests/lifecycle.rs`): long random operation
+  sequences with reopen, WAL wrap, archive and re-ingest on small regions,
+  checking `Db::check_invariants` after every op against a `BTreeMap`
+  oracle.
+- **Review regressions** (`tests/review_findings.rs`): one test per
+  architecture-review finding; CI fails if one is ignored.
 - **Differential and property tests** against a `BTreeMap` oracle and the
   executable models in `src/model.rs` (visibility, the per-key keep-set,
   TTL and range-delete winners).
@@ -246,13 +282,13 @@ What the suite covers:
 
 | Path | Contents |
 |---|---|
-| `src/db.rs` | `Db`: open/recovery, write path, point reads, flush, compaction selection and commit, archive and ingest |
+| `src/db/` | `Db`: `mod.rs` (config, open/recovery, write path), `read.rs`, `flush.rs`, `compaction.rs` (job policy and commits), `archive.rs` (archive and ingest), `invariants.rs` |
 | `src/wal.rs` | WAL record codec, writer, recovery |
 | `src/memtable.rs` | Sorted-slot memtable over a bump arena |
 | `src/sstable.rs` | SSTable writer and reader, bloom filter, index, range-tombstone blocks, relocation |
 | `src/compact.rs` | Merge engine, cursors, range-tombstone merger |
 | `src/scan.rs` | `Scan` / `RevScan` merge iterators |
-| `src/manifest.rs` | Manifest encoding and double-buffered commit/recover |
+| `src/manifest.rs` | Manifest: multi-block copies, pair or ring layout, staged edits, commit/recover |
 | `src/slots.rs` | Table-slot allocator: one table per fixed slot, next-fit, reservations |
 | `src/cache.rs` | CLOCK block cache |
 | `src/compress.rs` | LZ77 block codec |
@@ -260,16 +296,20 @@ What the suite covers:
 | `src/crc.rs` | Slicing-by-8 CRC-32 |
 | `src/model.rs` | Executable models used as test oracles |
 | `src/device.rs`, `src/flash.rs`, `src/esp32s3.rs` | `BlockDevice` trait, NOR flash adapter, ESP32-S3 SPI flash driver |
-| `src/profile.rs` | Measured ESP32-S3 const-generic profile |
+| `src/profile.rs`, `src/macros.rs` | Measured ESP32-S3 profile; the `db_types!` macro |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |
 | `xtensa-smoke/` | Bare-metal ESP32-S3 QEMU smoke test |
 
 ## Documents
 
-- [`SPEC.md`](SPEC.md): design spec, on-disk formats, and the per-version design log.
-- [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md): architecture
-  review (2026-09) with confirmed issues and recommendations.
+- [`SPEC.md`](SPEC.md): normative spec: constraints, formats, protocols, API.
+- [`CHANGELOG.md`](CHANGELOG.md): what changed in each version.
+- [`docs/adr/`](docs/adr/README.md): architecture decision records.
+- [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md): the v0.16
+  architecture review and the status of each finding.
+- [`docs/history/`](docs/history/milestones-v0.1-v0.16.md): the v0.1–v0.16
+  milestone log with its test-run reports.
 - [`BUDGET.md`](BUDGET.md): ESP32-S3 RAM accounting.
 - [`MUTATION_TRIAGE.md`](MUTATION_TRIAGE.md): mutation-testing results and
   equivalent-mutant reasoning.

@@ -56,4 +56,4 @@ question 2 asked whether `no_alloc` is a hard line.
 ## References
 
 - SPEC §1 (hard constraints), §4.1, §4.6, §4.7, §6, §10 question 2
-- SPEC §9: v0.4, v0.6, v0.7, v0.13, v0.16
+- [Milestone log](../history/milestones-v0.1-v0.16.md): v0.4, v0.6, v0.7, v0.13, v0.16

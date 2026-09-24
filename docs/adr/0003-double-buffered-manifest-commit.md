@@ -61,4 +61,4 @@ writes and `flush` (ADR-0001).
 ## References
 
 - SPEC §4.5 (Manifest), §4.6 (crash and reclamation bullets), §7
-- SPEC §9: v0.2, v0.3, v0.4, v0.4.1, v0.9, v0.10, v0.12
+- [Milestone log](../history/milestones-v0.1-v0.16.md): v0.2, v0.3, v0.4, v0.4.1, v0.9, v0.10, v0.12

@@ -6,6 +6,10 @@ made and described in [`SPEC.md`](../../SPEC.md). 0009–0013 record the
 v0.17 redesign that fixed the architecture review's findings
 ([`ARCHITECTURE_REVIEW.md`](../ARCHITECTURE_REVIEW.md)).
 
+ADRs 0001–0008 cite section numbers of the v0.16 `SPEC.md` (git
+history keeps it); its §9 milestone log now lives in
+[`docs/history/milestones-v0.1-v0.16.md`](../history/milestones-v0.1-v0.16.md).
+
 | ADR | Decision |
 |---|---|
 | [0001](0001-poll-based-block-device.md) | Poll-based async `BlockDevice` trait; horton ships no executor |

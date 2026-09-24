@@ -60,6 +60,6 @@ in-tree. Point reads go through the block index to a single data block
 
 ## References
 
-- SPEC §9 v0.13 (Scope, Format, Caller scratch, Crash model, Proof,
+- [Milestone log](../history/milestones-v0.1-v0.16.md) v0.13 (Scope, Format, Caller scratch, Crash model, Proof,
   Honest limits, Measured)
 - SPEC §1, §4.4

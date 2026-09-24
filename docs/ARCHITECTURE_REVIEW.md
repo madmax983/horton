@@ -16,6 +16,58 @@
   Those tests are `#[ignore]`d, so `cargo test` stays green, and they fail
   under `cargo test --test review_findings -- --ignored`.
 
+## Status (v0.17, 2026-09-24)
+
+Every finding below is fixed on the `claude/adoring-brahmagupta-1iqn35`
+branch. Each confirmed defect's test in
+[`tests/review_findings.rs`](../tests/review_findings.rs) was un-ignored in
+the commit that fixed it and is now its regression guard; CI fails if any
+is ignored again. Fixing them turned up four more (F14–F17), fixed the
+same way. The rest of this document is the original review, unchanged.
+
+| # | Fix | Regression tests |
+|---|---|---|
+| F1 | Tables live one per fixed slot of the table region; every writer is capped at its slot ([ADR-0009](adr/0009-fixed-slot-table-allocator.md)) | `f1_*`, `tests/slots.rs` |
+| F2 | The manifest persists the WAL replay floor (`flushed_seq`) and a sequence high-water mark (`seq_high`) | `f2_*` |
+| F3 | No free list: `open()` rebuilds the slot map from the manifest | `f3_*` |
+| F4 | Every device-touching call before `open()` returns `NotOpen` | `f4_*` |
+| F5 | `RevScan` yields each key's newest visible memtable version | `f5_*` |
+| F6 | Split-output compaction with per-output commits and input narrowing, trivial moves, consolidation, pressure push-down ([ADR-0010](adr/0010-split-output-compaction.md)) | `f6_*`, `tests/compact.rs`, `tests/crash_compact.rs` |
+| F7 | Multi-block manifest copies sized at compile time; optional copy ring ([ADR-0011](adr/0011-multi-block-manifest-and-edits.md)) | `f7_*`, `tests/manifest.rs` |
+| F8 | Every public future measured and gated; `flush` 29.8 → 17.6 KiB, `get` 9.1 → 1.1, scans 4.7 → 0.7/1.1; commits stage a `ManifestEdit`; `get` reports `Busy` ([`BUDGET.md`](../BUDGET.md)) | `tests/profile.rs`, `tests/manifest.rs` |
+| F9 | `WriteBatch` documented as group commit; manifest ring; next-fit slots ([ADR-0012](adr/0012-nor-flash-endurance.md)) | `tests/manifest.rs` (ring) |
+| F10 | `NoSpace` split into remedy-named errors; `NeedsCompaction` implies `compaction_pending()` ([ADR-0013](adr/0013-capacity-errors-name-their-remedy.md)) | `f10_*` |
+| F11 | Manifest-frame and slot-count const asserts; `open()` checks the regions (`BadConfig`); `db_types!` names every parameter | `f7_overlapping_regions_*`, `tests/profile.rs` |
+| F12 | Scans treat sequence 0 as invisible and terminate | `f12_*` |
+| F13 | A data block failing its CRC is `CorruptBlock` on every read path, through one funnel (`sstable::read_data_block`) | `f13_*` |
+| F14 | *(found while fixing F3)* A flush during an in-flight compaction could take the job's output blocks: compaction reserves its output slot | `f14_*` |
+| F15 | *(found while fixing F6)* A bottommost tombstone was dropped while an older re-ingested table still needed it: the drop now checks every table outside the job | `f15_*` |
+| F16 | *(found while fixing F6)* `delete_range` never gave space back: merges drop versions hidden by a range tombstone every reader sees, and a bottommost merge drops the tombstone once nothing it hides is left | `f16_*`, `tests/crash_compact.rs` |
+| F17 | *(found by the lifecycle fuzzer)* WAL writes after a reopen could be silently lost | `f17_*` |
+
+Structure and process items:
+
+- Done: `db.rs` split into `db/{mod,read,flush,archive,compaction,invariants}.rs`;
+  one `commit_mutation` write path; one point-read rule (`read_point`) for
+  `get` and the archive review; one data-block read funnel; both scan
+  directions share one range-tombstone lookup (which also prunes by
+  `max_seq` and exits early), fixing the reverse-scan drift; `pub mod
+  alloc` renamed `slots`; test oracles and low-level table builders
+  `#[doc(hidden)]`; `Error::widen` for `WriteBatch` errors; CI with a
+  pinned toolchain; license texts; parameterized scripts; the SPEC split
+  into `SPEC.md`, `CHANGELOG.md`, `docs/adr/`, and `docs/history/`; the
+  stale-documentation list; `Db::check_invariants` (I1–I6) checked after
+  every operation by the new lifecycle fuzzer; capacity tests per
+  geometry.
+- Not done, by choice: a direction-parameterized core shared by `Scan`
+  and `RevScan` (the concrete drift is fixed and the shared pieces are
+  factored out; merging the two cursor state machines is a large rewrite
+  of the most intricate read code for maintainability alone), a
+  one-block range-tombstone cache for scans, and per-cursor block buffers
+  for tied cursors (performance, unmeasured). Verus proofs of the slot
+  allocator and the durable sequence counter remain the queued PROOF
+  step. The ESP32-S3 flash driver is still unverified on silicon.
+
 ## Verdict
 
 horton's core design holds up and is unusually disciplined:

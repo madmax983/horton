@@ -65,6 +65,6 @@ different shape.
 
 ## References
 
-- SPEC §9 v0.12 (Scope, Design, Crash ordering, Proof, Honest limits)
-- SPEC §9 v0.10 (archive API, crash ordering, honest limits)
+- [Milestone log](../history/milestones-v0.1-v0.16.md) v0.12 (Scope, Design, Crash ordering, Proof, Honest limits)
+- [Milestone log](../history/milestones-v0.1-v0.16.md) v0.10 (archive API, crash ordering, honest limits)
 - SPEC §4.5, §4.6
