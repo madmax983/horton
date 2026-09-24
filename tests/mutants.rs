@@ -781,16 +781,19 @@ fn mut_manifest_decode_accepts_exact_fit() {
     }
 
     // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys:
-    // payload = 8 + 8 + 4 + 4 + (4 + 38) = 66, total = 12 + 66 + 4 = 82.
-    const BLOCK: usize = 82;
-    const CRC_END: usize = 78;
+    // payload = 8 + 8 + 4 + 8 + 8 + 4 + (4 + 38) = 82,
+    // total = 12 + 82 + 4 = 98.
+    const BLOCK: usize = 98;
+    const CRC_END: usize = 94;
     let mut buf = [0u8; BLOCK];
     buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-    buf[8..12].copy_from_slice(&66u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&82u32.to_le_bytes());
     let mut off = 12;
     w64(&mut buf, &mut off, 7); // seq
     w64(&mut buf, &mut off, 0); // wal_head
     w32(&mut buf, &mut off, 0); // next_table_id
+    w64(&mut buf, &mut off, 0); // flushed_seq
+    w64(&mut buf, &mut off, 0); // seq_high
     w32(&mut buf, &mut off, 1); // nlevels
     w32(&mut buf, &mut off, 1); // level 0: one table
     w32(&mut buf, &mut off, 7); // id
@@ -893,10 +896,11 @@ fn mut_manifest_decode_bound_rejects_overlong() {
     let mut buf = [0u8; 512];
     m.encode::<Infallible, 512>(&mut buf).unwrap();
     // Patch first_key's u16 length to KEY_MAX + 1. Layout: header(12) +
-    // seq(8) + wal_head(8) + next_table_id(4) + nlevels(4) + count(4) +
-    // id(4) + first_block(8) + block_count(4) = offset 56.
+    // seq(8) + wal_head(8) + next_table_id(4) + flushed_seq(8) +
+    // seq_high(8) + nlevels(4) + count(4) + id(4) + first_block(8) +
+    // block_count(4) = offset 72.
     assert_eq!(&buf[0..8], &MANIFEST_MAGIC.to_le_bytes());
-    buf[56..58].copy_from_slice(&9u16.to_le_bytes());
+    buf[72..74].copy_from_slice(&9u16.to_le_bytes());
     // Repair the CRC over the patched payload.
     let payload_len = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
     let crc_end = 12 + payload_len;
@@ -917,7 +921,7 @@ fn mut_manifest_decode_bound_rejects_overlong() {
 fn mut_manifest_encode_accepts_exact_fit() {
     use horton::{KeyBound, Manifest, TableRef};
 
-    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 82.
+    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 98.
     let mut m = Manifest::<1, 1, 8>::new();
     m.add_l0_table::<Infallible>(TableRef {
         id: 7,
@@ -930,11 +934,11 @@ fn mut_manifest_encode_accepts_exact_fit() {
         rdel_blocks: 0,
     })
     .unwrap();
-    let mut buf = [0u8; 82];
-    m.encode::<Infallible, 82>(&mut buf)
+    let mut buf = [0u8; 98];
+    m.encode::<Infallible, 98>(&mut buf)
         .expect("exact-fit manifest must encode");
     // And it must round-trip through decode.
-    let back = Manifest::<1, 1, 8>::decode::<Infallible, 82>(&buf)
+    let back = Manifest::<1, 1, 8>::decode::<Infallible, 98>(&buf)
         .expect("exact-fit manifest must decode");
     assert_eq!(back.seq(), 0);
     assert_eq!(back.l0().len(), 1);

@@ -9,7 +9,7 @@
 use horton::{Compaction, Config, Error, Progress, RevScan, Scan};
 
 mod common;
-use common::{MemDevice, TestDb, block_on, test_config};
+use common::{MemDevice, TestDb, block_on, noop_waker, test_config};
 
 /// Caller scratch for `compact_step`, matching the test database shape.
 type TestCompaction = Compaction<4096, 256, 1024, 1024>;
@@ -124,7 +124,6 @@ fn delete_x_and_compact_away(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompa
 /// compaction drops the tables holding the highest sequences, the floor
 /// falls, stale pre-wrap WAL records replay, and a deleted key comes back.
 #[test]
-#[ignore = "F2: derived seq floor lets stale pre-wrap WAL records resurrect deleted data"]
 fn f2_deleted_key_stays_deleted_across_reopen_after_wal_wrap() {
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();
@@ -152,7 +151,6 @@ fn f2_deleted_key_stays_deleted_across_reopen_after_wal_wrap() {
 /// F2 (variant) — with more stale records than memtable slots, the same
 /// replay overflows the memtable and `open()` fails outright.
 #[test]
-#[ignore = "F2: derived seq floor makes open() fail with CorruptWal"]
 fn f2_open_succeeds_after_wal_wrap_and_full_compaction() {
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();
@@ -165,6 +163,63 @@ fn f2_open_succeeds_after_wal_wrap_and_full_compaction() {
     assert!(opened.is_ok(), "open failed: {opened:?}");
     let mut buf = [0u8; 16];
     assert_eq!(block_on(db.get(b"x", &mut buf)), Ok(None));
+}
+
+/// F2 (ingest) — an ingested table can carry sequences from another
+/// history. The counter must resume above them, in session and across
+/// reopen, or a later local write loses to the older ingested version
+/// under highest-sequence-wins.
+#[test]
+fn f2_local_write_after_ingest_beats_the_ingested_version() {
+    use core::task::{Context, Poll};
+    use horton::BlockDevice;
+
+    // Source database: 300 mutations, so its table carries seqs up to 300.
+    let mut src: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(src.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    for i in 0..300u32 {
+        put_retrying(&mut src, &mut c, b"k", &i.to_le_bytes());
+    }
+    flush_retrying(&mut src, &mut c);
+    let t = *src.level_tables(0).unwrap().last().unwrap();
+    let sealed = src.archive_plan(0, t.id).unwrap().sealed();
+    // Upload the table's blocks to a remote device at offset 0.
+    let mut remote = MemDevice::<4096>::new();
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut buf = [0u8; 4096];
+    for (k, id) in (t.first_block..t.end_block()).enumerate() {
+        assert!(matches!(
+            src.device().poll_read_block(&mut cx, id, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        let dst = u64::try_from(k).unwrap();
+        assert!(matches!(
+            remote.poll_write_block(&mut cx, dst, &buf),
+            Poll::Ready(Ok(()))
+        ));
+    }
+
+    // A fresh database ingests it, then writes the same key locally.
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    assert_eq!(block_on(db.ingest_table(&sealed, &remote, 0)), Ok(true));
+    let seq = block_on(db.put(b"k", b"local")).unwrap();
+    assert!(
+        seq > sealed.max_seq,
+        "local write got seq {seq} <= ingested {}",
+        sealed.max_seq
+    );
+    let mut val = [0u8; 16];
+    assert_eq!(block_on(db.get(b"k", &mut val)), Ok(Some(5)));
+    assert_eq!(&val[..5], b"local");
+
+    // Across reopen too (the write is still only in the WAL).
+    let mut db = TestDb::new(db.into_device(), test_config());
+    block_on(db.open()).unwrap();
+    assert_eq!(block_on(db.get(b"k", &mut val)), Ok(Some(5)));
+    assert_eq!(&val[..5], b"local");
 }
 
 /// F3 — the open-time sweep inserts every unreferenced block below the

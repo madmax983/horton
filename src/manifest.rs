@@ -7,13 +7,14 @@
 //! Layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman03" | payload_len: u32 | payload | crc32: u32
+//! magic: u64 = "hrtman04" | payload_len: u32 | payload | crc32: u32
 //! ```
 //!
 //! `payload` is variable-length (only populated levels are stored):
 //!
 //! ```text
-//! seq: u64 | wal_head: u64 | next_table_id: u32 | nlevels: u32
+//! seq: u64 | wal_head: u64 | next_table_id: u32
+//!     | flushed_seq: u64 | seq_high: u64 | nlevels: u32
 //! per level: count: u32 | count * tableref
 //! tableref: id: u32 | first_block: u64 | block_count: u32
 //!           | fk_len: u16 | fk_bytes[KEY_MAX]
@@ -31,15 +32,17 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman03".
+/// Manifest block magic: ASCII "hrtman04".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
 /// layout with fixed `KEY_MAX` key bounds; "hrtman02" was the v0.4.1
 /// layout with length-prefixed key bounds; "hrtman03" is the v0.15 layout
-/// with the per-table `rdel_blocks` count. A foreign magic decodes as
+/// with the per-table `rdel_blocks` count; "hrtman04" (v0.17) adds the
+/// persisted sequence floors `flushed_seq` and `seq_high`. A foreign magic
+/// decodes as
 /// [`Error::CorruptManifest`] — old bytes are rejected, never misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman03");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman04");
 
 /// Fixed-size key bound: `len` significant bytes of `bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +192,16 @@ pub struct Manifest<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usi
     seq: u64,
     wal_head: u64,
     next_table_id: u32,
+    /// Highest sequence number that has left the WAL: every record with
+    /// `seq <= flushed_seq` is in a table or behind `wal_head`. Recovery
+    /// skips WAL records at or below it (stale pre-wrap blocks). Raised
+    /// only by flush — never derived from live tables, which can shrink.
+    flushed_seq: u64,
+    /// Highest sequence number ever issued as of the last commit.
+    /// Recovery resumes the counter at or above it, so sequence numbers
+    /// are never reused even after compaction or archival removes the
+    /// tables that held them.
+    seq_high: u64,
     levels: [Level<TABLES, KEY_MAX>; LEVELS],
 }
 
@@ -202,6 +215,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             seq: 0,
             wal_head: 0,
             next_table_id: 0,
+            flushed_seq: 0,
+            seq_high: 0,
             levels: [Level::EMPTY; LEVELS],
         }
     }
@@ -221,6 +236,36 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// Sets the WAL head (advanced past flushed WAL blocks on flush).
     pub const fn set_wal_head(&mut self, head: u64) {
         self.wal_head = head;
+    }
+
+    /// Highest sequence number that has left the WAL (see the field docs):
+    /// the WAL replay floor.
+    #[must_use]
+    pub const fn flushed_seq(&self) -> u64 {
+        self.flushed_seq
+    }
+
+    /// Highest sequence number issued as of the last commit: the floor the
+    /// sequence counter resumes from.
+    #[must_use]
+    pub const fn seq_high(&self) -> u64 {
+        self.seq_high
+    }
+
+    /// Records a flush: every mutation with `seq <= seq` has left the WAL.
+    /// Monotone — a lower value never lowers either floor.
+    pub const fn note_flushed(&mut self, seq: u64) {
+        if seq > self.flushed_seq {
+            self.flushed_seq = seq;
+        }
+        self.raise_seq_high(seq);
+    }
+
+    /// Raises the persisted sequence high-water mark. Monotone.
+    pub const fn raise_seq_high(&mut self, seq: u64) {
+        if seq > self.seq_high {
+            self.seq_high = seq;
+        }
     }
 
     /// Next table id to assign.
@@ -371,7 +416,12 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         })
     }
 
-    /// Highest sequence number across all tables (0 when empty).
+    /// Highest sequence number across all live tables (0 when empty).
+    ///
+    /// Derived, so it can *fall* when compaction or archival removes the
+    /// tables holding the newest sequences. Never use it as a durable
+    /// floor: that is what [`flushed_seq`](Self::flushed_seq) and
+    /// [`seq_high`](Self::seq_high) are for.
     #[must_use]
     pub fn max_seq(&self) -> u64 {
         let mut max = 0u64;
@@ -421,6 +471,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         enc.u64(self.seq)?;
         enc.u64(self.wal_head)?;
         enc.u32(self.next_table_id)?;
+        enc.u64(self.flushed_seq)?;
+        enc.u64(self.seq_high)?;
         enc.u32(u32::try_from(LEVELS).map_err(|_| Error::NoSpace)?)?;
         for level in &self.levels {
             enc.u32(u32::try_from(level.len).map_err(|_| Error::NoSpace)?)?;
@@ -482,6 +534,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let seq = dec.u64().map_err(|()| corrupt())?;
         let wal_head = dec.u64().map_err(|()| corrupt())?;
         let next_table_id = dec.u32().map_err(|()| corrupt())?;
+        let flushed_seq = dec.u64().map_err(|()| corrupt())?;
+        let seq_high = dec.u64().map_err(|()| corrupt())?;
         let nlevels = dec.u32().map_err(|()| corrupt())?;
         if usize::try_from(nlevels).map_err(|_| corrupt())? != LEVELS {
             return Err(corrupt());
@@ -505,6 +559,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             seq,
             wal_head,
             next_table_id,
+            flushed_seq,
+            seq_high,
             levels,
         })
     }

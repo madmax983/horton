@@ -469,18 +469,26 @@ impl<
                 }
             }
         }
-        // The sequence floor skips stale pre-wrap WAL records (see
-        // `WalWriter::recover_from`); when the WAL never wrapped it is a
-        // no-op, because every live record is newer than every table.
+        // The persisted flush floor skips stale pre-wrap WAL records (see
+        // `WalWriter::recover_from`). It must be the persisted value, not
+        // one derived from live tables: compaction and archival can remove
+        // the tables holding the newest sequences, and a derived floor
+        // would then fall below stale records and replay them.
         let state: RecoverState = self
             .wal
             .recover_from(
                 &mut self.table,
                 self.manifest.wal_head(),
-                self.manifest.max_seq(),
+                self.manifest.flushed_seq(),
             )
             .await?;
-        self.next_seq = state.max_seq.max(self.manifest.max_seq());
+        // Resume above every sequence ever issued: the WAL's newest record,
+        // the persisted high-water mark, and any live table (an ingested
+        // table can carry sequences from another history).
+        self.next_seq = state
+            .max_seq
+            .max(self.manifest.seq_high())
+            .max(self.manifest.max_seq());
         Ok(OpenReport {
             recovered_records: state.records,
             max_seq: self.next_seq,
@@ -1032,6 +1040,10 @@ impl<
         // advances past it (monotone; never lowers the counter).
         let mut staged = self.manifest;
         staged.advance_next_table_id(sealed.id.saturating_add(1));
+        // The table may carry sequences from another history: the counter
+        // must resume above them, or a later local write could lose to an
+        // older ingested version under highest-sequence-wins.
+        staged.raise_seq_high(self.next_seq.max(sealed.max_seq));
         staged.add_l0_table::<D::Error>(TableRef {
             id: sealed.id,
             first_block: base,
@@ -1049,6 +1061,7 @@ impl<
         // Commit point passed: publish the staged state, then claim the
         // reserved run — strictly after the visibility point.
         self.manifest = staged;
+        self.next_seq = self.next_seq.max(sealed.max_seq);
         match free_base {
             Some(b) => {
                 debug_assert_eq!(b, base);
@@ -1148,6 +1161,8 @@ impl<
         // at recovery.)
         let mut staged = self.manifest;
         staged.set_wal_head(self.cfg.wal_start);
+        // Every issued mutation has left the WAL: the memtable is empty.
+        staged.note_flushed(self.next_seq);
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
         staged
             .commit(self.wal.device_mut(), scratch, slot_a, slot_b)
@@ -1332,6 +1347,9 @@ impl<
         } else {
             self.wal.next_block()
         });
+        // Every issued mutation is now in a table or behind `wal_head`:
+        // raise the persisted replay floor with this same commit.
+        staged.note_flushed(self.next_seq);
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
         staged
             .commit(self.wal.device_mut(), &mut data, slot_a, slot_b)
@@ -1485,6 +1503,7 @@ impl<
         if !staged.remove_table_from_level::<D::Error>(level, table_id)? {
             return Ok(false);
         }
+        staged.raise_seq_high(self.next_seq);
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
         staged
             .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
@@ -2150,6 +2169,9 @@ impl<
         if let Some(tref) = out_ref {
             staged.add_table_to_level::<D::Error>(c.target_level, tref)?;
         }
+        // Compaction may drop the tables holding the newest sequences
+        // (bottommost tombstones): persist the counter so it never regresses.
+        staged.raise_seq_high(self.next_seq);
         let (slot_a, slot_b) = (self.cfg.manifest_a, self.cfg.manifest_b);
         staged
             .commit(self.wal.device_mut(), &mut scratch, slot_a, slot_b)
