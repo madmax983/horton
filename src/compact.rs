@@ -1478,9 +1478,11 @@ mod tests {
         base: u64,
         entries: &[(&[u8], &[u8], u64)],
     ) -> TableRef<256> {
+        let mut buf = [0u8; BLOCK];
         let rdel_blocks = block_on(sstable::write_rdel_blocks::<_, BLOCK>(
             dev,
             base,
+            &mut buf,
             entries.iter().map(|(s, e, seq)| sstable::RdelEntry {
                 start: s,
                 end: e,
@@ -1707,7 +1709,8 @@ mod tests {
         let mut rng = 7u64;
         for n in 0u8..30 {
             let mut dev = TestDevice::<64>::new();
-            let mut w = sstable::RdelWriter::<64>::new(200);
+            let mut buf = [0u8; 64];
+            let mut w = sstable::RdelWriter::<64>::new(200, &mut buf);
             for i in 0..n {
                 rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 let sl = 1 + usize::try_from(rng >> 61).unwrap(); // 1..=8
@@ -1733,7 +1736,8 @@ mod tests {
         }
         // Maximum-size entries meet the bound exactly.
         let mut dev = TestDevice::<64>::new();
-        let mut w = sstable::RdelWriter::<64>::new(200);
+        let mut buf = [0u8; 64];
+        let mut w = sstable::RdelWriter::<64>::new(200, &mut buf);
         for i in 0..5u8 {
             block_on(w.push(
                 &mut dev,
@@ -1753,7 +1757,8 @@ mod tests {
     #[test]
     fn rdel_writer_refuses_to_pass_its_block_limit() {
         let mut dev = TestDevice::<64>::new();
-        let mut w = sstable::RdelWriter::<64>::new(200).with_block_limit(1);
+        let mut buf = [0u8; 64];
+        let mut w = sstable::RdelWriter::<64>::new(200, &mut buf).with_block_limit(1);
         let e = |i: u8| sstable::RdelEntry {
             start: &[b'a'; 8],
             end: &[b'z'; 8],

@@ -197,25 +197,20 @@ pub struct Db<
     /// [`Error::NotOpen`] otherwise: before recovery the WAL append
     /// position is `wal_start`, so a write would clobber live WAL blocks.
     opened: bool,
-    /// Block-read buffer for [`Db::get`]. A read fills every byte before
-    /// `get` reads it. A zeroed buffer on each call would waste work.
-    /// Calls reuse this buffer instead.
+    /// Block-read buffer for point reads, and the block scratch of every
+    /// `&mut self` operation (manifest commits, ingest's copy): their
+    /// futures hold no block buffer of their own (F8).
     ///
-    /// The buffer sits in a `RefCell`. This lets `get` write to it
-    /// through `&self`. Two `get` calls can run at once (interleaved
-    /// awaits on one executor). The second call then uses its own local
-    /// buffer, not this one.
-    ///
-    /// This buffer used to live on `get`'s stack, for one call only. It
-    /// now lives here, for the life of the `Db`. Count `BLOCK` bytes of
-    /// permanent RAM for this field against SPEC.md's RAM budget.
+    /// The buffer sits in a `RefCell` so `get` can use it through
+    /// `&self`. Two `get` calls polled concurrently on one handle cannot
+    /// both have it: the second returns [`Error::Busy`] rather than carry
+    /// a fallback buffer in every `get` future. `&mut self` operations
+    /// reach it with `get_mut`, which no read can contend with.
     get_scratch: RefCell<[u8; BLOCK]>,
     /// Decompression buffer for point reads: data blocks flagged
     /// compressed inflate into here before parsing (see
     /// [`sstable::TableReader::lookup_at`](crate::sstable::TableReader::lookup_at)).
-    /// Same borrow discipline as `get_scratch`: `get_at` tries the shared
-    /// buffer and falls back to a stack buffer when a concurrent `get`
-    /// already holds it. Count another `BLOCK` bytes of permanent RAM.
+    /// Same borrow discipline as `get_scratch`.
     decomp_scratch: RefCell<[u8; BLOCK]>,
     /// `SSTable` block cache (`CACHE` slots of `BLOCK` bytes plus one tag
     /// per slot). Served on the read path — point reads, forward and
@@ -819,6 +814,11 @@ impl<
     /// encoded size exceeds one block cannot commit atomically and is
     /// rejected with [`Error::BatchTooLarge`] — never silently split.
     /// An empty batch is a no-op returning the current sequence number.
+    ///
+    /// This is also horton's **group commit**: every single-op write
+    /// (`put`, `delete`, …) costs one WAL block write — one sector erase on
+    /// NOR flash — while a batch pays that once for all its ops. Batch
+    /// writes that arrive together to save both time and flash wear.
     ///
     /// # Errors
     ///

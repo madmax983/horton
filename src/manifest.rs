@@ -691,36 +691,89 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// Body bytes this manifest encodes to.
     #[must_use]
     pub fn body_len(&self) -> usize {
-        let refs: usize = self
-            .tables()
-            .iter()
-            .map(|t| 44 + usize::from(t.first_key.len) + usize::from(t.last_key.len))
-            .sum();
-        8 + 4 + 8 + 8 + 4 + 4 * LEVELS + refs
+        self.view_body_len(&ManifestEdit::EMPTY)
     }
 
     /// Blocks this manifest's copy occupies now.
     #[must_use]
     pub fn encoded_blocks<const BLOCK: usize>(&self) -> usize {
-        self.body_len().div_ceil(Self::chunk::<BLOCK>()).max(1)
+        Self::blocks_for::<BLOCK>(self.body_len())
     }
 
-    /// Writes the body to `w`, which keeps only the bytes of one block's
-    /// chunk.
-    fn write_body(&self, w: &mut Window<'_>) {
-        w.u64(self.wal_head);
-        w.u32(self.next_table_id);
-        w.u64(self.flushed_seq);
-        w.u64(self.seq_high);
+    /// Blocks a body of `len` bytes occupies.
+    const fn blocks_for<const BLOCK: usize>(len: usize) -> usize {
+        let n = len.div_ceil(Self::chunk::<BLOCK>());
+        if n == 0 { 1 } else { n }
+    }
+
+    /// Body bytes of the manifest as `edit` would leave it.
+    fn view_body_len(&self, edit: &ManifestEdit<KEY_MAX>) -> usize {
+        let mut refs = 0;
+        for li in 0..LEVELS {
+            self.view_level(edit, li, |t| {
+                refs += 44 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
+            });
+        }
+        8 + 4 + 8 + 8 + 4 + 4 * LEVELS + refs
+    }
+
+    /// Calls `f` on each ref of level `li` as `edit` would leave it, in
+    /// order: removed refs skipped, narrowed refs with their new first
+    /// key, the added ref (if it goes to `li`) appended to level 0 or
+    /// inserted in first-key order — exactly what
+    /// [`apply_edit`](Self::apply_edit) produces.
+    fn view_level(
+        &self,
+        edit: &ManifestEdit<KEY_MAX>,
+        li: usize,
+        mut f: impl FnMut(&TableRef<KEY_MAX>),
+    ) {
+        let s = self.start(li);
+        let mut pending = edit.added.filter(|(l, _)| *l == li).map(|(_, t)| t);
+        for pos in s..s + self.counts[li] {
+            if bit(edit.removed, pos) {
+                continue;
+            }
+            let narrowed;
+            let t = if bit(edit.narrowed, pos) {
+                narrowed = TableRef {
+                    first_key: edit.narrow_to,
+                    ..self.flat()[pos]
+                };
+                &narrowed
+            } else {
+                &self.flat()[pos]
+            };
+            if li > 0
+                && let Some(a) = pending
+                && t.first_key.as_slice() >= a.first_key.as_slice()
+            {
+                f(&a);
+                pending = None;
+            }
+            f(t);
+        }
+        if let Some(a) = pending {
+            f(&a);
+        }
+    }
+
+    /// Writes the body of the manifest as `edit` would leave it to `w`,
+    /// which keeps only the bytes of one block's chunk.
+    fn write_body(&self, edit: &ManifestEdit<KEY_MAX>, w: &mut Window<'_>) {
+        w.u64(edit.wal_head.unwrap_or(self.wal_head));
+        w.u32(self.next_table_id.max(edit.next_table_id));
+        w.u64(self.flushed_seq.max(edit.flushed));
+        w.u64(self.seq_high.max(edit.seq_high).max(edit.flushed));
         // `LEVELS` and each level's count are bounded by the pool, far
         // below `u32::MAX`.
         #[allow(clippy::cast_possible_truncation)]
         w.u32(LEVELS as u32);
         for li in 0..LEVELS {
-            let level = self.level(li).unwrap_or(&[]);
-            #[allow(clippy::cast_possible_truncation)]
-            w.u32(level.len() as u32);
-            for tref in level {
+            let mut n = 0u32;
+            self.view_level(edit, li, |_| n += 1);
+            w.u32(n);
+            self.view_level(edit, li, |tref| {
                 w.u32(tref.id);
                 w.u64(tref.first_block);
                 w.u32(tref.block_count);
@@ -732,7 +785,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 w.u64(tref.min_seq);
                 w.u32(tref.entry_count);
                 w.u32(tref.rdel_blocks);
-            }
+            });
         }
     }
 
@@ -747,13 +800,26 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         index: usize,
         out: &mut [u8; BLOCK],
     ) -> Result<(), Error<E>> {
+        self.encode_view_block(&ManifestEdit::EMPTY, self.seq, index, out)
+    }
+
+    /// Encodes block `index` of the copy of this manifest as `edit` would
+    /// leave it, stamped with `seq`.
+    fn encode_view_block<E, const BLOCK: usize>(
+        &self,
+        edit: &ManifestEdit<KEY_MAX>,
+        seq: u64,
+        index: usize,
+        out: &mut [u8; BLOCK],
+    ) -> Result<(), Error<E>> {
         let chunk = Self::chunk::<BLOCK>();
-        let count = self.encoded_blocks::<BLOCK>();
+        let body = self.view_body_len(edit);
+        let count = Self::blocks_for::<BLOCK>(body);
         if index >= count {
             return Err(Error::ManifestFull);
         }
         let lo = index * chunk;
-        let len = self.body_len().saturating_sub(lo).min(chunk);
+        let len = body.saturating_sub(lo).min(chunk);
         out.fill(0);
         {
             let mut w = Window {
@@ -761,10 +827,10 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 pos: 0,
                 lo,
             };
-            self.write_body(&mut w);
+            self.write_body(edit, &mut w);
         }
         out[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-        out[8..16].copy_from_slice(&self.seq.to_le_bytes());
+        out[8..16].copy_from_slice(&seq.to_le_bytes());
         let (i16, c16, l32) = (
             u16::try_from(index).map_err(|_| Error::ManifestFull)?,
             u16::try_from(count).map_err(|_| Error::ManifestFull)?,
@@ -1018,28 +1084,52 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             .await
     }
 
-    /// Commits: bumps `seq`, writes copy `seq % copies` block by block,
-    /// then flushes the device. Only the blocks the manifest currently
-    /// fills are written.
+    /// Commits: writes copy `seq + 1` (of `copies`, round robin) block by
+    /// block, flushes the device, then bumps `seq`. Only the blocks the
+    /// manifest currently fills are written.
     ///
     /// # Errors
     ///
     /// [`Error::CounterExhausted`] when the sequence counter overflows, or
-    /// [`Error::Device`] on I/O failure.
+    /// [`Error::Device`] on I/O failure (`seq` is then unchanged).
     pub async fn commit_to<D: BlockDevice, const BLOCK: usize>(
         &mut self,
         device: &mut D,
         scratch: &mut [u8; BLOCK],
         layout: ManifestLayout,
     ) -> Result<(), Error<D::Error>> {
-        self.seq = self.seq.checked_add(1).ok_or(Error::CounterExhausted)?;
+        self.commit_edit(&ManifestEdit::EMPTY, device, scratch, layout)
+            .await
+    }
+
+    /// Commits the manifest as `edit` would leave it, then applies `edit`
+    /// in memory — only once the commit has landed. A failed commit leaves
+    /// this manifest exactly as it was, like committing an edited copy,
+    /// but without the copy: the caller's future holds the small `edit`
+    /// instead of a whole manifest.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadLevel`] or [`Error::ManifestFull`] when the edit does
+    /// not fit (checked before any I/O); [`Error::CounterExhausted`] when
+    /// the sequence counter overflows; [`Error::Device`] on I/O failure.
+    pub async fn commit_edit<D: BlockDevice, const BLOCK: usize>(
+        &mut self,
+        edit: &ManifestEdit<KEY_MAX>,
+        device: &mut D,
+        scratch: &mut [u8; BLOCK],
+        layout: ManifestLayout,
+    ) -> Result<(), Error<D::Error>> {
+        self.check_edit(edit)?;
+        let seq = self.seq.checked_add(1).ok_or(Error::CounterExhausted)?;
         let copies = u64::from(layout.copies());
         // `seq % copies < copies <= u32::MAX`: the narrowing is exact.
         #[allow(clippy::cast_possible_truncation)]
-        let k = (self.seq % copies) as u32;
+        let k = (seq % copies) as u32;
         let start = layout.copy_start(k, Self::max_blocks::<BLOCK>());
-        for i in 0..self.encoded_blocks::<BLOCK>() {
-            self.encode_block::<D::Error, BLOCK>(i, scratch)?;
+        let blocks = Self::blocks_for::<BLOCK>(self.view_body_len(edit));
+        for i in 0..blocks {
+            self.encode_view_block::<D::Error, BLOCK>(edit, seq, i, scratch)?;
             let id = start + i as u64;
             poll_fn(|cx| device.poll_write_block(cx, id, scratch))
                 .await
@@ -1048,7 +1138,265 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         poll_fn(|cx| device.poll_flush(cx))
             .await
             .map_err(Error::Device)?;
+        self.apply_checked(edit);
+        self.seq = seq;
         Ok(())
+    }
+
+    /// Stages removing table `id` from `level` into `edit`. Returns
+    /// `false` (and stages nothing) when the table is not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadLevel`] when `level` is out of range.
+    pub fn stage_remove<E>(
+        &self,
+        edit: &mut ManifestEdit<KEY_MAX>,
+        level: usize,
+        id: u32,
+    ) -> Result<bool, Error<E>> {
+        let Some(pos) = self.position(level, id)? else {
+            return Ok(false);
+        };
+        edit.removed |= 1 << pos;
+        Ok(true)
+    }
+
+    /// Stages raising table `id`'s first key at `level` to `first` into
+    /// `edit` (see [`narrow_table`](Self::narrow_table)). Every narrowing
+    /// in one edit shares one new first key. Returns `false` when the
+    /// table is not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadLevel`] when `level` is out of range;
+    /// [`Error::ManifestFull`] when `edit` already narrows to a different
+    /// key.
+    pub fn stage_narrow<E>(
+        &self,
+        edit: &mut ManifestEdit<KEY_MAX>,
+        level: usize,
+        id: u32,
+        first: KeyBound<KEY_MAX>,
+    ) -> Result<bool, Error<E>> {
+        let Some(pos) = self.position(level, id)? else {
+            return Ok(false);
+        };
+        if edit.narrowed != 0 && edit.narrow_to != first {
+            return Err(Error::ManifestFull);
+        }
+        edit.narrowed |= 1 << pos;
+        edit.narrow_to = first;
+        Ok(true)
+    }
+
+    /// Pool position of table `id` at `level`.
+    fn position<E>(&self, level: usize, id: u32) -> Result<Option<usize>, Error<E>> {
+        const {
+            assert!(
+                LEVELS * TABLES <= 64,
+                "manifest edits address pool positions in a 64-bit mask"
+            );
+        }
+        if level >= LEVELS {
+            return Err(Error::BadLevel { level });
+        }
+        let s = self.start(level);
+        Ok(self.flat()[s..s + self.counts[level]]
+            .iter()
+            .position(|t| t.id == id)
+            .map(|p| s + p))
+    }
+
+    /// Checks that `edit` fits this manifest: its positions are live, its
+    /// added ref's level exists and has room, and the pool has room.
+    fn check_edit<E>(&self, edit: &ManifestEdit<KEY_MAX>) -> Result<(), Error<E>> {
+        let live = self.live();
+        let live_mask = if live >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << live) - 1
+        };
+        if (edit.removed | edit.narrowed) & !live_mask != 0 {
+            return Err(Error::ManifestFull);
+        }
+        if let Some((level, _)) = edit.added {
+            if level >= LEVELS {
+                return Err(Error::BadLevel { level });
+            }
+            let removed = edit.removed.count_ones() as usize;
+            if live - removed >= Self::CAPACITY {
+                return Err(Error::ManifestFull);
+            }
+            if level == 0 {
+                let l0_mask = if self.counts[0] >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << self.counts[0]) - 1
+                };
+                let l0 = self.counts[0] - (edit.removed & l0_mask).count_ones() as usize;
+                if l0 >= TABLES {
+                    return Err(Error::ManifestFull);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies `edit` in memory, without committing it.
+    ///
+    /// # Errors
+    ///
+    /// As [`commit_edit`](Self::commit_edit)'s pre-I/O checks; the
+    /// manifest is unchanged on error.
+    pub fn apply_edit<E>(&mut self, edit: &ManifestEdit<KEY_MAX>) -> Result<(), Error<E>> {
+        self.check_edit(edit)?;
+        self.apply_checked(edit);
+        Ok(())
+    }
+
+    /// Applies an edit that [`check_edit`](Self::check_edit) accepted:
+    /// scalars, then narrowings, then removals (highest position first, so
+    /// lower positions stay put), then the added ref — the order
+    /// [`view_level`](Self::view_level) encodes.
+    fn apply_checked(&mut self, edit: &ManifestEdit<KEY_MAX>) {
+        if let Some(head) = edit.wal_head {
+            self.wal_head = head;
+        }
+        self.note_flushed(edit.flushed);
+        self.raise_seq_high(edit.seq_high);
+        self.advance_next_table_id(edit.next_table_id);
+        let live = self.live();
+        let narrow_to = edit.narrow_to;
+        for (pos, t) in self.flat_mut()[..live].iter_mut().enumerate() {
+            if bit(edit.narrowed, pos) {
+                t.first_key = narrow_to;
+            }
+        }
+        for pos in (0..live).rev() {
+            if bit(edit.removed, pos) {
+                let level = self.level_at(pos);
+                let used = self.live();
+                let flat = self.flat_mut();
+                flat.copy_within(pos + 1..used, pos);
+                flat[used - 1] = TableRef::EMPTY;
+                self.counts[level] -= 1;
+            }
+        }
+        if let Some((level, tref)) = edit.added {
+            // Checked: the level exists and it and the pool have room.
+            let added = self.add_table_to_level::<()>(level, tref);
+            debug_assert!(added.is_ok(), "check_edit admitted an unfit add");
+        }
+    }
+
+    /// Level of the live ref at pool position `pos`.
+    fn level_at(&self, pos: usize) -> usize {
+        let mut end = 0;
+        for (li, &n) in self.counts.iter().enumerate() {
+            end += n;
+            if pos < end {
+                return li;
+            }
+        }
+        LEVELS - 1
+    }
+}
+
+/// True when bit `pos` of `mask` is set (`false` past bit 63).
+const fn bit(mask: u64, pos: usize) -> bool {
+    pos < 64 && (mask >> pos) & 1 == 1
+}
+
+/// A staged change to a [`Manifest`], committed with
+/// [`Manifest::commit_edit`] without copying the manifest.
+///
+/// Scalar updates are monotone (`note_flushed`, `raise_seq_high`,
+/// `advance_next_table_id`) or plain (`set_wal_head`). Table changes are
+/// staged through the manifest ([`Manifest::stage_remove`],
+/// [`Manifest::stage_narrow`]) — they address pool positions, so the
+/// manifest must not change between staging and commit — plus at most
+/// one [`add`](Self::add). They apply in the order narrow, remove, add.
+#[derive(Debug, Clone, Copy)]
+pub struct ManifestEdit<const KEY_MAX: usize> {
+    wal_head: Option<u64>,
+    flushed: u64,
+    seq_high: u64,
+    next_table_id: u32,
+    /// Pool positions removed.
+    removed: u64,
+    /// Pool positions whose first key becomes `narrow_to`.
+    narrowed: u64,
+    narrow_to: KeyBound<KEY_MAX>,
+    added: Option<(usize, TableRef<KEY_MAX>)>,
+}
+
+impl<const KEY_MAX: usize> ManifestEdit<KEY_MAX> {
+    /// The edit that changes nothing.
+    pub const EMPTY: Self = Self {
+        wal_head: None,
+        flushed: 0,
+        seq_high: 0,
+        next_table_id: 0,
+        removed: 0,
+        narrowed: 0,
+        narrow_to: KeyBound::EMPTY,
+        added: None,
+    };
+
+    /// An empty edit.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self::EMPTY
+    }
+
+    /// Sets the WAL head (see [`Manifest::set_wal_head`]).
+    pub const fn set_wal_head(&mut self, head: u64) {
+        self.wal_head = Some(head);
+    }
+
+    /// Raises the flushed sequence and the high-water mark (see
+    /// [`Manifest::note_flushed`]).
+    pub const fn note_flushed(&mut self, seq: u64) {
+        if seq > self.flushed {
+            self.flushed = seq;
+        }
+    }
+
+    /// Raises the sequence high-water mark (see
+    /// [`Manifest::raise_seq_high`]).
+    pub const fn raise_seq_high(&mut self, seq: u64) {
+        if seq > self.seq_high {
+            self.seq_high = seq;
+        }
+    }
+
+    /// Raises the next table id to at least `floor` (see
+    /// [`Manifest::advance_next_table_id`]).
+    pub const fn advance_next_table_id(&mut self, floor: u32) {
+        if floor > self.next_table_id {
+            self.next_table_id = floor;
+        }
+    }
+
+    /// Adds `tref` to `level`: appended to level 0, inserted in first-key
+    /// order deeper (see [`Manifest::add_table_to_level`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ManifestFull`] when the edit already adds a table.
+    pub const fn add<E>(&mut self, level: usize, tref: TableRef<KEY_MAX>) -> Result<(), Error<E>> {
+        if self.added.is_some() {
+            return Err(Error::ManifestFull);
+        }
+        self.added = Some((level, tref));
+        Ok(())
+    }
+}
+
+impl<const KEY_MAX: usize> Default for ManifestEdit<KEY_MAX> {
+    fn default() -> Self {
+        Self::EMPTY
     }
 }
 

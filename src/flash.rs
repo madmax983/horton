@@ -8,8 +8,35 @@
 //!
 //! Horton's block size equals the flash sector size (4096), so every block
 //! write is exactly one sector: erase it, then program it. No
-//! read-modify-write, no hidden RAM, no wear-leveling (out of scope: the
-//! allocator already spreads writes across reclaimed blocks).
+//! read-modify-write and no hidden RAM.
+//!
+//! # Endurance
+//!
+//! Every block write costs one sector erase, so wear follows the write
+//! pattern of each region (figures assume W25Q-class NOR: 100k P/E
+//! cycles, 45–400 ms per 4 KiB erase):
+//!
+//! - **WAL.** Each durable mutation (`put`, `delete`, one
+//!   [`WriteBatch`](crate::WriteBatch)) commits one whole block and moves
+//!   on, so a WAL sector is erased once per `wal_blocks` commits: the
+//!   region lasts about `100k × wal_blocks` commits, and erase time caps
+//!   durable commits at roughly 20 per second. **Group commit** is the
+//!   lever: a [`WriteBatch`](crate::WriteBatch) puts every op that fits one
+//!   block into a single commit (one erase instead of one per op).
+//! - **Manifest.** Every flush, compaction output, archive, and ingest
+//!   rewrites one manifest copy. With the default two copies each copy is
+//!   erased every other commit, which makes the manifest the first region
+//!   to wear out. [`Config::with_manifest_ring`](crate::Config::with_manifest_ring)
+//!   rotates commits across `N` copies, multiplying the manifest's life by
+//!   `N / 2`.
+//! - **Tables.** Slots are allocated next-fit from a rotating hint
+//!   ([`SlotMap`](crate::SlotMap)), so successive tables land in
+//!   successive slots and erases spread across the whole table region.
+//!
+//! There is no NOR page-program append path: the WAL never programs into
+//! an already-erased sector, so a mutation always pays a full erase. See
+//! `docs/adr/0012-nor-flash-endurance.md` for why that stays out of scope
+//! for now.
 
 use core::fmt;
 use core::marker::PhantomData;

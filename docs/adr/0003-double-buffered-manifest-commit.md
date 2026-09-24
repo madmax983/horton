@@ -1,6 +1,8 @@
 # ADR-0003: Double-buffered manifest as the single commit point; reserve-then-claim allocation
 
-Status: Accepted (v0.2 and v0.3, 2026-09-13; reclamation added in v0.4.1)
+Status: Accepted (v0.2 and v0.3, 2026-09-13; reclamation added in v0.4.1).
+Allocation superseded by ADR-0009; one-block slots superseded by ADR-0011
+(v0.17). The single-commit-point rule stands.
 
 ## Context
 

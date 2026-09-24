@@ -116,6 +116,11 @@ pub enum Error<E> {
     /// spans [`Manifest::max_blocks`](crate::Manifest::max_blocks) blocks).
     /// Nothing was read or written.
     BadConfig,
+    /// Another point read on this [`Db`](crate::Db) holds the shared read
+    /// buffers: two `get` futures were polled concurrently on one handle.
+    /// Nothing was read. **Remedy:** finish the other read, then retry —
+    /// or read through a [`Scan`](crate::Scan), which owns its buffers.
+    Busy,
     /// The database handle was used before a successful
     /// [`Db::open`](crate::Db::open). Nothing was read or written: call
     /// `open()` first. (Writing before recovery would append over live WAL

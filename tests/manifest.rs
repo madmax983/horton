@@ -6,9 +6,9 @@ mod common;
 
 use std::future::poll_fn;
 
-use common::{MemDevice, block_on};
+use common::{Lcg, MemDevice, block_on};
 use horton::manifest::{KeyBound, Manifest, TableRef};
-use horton::{BlockDevice, Error};
+use horton::{BlockDevice, Error, ManifestEdit};
 
 const BLOCK: usize = 4096;
 const SLOT_A: u64 = 0;
@@ -383,4 +383,257 @@ fn ring_rotates_and_recovers_the_newest_copy() {
     write_block(&mut dev, newest, &[0x5A; BLOCK]);
     let (back, _) = block_on(TestManifest::recover_from(&mut dev, &mut scratch, layout)).unwrap();
     assert_eq!(back.seq(), m.seq() - 1);
+}
+
+// ---------------------------------------------------------------------------
+// Manifest edits (F8): commits stage a small edit instead of a manifest
+// copy. The committed view and the in-memory result must be exactly what
+// the classic mutation API produces.
+// ---------------------------------------------------------------------------
+
+type EditManifest = Manifest<3, 4, 16>;
+
+fn key(n: u64) -> KeyBound<16> {
+    KeyBound::from_slice(format!("k{n:06}").as_bytes()).unwrap()
+}
+
+fn ref_span(id: u32, lo: u64, hi: u64) -> TableRef<16> {
+    TableRef {
+        id,
+        first_block: u64::from(id) * 8,
+        block_count: 4,
+        first_key: key(lo),
+        last_key: key(hi),
+        max_seq: 10 + u64::from(id),
+        min_seq: 1,
+        entry_count: 3,
+        rdel_blocks: 0,
+    }
+}
+
+/// Everything observable about a manifest except `seq`.
+fn state(m: &EditManifest) -> (Vec<Vec<TableRef<16>>>, [u64; 4]) {
+    let levels = (0..3).map(|l| m.level(l).unwrap().to_vec()).collect();
+    let scalars = [
+        m.wal_head(),
+        u64::from(m.next_table_id()),
+        m.flushed_seq(),
+        m.seq_high(),
+    ];
+    (levels, scalars)
+}
+
+/// A random manifest: up to 4 overlapping L0 tables, and sorted disjoint
+/// runs in L1 and L2, within the 12-ref pool.
+fn random_manifest(rng: &mut Lcg) -> EditManifest {
+    let mut m = EditManifest::new();
+    m.set_wal_head(rng.next() % 1000);
+    m.note_flushed(rng.next() % 1000);
+    m.advance_next_table_id(50);
+    let mut id = 1;
+    for _ in 0..rng.next_bounded(5) {
+        let lo = rng.next() % 900;
+        m.add_l0_table::<DevError>(ref_span(id, lo, lo + rng.next() % 90))
+            .unwrap();
+        id += 1;
+    }
+    for level in 1..3 {
+        let mut at = rng.next() % 50;
+        for _ in 0..rng.next_bounded(5) {
+            if m.free_refs() == 0 {
+                break;
+            }
+            let hi = at + 1 + rng.next() % 40;
+            m.add_table_to_level::<DevError>(level, ref_span(id, at, hi))
+                .unwrap();
+            id += 1;
+            at = hi + 1 + rng.next() % 20;
+        }
+    }
+    m
+}
+
+#[test]
+fn committed_edits_match_the_classic_mutations() {
+    let mut rng = Lcg::new(0xED17);
+    let mut scratch = [0u8; BLOCK];
+    for round in 0..500 {
+        let base = random_manifest(&mut rng);
+        let mut edit = ManifestEdit::new();
+        let mut expected = base;
+        // Scalars.
+        if rng.next().is_multiple_of(2) {
+            let h = rng.next() % 1000;
+            edit.set_wal_head(h);
+            expected.set_wal_head(h);
+        }
+        let flushed = rng.next() % 2000;
+        edit.note_flushed(flushed);
+        expected.note_flushed(flushed);
+        let high = rng.next() % 3000;
+        edit.raise_seq_high(high);
+        expected.raise_seq_high(high);
+        let next_id = u32::try_from(rng.next() % 100).unwrap();
+        edit.advance_next_table_id(next_id);
+        expected.advance_next_table_id(next_id);
+        // Narrow one deeper table's first key within its own range (so the
+        // level stays sorted), plus any L0 table containing that key.
+        let mut narrowed = Vec::new();
+        let deep = rng.next_bounded(2) + 1;
+        let deep_tables = base.level(deep).unwrap().to_vec();
+        let mut narrow_key = None;
+        if !deep_tables.is_empty() && rng.next().is_multiple_of(2) {
+            let r = deep_tables[rng.next_bounded(deep_tables.len())];
+            let lo: u64 = std::str::from_utf8(&r.first_key.as_slice()[1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let hi: u64 = std::str::from_utf8(&r.last_key.as_slice()[1..])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let k = key(lo + 1 + rng.next() % (hi - lo));
+            narrow_key = Some(k);
+            narrowed.push((deep, r.id));
+            for t in base.l0() {
+                if t.first_key.as_slice() < k.as_slice() && k.as_slice() <= t.last_key.as_slice() {
+                    narrowed.push((0, t.id));
+                }
+            }
+        }
+        for &(l, id) in &narrowed {
+            let k = narrow_key.unwrap();
+            assert!(base.stage_narrow::<DevError>(&mut edit, l, id, k).unwrap());
+            assert!(expected.narrow_table::<DevError>(l, id, k).unwrap());
+        }
+        // Remove a random subset of the rest.
+        for l in 0..3 {
+            for t in base.level(l).unwrap() {
+                if !narrowed.contains(&(l, t.id)) && rng.next().is_multiple_of(3) {
+                    assert!(base.stage_remove::<DevError>(&mut edit, l, t.id).unwrap());
+                    assert!(
+                        expected
+                            .remove_table_from_level::<DevError>(l, t.id)
+                            .unwrap()
+                    );
+                }
+            }
+        }
+        // Add one table somewhere, when it fits.
+        if !rng.next().is_multiple_of(4) {
+            let level = rng.next_bounded(3);
+            let lo = rng.next() % 900;
+            let t = ref_span(99, lo, lo + 5);
+            if expected.add_table_to_level::<DevError>(level, t).is_ok() {
+                edit.add::<DevError>(level, t).unwrap();
+            }
+        }
+        // In memory.
+        let mut applied = base;
+        applied.apply_edit::<DevError>(&edit).unwrap();
+        assert_eq!(state(&applied), state(&expected), "round {round}: apply");
+        // Committed: the durable view equals the classic result.
+        let mut dev = MemDevice::<BLOCK>::new();
+        let mut committed = base;
+        let layout = horton::ManifestLayout::ring(0, 3);
+        block_on(committed.commit_edit(&edit, &mut dev, &mut scratch, layout)).unwrap();
+        assert_eq!(committed.seq(), base.seq() + 1);
+        assert_eq!(state(&committed), state(&expected), "round {round}: commit");
+        let (back, _) =
+            block_on(EditManifest::recover_from(&mut dev, &mut scratch, layout)).unwrap();
+        assert_eq!(state(&back), state(&expected), "round {round}: recover");
+    }
+}
+
+/// A device whose writes fail.
+struct FailingDevice {
+    writes: usize,
+}
+
+impl BlockDevice for FailingDevice {
+    type Error = ();
+    const BLOCK: usize = BLOCK;
+    fn poll_read_block(
+        &self,
+        _cx: &mut core::task::Context<'_>,
+        _id: u64,
+        buf: &mut [u8],
+    ) -> core::task::Poll<Result<(), ()>> {
+        buf.fill(0);
+        core::task::Poll::Ready(Ok(()))
+    }
+    fn poll_write_block(
+        &mut self,
+        _cx: &mut core::task::Context<'_>,
+        _id: u64,
+        _buf: &[u8],
+    ) -> core::task::Poll<Result<(), ()>> {
+        self.writes += 1;
+        core::task::Poll::Ready(Err(()))
+    }
+    fn poll_flush(
+        &mut self,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), ()>> {
+        core::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn failed_edit_commit_leaves_the_manifest_unchanged() {
+    let mut rng = Lcg::new(3);
+    let base = random_manifest(&mut rng);
+    let mut m = base;
+    let mut edit = ManifestEdit::new();
+    edit.set_wal_head(77);
+    edit.add::<()>(1, ref_span(99, 990, 995)).unwrap();
+    let mut dev = FailingDevice { writes: 0 };
+    let mut scratch = [0u8; BLOCK];
+    let res = block_on(m.commit_edit(&edit, &mut dev, &mut scratch, pair_layout()));
+    assert_eq!(res, Err(Error::Device(())));
+    assert_eq!(dev.writes, 1);
+    assert_eq!(m.seq(), base.seq());
+    assert_eq!(state(&m), state(&base));
+}
+
+#[test]
+fn unfit_edits_fail_before_any_io() {
+    let mut m = EditManifest::new();
+    for id in 0..4 {
+        m.add_l0_table::<()>(ref_span(id, 0, 9)).unwrap();
+    }
+    let mut dev = FailingDevice { writes: 0 };
+    let mut scratch = [0u8; BLOCK];
+    // L0 is full.
+    let mut edit = ManifestEdit::new();
+    edit.add::<()>(0, ref_span(9, 0, 9)).unwrap();
+    let res = block_on(m.commit_edit(&edit, &mut dev, &mut scratch, pair_layout()));
+    assert_eq!(res, Err(Error::ManifestFull));
+    // ...unless the same edit removes an L0 table.
+    assert!(m.stage_remove::<()>(&mut edit, 0, 2).unwrap());
+    let mut applied = m;
+    applied.apply_edit::<()>(&edit).unwrap();
+    assert_eq!(applied.l0().len(), 4);
+    // No such level.
+    let mut edit = ManifestEdit::new();
+    edit.add::<()>(3, ref_span(9, 0, 9)).unwrap();
+    let res = block_on(m.commit_edit(&edit, &mut dev, &mut scratch, pair_layout()));
+    assert_eq!(res, Err(Error::BadLevel { level: 3 }));
+    assert_eq!(
+        m.stage_remove::<()>(&mut ManifestEdit::new(), 5, 1),
+        Err(Error::BadLevel { level: 5 })
+    );
+    // One add per edit; one narrowing key per edit.
+    let mut edit = ManifestEdit::new();
+    edit.add::<()>(1, ref_span(9, 0, 9)).unwrap();
+    assert_eq!(
+        edit.add::<()>(1, ref_span(10, 20, 29)),
+        Err(Error::ManifestFull)
+    );
+    assert!(m.stage_narrow::<()>(&mut edit, 0, 0, key(3)).unwrap());
+    assert_eq!(
+        m.stage_narrow::<()>(&mut edit, 0, 1, key(4)),
+        Err(Error::ManifestFull)
+    );
+    assert_eq!(dev.writes, 0, "every refusal came before I/O");
 }

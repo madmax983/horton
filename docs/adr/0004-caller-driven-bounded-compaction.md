@@ -1,6 +1,8 @@
 # ADR-0004: Caller-driven, bounded compaction with caller-owned scratch
 
-Status: Accepted (v0.4, 2026-09-14; extended to every level in v0.8)
+Status: Accepted (v0.4, 2026-09-14; extended to every level in v0.8).
+Selection and single-output jobs superseded by ADR-0010 (v0.17); the
+caller-driven, bounded-step API stands.
 
 ## Context
 

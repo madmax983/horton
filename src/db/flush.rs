@@ -3,7 +3,7 @@
 use super::Db;
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::{KeyBound, TableRef};
+use crate::manifest::{KeyBound, ManifestEdit, TableRef};
 use crate::memtable::MemTable;
 use crate::sstable;
 impl<
@@ -24,7 +24,7 @@ impl<
     /// The `wal_head` move rides a manifest commit, so it stays atomic with
     /// the flush; stale pre-wrap blocks are skipped at recovery by the
     /// sequence floor (see `WalWriter::recover_from`).
-    async fn wrap_wal_if_full(&mut self, scratch: &mut [u8; BLOCK]) -> Result<(), Error<D::Error>> {
+    async fn wrap_wal_if_full(&mut self) -> Result<(), Error<D::Error>> {
         if self.wal.next_block() < self.cfg.wal_end {
             return Ok(());
         }
@@ -33,29 +33,35 @@ impl<
         // records exist. (Stale pre-wrap blocks may still sit between
         // `wal_head` and the append position; the sequence floor skips them
         // at recovery.)
-        let mut staged = self.manifest;
-        staged.set_wal_head(self.cfg.wal_start);
+        let mut edit = ManifestEdit::new();
+        edit.set_wal_head(self.cfg.wal_start);
         // Every issued mutation has left the WAL: the memtable is empty.
-        staged.note_flushed(self.next_seq);
+        edit.note_flushed(self.next_seq);
         let layout = self.manifest_layout();
-        staged
-            .commit_to(self.wal.device_mut(), scratch, layout)
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
             .await?;
-        self.manifest = staged;
         self.wal.reset_to(self.cfg.wal_start);
         Ok(())
     }
 
-    /// Writes the memtable's range-tombstone section at `base`, returning
-    /// the blocks written.
+    /// Writes the memtable's range-tombstone section at `base` through
+    /// the block buffer `buf`, returning the blocks written.
     async fn write_flush_rdel(
         device: &mut D,
         table: &MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
         base: u64,
+        buf: &mut [u8; BLOCK],
     ) -> Result<u32, Error<D::Error>> {
         sstable::write_rdel_blocks::<D, BLOCK>(
             device,
             base,
+            buf,
             table.iter().filter_map(|e| {
                 if e.range_del {
                     Some(sstable::RdelEntry {
@@ -137,11 +143,10 @@ impl<
         self.ensure_open()?;
         // Every acked mutation must be durable in the WAL or the new table.
         self.wal.commit().await?;
-        let mut scratch = [0u8; BLOCK];
         if self.table.is_empty() {
             // Still a no-op for the table region, but the WAL may need
             // wrapping after earlier flushes filled it.
-            self.wrap_wal_if_full(&mut scratch).await?;
+            self.wrap_wal_if_full().await?;
             return Ok(());
         }
         // Fail before doing I/O when level 0 cannot take another table;
@@ -180,15 +185,14 @@ impl<
         let slot = self.free_slot_for(total)?;
         let base = self.slots.slot_base(slot);
         // Pass 2: stream the blocks — the data section at `base`, then the
-        // rdel section right after it, then bloom/index/footer. `data`
-        // doubles as the manifest scratch below; it is a plain stack local.
-        // `cs` is this flush's compression scratch: every data block is
+        // rdel section right after it, then bloom/index/footer. `cs` is
+        // this flush's compression scratch: every data block is
         // trial-compressed and the compressed form kept when it saves
         // enough. The writer's block limit is the planned data-block
         // count: plan and writer share one packing rule, so it is never
         // reached — but a mismatch fails loudly instead of overrunning
-        // the slot.
-        let mut data = [0u8; BLOCK];
+        // the slot. The rdel section is written through the writer's data
+        // buffer, idle between `seal_data` and `finish_meta`.
         let mut cs = crate::compress::CompressScratch::<BLOCK>::new();
         {
             let device = self.wal.device_mut();
@@ -205,37 +209,43 @@ impl<
             let data_blocks = w.seal_data(&mut *device, Some(&mut cs)).await?;
             debug_assert_eq!(data_blocks, plan.data_blocks);
             let rdel_base = base.checked_add(data_blocks).ok_or(Error::TableTooLarge)?;
-            let rdel_written = Self::write_flush_rdel(&mut *device, table, rdel_base).await?;
+            let rdel_written =
+                Self::write_flush_rdel(&mut *device, table, rdel_base, w.spare_block()).await?;
             debug_assert_eq!(rdel_written, rdel_plan.blocks);
             w.finish_meta(&mut *device, rdel_written, rdel_plan.min_seq)
                 .await?;
         }
-        // The manifest commit is the atomic visibility point. Stage the new
-        // manifest in a copy and publish it only after the commit lands, so
-        // a returned I/O error leaves the in-memory state exactly as it was
-        // and the flush can simply be retried.
-        let mut staged = self.manifest;
-        let id = staged.alloc_table_id::<D::Error>()?;
+        // The manifest commit is the atomic visibility point. Stage the
+        // change as an edit, applied in memory only once the commit lands,
+        // so a returned I/O error leaves the in-memory state exactly as it
+        // was and the flush can simply be retried.
+        let mut edit = ManifestEdit::new();
+        let id = self.manifest.next_table_id();
+        edit.advance_next_table_id(id.checked_add(1).ok_or(Error::CounterExhausted)?);
         let tref = Self::flush_tref(id, base, total, &plan, &rdel_plan)?;
-        staged.add_l0_table::<D::Error>(tref)?;
+        edit.add::<D::Error>(0, tref)?;
         // Advance the WAL head past the flushed records; wrap the region
         // when it is exhausted. Folded into this same atomic commit, so no
         // extra crash window opens between the wrap and its durability.
         let wrap = self.wal.next_block() >= self.cfg.wal_end;
-        staged.set_wal_head(if wrap {
+        edit.set_wal_head(if wrap {
             self.cfg.wal_start
         } else {
             self.wal.next_block()
         });
         // Every issued mutation is now in a table or behind `wal_head`:
         // raise the persisted replay floor with this same commit.
-        staged.note_flushed(self.next_seq);
+        edit.note_flushed(self.next_seq);
         let layout = self.manifest_layout();
-        staged
-            .commit_to(self.wal.device_mut(), &mut data, layout)
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
             .await?;
-        // Commit point passed: publish the staged state and claim the slot.
-        self.manifest = staged;
+        // Commit point passed: the edit is applied; claim the slot.
         self.slots.claim(slot);
         // The flushed contents now live in the table; drop the memtable.
         self.table.clear();

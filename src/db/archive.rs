@@ -7,7 +7,7 @@ use crate::cache::CachePort;
 use crate::compact::{EntryStream, ranges_overlap};
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::{KeyBound, TableRef};
+use crate::manifest::{KeyBound, ManifestEdit, TableRef};
 use crate::sstable;
 /// A plan to archive (upload, then forget) one sealed `SSTable`.
 ///
@@ -176,9 +176,17 @@ impl<
         // Stream the blocks from the source device, verifying each
         // block's CRC as it lands so remote corruption fails fast,
         // before the manifest commit.
-        let mut buf = [0u8; BLOCK];
-        self.copy_verified_blocks(remote, src_base, base, sealed.block_count, &mut buf)
-            .await?;
+        // The `Db`'s block scratch carries the copy: `&mut self` rules out
+        // a concurrent read.
+        Self::copy_verified_blocks(
+            self.wal.device_mut(),
+            remote,
+            src_base,
+            base,
+            sealed.block_count,
+            self.get_scratch.get_mut(),
+        )
+        .await?;
         // Relocate the copy: index entries and the footer carry the
         // absolute block ids of the table's original placement, which are
         // rewritten to the destination layout and re-sealed.
@@ -187,7 +195,7 @@ impl<
             base,
             sealed.block_count,
             sealed.rdel_blocks,
-            &mut buf,
+            self.get_scratch.get_mut(),
         )
         .await?;
         // Validate the relocated copy: footer magic/CRC plus the
@@ -198,7 +206,7 @@ impl<
             .ok_or(Error::CorruptManifest)?;
         let reader = sstable::TableReader::<D, BLOCK, BLOOM_BYTES>::open(
             self.wal.device(),
-            &mut buf,
+            self.get_scratch.get_mut(),
             footer,
         )
         .await?;
@@ -215,30 +223,37 @@ impl<
         // Graft into L0 through the atomic manifest commit. Future local
         // tables must never collide with the ingested id, so the id floor
         // advances past it (monotone; never lowers the counter).
-        let mut staged = self.manifest;
-        staged.advance_next_table_id(sealed.id.saturating_add(1));
+        let mut edit = ManifestEdit::new();
+        edit.advance_next_table_id(sealed.id.saturating_add(1));
         // The table may carry sequences from another history: the counter
         // must resume above them, or a later local write could lose to an
         // older ingested version under highest-sequence-wins.
-        staged.raise_seq_high(self.next_seq.max(sealed.max_seq));
-        staged.add_l0_table::<D::Error>(TableRef {
-            id: sealed.id,
-            first_block: base,
-            block_count: sealed.block_count,
-            first_key: sealed.first_key,
-            last_key: sealed.last_key,
-            max_seq: sealed.max_seq,
-            min_seq: sealed.min_seq,
-            entry_count: sealed.entry_count,
-            rdel_blocks: sealed.rdel_blocks,
-        })?;
+        edit.raise_seq_high(self.next_seq.max(sealed.max_seq));
+        edit.add::<D::Error>(
+            0,
+            TableRef {
+                id: sealed.id,
+                first_block: base,
+                block_count: sealed.block_count,
+                first_key: sealed.first_key,
+                last_key: sealed.last_key,
+                max_seq: sealed.max_seq,
+                min_seq: sealed.min_seq,
+                entry_count: sealed.entry_count,
+                rdel_blocks: sealed.rdel_blocks,
+            },
+        )?;
         let layout = self.manifest_layout();
-        staged
-            .commit_to(self.wal.device_mut(), &mut buf, layout)
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
             .await?;
-        // Commit point passed: publish the staged state, then claim the
-        // slot — strictly after the visibility point.
-        self.manifest = staged;
+        // Commit point passed: the edit is applied; claim the slot —
+        // strictly after the visibility point.
         self.next_seq = self.next_seq.max(sealed.max_seq);
         self.slots.claim(slot);
         Ok(true)
@@ -247,7 +262,7 @@ impl<
     /// Copies `count` blocks from `remote` at `src_base` to the local
     /// device at `dst_base`, verifying each block's CRC as it lands.
     async fn copy_verified_blocks<R>(
-        &mut self,
+        device: &mut D,
         remote: &R,
         src_base: u64,
         dst_base: u64,
@@ -269,7 +284,7 @@ impl<
             let dst = dst_base
                 .checked_add(u64::from(k))
                 .ok_or(Error::CorruptManifest)?;
-            poll_fn(|cx| self.wal.device_mut().poll_write_block(cx, dst, buf))
+            poll_fn(|cx| device.poll_write_block(cx, dst, buf))
                 .await
                 .map_err(Error::Device)?;
         }
@@ -354,19 +369,25 @@ impl<
         if slot.is_some_and(|s| self.job_inputs & (1u64 << s) != 0) {
             self.abort_job();
         }
-        let mut scratch = [0u8; BLOCK];
-        let mut staged = self.manifest;
-        if !staged.remove_table_from_level::<D::Error>(level, table_id)? {
+        let mut edit = ManifestEdit::new();
+        if !self
+            .manifest
+            .stage_remove::<D::Error>(&mut edit, level, table_id)?
+        {
             return Ok(false);
         }
-        staged.raise_seq_high(self.next_seq);
+        edit.raise_seq_high(self.next_seq);
         let layout = self.manifest_layout();
-        staged
-            .commit_to(self.wal.device_mut(), &mut scratch, layout)
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
             .await?;
-        // Commit point passed: publish the staged state, then free the
-        // table's slot strictly after the visibility point.
-        self.manifest = staged;
+        // Commit point passed: the edit is applied; free the table's slot
+        // strictly after the visibility point.
         // The table's blocks are unreachable now; drop its cache entries
         // so their slots serve the hot set (hygiene — ids never repeat,
         // so stale entries could never be read).
@@ -392,6 +413,23 @@ impl<
     ) -> Result<(), Error<D::Error>> {
         let mut key = [0u8; KEY_MAX];
         let mut val = [0u8; VAL_MAX];
+        self.check_points_no_resurrection(candidate, &mut key, &mut val)
+            .await?;
+        self.check_rdels_no_resurrection(candidate, &mut key, &mut val)
+            .await
+    }
+
+    /// The point-tombstone half of [`check_no_resurrection`]: its own
+    /// future, so the entry stream's block buffers and the rdel half's
+    /// block buffer never coexist in the caller's future.
+    ///
+    /// [`check_no_resurrection`]: Self::check_no_resurrection
+    async fn check_points_no_resurrection(
+        &self,
+        candidate: &TableRef<KEY_MAX>,
+        key: &mut [u8; KEY_MAX],
+        val: &mut [u8; VAL_MAX],
+    ) -> Result<(), Error<D::Error>> {
         let mut stream =
             EntryStream::<D, BLOCK, KEY_MAX, VAL_MAX>::open(self.wal.device(), candidate).await?;
         // Copy the head key out so the stream borrow ends before the
@@ -413,12 +451,10 @@ impl<
                     if seq > view {
                         continue;
                     }
-                    let cur_hit = self
-                        .get_at_excluding(&key[..klen], &mut val, view, None)
-                        .await?;
+                    let cur_hit = self.read_point(&key[..klen], val, view, 0, None).await?;
                     if cur_hit.is_none() {
                         let alt_hit = self
-                            .get_at_excluding(&key[..klen], &mut val, view, Some(candidate.id))
+                            .read_point(&key[..klen], val, view, 0, Some(candidate.id))
                             .await?;
                         if alt_hit.is_some() {
                             return Err(Error::WouldResurrect {
@@ -432,6 +468,18 @@ impl<
                 break;
             }
         }
+        Ok(())
+    }
+
+    /// The range-tombstone half of [`check_no_resurrection`].
+    ///
+    /// [`check_no_resurrection`]: Self::check_no_resurrection
+    async fn check_rdels_no_resurrection(
+        &self,
+        candidate: &TableRef<KEY_MAX>,
+        key: &mut [u8; KEY_MAX],
+        val: &mut [u8; VAL_MAX],
+    ) -> Result<(), Error<D::Error>> {
         // Range tombstones: detaching the candidate must not resurrect a
         // key the tombstone currently hides. For each tombstone, the live
         // view plus every snapshot that can see it must observe no
@@ -468,10 +516,8 @@ impl<
                 // never parsed as entries.
                 let (e, next) = sstable::rdel_parse_at(&raw[..], off)
                     .map_err(|()| Error::CorruptBlock { id })?;
-                self.check_rdel_no_resurrection(
-                    candidate, e.start, e.end, e.seq, &mut key, &mut val,
-                )
-                .await?;
+                self.check_rdel_no_resurrection(candidate, e.start, e.end, e.seq, key, val)
+                    .await?;
                 off = next;
                 i += 1;
             }
@@ -542,10 +588,10 @@ impl<
                 }
                 let klen = k.len();
                 key[..klen].copy_from_slice(k);
-                let cur_hit = self.get_at_excluding(&key[..klen], val, view, None).await?;
+                let cur_hit = self.read_point(&key[..klen], val, view, 0, None).await?;
                 if cur_hit.is_none() {
                     let alt_hit = self
-                        .get_at_excluding(&key[..klen], val, view, Some(candidate.id))
+                        .read_point(&key[..klen], val, view, 0, Some(candidate.id))
                         .await?;
                     if alt_hit.is_some() {
                         return Err(refuse());

@@ -14,7 +14,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use common::{MemDevice, block_on, noop_waker, test_config};
-use horton::{BlockDevice, Config, Manifest, SstEntry, TableRef, bloom_k, plan_table, write_table};
+use horton::{
+    BlockDevice, Config, Error, Manifest, SstEntry, TableRef, bloom_k, plan_table, write_table,
+};
 
 type DevError = core::convert::Infallible;
 type TestManifest = Manifest<7, 4, 256>;
@@ -266,14 +268,13 @@ impl BlockDevice for PendingOnceDevice {
 }
 
 #[test]
-fn concurrent_gets_do_not_panic_when_interleaved() {
-    // `get` takes `&self`. An executor can run two calls at once.
-    // It can interleave their polls.
-    // `PendingOnceDevice` forces the first `get` to suspend. This
-    // happens right after it claims the shared scratch buffer.
-    // The first `get` is still suspended. The second `get` is polled
-    // during this time. It must fall back to its own buffer instead of
-    // panicking. Both calls must still return the right value.
+fn concurrent_gets_report_busy_instead_of_panicking() {
+    // `get` takes `&self`, so an executor can poll two calls at once.
+    // `PendingOnceDevice` suspends the first `get` right after it claims
+    // the `Db`'s shared read buffers. The second `get`, polled meanwhile,
+    // must return `Busy` — not panic, and not carry fallback buffers in
+    // every `get` future (F8). The first completes normally, and a retry
+    // of the second then succeeds.
     type PendingDb = horton::Db<PendingOnceDevice, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
     let mut dev = MemDevice::new();
     let t0 = write_single(&mut dev, slot(0), b"alpha", b"AAAA", 1, false, 0);
@@ -315,11 +316,11 @@ fn concurrent_gets_do_not_panic_when_interleaved() {
         .expect("fut_a completed")
         .expect("get ok")
         .expect("present");
-    let n_b = done_b
-        .expect("fut_b completed")
-        .expect("get ok")
-        .expect("present");
     assert_eq!(&buf_a[..n_a], b"AAAA");
+    assert_eq!(done_b.expect("fut_b completed"), Err(Error::Busy));
+    let n_b = block_on(db.get(b"alpha", &mut buf_b))
+        .expect("retry ok")
+        .expect("present");
     assert_eq!(&buf_b[..n_b], b"AAAA");
 }
 

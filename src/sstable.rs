@@ -778,6 +778,16 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         Ok(())
     }
 
+    /// The data staging buffer, idle between [`seal_data`](Self::seal_data)
+    /// and [`finish_meta`](Self::finish_meta): the caller may stage the
+    /// range-tombstone section in it instead of holding another block.
+    /// `finish_meta` clears it before use; no entry may be pushed after
+    /// `seal_data`.
+    pub(crate) fn spare_block(&mut self) -> &mut [u8; BLOCK] {
+        debug_assert_eq!(self.n, 0, "seal_data must run before spare_block");
+        &mut self.data
+    }
+
     /// Writes the bloom, index, and footer blocks after the data section
     /// and the `rdel_blocks`-block range-tombstone section the caller
     /// wrote at `base + data_blocks`, then flushes the device so the table
@@ -1057,9 +1067,12 @@ async fn seal_rdel_block<D: BlockDevice, const BLOCK: usize>(
 /// The section layout is `[rdel block]*`: entries packed greedily at
 /// `[0..payload]`, zero padding, `count u16` at `[BLOCK-6..BLOCK-4]`,
 /// CRC32 over `[0..BLOCK-4]`. Rdel blocks are never compressed.
-pub(crate) struct RdelWriter<const BLOCK: usize> {
+pub(crate) struct RdelWriter<'b, const BLOCK: usize> {
     base: u64,
-    buf: [u8; BLOCK],
+    /// The staging block, borrowed: the section is written between a
+    /// table's data and meta blocks, when the table writer's data buffer
+    /// is idle (see [`TableWriter::spare_block`]).
+    buf: &'b mut [u8; BLOCK],
     payload: usize,
     count: u32,
     blocks: u32,
@@ -1067,13 +1080,14 @@ pub(crate) struct RdelWriter<const BLOCK: usize> {
     limit: u32,
 }
 
-impl<const BLOCK: usize> RdelWriter<BLOCK> {
-    /// Writer for the section starting at `base`. `const`-constructible.
+impl<'b, const BLOCK: usize> RdelWriter<'b, BLOCK> {
+    /// Writer for the section starting at `base`, staging blocks in `buf`
+    /// (its prior contents are irrelevant). `const`-constructible.
     #[must_use]
-    pub(crate) const fn new(base: u64) -> Self {
+    pub(crate) const fn new(base: u64, buf: &'b mut [u8; BLOCK]) -> Self {
         Self {
             base,
-            buf: [0u8; BLOCK],
+            buf,
             payload: 0,
             count: 0,
             blocks: 0,
@@ -1121,7 +1135,7 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
                 .base
                 .checked_add(u64::from(self.blocks))
                 .ok_or(Error::TableTooLarge)?;
-            seal_rdel_block(device, id, &mut self.buf, self.payload, self.count).await?;
+            seal_rdel_block(device, id, self.buf, self.payload, self.count).await?;
             self.blocks += 1;
             self.payload = 0;
             self.count = 0;
@@ -1157,7 +1171,7 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
                 .base
                 .checked_add(u64::from(self.blocks))
                 .ok_or(Error::TableTooLarge)?;
-            seal_rdel_block(device, id, &mut self.buf, self.payload, self.count).await?;
+            seal_rdel_block(device, id, self.buf, self.payload, self.count).await?;
             self.blocks += 1;
             self.count = 0;
             self.payload = 0;
@@ -1181,12 +1195,13 @@ impl<const BLOCK: usize> RdelWriter<BLOCK> {
 pub(crate) async fn write_rdel_blocks<D, const BLOCK: usize>(
     device: &mut D,
     base: u64,
+    buf: &mut [u8; BLOCK],
     rdels: impl Iterator<Item = RdelEntry<'_>>,
 ) -> Result<u32, Error<D::Error>>
 where
     D: BlockDevice,
 {
-    let mut w = RdelWriter::<BLOCK>::new(base);
+    let mut w = RdelWriter::<BLOCK>::new(base, buf);
     for r in rdels {
         w.push(device, r).await?;
     }

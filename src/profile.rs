@@ -44,13 +44,17 @@ crate::db_types! {
 /// Static RAM budget for the ESP32-S3 profile.
 ///
 /// Covers one [`Db`](crate::Db), one [`Scan`](crate::Scan), and one
-/// [`Compaction`](crate::Compaction) scratch.
-/// `tests/profile.rs` asserts the measured total stays under this; growth
+/// [`Compaction`](crate::Compaction) scratch, **plus the largest set of
+/// futures that can be live at once** (an executor stores them: a static
+/// task arena, or a poll loop's stack) — the largest `&mut self` call's
+/// future, or a `get` alongside a scan step. `tests/profile.rs` measures
+/// every public future and asserts the total stays under this; growth
 /// past it fails loudly so the re-tune is a conscious decision, not
 /// silent bloat.
 ///
-/// Raised from 64 KiB to 96 KiB for v0.13: block compression needs ~20
-/// KiB of caller-owned scratch (see `BUDGET.md`), and the
-/// S3's 512 KiB SRAM still leaves ample room for the kernel, stacks,
-/// and drivers.
-pub const ESP32S3_RAM_BUDGET: usize = 98_304;
+/// History: 64 KiB until v0.13; 96 KiB for block compression's ~20 KiB of
+/// caller-owned scratch; 112 KiB once the futures were counted (F8 in
+/// `docs/ARCHITECTURE_REVIEW.md` — `flush` alone is ~17 KiB, most of it
+/// its table writer and compression scratch). The S3's 512 KiB SRAM still
+/// leaves ample room for the kernel, stacks, and drivers.
+pub const ESP32S3_RAM_BUDGET: usize = 114_688;

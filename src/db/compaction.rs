@@ -35,7 +35,7 @@ use crate::compact::{
 };
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::{KeyBound, TableRef};
+use crate::manifest::{KeyBound, ManifestEdit, TableRef};
 use crate::sstable::{self, RdelEntry};
 
 /// What `compact_select` decided.
@@ -443,16 +443,20 @@ impl<
             // re-parent it with one manifest edit, no data rewritten.
             let tref = c.inputs[0].tref;
             c.reset();
-            let mut staged = self.manifest;
-            staged.remove_table_from_level::<D::Error>(src, tref.id)?;
-            staged.add_table_to_level::<D::Error>(tgt, tref)?;
-            staged.raise_seq_high(self.next_seq);
-            let mut scratch = [0u8; BLOCK];
+            let mut edit = ManifestEdit::new();
+            self.manifest
+                .stage_remove::<D::Error>(&mut edit, src, tref.id)?;
+            edit.add::<D::Error>(tgt, tref)?;
+            edit.raise_seq_high(self.next_seq);
             let layout = self.manifest_layout();
-            staged
-                .commit_to(self.wal.device_mut(), &mut scratch, layout)
+            self.manifest
+                .commit_edit(
+                    &edit,
+                    self.wal.device_mut(),
+                    self.get_scratch.get_mut(),
+                    layout,
+                )
                 .await?;
-            self.manifest = staged;
             return Ok(Some(Selected::Moved));
         }
         if self.job_need(src_data) > free {
@@ -636,8 +640,10 @@ impl<
             .out_base
             .checked_add(data_blocks)
             .ok_or(Error::TableTooLarge)?;
-        let mut rdel_out =
-            sstable::RdelWriter::<BLOCK>::new(rdel_base).with_block_limit(c.rdel_budget);
+        // The writer's data buffer is idle until `finish_meta`: the rdel
+        // section stages there.
+        let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(rdel_base, c.writer.spare_block())
+            .with_block_limit(c.rdel_budget);
         let mut rdel_stats = RdelStats::<KEY_MAX>::new();
         {
             // Retired inputs lie behind this output's range (and their
@@ -722,13 +728,13 @@ impl<
             _ => KeyBound::EMPTY,
         };
         let past_k = k.successor();
-        let mut staged = self.manifest;
+        let mut edit = ManifestEdit::new();
         let mut freed = 0u64;
         let mut retired_src = 0u8;
         let mut retired_tgt = c.tgt_retired;
         // Settles input `id` at `level`: retire it, or narrow it past `k`.
         // Returns whether it retired.
-        let mut settle = |staged: &mut crate::manifest::Manifest<LEVELS, TABLES, KEY_MAX>,
+        let mut settle = |edit: &mut ManifestEdit<KEY_MAX>,
                           level: usize,
                           id: u32|
          -> Result<bool, Error<D::Error>> {
@@ -740,44 +746,48 @@ impl<
                 if let Some(slot) = self.slots.slot_of(t.first_block, u64::from(t.block_count)) {
                     freed |= 1u64 << slot;
                 }
-                staged.remove_table_from_level::<D::Error>(level, id)?;
+                self.manifest.stage_remove::<D::Error>(edit, level, id)?;
             } else if t.first_key.as_slice() <= k.as_slice()
                 && let Some(first) = past_k
             {
-                staged.narrow_table::<D::Error>(level, id, first)?;
+                self.manifest
+                    .stage_narrow::<D::Error>(edit, level, id, first)?;
             }
             Ok(retire)
         };
         for i in 0..c.n_src {
             if c.src_retired & (1u8 << i) == 0
-                && settle(&mut staged, c.inputs[i].level, c.inputs[i].tref.id)?
+                && settle(&mut edit, c.inputs[i].level, c.inputs[i].tref.id)?
             {
                 retired_src |= 1u8 << i;
             }
         }
         for j in c.tgt_retired..c.n_tgt {
             // Targets are sorted and disjoint: the retired ones are a prefix.
-            if settle(&mut staged, c.target_level, c.tgt[j])? {
+            if settle(&mut edit, c.target_level, c.tgt[j])? {
                 retired_tgt = j + 1;
             }
         }
         // Retire and narrow first, then insert the output: its first key
         // must sort against the inputs' raised bounds.
         if let Some(t) = out {
-            staged.add_table_to_level::<D::Error>(c.target_level, t)?;
+            edit.add::<D::Error>(c.target_level, t)?;
         }
         // Compaction may drop the tables holding the newest sequences
         // (bottommost tombstones): persist the counter so it never regresses.
-        staged.raise_seq_high(self.next_seq);
-        let mut scratch = [0u8; BLOCK];
+        edit.raise_seq_high(self.next_seq);
         let layout = self.manifest_layout();
-        staged
-            .commit_to(self.wal.device_mut(), &mut scratch, layout)
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
             .await?;
-        // Commit point passed: publish, then settle the slots and drop the
-        // retired tables' cache entries (hygiene — ids never repeat, so
-        // stale entries could never be read).
-        self.manifest = staged;
+        // Commit point passed: the edit is applied. Settle the slots and
+        // drop the retired tables' cache entries (hygiene — ids never
+        // repeat, so stale entries could never be read).
         if out.is_some() {
             self.slots.commit(c.out_slot);
         }

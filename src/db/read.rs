@@ -77,11 +77,9 @@ impl<
     /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the winning
     /// value, [`Error::CorruptManifest`] when a table's block range is
     /// malformed, [`Error::CorruptBlock`] when a table's index or footer
-    /// fails verification, or [`Error::Device`] on I/O failure.
-    // This call holds `get_scratch`'s borrow across its own awaits.
-    // `try_borrow_mut` stops two calls from holding this borrow at once.
-    // So the lint does not apply here.
-    #[allow(clippy::await_holding_refcell_ref)]
+    /// fails verification, [`Error::Busy`] when another `get` on this
+    /// handle is in flight (reads share the `Db`'s block buffers), or
+    /// [`Error::Device`] on I/O failure.
     pub async fn get(
         &self,
         key: &[u8],
@@ -104,14 +102,7 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the winning
-    /// value, [`Error::CorruptManifest`] when a table's block range is
-    /// malformed, [`Error::CorruptBlock`] when a table's index or footer
-    /// fails verification, or [`Error::Device`] on I/O failure.
-    // This call holds `get_scratch`'s borrow across its own awaits.
-    // `try_borrow_mut` stops two calls from holding this borrow at once.
-    // So the lint does not apply here.
-    #[allow(clippy::await_holding_refcell_ref)]
+    /// Same as [`get`](Db::get).
     pub async fn get_at(
         &self,
         key: &[u8],
@@ -131,7 +122,6 @@ impl<
     /// # Errors
     ///
     /// Same as [`get`](Db::get).
-    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn get_with_time(
         &self,
         key: &[u8],
@@ -151,7 +141,6 @@ impl<
     /// # Errors
     ///
     /// Same as [`get_at`](Db::get_at).
-    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn get_at_with_time(
         &self,
         key: &[u8],
@@ -160,12 +149,41 @@ impl<
         now: u64,
     ) -> Result<Option<usize>, Error<D::Error>> {
         self.ensure_open()?;
+        self.read_point(key, val_buf, max_seq, now, None).await
+    }
+
+    /// The point-read rule, shared by every `get` variant and the archive
+    /// resurrection review: the memtable, then level 0 newest table first,
+    /// then deeper levels; the highest sequence at or below `max_seq`
+    /// wins, a strictly newer covering range tombstone hides it, and a
+    /// winner expired at `now` reads as missing (`now = 0`: nothing
+    /// expires). `exclude` names one table to leave out (the archival
+    /// candidate), or `None`.
+    ///
+    /// Blocks are read through the `Db`'s two shared buffers, so the
+    /// future holds no block buffer of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Busy`] when another read holds the shared buffers (two
+    /// `get` futures polled concurrently); otherwise as [`get`](Db::get).
+    // The borrows are held across this call's own awaits on purpose;
+    // `try_borrow_mut` turns a concurrent second read into `Busy`, never a
+    // panic.
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub(super) async fn read_point(
+        &self,
+        key: &[u8],
+        val_buf: &mut [u8],
+        max_seq: u64,
+        now: u64,
+        exclude: Option<u32>,
+    ) -> Result<Option<usize>, Error<D::Error>> {
         // The winning value's bytes are staged here; table lookups copy
         // into a per-table buffer first so a losing hit can never clobber
         // the winner. Values are at most VAL_MAX bytes (enforced on the
         // write path), so the staging always fits.
         let mut acc = ReadAcc::<VAL_MAX>::new();
-
         if let Some(entry) = self.table.get_at(key, max_seq) {
             // The memtable holds the newest mutations; `get_at` already
             // selected the newest version at or below the snapshot, and
@@ -184,45 +202,27 @@ impl<
         if let Some(q) = self.table.max_covering_rdel(key, max_seq) {
             acc.cover_seq = q;
         }
-
-        // Use the shared buffer when it is free (see `get_scratch`). Fall
-        // back to a local buffer when another `get` call already holds it.
-        let mut shared_scratch = self.get_scratch.try_borrow_mut().ok();
-        let mut owned_scratch;
-        let scratch: &mut [u8; BLOCK] = if let Some(guard) = shared_scratch.as_mut() {
-            guard
-        } else {
-            owned_scratch = [0u8; BLOCK];
-            &mut owned_scratch
-        };
-        // The decompression buffer follows the same discipline: shared
-        // when free, stack-local when a concurrent `get` holds it.
-        let mut shared_decomp = self.decomp_scratch.try_borrow_mut().ok();
-        let mut owned_decomp;
-        let decomp: &mut [u8; BLOCK] = if let Some(guard) = shared_decomp.as_mut() {
-            guard
-        } else {
-            owned_decomp = [0u8; BLOCK];
-            &mut owned_decomp
+        let (Ok(mut scratch), Ok(mut decomp)) = (
+            self.get_scratch.try_borrow_mut(),
+            self.decomp_scratch.try_borrow_mut(),
+        ) else {
+            return Err(Error::Busy);
         };
         // Level 0, newest table first: its tables overlap, and newer tables
-        // hold higher sequence numbers.
-        for tref in self.manifest.l0().iter().rev() {
-            self.consider_table(tref, key, max_seq, scratch, decomp, &mut acc)
-                .await?;
-        }
-        // Deeper levels in order. Highest-seq-wins keeps the result exact
-        // regardless of how tables are placed; v0.4 compaction will keep
-        // each level's ranges disjoint and sorted.
-        for li in 1..LEVELS {
-            // `li < LEVELS` by construction; the fallback is unreachable.
+        // hold higher sequence numbers. Deeper levels in order:
+        // highest-seq-wins keeps the result exact however tables are
+        // placed.
+        for li in 0..LEVELS {
             let tables = self.manifest.level(li).unwrap_or(&[]);
-            for tref in tables {
-                self.consider_table(tref, key, max_seq, scratch, decomp, &mut acc)
-                    .await?;
+            let n = tables.len();
+            for i in 0..n {
+                let tref = &tables[if li == 0 { n - 1 - i } else { i }];
+                if Some(tref.id) != exclude {
+                    self.consider_table(tref, key, max_seq, &mut scratch, &mut decomp, &mut acc)
+                        .await?;
+                }
             }
         }
-
         match acc.best {
             Best::Missing | Best::Tombstone => Ok(None),
             Best::Value(len) => {
@@ -303,80 +303,5 @@ impl<
             acc.cover_seq = q;
         }
         Ok(())
-    }
-
-    /// [`Db::get_at`] with one table excluded from the read.
-    ///
-    /// `exclude` holds a table id to skip (the archival candidate under
-    /// resurrection review, or `None` for a normal read). The memtable is
-    /// always included.
-    pub(super) async fn get_at_excluding(
-        &self,
-        key: &[u8],
-        val_buf: &mut [u8],
-        max_seq: u64,
-        exclude: Option<u32>,
-    ) -> Result<Option<usize>, Error<D::Error>> {
-        let mut acc = ReadAcc::<VAL_MAX>::new();
-
-        if let Some(entry) = self.table.get_at(key, max_seq) {
-            // The memtable holds the newest mutations; `get_at` already
-            // selected the newest version at or below the snapshot.
-            acc.best_seq = entry.seq;
-            if entry.tombstone {
-                acc.best = Best::Tombstone;
-            } else {
-                acc.stage[..entry.val.len()].copy_from_slice(entry.val);
-                acc.best = Best::Value(entry.val.len());
-                acc.best_expire_at = entry.expire_at;
-            }
-        }
-        // Memtable range tombstones hide the key exactly like table ones;
-        // expiry is read-time (`now = 0` here), so TTL values still count
-        // as live for the resurrection review.
-        if let Some(q) = self.table.max_covering_rdel(key, max_seq)
-            && q > acc.cover_seq
-        {
-            acc.cover_seq = q;
-        }
-
-        let mut scratch = [0u8; BLOCK];
-        let mut decomp = [0u8; BLOCK];
-        // Level 0, newest table first: its tables overlap, and newer
-        // tables hold higher sequence numbers.
-        for tref in self.manifest.l0().iter().rev() {
-            if Some(tref.id) != exclude {
-                self.consider_table(tref, key, max_seq, &mut scratch, &mut decomp, &mut acc)
-                    .await?;
-            }
-        }
-        // Deeper levels in order. Highest-seq-wins keeps the result exact
-        // regardless of how tables are placed.
-        for li in 1..LEVELS {
-            let tables = self.manifest.level(li).unwrap_or(&[]);
-            for tref in tables {
-                if Some(tref.id) != exclude {
-                    self.consider_table(tref, key, max_seq, &mut scratch, &mut decomp, &mut acc)
-                        .await?;
-                }
-            }
-        }
-
-        match acc.best {
-            Best::Missing | Best::Tombstone => Ok(None),
-            Best::Value(len) => {
-                // A covering range tombstone newer than the point winner
-                // hides the key. (`now = 0`: TTL values read as live, the
-                // conservative choice for a resurrection review.)
-                if acc.cover_seq > acc.best_seq {
-                    return Ok(None);
-                }
-                if len > val_buf.len() {
-                    return Err(Error::BufferTooSmall { need: len });
-                }
-                val_buf[..len].copy_from_slice(&acc.stage[..len]);
-                Ok(Some(len))
-            }
-        }
     }
 }
