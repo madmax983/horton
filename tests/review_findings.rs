@@ -416,3 +416,39 @@ fn f12_seq0_entries_are_invisible_and_scans_terminate() {
         assert_eq!(got, want, "reverse={reverse}");
     }
 }
+
+/// F13 — a data block failing its CRC read as "absent" on the point-read
+/// path, so `get` fell through to an older version in a deeper table (a
+/// silent stale read) while scans reported `CorruptBlock`. Both must
+/// report the corruption.
+#[test]
+fn f13_corrupt_newer_block_is_an_error_not_a_stale_read() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"k", b"old")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.put(b"k", b"new")).unwrap();
+    block_on(db.flush()).unwrap();
+    let newer = *db.level_tables(0).unwrap().last().unwrap();
+    // The newer table's first data block (range-tombstone blocks, if any,
+    // precede it in this layout; this table has none).
+    assert_eq!(newer.rdel_blocks, 0);
+    let data_block = usize::try_from(newer.first_block).unwrap();
+    let mut dev = db.into_device();
+    dev.blocks_mut()[data_block][20] ^= 0xFF; // bit rot
+    let mut db = TestDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+    let mut buf = [0u8; 8];
+    assert!(
+        matches!(
+            block_on(db.get(b"k", &mut buf)),
+            Err(Error::CorruptBlock { .. })
+        ),
+        "a corrupt newer version must not silently fall back to the older one"
+    );
+    let mut s = Box::new(Scan::new(&db));
+    assert!(matches!(
+        block_on(s.seek(b"", None, u64::MAX)),
+        Err(Error::CorruptBlock { .. })
+    ));
+}

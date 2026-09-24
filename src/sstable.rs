@@ -20,9 +20,10 @@
 //! - Footer block: `magic u64 = "lsmtable" | index_block u64 |
 //!   bloom_block u64 | entry_count u64 | k u8`.
 //!
-//! A failed CRC means "treat as absent": a bad footer or index block is a
-//! [`Error::CorruptBlock`]; a bad data block is skipped. Corruption is never
-//! silent.
+//! A failed CRC is [`Error::CorruptBlock`] for footer, index, data, and
+//! range-tombstone blocks: corruption is never silent, and never reads as
+//! "absent" (which would let an older version elsewhere win). Only the
+//! bloom block is advisory — a bad bloom CRC just disables the filter.
 //!
 //! Bounds: restart offsets are `u16`, so a data block effectively tops out
 //! at 64 KiB, and at most 2048 entries share one data block (restart offsets
@@ -2189,21 +2190,22 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         // Data blocks are contiguous, so the run walk below only moves
         // forward, and `remaining` keeps it inside the table's data blocks.
         loop {
-            // Data: a torn block is treated as absent.
+            // Data: a block that fails its CRC is an error, never a miss.
+            // A committed table's blocks were durable before the manifest
+            // made them visible, so a bad CRC is media corruption, not a
+            // torn write — and reporting "absent" would let an older
+            // version in a deeper table win (a silent stale read). Scans
+            // and compaction already treat it the same way.
             read_block_cached(device, self.cache, self.table_id, block_id, scratch, true).await?;
-            if check_block_crc::<D::Error, BLOCK>(scratch, block_id).is_err() {
-                return Ok(Lookup::Missing);
-            }
+            check_block_crc::<D::Error, BLOCK>(scratch, block_id)?;
             // A flagged block inflates into `decomp`; a raw block parses
-            // in place from `scratch`. A flag/decoding failure here is a
-            // format violation, not a torn write — but like a torn write
-            // it reads as absent, never as a wrong value.
+            // in place from `scratch`. A flag/decoding failure is a format
+            // violation: `CorruptBlock`, like a bad CRC.
             let body_end = BLOCK - CRC_LEN;
-            let body: &[u8] = match inflate_data_block::<D::Error, BLOCK>(scratch, decomp, block_id)
-            {
-                Err(_) => return Ok(Lookup::Missing),
-                Ok(true) => &decomp[..body_end],
-                Ok(false) => &scratch[..body_end],
+            let body: &[u8] = if inflate_data_block::<D::Error, BLOCK>(scratch, decomp, block_id)? {
+                &decomp[..body_end]
+            } else {
+                &scratch[..body_end]
             };
             match data_lookup::<D::Error>(body, key, val_buf, block_id, max_seq)? {
                 BlockOutcome::Hit(DataHit::Value {

@@ -929,20 +929,24 @@ fn sstable_targeted_block_corruption() {
         .expect("compressed corpus has no flagged block");
 
     // 8. Compression flag with an impossible length (0x7FFF): inflate
-    //    rejects it and the key reads as absent — never a panic.
+    //    rejects it and the read reports the corrupt block — never a
+    //    panic, and never "absent" (which would let an older version
+    //    elsewhere win).
     let dev = device_with_block(&cpristine, flagged, |b| {
         b[BLOCK - 6..BLOCK - 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
         fix_block_crc(b);
     });
-    assert_eq!(
-        try_get(&dev, cfooter, cbase, b"ckey000"),
-        Ok(None),
-        "impossible compressed length must read as absent"
+    assert!(
+        matches!(
+            try_get(&dev, cfooter, cbase, b"ckey000"),
+            Err(Error::CorruptBlock { id }) if id == flagged
+        ),
+        "impossible compressed length must be CorruptBlock"
     );
 
     // 9. Compression flag with a plausible length over garbage bytes: the
-    //    LZ77 decoder rejects the stream; the key reads as absent (or the
-    //    block is corrupt) — never a panic, never a wrong value.
+    //    LZ77 decoder rejects the stream, or it decodes to bytes that no
+    //    longer hold the key — never a panic, never a wrong value.
     let dev = device_with_block(&cpristine, flagged, |b| {
         let clen = usize::from(u16::from_le_bytes([b[BLOCK - 6], b[BLOCK - 5]]) & 0x7FFF);
         for x in b.iter_mut().take(clen) {
