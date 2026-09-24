@@ -345,11 +345,13 @@ fn torn_manifest_slot_during_compaction() {
 
 /// Torn manifest slot during a range-tombstone compaction: same two
 /// regimes, but the pre-compaction state carries the range tombstone, so
-/// k1 stays shadowed in every recovered view.
+/// k1 stays shadowed in every recovered view. The job is bottommost, so it
+/// collects the tombstone and k1's hidden version (F16): the output is the
+/// data-only table, and the landed state must still hide k1.
 #[test]
 fn torn_manifest_slot_during_rdel_compaction() {
     let w = count_rdel_compaction_writes();
-    assert!(w > 5, "rdel output should write more blocks, got {w}");
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
 
     let mut want = BTreeMap::new();
     want.insert(vec![b'k', b'0'], vec![b'v', b'0']);

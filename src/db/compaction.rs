@@ -587,6 +587,10 @@ impl<
         }
         let tgt_level = self.manifest.level(tgt).unwrap_or(&[]);
         c.open_next_target(device, tgt_level).await?;
+        // Range tombstones every reader sees drop the versions they hide
+        // (and, at the bottom, themselves): the merge tracks them as it
+        // goes.
+        c.start_cover(rdel_entries > 0);
         c.state = State::Merging;
         Ok(())
     }
@@ -640,6 +644,7 @@ impl<
             .out_base
             .checked_add(data_blocks)
             .ok_or(Error::TableTooLarge)?;
+        let drop_below = c.rdel_drop_floor();
         // The writer's data buffer is idle until `finish_meta`: the rdel
         // section stages there.
         let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(rdel_base, c.writer.spare_block())
@@ -661,7 +666,9 @@ impl<
                 c.oldest_snapshot,
             );
             while merger.next_merged(&*device, &mut c.raw, &targets).await? {
-                if let Some(piece) = clip(merger.current_entry(), Some(&lo), hi.as_ref()) {
+                if let Some(piece) = clip(merger.current_entry(), Some(&lo), hi.as_ref())
+                    && piece.seq >= drop_below
+                {
                     rdel_out.push(&mut *device, piece).await?;
                     rdel_stats.observe::<D::Error>(&piece, rdel_base)?;
                 }

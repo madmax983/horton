@@ -11,7 +11,89 @@ misread (SPEC §4.5).
 
 ## [Unreleased]
 
-- Architecture review (`docs/ARCHITECTURE_REVIEW.md`), README, quickstart example.
+Fixes every finding of the v0.16 architecture review
+([`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md)). Each
+confirmed defect has a regression test in `tests/review_findings.rs`; CI
+fails if one is ever `#[ignore]`d again. The on-disk format changes
+(manifest `hrtman05`, SSTable `hrtsst02`): v0.16 images are rejected, not
+misread.
+
+### Fixed
+
+- **F1** Compaction output could outgrow its reservation and overwrite
+  a live table. Tables now live one per fixed slot, and every writer is
+  capped at its slot (ADR-0009).
+- **F2** A deleted key could come back after a WAL wrap and reopen. The
+  manifest persists the WAL replay floor and a sequence high-water mark.
+- **F3** `open()` failed after ordinary compaction when the free list
+  filled. There is no free list any more: the slot map is rebuilt from
+  the manifest.
+- **F4** Writes before `open()` could destroy acknowledged data. Every
+  device-touching call before `open()` returns `Error::NotOpen`.
+- **F5** `RevScan` could yield an older memtable version of a key.
+- **F6** Writes stopped with about 4% of the table region used.
+  Compaction splits outputs, commits each one, moves and consolidates
+  tables, and pushes down under pressure; writes now continue until most
+  of the region holds live data (ADR-0010).
+- **F7** The manifest had to fit one block (`TestDb` stopped at 7 of 28
+  tables). Manifest copies span `Manifest::max_blocks` blocks (ADR-0011).
+- **F12** A sequence-0 entry wedged `Scan::next`.
+- **F13** A data block failing its CRC read as "absent" on point reads,
+  surfacing stale values. It is `CorruptBlock` now.
+- **F14** A flush during an in-flight compaction could take the job's
+  output blocks. Compaction reserves its output slot.
+- **F15** Compaction dropped a bottommost tombstone that an older
+  re-ingested table still needed.
+- **F16** (found while fixing F6) `delete_range` never gave space back:
+  compaction kept every version a range tombstone hid, and the tombstone,
+  forever. A merge now drops versions hidden from every reader by a range
+  tombstone in the job, and a bottommost merge drops the tombstone once
+  nothing it hides is left. Merges also clip each input's range
+  tombstones to its live lower bound, so a narrowed table's dead
+  tombstones are never re-emitted.
+- **F17** WAL writes after a reopen could be silently lost (found by the
+  lifecycle fuzzer).
+- A newer range tombstone could be dropped in favour of an older,
+  identical one when merging.
+
+### Added
+
+- `Config::with_manifest_ring(n)`: rotate manifest commits over `n`
+  copies for NOR endurance (ADR-0012).
+- `ManifestLayout`, `ManifestEdit`, `Manifest::commit_edit`,
+  `stage_remove`, `stage_narrow`, `apply_edit`, `narrow_table`,
+  `KeyBound::successor`.
+- `db_types!`: declare `Db`/`Scan`/`RevScan`/`Compaction` aliases with
+  named parameters.
+- `Db::slot_stats`, `Db::check_invariants` (the lifecycle fuzzer checks
+  it after every operation).
+- Errors `WalFull`, `NeedsCompaction`, `RegionFull`, `SnapshotLimit`,
+  `ManifestFull`, `TableTooLarge`, `CounterExhausted`, `BadLevel`,
+  `BadConfig`, `NotOpen`, `Busy`.
+- `tests/lifecycle.rs`: a differential fuzzer over long operation
+  sequences with reopen, across three geometries.
+- The RAM gate measures every public future (`tests/profile.rs`).
+- CI (fmt, clippy pedantic + nursery, rustdoc, debug and release tests,
+  miri subset, bench build), a pinned toolchain, license texts, ADRs.
+
+### Changed
+
+- **Breaking:** `Error::NoSpace` is gone; each capacity condition has
+  its own variant naming the remedy (ADR-0013).
+- **Breaking:** `Config::new`'s second manifest position must leave room
+  for a whole copy (`Manifest::max_blocks` blocks); `open()` rejects
+  overlapping regions with `BadConfig`.
+- **Breaking:** two `get` futures polled concurrently on one `Db`: the
+  second returns `Error::Busy` instead of using fallback buffers.
+- `compaction_pending()` also reports an in-flight job.
+- The table region is `LEVELS × TABLES` fixed slots (at most 64).
+- Futures shrank: `flush` 29.8 → 17.6 KiB, `get` 9.1 → 1.1 KiB,
+  `compact_step` 6.6 → 2.1 KiB, `ingest_table` 6.3 → 0.6 KiB. Manifest
+  commits stage a small edit instead of a manifest copy.
+- The ESP32-S3 budget is 112 KiB and now covers structs plus peak
+  futures (112,200 bytes measured).
+- `db.rs` is split into `db/{mod,read,flush,archive,compaction,invariants}.rs`;
+  point reads and the archive resurrection review share one read rule.
 
 ## [0.16.0] - 2026-09-23
 

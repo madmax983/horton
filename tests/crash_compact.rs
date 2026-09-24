@@ -204,8 +204,12 @@ fn run_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 }
 
 /// Exhaustive: every crash point of one L0→L1 compaction job carrying
-/// range tombstones (exercises the rdel two-pass count/write: the output
-/// reserves and streams rdel blocks before the data merge).
+/// range tombstones.
+///
+/// The output is bottommost and every reader sees the tombstone, so the
+/// merge gives its space back (F16): k1's hidden version is dropped, and
+/// then the tombstone itself — nothing it hides is left anywhere. The
+/// output is the 4-block data-only table, then the manifest commit.
 ///
 /// The manifest commit is the job's last device write, so a crash either
 /// lands it (post-compaction) or drops it (pre-compaction, orphans swept
@@ -215,8 +219,7 @@ fn run_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 #[test]
 fn crash_during_rdel_compaction_is_atomic() {
     let w = count_rdel_compaction_writes();
-    // Sanity: the rdel section adds blocks vs the 5-write data-only job.
-    assert!(w > 5, "rdel output should write more blocks, got {w}");
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
 
     let mut want = BTreeMap::new();
     want.insert(vec![b'k', b'0'], vec![b'v', b'0']);
@@ -231,15 +234,21 @@ fn crash_during_rdel_compaction_is_atomic() {
         assert_eq!(rep.recovered_records, 0, "crash_at={crash_at}");
         if crash_at == w {
             assert_eq!(rep.l0_tables, 0, "crash_at={crash_at}");
+            let l1 = db.level_tables(1).unwrap();
+            assert_eq!(l1.len(), 1, "crash_at={crash_at}");
+            assert_eq!(l1[0].rdel_blocks, 0, "the tombstone was collected");
+            assert_eq!(l1[0].entry_count, 3, "k1's hidden version was dropped");
         } else {
             assert_eq!(rep.l0_tables, 4, "crash_at={crash_at}");
         }
     }
 }
 
-/// Builds a database with two identical range tombstones over k0..=k3
-/// (seq 3 and seq 4) shadowing an older put: the bottommost merge must
-/// emit only the newer tombstone and drop the older shadowed one.
+/// Builds a database with two identical range tombstones over `[k0, k3)`
+/// plus three wider ones, all covering an older put of k0. Five tombstones
+/// cover k0 at once — more than the merge tracks — so the merge keeps the
+/// job's range tombstones, and the bottommost shadow gate must emit only
+/// the newer of the identical pair.
 fn build_with_shadowed_rdel() -> MemDevice<BLOCK> {
     let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
     block_on(db.open()).unwrap();
@@ -248,8 +257,11 @@ fn build_with_shadowed_rdel() -> MemDevice<BLOCK> {
     block_on(db.put(b"k0", b"new")).unwrap();
     block_on(db.flush()).unwrap();
     block_on(db.delete_range(b"k0", b"k3")).unwrap();
-    block_on(db.flush()).unwrap();
     block_on(db.delete_range(b"k0", b"k3")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.delete_range(b"k0", b"k4")).unwrap();
+    block_on(db.delete_range(b"k0", b"k5")).unwrap();
+    block_on(db.delete_range(b"k0", b"k6")).unwrap();
     block_on(db.flush()).unwrap();
     assert!(db.compaction_pending());
     db.into_device()
@@ -283,19 +295,19 @@ fn run_shadowed_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 /// shadowed duplicate range tombstone.
 ///
 /// L1..L6 are empty, so the L0→L1 output is bottommost
-/// ([`Db::is_bottommost_output`]): the newer `[k0,k3]` tombstone (seq 4)
-/// is emitted and the older identical one (seq 3) is dropped by the
-/// shadow gate — while both covered puts stay hidden under the surviving
-/// tombstone. A crash either lands the commit (post: L0 drained, one L1
-/// table carrying exactly the newer tombstone) or drops it (pre: L0
-/// intact). The logical map is empty in every case: k0 was deleted, and
-/// k1..k3 were never written.
+/// ([`Db::is_bottommost_output`]). Both puts of k0 are hidden from every
+/// reader, so they are dropped. Five tombstones cover k0 — more than the
+/// merge tracks at once — so the job's tombstones are kept, and the
+/// shadow gate drops the older of the identical `[k0,k3)` pair. A crash
+/// either lands the commit (post: L0 drained, one range-only L1 table
+/// with four tombstones) or drops it (pre: L0 intact). The logical map is
+/// empty in every case.
 #[test]
 fn crash_during_bottommost_rdel_shadow_drop_is_atomic() {
     let w = count_shadowed_rdel_writes();
-    // Sanity: the surviving tombstone's table is 5 blocks (rdel + data +
-    // index + bloom + footer), then the manifest commit.
-    assert_eq!(w, 6, "write count changed; oracle below needs updating");
+    // Sanity: the range-only table is 4 blocks (rdel + bloom + index +
+    // footer), then the manifest commit.
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
 
     let want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
@@ -307,11 +319,10 @@ fn crash_during_bottommost_rdel_shadow_drop_is_atomic() {
         assert_eq!(rep.recovered_records, 0, "crash_at={crash_at}");
         if crash_at == w {
             assert_eq!(rep.l0_tables, 0, "crash_at={crash_at}");
-            assert_eq!(
-                db.level_tables(1).map(<[horton::TableRef<256>]>::len),
-                Some(1),
-                "crash_at={crash_at}"
-            );
+            let l1 = db.level_tables(1).unwrap();
+            assert_eq!(l1.len(), 1, "crash_at={crash_at}");
+            assert_eq!(l1[0].entry_count, 0, "both puts of k0 were dropped");
+            assert_eq!(l1[0].rdel_blocks, 1, "the tombstones were kept");
         } else {
             assert_eq!(rep.l0_tables, 4, "crash_at={crash_at}");
         }
@@ -429,13 +440,26 @@ fn build_multi() -> MemDevice<BLOCK> {
         while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
     }
     assert!(db.level_tables(1).unwrap().len() >= 3, "setup: L1 split");
+    // The range delete below spans several L1 tables. (It stays narrow:
+    // the merge gives the deleted values' space back, and the job must
+    // still write several outputs.)
+    let spanned = db
+        .level_tables(1)
+        .unwrap()
+        .iter()
+        .filter(|t| {
+            t.first_key.as_slice() < mkey(20).as_slice()
+                && t.last_key.as_slice() >= mkey(14).as_slice()
+        })
+        .count();
+    assert!(spanned >= 2, "setup: the range spans {spanned} L1 tables");
     for flush in 0..4u32 {
         let i = flush * 9;
         block_on(db.put(&mkey(i), &val(i, 7))).unwrap();
         block_on(db.put(&mkey(i + 4), &val(i + 4, 7))).unwrap();
         if flush == 1 {
             block_on(db.delete(&mkey(3))).unwrap();
-            block_on(db.delete_range(&mkey(10), &mkey(25))).unwrap();
+            block_on(db.delete_range(&mkey(14), &mkey(20))).unwrap();
         }
         block_on(db.flush()).unwrap();
     }

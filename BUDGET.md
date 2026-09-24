@@ -28,8 +28,8 @@ not counted here.
 |---|---|---|
 | `Db` | 25,248 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache |
 | `Scan` | 10,536 | logical block buffer, physical read buffer, cursors |
-| `Compaction` | 56,744 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch |
-| **Structs** | **92,528** | |
+| `Compaction` | 58,840 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,096 bytes: F16) |
+| **Structs** | **94,624** | |
 
 ## Measured futures
 
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 92,528 + max(17,576, 1,056 + 4,752) = 110,104 bytes
+= 94,624 + max(17,576, 1,056 + 4,752) = 112,200 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in

@@ -911,3 +911,120 @@ fn f10_capacity_errors_name_their_remedy() {
     assert_eq!(block_on(db.flush()), Err(Error::RegionFull));
     assert!(!db.compaction_pending());
 }
+
+/// Blocks held by live tables whose key range meets `[0, hi)` (4-byte
+/// big-endian keys). The churn keys of `churn_l0` lie far above.
+fn live_blocks(db: &TestDb<MemDevice<4096>>, hi: u32) -> u64 {
+    (0..7)
+        .flat_map(|l| db.level_tables(l).unwrap().to_vec())
+        .filter(|t| t.first_key.as_slice() < hi.to_be_bytes().as_slice())
+        .map(|t| u64::from(t.block_count))
+        .sum()
+}
+
+/// Writes `n` 1000-byte values, then flushes and drains compaction so
+/// they settle at the bottom of the tree.
+fn settled_values(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction, n: u32) {
+    for i in 0..n {
+        put_retrying(db, c, &i.to_be_bytes(), &[7u8; 1000]);
+    }
+    flush_retrying(db, c);
+    drain_compaction(db, c);
+}
+
+/// Flushes a few unrelated keys so L0 fills and compaction runs over the
+/// range tombstone.
+fn churn_l0(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction) {
+    for k in 0..8u32 {
+        put_retrying(db, c, &(1_000_000 + k).to_be_bytes(), b"x");
+        flush_retrying(db, c);
+        drain_compaction(db, c);
+    }
+}
+
+/// F16 — found while fixing F6: `delete_range` never gave space back.
+/// Compaction kept every version a range tombstone hid, and the range
+/// tombstone itself, forever — even at the bottom of the tree with no
+/// snapshot to observe them. Now a merge drops versions hidden from every
+/// reader by a range tombstone in the same job, and a bottommost merge
+/// drops the range tombstone once nothing it hides is left anywhere.
+#[test]
+fn f16_range_delete_gives_the_space_back() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    settled_values(&mut db, &mut c, 400);
+    let before = live_blocks(&db, 400);
+    assert!(before > 100, "setup: {before} blocks of values");
+    block_on(db.delete_range(&0u32.to_be_bytes(), &400u32.to_be_bytes())).unwrap();
+    churn_l0(&mut db, &mut c);
+    let after = live_blocks(&db, 400);
+    assert_eq!(
+        after, 0,
+        "range-deleted values still hold {after} of {before} blocks"
+    );
+    let rdel_blocks: u32 = (0..7)
+        .flat_map(|l| db.level_tables(l).unwrap().to_vec())
+        .map(|t| t.rdel_blocks)
+        .sum();
+    assert_eq!(
+        rdel_blocks, 0,
+        "the bottommost range tombstone is collected"
+    );
+    let mut buf = [0u8; 1024];
+    for i in (0..400u32).step_by(7) {
+        assert_eq!(block_on(db.get(&i.to_be_bytes(), &mut buf)), Ok(None));
+    }
+    assert_eq!(db.check_invariants(), Ok(()));
+    // Survives reopen.
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(db.into_device(), test_config());
+    block_on(db.open()).unwrap();
+    assert_eq!(db.check_invariants(), Ok(()));
+    for i in (0..400u32).step_by(7) {
+        assert_eq!(block_on(db.get(&i.to_be_bytes(), &mut buf)), Ok(None));
+    }
+}
+
+/// F16 (snapshot) — a snapshot older than the range tombstone still sees
+/// the values, so compaction must keep them (and the tombstone) for as
+/// long as the snapshot lives, then give the space back.
+#[test]
+fn f16_range_delete_keeps_what_a_snapshot_sees() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    settled_values(&mut db, &mut c, 200);
+    let before = live_blocks(&db, 200);
+    let snap = db.snapshot().unwrap();
+    block_on(db.delete_range(&0u32.to_be_bytes(), &200u32.to_be_bytes())).unwrap();
+    churn_l0(&mut db, &mut c);
+    let mut buf = [0u8; 1024];
+    for i in 0..200u32 {
+        let k = i.to_be_bytes();
+        assert_eq!(block_on(db.get(&k, &mut buf)), Ok(None), "live view");
+        assert_eq!(
+            block_on(db.get_at(&k, &mut buf, snap)),
+            Ok(Some(1000)),
+            "snapshot view of {i}"
+        );
+    }
+    // Merges repack the kept values, so allow some slack.
+    let kept = live_blocks(&db, 200);
+    assert!(kept * 4 >= before * 3, "kept {kept} of {before} blocks");
+    db.release_snapshot(snap);
+    churn_l0(&mut db, &mut c);
+    // Pressure-free trees only compact full levels: push the range down
+    // through every level it touches.
+    for _ in 0..4 {
+        churn_l0(&mut db, &mut c);
+    }
+    let after = live_blocks(&db, 200);
+    assert_eq!(
+        after, 0,
+        "after the snapshot's release: {after} of {before} blocks"
+    );
+    for i in (0..200u32).step_by(5) {
+        assert_eq!(block_on(db.get(&i.to_be_bytes(), &mut buf)), Ok(None));
+    }
+    assert_eq!(db.check_invariants(), Ok(()));
+}

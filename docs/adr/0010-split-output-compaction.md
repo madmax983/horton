@@ -41,6 +41,17 @@ slot.
 - **Tombstone drops** (F15): a bottommost tombstone is dropped only when
   no table outside the job — shallower ones included — may hold an
   older version.
+- **Range-tombstone GC** (F16): a range tombstone every reader sees
+  (older than every live snapshot) hides every older version of the
+  keys it covers, so the merge drops those versions at any level, keeping
+  the tombstone. A bottommost merge also drops the tombstone once nothing
+  it hides is left: every older version in its range was dropped by this
+  job, and nothing outside the job is older. The merge learns which
+  tombstones cover each key from a second rdel merge streamed alongside
+  the key merge, with room for four at once; when more overlap, the job
+  keeps its tombstones (the version drop stays sound for any subset).
+  Every rdel merge clips each input's entries to the input's live lower
+  bound, so a narrowed table's dead tombstones never come back.
 
 ## Consequences
 
@@ -54,10 +65,14 @@ slot.
 - Selection is more complex than "compact the full level", and the
   lifecycle fuzzer (`tests/lifecycle.rs`, three geometries) is what
   keeps it honest.
+- Range deletes give their space back once no snapshot predates them;
+  the coverage stream costs about 2 KiB of `Compaction` scratch on the
+  ESP32 profile.
 
 ## References
 
 - `src/db/compaction.rs`, `src/compact.rs`
-- `docs/ARCHITECTURE_REVIEW.md` F6, F15
+- `docs/ARCHITECTURE_REVIEW.md` F6, F15, F16
 - `tests/compact.rs`, `tests/crash_compact.rs`,
-  `tests/review_findings.rs` (`f6_*`, `f15_*`), `tests/lifecycle.rs`
+  `tests/review_findings.rs` (`f6_*`, `f15_*`, `f16_*`),
+  `tests/lifecycle.rs`
