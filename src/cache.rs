@@ -12,8 +12,8 @@
 //! monotone and never reused within a manifest lineage, and a table's
 //! device blocks are immutable once visible, so a cached entry can never
 //! name live data it doesn't describe — even after the table is dropped
-//! and its blocks are reclaimed. See SPEC §9 (v0.16) for the full
-//! argument.
+//! and its blocks are reclaimed. The v0.16 entry of
+//! `docs/history/milestones-v0.1-v0.16.md` has the full argument.
 //!
 //! # Eviction: CLOCK
 //!

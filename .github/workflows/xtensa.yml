@@ -1,0 +1,27 @@
+name: xtensa
+
+# Manual only: the ESP toolchain install is slow and the gate is optional.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  xtensa-check:
+    name: xtensa-esp32s3-none-elf build gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          ldproxy: false
+          default: true
+          buildtargets: esp32s3
+      - run: ./xtensa-check.sh
+        env:
+          # The repo's rust-toolchain.toml pins stable; this gate needs the
+          # ESP fork that the action installed as `esp`.
+          RUSTUP_TOOLCHAIN: esp
+          # A fresh runner has no cached build-std crates, so allow fetching.
+          HORTON_XTENSA_OFFLINE: "0"

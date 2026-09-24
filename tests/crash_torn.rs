@@ -266,7 +266,7 @@ fn torn_manifest_slot_during_flush() {
         // Both manifest slots decode now: the torn bytes are gone.
         let mut dev = db.into_device();
         let mut scratch = [0u8; BLOCK];
-        let (m, fresh) = block_on(TestManifest::recover(&mut dev, &mut scratch, 0, 1)).unwrap();
+        let (m, fresh) = block_on(TestManifest::recover(&mut dev, &mut scratch, 0, 4)).unwrap();
         assert!(!fresh, "torn_len={torn_len}");
         assert_eq!(m.seq(), if landed { 2 } else { 1 }, "torn_len={torn_len}");
         assert_eq!(
@@ -345,11 +345,13 @@ fn torn_manifest_slot_during_compaction() {
 
 /// Torn manifest slot during a range-tombstone compaction: same two
 /// regimes, but the pre-compaction state carries the range tombstone, so
-/// k1 stays shadowed in every recovered view.
+/// k1 stays shadowed in every recovered view. The job is bottommost, so it
+/// collects the tombstone and k1's hidden version (F16): the output is the
+/// data-only table, and the landed state must still hide k1.
 #[test]
 fn torn_manifest_slot_during_rdel_compaction() {
     let w = count_rdel_compaction_writes();
-    assert!(w > 5, "rdel output should write more blocks, got {w}");
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
 
     let mut want = BTreeMap::new();
     want.insert(vec![b'k', b'0'], vec![b'v', b'0']);

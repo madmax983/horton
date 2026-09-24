@@ -329,7 +329,7 @@ fn ingest_no_space_when_l0_full() {
 
     assert!(matches!(
         block_on(db.ingest_table(&sealed, &remote, 0)),
-        Err(Error::NoSpace)
+        Err(Error::NeedsCompaction)
     ));
     assert_eq!(db.level_tables(0).unwrap().len(), 4);
 }

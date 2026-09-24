@@ -217,6 +217,17 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         self.arena_len
     }
 
+    /// Lowest sequence number held (`u64::MAX` when empty). Linear in the
+    /// slot count; compaction calls it once per job.
+    #[must_use]
+    pub fn min_seq(&self) -> u64 {
+        self.slots[..self.len]
+            .iter()
+            .map(|slot| slot.seq)
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
     /// Highest sequence number ever inserted (also updated on replay).
     #[must_use]
     pub const fn max_seq(&self) -> u64 {

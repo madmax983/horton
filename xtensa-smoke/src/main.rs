@@ -126,10 +126,10 @@ fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 // ---------------------------------------------------------------------------
-// RAM-backed block device: 34 blocks of 4 KiB in .bss (136 KiB).
+// RAM-backed block device: 36 blocks of 4 KiB in .bss (144 KiB).
 // ---------------------------------------------------------------------------
 
-const NBLOCKS: usize = 34;
+const NBLOCKS: usize = 36;
 
 static mut RAMDISK: [[u8; 4096]; NBLOCKS] = [[0; 4096]; NBLOCKS];
 
@@ -172,14 +172,17 @@ impl BlockDevice for RamDevice {
 
 // ---------------------------------------------------------------------------
 // The database: small profile, regions manifest 0/1, WAL [2,16), tables
-// [16,34). Every put commits its own WAL block ("durable before it
-// returns"), so the WAL region must cover every put between flushes.
+// [16,36). Every put commits its own WAL block ("durable before it
+// returns"), so the WAL region must cover every put between flushes. The
+// table region is 2 levels x 2 tables = 4 slots of 5 blocks: each slot must
+// hold a full memtable's table (`Db::open` checks), and the RAM disk is
+// SRAM, so the smoke keeps the tree small.
 // ---------------------------------------------------------------------------
 
-type SmokeDb = Db<RamDevice, 4096, 32, 64, 16, 2048, 4, 4, 64, 64>;
+type SmokeDb = Db<RamDevice, 4096, 32, 64, 16, 2048, 2, 2, 64, 0>;
 type SmokeCompaction = Compaction<4096, 32, 64, 64>;
 
-static mut DB: SmokeDb = SmokeDb::new(RamDevice, Config::new(2, 16, 16, 34, 0, 1));
+static mut DB: SmokeDb = SmokeDb::new(RamDevice, Config::new(2, 16, 16, 36, 0, 1));
 static mut COMPACTION: SmokeCompaction = SmokeCompaction::new();
 
 fn check(cond: bool, msg: &str) {

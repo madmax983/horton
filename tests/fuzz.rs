@@ -199,7 +199,7 @@ fn sstable_corpus(base: u64) -> (MemDevice<BLOCK>, Vec<[u8; BLOCK]>, u64) {
         });
     let k = bloom_k(1024 * 8, 40);
     let nblocks = block_on(write_table::<_, BLOCK, 1024, 256>(
-        &mut dev, base, k, entries, None, 0,
+        &mut dev, base, k, entries, None,
     ))
     .unwrap();
     let pristine = dev.blocks_mut().clone();
@@ -217,7 +217,6 @@ fn sstable_corpus_is_valid() {
         &dev,
         &mut scratch,
         base + nblocks - 1,
-        base,
     ))
     .unwrap();
     let mut val_buf = [0u8; 1024];
@@ -257,7 +256,6 @@ fn sstable_decoder_never_panics() {
             &dev,
             &mut scratch,
             footer,
-            base,
         ));
         if let Ok(reader) = open {
             for j in 0..40u64 {
@@ -278,6 +276,7 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         first_key: KeyBound::from_slice(b"a").unwrap(),
         last_key: KeyBound::from_slice(b"z").unwrap(),
         max_seq: 10,
+        min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
     }
@@ -643,7 +642,6 @@ fn sstable_corpus_compressed(base: u64) -> (MemDevice<BLOCK>, Vec<[u8; BLOCK]>, 
         k,
         entries,
         Some(&mut cs),
-        0,
     ))
     .unwrap();
     let pristine = dev.blocks_mut().clone();
@@ -675,7 +673,6 @@ fn sstable_corpus_compressed_is_valid() {
         &dev,
         &mut scratch,
         base + nblocks - 1,
-        base,
     ))
     .unwrap();
     let mut val_buf = [0u8; 1024];
@@ -730,7 +727,6 @@ fn sstable_compressed_decoder_never_panics() {
             &dev,
             &mut scratch,
             footer,
-            base,
         ));
         if let Ok(reader) = open {
             for j in (0..200u64).step_by(17) {
@@ -771,12 +767,11 @@ fn device_with_block(
     dev
 }
 
-/// Opens the table at `[base, footer]` and gets `key`, returning the raw
+/// Opens the table ending at `footer` and gets `key`, returning the raw
 /// outcome (no unwrap: the tests assert on `Err` variants).
 fn try_get(
     dev: &MemDevice<BLOCK>,
     footer: u64,
-    base: u64,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, Error<DevError>> {
     let mut scratch = [0u8; BLOCK];
@@ -786,7 +781,6 @@ fn try_get(
         dev,
         &mut scratch,
         footer,
-        base,
     ))?;
     let n = block_on(reader.get(&mut scratch, &mut decomp, key, &mut val_buf))?;
     Ok(n.map(|len| val_buf[..len].to_vec()))
@@ -813,7 +807,7 @@ fn sstable_targeted_block_corruption() {
     });
     assert!(
         matches!(
-            try_get(&dev, footer, base, b"skey00"),
+            try_get(&dev, footer, b"skey00"),
             Err(Error::CorruptBlock { .. })
         ),
         "huge restart count must be CorruptBlock"
@@ -829,7 +823,7 @@ fn sstable_targeted_block_corruption() {
     });
     assert!(
         matches!(
-            try_get(&dev, footer, base, b"skey00"),
+            try_get(&dev, footer, b"skey00"),
             Err(Error::CorruptBlock { .. })
         ),
         "OOB restart offset must be CorruptBlock"
@@ -842,7 +836,7 @@ fn sstable_targeted_block_corruption() {
     });
     for i in 0..40u8 {
         let key = format!("skey{i:02}");
-        let got = try_get(&dev, footer, base, key.as_bytes()).unwrap();
+        let got = try_get(&dev, footer, key.as_bytes()).unwrap();
         if i % 13 == 12 {
             assert_eq!(got, None, "tombstone {i}");
         } else {
@@ -860,7 +854,7 @@ fn sstable_targeted_block_corruption() {
     for i in 0..40u8 {
         let key = format!("skey{i:02}");
         assert!(
-            try_get(&dev, footer, base, key.as_bytes()).is_ok(),
+            try_get(&dev, footer, key.as_bytes()).is_ok(),
             "corrupt-but-CRC-valid bloom must not hard-error"
         );
     }
@@ -873,7 +867,7 @@ fn sstable_targeted_block_corruption() {
     });
     assert!(
         matches!(
-            try_get(&dev, footer, base, b"skey00"),
+            try_get(&dev, footer, b"skey00"),
             Err(Error::CorruptBlock { .. })
         ),
         "corrupt index entry must be CorruptBlock"
@@ -886,17 +880,37 @@ fn sstable_targeted_block_corruption() {
     });
     assert!(
         matches!(
-            try_get(&dev, footer, base, b"skey00"),
+            try_get(&dev, footer, b"skey00"),
             Err(Error::CorruptBlock { .. })
         ),
         "zeroed footer k must be CorruptBlock"
     );
 
-    // 7. Footer lying about rdel_blocks: the range-tombstone scan must
-    //    fail fast on the first CRC mismatch, never spin over u32::MAX
-    //    blocks.
+    // 7. Footer lying about rdel_blocks: the table must fail fast with
+    //    `CorruptBlock` — at open (the section would start before block 0:
+    //    it sits right before the bloom block) or at the first rdel CRC
+    //    mismatch — never spin over u32::MAX blocks.
     let dev = device_with_block(&pristine, footer, |b| {
         b[33..37].copy_from_slice(&500u32.to_le_bytes());
+        fix_block_crc(b);
+    });
+    let mut scratch = [0u8; BLOCK];
+    let outcome = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, 1024>::open(
+        &dev,
+        &mut scratch,
+        footer,
+    ))
+    .and_then(|reader| block_on(reader.covering_rdel_seq(&mut scratch, b"skey00", u64::MAX)));
+    assert!(
+        matches!(outcome, Err(Error::CorruptBlock { .. })),
+        "lying rdel_blocks must fail fast, not hang: {outcome:?}"
+    );
+    // The same lie with a count that fits below the bloom block: open
+    // succeeds, and the probe reads data blocks as rdel blocks — their
+    // CRCs pass but the count field (a restart count) must still never
+    // yield a wrong answer or a hang.
+    let dev = device_with_block(&pristine, footer, |b| {
+        b[33..37].copy_from_slice(&1u32.to_le_bytes());
         fix_block_crc(b);
     });
     let mut scratch = [0u8; BLOCK];
@@ -904,15 +918,12 @@ fn sstable_targeted_block_corruption() {
         &dev,
         &mut scratch,
         footer,
-        base,
     ))
     .unwrap();
+    let probe = block_on(reader.covering_rdel_seq(&mut scratch, b"skey00", u64::MAX));
     assert!(
-        matches!(
-            block_on(reader.covering_rdel_seq(&mut scratch, b"skey00", u64::MAX)),
-            Err(Error::CorruptBlock { .. })
-        ),
-        "lying rdel_blocks must fail fast, not hang"
+        matches!(probe, Ok(None) | Err(Error::CorruptBlock { .. })),
+        "a misread rdel section must be absent-or-corrupt: {probe:?}"
     );
 
     // Compressed corpus: a data block carrying the compression flag.
@@ -929,20 +940,24 @@ fn sstable_targeted_block_corruption() {
         .expect("compressed corpus has no flagged block");
 
     // 8. Compression flag with an impossible length (0x7FFF): inflate
-    //    rejects it and the key reads as absent — never a panic.
+    //    rejects it and the read reports the corrupt block — never a
+    //    panic, and never "absent" (which would let an older version
+    //    elsewhere win).
     let dev = device_with_block(&cpristine, flagged, |b| {
         b[BLOCK - 6..BLOCK - 4].copy_from_slice(&0xFFFFu16.to_le_bytes());
         fix_block_crc(b);
     });
-    assert_eq!(
-        try_get(&dev, cfooter, cbase, b"ckey000"),
-        Ok(None),
-        "impossible compressed length must read as absent"
+    assert!(
+        matches!(
+            try_get(&dev, cfooter, b"ckey000"),
+            Err(Error::CorruptBlock { id }) if id == flagged
+        ),
+        "impossible compressed length must be CorruptBlock"
     );
 
     // 9. Compression flag with a plausible length over garbage bytes: the
-    //    LZ77 decoder rejects the stream; the key reads as absent (or the
-    //    block is corrupt) — never a panic, never a wrong value.
+    //    LZ77 decoder rejects the stream, or it decodes to bytes that no
+    //    longer hold the key — never a panic, never a wrong value.
     let dev = device_with_block(&cpristine, flagged, |b| {
         let clen = usize::from(u16::from_le_bytes([b[BLOCK - 6], b[BLOCK - 5]]) & 0x7FFF);
         for x in b.iter_mut().take(clen) {
@@ -952,7 +967,7 @@ fn sstable_targeted_block_corruption() {
     });
     assert!(
         matches!(
-            try_get(&dev, cfooter, cbase, b"ckey000"),
+            try_get(&dev, cfooter, b"ckey000"),
             Ok(None) | Err(Error::CorruptBlock { .. })
         ),
         "garbage compressed payload must be absent-or-corrupt, never a wrong value"
@@ -1196,7 +1211,6 @@ fn cache_poisoned_block_matches_device() {
             7,
             &mut scratch,
             footer,
-            base,
         ))
         .unwrap();
 
@@ -1209,7 +1223,6 @@ fn cache_poisoned_block_matches_device() {
             &dev_b,
             &mut scratch_b,
             footer,
-            base,
         ))
         .unwrap();
 

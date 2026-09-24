@@ -17,8 +17,7 @@ use horton::{BlockDevice, Compaction, Progress, SealedTable};
 const BLOCK: usize = 4096;
 const BODY: usize = BLOCK - 4; // decompressed size is always the full logical block
 
-type TestScan<'d> =
-    horton::Scan<'d, MemDevice<BLOCK>, BLOCK, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type TestScan<'d> = horton::Scan<'d, MemDevice<BLOCK>, BLOCK, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 const fn scratch() -> CompressScratch<BLOCK> {
     CompressScratch::new()
@@ -210,7 +209,7 @@ fn decoder_fuzz_no_panic() {
 fn put_flushing(db: &mut TestDb<MemDevice<BLOCK>>, k: &[u8], v: &[u8]) {
     match block_on(db.put(k, v)) {
         Ok(_) => {}
-        Err(horton::Error::ArenaFull | horton::Error::NoSpace) => {
+        Err(horton::Error::ArenaFull | horton::Error::WalFull) => {
             block_on(db.flush()).unwrap();
             block_on(db.put(k, v)).unwrap();
         }
@@ -325,7 +324,6 @@ fn flush_leaves_random_data_raw() {
         k,
         entries.iter().copied(),
         Some(&mut cs),
-        0,
     ))
     .unwrap();
     assert_eq!(nblocks, plan.data_blocks + 3);
@@ -345,7 +343,6 @@ fn flush_leaves_random_data_raw() {
             &dev,
             &mut scratch,
             base + nblocks - 1,
-            base,
         ),
     )
     .unwrap();

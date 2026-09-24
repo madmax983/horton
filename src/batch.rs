@@ -111,7 +111,9 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const OPS: usize>
     ///
     /// [`Error::BatchFull`] when `OPS` ops are already queued,
     /// [`Error::EmptyKey`], [`Error::KeyTooLarge`], or
-    /// [`Error::ValueTooLarge`].
+    /// [`Error::ValueTooLarge`]. A batch touches no device, so its error
+    /// type is `Error<Infallible>`; [`Error::widen`] converts it for a
+    /// `Db` result: `batch.put(k, v).map_err(Error::widen)?`.
     pub fn put(&mut self, key: &[u8], val: &[u8]) -> Result<(), Error<Infallible>> {
         self.push(Op::Put, key, val)
     }

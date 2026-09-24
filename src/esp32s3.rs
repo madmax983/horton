@@ -26,9 +26,10 @@
 //!
 //! Every `WREN` is followed by a `WEL` check (`Error::WriteEnableFailed`)
 //! and every poll is bounded (`Error::Timeout`). QEMU's `esp32s3`
-//! machine does not emulate the `SPI_MEM` user-command path (see
-//! SPEC.md §9, v0.7), so on-target proof of these sequences needs
-//! silicon; the host mock is the executable proof in the meantime.
+//! machine does not emulate the `SPI_MEM` user-command path (see the v0.7
+//! entry of `docs/history/milestones-v0.1-v0.16.md`), so on-target proof
+//! of these sequences needs silicon; the host mock is the executable
+//! proof in the meantime.
 
 use crate::flash::Flash;
 

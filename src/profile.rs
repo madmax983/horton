@@ -5,41 +5,56 @@
 //! layout on xtensa; see `BUDGET.md` for the accounting). The device's own
 //! storage (e.g. a RAM disk or flash region) is extra.
 
-use crate::compact::Compaction;
-use crate::{Db, Scan};
+crate::db_types! {
+    block: 4096,
+    key_max: 32,
+    val_max: 64,
+    memtable_entries: 16,
+    memtable_arena: 2048,
+    levels: 4,
+    tables_per_level: 4,
+    bloom_bytes: 64,
+    cache_blocks: 2;
 
-/// ESP32-S3 profile: 4 KiB blocks (the SPI flash sector size — required by
-/// [`FlashBlockDevice`](crate::flash::FlashBlockDevice)), keys to 32 bytes,
-/// values to 64, a 16-entry memtable over a 2 KiB arena, 4 levels of up to
-/// 4 tables each.
-///
-/// Measured static RAM: [`Db`] 17,064 + [`Scan`] 10,392 + [`Compaction`]
-/// 56,192 = 83,648 bytes, under [`ESP32S3_RAM_BUDGET`]. The v0.13 block
-/// compression accounts for ~20 KiB of that: a 4 KiB decompression buffer
-/// each on [`Db`] (point reads) and [`Scan`], and on [`Compaction`] an 8
-/// KiB trial-compression scratch plus one 4 KiB shared physical-read
-/// buffer (the eight merge cursors share it — each keeps only its
-/// logical block resident). Every byte is load-bearing: the read path
-/// cannot inflate a block without a target, and the writer cannot trial-
-/// compress without staging. 83,648 bytes is 16% of the S3's 512 KiB
-/// SRAM; the budget below keeps comfortable room for the kernel.
-pub type Esp32S3Db<D> = Db<D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64, 2>;
+    /// ESP32-S3 profile: the [`Db`](crate::Db) instantiation for 4 KiB SPI-flash sectors.
+    ///
+    /// Keys to 32 bytes, values to 64, a 16-entry memtable over a 2 KiB arena,
+    /// 4 levels of up to 4 tables each, a 2-slot block cache. `BLOCK = 4096`
+    /// is the SPI flash sector size, required by
+    /// [`FlashBlockDevice`](crate::flash::FlashBlockDevice).
+    ///
+    /// Static RAM is measured, not estimated: `tests/profile.rs` prints the
+    /// `size_of` of [`Db`](crate::Db), [`Scan`](crate::Scan), and
+    /// [`Compaction`](crate::Compaction) for this profile and
+    /// asserts their sum stays under [`ESP32S3_RAM_BUDGET`]. `BUDGET.md`
+    /// records the current numbers and what each buffer is for.
+    pub type Db = Esp32S3Db;
 
-/// [`Scan`] instantiated for the ESP32-S3 profile.
-pub type Esp32S3Scan<'d, D> = Scan<'d, D, 4096, 32, 64, 16, 2048, 4, 4, 64, 64, 2>;
+    /// [`Scan`](crate::Scan) instantiated for the ESP32-S3 profile.
+    pub type Scan = Esp32S3Scan;
 
-/// [`Compaction`] scratch instantiated for the ESP32-S3 profile.
-pub type Esp32S3Compaction = Compaction<4096, 32, 64, 64>;
+    /// [`RevScan`](crate::RevScan) instantiated for the ESP32-S3 profile.
+    pub type RevScan = Esp32S3RevScan;
+
+    /// [`Compaction`](crate::Compaction) scratch instantiated for the
+    /// ESP32-S3 profile.
+    pub type Compaction = Esp32S3Compaction;
+}
 
 /// Static RAM budget for the ESP32-S3 profile.
 ///
-/// Covers one [`Db`], one [`Scan`], and one [`Compaction`] scratch.
-/// `tests/profile.rs` asserts the measured total stays under this; growth
+/// Covers one [`Db`](crate::Db), one [`Scan`](crate::Scan), and one
+/// [`Compaction`](crate::Compaction) scratch, **plus the largest set of
+/// futures that can be live at once** (an executor stores them: a static
+/// task arena, or a poll loop's stack) — the largest `&mut self` call's
+/// future, or a `get` alongside a scan step. `tests/profile.rs` measures
+/// every public future and asserts the total stays under this; growth
 /// past it fails loudly so the re-tune is a conscious decision, not
 /// silent bloat.
 ///
-/// Raised from 64 KiB to 96 KiB for v0.13: block compression needs ~20
-/// KiB of caller-owned scratch (see the profile docs above), and the
-/// S3's 512 KiB SRAM still leaves ample room for the kernel, stacks,
-/// and drivers.
-pub const ESP32S3_RAM_BUDGET: usize = 98_304;
+/// History: 64 KiB until v0.13; 96 KiB for block compression's ~20 KiB of
+/// caller-owned scratch; 112 KiB once the futures were counted (F8 in
+/// `docs/ARCHITECTURE_REVIEW.md` — `flush` alone is ~17 KiB, most of it
+/// its table writer and compression scratch). The S3's 512 KiB SRAM still
+/// leaves ample room for the kernel, stacks, and drivers.
+pub const ESP32S3_RAM_BUDGET: usize = 114_688;

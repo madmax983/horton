@@ -4,10 +4,12 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
-//! v0.16 surface: [`MemTable`], the [`wal`] write-ahead log, the async
+//! v0.17 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
-//! [`manifest`] crash-safe root pointer, the [`alloc`] block allocator
-//! (bump pointer plus free list), the [`Db`] database (WAL + memtable +
+//! [`manifest`] crash-safe root pointer (multi-block copies, an optional
+//! copy ring, commits staged as a [`ManifestEdit`]), the [`slots`]
+//! table-slot allocator (one table per fixed slot), [`db_types!`] for
+//! naming a database shape, the [`Db`] database (WAL + memtable +
 //! flush into `SSTables`, multi-level bloom-gated reads with key-range
 //! pruning and highest-sequence-wins), the [`Scan`] merge iterator with
 //! snapshot reads and reverse iteration, atomic multi-op [`WriteBatch`]
@@ -26,9 +28,9 @@
 //! by the `CACHE` const generic on [`Db`] (`0` disables it), caching
 //! physical device-block images before CRC, bloom, decompression, TTL,
 //! and range-delete interpretation, with explicit invalidation when
-//! compaction or archive removal retires tables. See SPEC §9 for the
-//! tombstone rule: delete-bearing workloads archive only from the
-//! bottommost level.
+//! compaction or archive removal retires tables. Archiving a table whose
+//! tombstones still hide a value somewhere is refused
+//! ([`Error::WouldResurrect`]).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -38,7 +40,6 @@
 // requiring the device (or the futures) to be `Send`.
 #![allow(clippy::future_not_send)]
 
-pub mod alloc;
 pub mod batch;
 pub mod cache;
 pub mod compact;
@@ -49,27 +50,33 @@ pub mod device;
 pub mod error;
 pub mod esp32s3;
 pub mod flash;
+mod macros;
 pub mod manifest;
 pub mod memtable;
+// Executable reference models of the read rules: test oracles for the
+// differential tests, not part of the storage API.
+#[doc(hidden)]
 pub mod model;
 pub mod profile;
 pub mod scan;
+pub mod slots;
 pub mod sstable;
 pub mod wal;
 
-pub use alloc::{Bump, FreeList};
 pub use batch::WriteBatch;
 pub use cache::{BlockCache, CachePort, CacheStats};
 pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
-pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable};
+pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable, SlotStats};
 pub use device::BlockDevice;
 pub use error::Error;
-pub use manifest::{KeyBound, Level, MANIFEST_MAGIC, Manifest, TableRef};
+pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestEdit, ManifestLayout, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
 pub use scan::{RevScan, Scan};
-pub use sstable::{
-    Lookup as SstLookup, SSTABLE_MAGIC, SstEntry, TablePlan, TableReader, bloom_k,
-    bloom_maybe_contains, plan_table, write_table,
-};
+pub use slots::{MAX_SLOTS, SlotMap};
+pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
+// Low-level table construction, for tests and tooling: `Db` builds its
+// tables itself.
+#[doc(hidden)]
+pub use sstable::{SstEntry, TablePlan, bloom_k, bloom_maybe_contains, plan_table, write_table};
 pub use wal::{Op, RecoverState, WalWriter};
