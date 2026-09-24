@@ -244,6 +244,52 @@ impl<
         }
     }
 
+    /// Highest range-tombstone sequence at/below `max_seq` covering `key`,
+    /// across the memtable and every table with a range-tombstone section —
+    /// or `None` when no range tombstone covers `key`. Tables without an
+    /// rdel section, and tables whose `[first_key, last_key]` cannot contain
+    /// `key`, are skipped without I/O. (`last_key` carries the greatest
+    /// exclusive rdel end inclusively, so the bound prune is a conservative
+    /// superset: it may probe a table whose rdels miss, never skip one
+    /// whose rdels hit.) Both scan directions use it; `scratch` is the
+    /// scan's physical-read buffer, dead between block reads, so the scan
+    /// futures hold no block buffer for it.
+    pub(crate) async fn covering_rdel_seq(
+        &self,
+        key: &[u8],
+        max_seq: u64,
+        scratch: &mut [u8; BLOCK],
+    ) -> Result<Option<u64>, Error<D::Error>> {
+        let mut best: Option<u64> = self.table.max_covering_rdel(key, max_seq);
+        for li in 0..LEVELS {
+            let tables = self.manifest.level(li).unwrap_or(&[]);
+            for tref in tables {
+                if tref.rdel_blocks == 0 {
+                    continue;
+                }
+                if tref.first_key.as_slice() > key || tref.last_key.as_slice() < key {
+                    continue;
+                }
+                if let Some(q) = sstable::covering_rdel_seq_in(
+                    self.device(),
+                    Some(self.cache_port()),
+                    tref.id,
+                    scratch,
+                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
+                    tref.rdel_blocks,
+                    key,
+                    max_seq,
+                )
+                .await?
+                    && best.is_none_or(|b| q > b)
+                {
+                    best = Some(q);
+                }
+            }
+        }
+        Ok(best)
+    }
+
     /// Considers one table for [`Db::get_at`]: key-range prune, sequence prune,
     /// then a bloom-gated lookup. A hit with a higher sequence number than
     /// the best so far — and visible at `max_seq` — is promoted into `acc`.

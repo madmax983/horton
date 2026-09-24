@@ -386,7 +386,8 @@ impl<
             // winning value with `expire_at <= now`, hides the key. An
             // expired winner never falls through to an older version.
             let covered = self
-                .covering_rdel_seq(wkey)
+                .db
+                .covering_rdel_seq(wkey, self.max_seq, &mut self.raw)
                 .await?
                 .is_some_and(|q| q > winner_seq);
             let expired =
@@ -478,17 +479,17 @@ impl<
         let db = self.db;
         // Cold insert: a scan streams each data block once with no reuse,
         // so scan blocks must not displace the point-read hot set.
-        sstable::read_block_cached(
+        let inflated = sstable::read_data_block(
             db.device(),
             Some(db.cache_port()),
             table_id,
             id,
             &mut self.raw,
+            &mut self.block,
             false,
         )
         .await?;
-        sstable::check_block_crc::<D::Error, BLOCK>(&self.raw, id)?;
-        if !sstable::inflate_data_block::<D::Error, BLOCK>(&self.raw, &mut self.block, id)? {
+        if !inflated {
             self.block.copy_from_slice(&self.raw);
         }
         self.block_id = Some(id);
@@ -801,57 +802,6 @@ impl<
             ))
         }
     }
-
-    /// Highest range-tombstone sequence at/below `max_seq` covering `key`,
-    /// across the memtable and every table with a range-tombstone section —
-    /// or `None` when no range tombstone covers `key`. Tables without an
-    /// rdel section, and tables whose `[first_key, last_key]` cannot contain
-    /// `key`, are skipped without I/O. (`last_key` carries the greatest
-    /// exclusive rdel end inclusively, so the bound prune is a conservative
-    /// superset: it may probe a table whose rdels miss, never skip one
-    /// whose rdels hit.)
-    async fn covering_rdel_seq(&self, key: &[u8]) -> Result<Option<u64>, Error<D::Error>> {
-        let max_seq = self.max_seq;
-        let db = self.db;
-        let mut best: Option<u64> = db.memtable().max_covering_rdel(key, max_seq);
-        // Most tables carry no range tombstones, so this call is usually a
-        // no-op below: lazily allocate the block-sized scratch only once a
-        // table actually needs it, instead of zeroing BLOCK bytes up front
-        // on every call regardless of whether anything ever reads it.
-        let mut scratch: Option<[u8; BLOCK]> = None;
-        for li in 0..LEVELS {
-            let tables = db.manifest_ref().level(li).unwrap_or(&[]);
-            for tref in tables {
-                if tref.rdel_blocks == 0 {
-                    continue;
-                }
-                if tref.first_key.as_slice() > key || tref.last_key.as_slice() < key {
-                    continue;
-                }
-                if let Some(q) = sstable::covering_rdel_seq_in(
-                    db.device(),
-                    Some(db.cache_port()),
-                    tref.id,
-                    // clippy wants `get_or_insert` (eager), but that zeroes
-                    // BLOCK bytes on every call regardless of whether
-                    // `scratch` is already populated — measured with
-                    // callgrind (see PR), not decorative.
-                    #[allow(clippy::unnecessary_lazy_evaluations)]
-                    scratch.get_or_insert_with(|| [0u8; BLOCK]),
-                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
-                    tref.rdel_blocks,
-                    key,
-                    max_seq,
-                )
-                .await?
-                    && best.is_none_or(|b| q > b)
-                {
-                    best = Some(q);
-                }
-            }
-        }
-        Ok(best)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -923,9 +873,11 @@ impl<const KEY_MAX: usize> RevCursor<KEY_MAX> {
 ///
 /// Positioning inside a data block binary-searches the restart points
 /// for the last restart that can lead to a qualifying entry, then walks
-/// regions backward. Regions run newest-first, so the walk meets newer
-/// versions first; a version run straddling restarts — or data blocks —
-/// still resolves to the newest visible version.
+/// regions backward. A key's versions are stored newest-first, so a
+/// backward walk meets a straddling run's *older* versions first; ties
+/// across regions keep the earlier region's (newer) version, and a run
+/// that straddles data blocks is followed back into earlier blocks
+/// (`resolve_run`), so the newest visible version always wins.
 ///
 /// All memory is caller-owned: one `[u8; BLOCK]` buffer plus one small
 /// cursor per table. No allocation, no hidden buffering.
@@ -1264,7 +1216,8 @@ impl<
             // winning value with `expire_at <= now`, hides the key. An
             // expired winner never falls through to an older version.
             let covered = self
-                .covering_rdel_seq(wkey)
+                .db
+                .covering_rdel_seq(wkey, self.max_seq, &mut self.raw)
                 .await?
                 .is_some_and(|q| q > winner_seq);
             let expired =
@@ -1386,17 +1339,17 @@ impl<
         let db = self.db;
         // Cold insert: a scan streams each data block once with no reuse,
         // so scan blocks must not displace the point-read hot set.
-        sstable::read_block_cached(
+        let inflated = sstable::read_data_block(
             db.device(),
             Some(db.cache_port()),
             table_id,
             id,
             &mut self.raw,
+            &mut self.block,
             false,
         )
         .await?;
-        sstable::check_block_crc::<D::Error, BLOCK>(&self.raw, id)?;
-        if !sstable::inflate_data_block::<D::Error, BLOCK>(&self.raw, &mut self.block, id)? {
+        if !inflated {
             self.block.copy_from_slice(&self.raw);
         }
         self.block_id = Some(id);
@@ -1702,11 +1655,11 @@ impl<
     ///
     /// Positioning binary-searches the restart points for the last
     /// restart that can lead to a qualifying entry, then walks regions
-    /// backward. Regions run newest-first, so the walk meets newer
-    /// versions first: within a region the strictly-greatest key wins,
-    /// and across regions a tie keeps the earlier region's (newer)
-    /// version — a version run straddling restarts still resolves to the
-    /// newest visible version. The walk breaks out early once the next
+    /// backward. A key's versions are stored newest-first, so the walk
+    /// meets a straddling run's older versions first: within a region the
+    /// strictly-greatest key wins, and across regions a tie keeps the
+    /// earlier region's (newer) version — a version run straddling
+    /// restarts still resolves to the newest visible version. The walk breaks out early once the next
     /// region's first key drops below the best key found: everything
     /// further back is smaller and cannot tie or beat it.
     fn search_block_rev(
@@ -2026,47 +1979,5 @@ impl<
                 c.expire_at,
             ))
         }
-    }
-
-    /// Highest range-tombstone sequence at/below `max_seq` covering `key`,
-    /// across the memtable and every table with a range-tombstone section —
-    /// or `None` when no range tombstone covers `key`. Tables without an
-    /// rdel section, and tables whose `[first_key, last_key]` cannot contain
-    /// `key`, are skipped without I/O. (`last_key` carries the greatest
-    /// exclusive rdel end inclusively, so the bound prune is a conservative
-    /// superset: it may probe a table whose rdels miss, never skip one
-    /// whose rdels hit.)
-    async fn covering_rdel_seq(&self, key: &[u8]) -> Result<Option<u64>, Error<D::Error>> {
-        let max_seq = self.max_seq;
-        let db = self.db;
-        let mut best: Option<u64> = db.memtable().max_covering_rdel(key, max_seq);
-        let mut scratch = [0u8; BLOCK];
-        for li in 0..LEVELS {
-            let tables = db.manifest_ref().level(li).unwrap_or(&[]);
-            for tref in tables {
-                if tref.rdel_blocks == 0 {
-                    continue;
-                }
-                if tref.first_key.as_slice() > key || tref.last_key.as_slice() < key {
-                    continue;
-                }
-                if let Some(q) = sstable::covering_rdel_seq_in(
-                    db.device(),
-                    Some(db.cache_port()),
-                    tref.id,
-                    &mut scratch,
-                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
-                    tref.rdel_blocks,
-                    key,
-                    max_seq,
-                )
-                .await?
-                    && best.is_none_or(|b| q > b)
-                {
-                    best = Some(q);
-                }
-            }
-        }
-        Ok(best)
     }
 }

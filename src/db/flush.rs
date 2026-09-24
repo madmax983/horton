@@ -117,7 +117,7 @@ impl<
     /// leaves the new state. Never a mix.
     ///
     /// The table goes into a free slot of the table region (see
-    /// [`SlotMap`](crate::alloc::SlotMap)), claimed only once the manifest commit lands, so a
+    /// [`SlotMap`](crate::slots::SlotMap)), claimed only once the manifest commit lands, so a
     /// returned I/O error leaves the in-memory state exactly as it was and
     /// the flush can simply be retried.
     ///

@@ -2023,8 +2023,6 @@ pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
     Ok(best)
 }
 
-/// Point-lookup reader over one table. Holds a shared device reference;
-/// every lookup reuses the caller's scratch block.
 /// Reads one `SSTable` block through the block cache when one is supplied.
 ///
 /// On a hit the cached image is copied into `scratch` and no device I/O
@@ -2056,6 +2054,37 @@ pub(crate) async fn read_block_cached<D: BlockDevice, const BLOCK: usize>(
         c.put(table_id, block_id, scratch, hot);
     }
     Ok(())
+}
+
+/// The single funnel for data-block reads, shared by point lookups, both
+/// scan directions, and compaction: reads block `block_id` into `raw`
+/// (through the cache when given; `hot` inserts it as a point read
+/// would), verifies its CRC, and inflates it into `logical` when its
+/// compression flag is set. Returns `true` when `logical` holds the
+/// inflated block, `false` when `raw` holds the logical block as stored
+/// (callers that need it in `logical` copy it).
+///
+/// A committed table's blocks were durable before the manifest made them
+/// visible, so a bad CRC is media corruption, never a torn write: it is
+/// [`Error::CorruptBlock`] everywhere — reporting "absent" instead would
+/// let an older version in a deeper table win (a silent stale read). A
+/// flag or decoding failure is `CorruptBlock` too.
+///
+/// # Errors
+///
+/// [`Error::CorruptBlock`] as above, or [`Error::Device`] on I/O failure.
+pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    raw: &mut [u8; BLOCK],
+    logical: &mut [u8; BLOCK],
+    hot: bool,
+) -> Result<bool, Error<D::Error>> {
+    read_block_cached(device, cache, table_id, block_id, raw, hot).await?;
+    check_block_crc::<D::Error, BLOCK>(raw, block_id)?;
+    inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)
 }
 
 /// Point-lookup reader over one table. Holds a shared device reference;
@@ -2367,19 +2396,21 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         // Data blocks are contiguous, so the run walk below only moves
         // forward, and `remaining` keeps it inside the table's data blocks.
         loop {
-            // Data: a block that fails its CRC is an error, never a miss.
-            // A committed table's blocks were durable before the manifest
-            // made them visible, so a bad CRC is media corruption, not a
-            // torn write — and reporting "absent" would let an older
-            // version in a deeper table win (a silent stale read). Scans
-            // and compaction already treat it the same way.
-            read_block_cached(device, self.cache, self.table_id, block_id, scratch, true).await?;
-            check_block_crc::<D::Error, BLOCK>(scratch, block_id)?;
+            // A bad CRC is an error, never a miss (see `read_data_block`).
             // A flagged block inflates into `decomp`; a raw block parses
-            // in place from `scratch`. A flag/decoding failure is a format
-            // violation: `CorruptBlock`, like a bad CRC.
+            // in place from `scratch`.
+            let inflated = read_data_block(
+                device,
+                self.cache,
+                self.table_id,
+                block_id,
+                scratch,
+                decomp,
+                true,
+            )
+            .await?;
             let body_end = BLOCK - CRC_LEN;
-            let body: &[u8] = if inflate_data_block::<D::Error, BLOCK>(scratch, decomp, block_id)? {
+            let body: &[u8] = if inflated {
                 &decomp[..body_end]
             } else {
                 &scratch[..body_end]

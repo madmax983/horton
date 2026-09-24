@@ -17,7 +17,6 @@
 
 use core::cell::RefCell;
 
-use crate::alloc::{MAX_SLOTS, SlotMap};
 use crate::batch::WriteBatch;
 use crate::cache::{BlockCache, CachePort, CacheStats};
 use crate::compact::COMPACTION_KMAX;
@@ -25,6 +24,7 @@ use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{Manifest, ManifestLayout, TableRef};
 use crate::memtable::MemTable;
+use crate::slots::{MAX_SLOTS, SlotMap};
 use crate::sstable;
 use crate::wal::{Op, RecoverState, WAL_RECORD_OVERHEAD, WalWriter};
 
@@ -229,6 +229,27 @@ pub struct Db<
 struct StageMark {
     stage_len: usize,
     next_block: u64,
+}
+
+/// One single-op write, for [`Db::commit_mutation`].
+#[derive(Debug, Clone, Copy)]
+enum Mutation<'a> {
+    Put {
+        key: &'a [u8],
+        val: &'a [u8],
+    },
+    PutTtl {
+        key: &'a [u8],
+        val: &'a [u8],
+        expire_at: u64,
+    },
+    Delete {
+        key: &'a [u8],
+    },
+    RangeDelete {
+        start: &'a [u8],
+        end: &'a [u8],
+    },
 }
 
 impl<
@@ -668,6 +689,71 @@ impl<
         Ok(())
     }
 
+    /// The single-op write path shared by [`put`](Db::put),
+    /// [`delete`](Db::delete), [`delete_range`](Db::delete_range) and
+    /// [`put_with_ttl`](Db::put_with_ttl): validate against the memtable,
+    /// append one WAL record, commit it, then apply it to the memtable.
+    /// A failed append or commit rolls the WAL stage back
+    /// ([`rollback_commit`](Self::rollback_commit)), so a rejected write
+    /// leaves no trace and consumes no sequence number unless its block
+    /// may already be durable.
+    async fn commit_mutation(&mut self, m: Mutation<'_>) -> Result<u64, Error<D::Error>> {
+        self.ensure_open()?;
+        match m {
+            Mutation::Put { key, val } | Mutation::PutTtl { key, val, .. } => {
+                self.table.check_insert::<D::Error>(key, val, false)?;
+            }
+            Mutation::Delete { key } => self.table.check_insert::<D::Error>(key, &[], true)?,
+            Mutation::RangeDelete { start, end } => {
+                self.table.check_insert_range_del::<D::Error>(start, end)?;
+            }
+        }
+        let seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or(Error::CounterExhausted)?;
+        let mark = self.stage_mark();
+        let appended = match m {
+            Mutation::Put { key, val } => self.wal.append(seq, Op::Put, key, val).await,
+            Mutation::PutTtl {
+                key,
+                val,
+                expire_at,
+            } => self.wal.append_ttl(seq, key, val, expire_at).await,
+            Mutation::Delete { key } => self.wal.append(seq, Op::Delete, key, &[]).await,
+            Mutation::RangeDelete { start, end } => {
+                self.wal.append(seq, Op::RangeDelete, start, end).await
+            }
+        };
+        if let Err(e) = appended {
+            self.rollback_commit(mark, 0)?;
+            return Err(e);
+        }
+        if let Err(e) = self.wal.commit().await {
+            let landed = self.wal.next_block() != mark.next_block;
+            self.rollback_commit(mark, u64::from(landed))?;
+            return Err(e);
+        }
+        self.next_seq = seq;
+        // The memtable is unchanged since the check above, so the insert
+        // cannot fail.
+        match m {
+            Mutation::Put { key, val } => self.table.insert(key, val, seq, false)?,
+            Mutation::PutTtl {
+                key,
+                val,
+                expire_at,
+            } => self
+                .table
+                .insert_ttl::<D::Error>(key, val, seq, expire_at)?,
+            Mutation::Delete { key } => self.table.insert(key, &[], seq, true)?,
+            Mutation::RangeDelete { start, end } => {
+                self.table.insert_range_del::<D::Error>(start, end, seq)?;
+            }
+        }
+        Ok(seq)
+    }
+
     /// Stores `key` → `val`, durable before it returns. Returns the sequence
     /// number assigned to the mutation.
     ///
@@ -678,26 +764,7 @@ impl<
     /// [`Error::WalFull`] (flush, then retry), [`Error::CounterExhausted`],
     /// or [`Error::Device`].
     pub async fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, Error<D::Error>> {
-        self.ensure_open()?;
-        self.table.check_insert::<D::Error>(key, val, false)?;
-        let seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or(Error::CounterExhausted)?;
-        let mark = self.stage_mark();
-        if let Err(e) = self.wal.append(seq, Op::Put, key, val).await {
-            self.rollback_commit(mark, 0)?;
-            return Err(e);
-        }
-        if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed))?;
-            return Err(e);
-        }
-        self.next_seq = seq;
-        // The table is unchanged since check_insert, so this cannot fail.
-        self.table.insert(key, val, seq, false)?;
-        Ok(seq)
+        self.commit_mutation(Mutation::Put { key, val }).await
     }
 
     /// Deletes `key` via a tombstone, durable before it returns. Returns the
@@ -707,26 +774,7 @@ impl<
     ///
     /// Same as [`put`](Db::put).
     pub async fn delete(&mut self, key: &[u8]) -> Result<u64, Error<D::Error>> {
-        self.ensure_open()?;
-        self.table.check_insert::<D::Error>(key, &[], true)?;
-        let seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or(Error::CounterExhausted)?;
-        let mark = self.stage_mark();
-        if let Err(e) = self.wal.append(seq, Op::Delete, key, &[]).await {
-            self.rollback_commit(mark, 0)?;
-            return Err(e);
-        }
-        if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed))?;
-            return Err(e);
-        }
-        self.next_seq = seq;
-        // The table is unchanged since check_insert, so this cannot fail.
-        self.table.insert(key, &[], seq, true)?;
-        Ok(seq)
+        self.commit_mutation(Mutation::Delete { key }).await
     }
 
     /// Deletes every key in `[start, end)` via one range tombstone, durable
@@ -743,26 +791,8 @@ impl<
         if start >= end {
             return Ok(self.next_seq);
         }
-        self.table.check_insert_range_del::<D::Error>(start, end)?;
-        let seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or(Error::CounterExhausted)?;
-        let mark = self.stage_mark();
-        if let Err(e) = self.wal.append(seq, Op::RangeDelete, start, end).await {
-            self.rollback_commit(mark, 0)?;
-            return Err(e);
-        }
-        if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed))?;
-            return Err(e);
-        }
-        self.next_seq = seq;
-        // The table is unchanged since check_insert_range_del, so this
-        // cannot fail.
-        self.table.insert_range_del::<D::Error>(start, end, seq)?;
-        Ok(seq)
+        self.commit_mutation(Mutation::RangeDelete { start, end })
+            .await
     }
 
     /// Puts `key`/`val` with an absolute expiry tick, durable before it
@@ -781,27 +811,12 @@ impl<
         val: &[u8],
         expire_at: u64,
     ) -> Result<u64, Error<D::Error>> {
-        self.ensure_open()?;
-        self.table.check_insert::<D::Error>(key, val, false)?;
-        let seq = self
-            .next_seq
-            .checked_add(1)
-            .ok_or(Error::CounterExhausted)?;
-        let mark = self.stage_mark();
-        if let Err(e) = self.wal.append_ttl(seq, key, val, expire_at).await {
-            self.rollback_commit(mark, 0)?;
-            return Err(e);
-        }
-        if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed))?;
-            return Err(e);
-        }
-        self.next_seq = seq;
-        // The table is unchanged since check_insert, so this cannot fail.
-        self.table
-            .insert_ttl::<D::Error>(key, val, seq, expire_at)?;
-        Ok(seq)
+        self.commit_mutation(Mutation::PutTtl {
+            key,
+            val,
+            expire_at,
+        })
+        .await
     }
 
     /// Applies every op in `batch` atomically: all become durable and

@@ -58,6 +58,6 @@ architecture review found three defects in that scheme:
 
 ## References
 
-- `src/alloc.rs`, `Db::open`, `Db::free_slot_for`
+- `src/slots.rs`, `Db::open`, `Db::free_slot_for`
 - `docs/ARCHITECTURE_REVIEW.md` F1, F3, F14
-- `tests/review_findings.rs`: `f1_*`, `f3_*`, `f14_*`; `tests/alloc.rs`
+- `tests/review_findings.rs`: `f1_*`, `f3_*`, `f14_*`; `tests/slots.rs`

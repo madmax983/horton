@@ -1,7 +1,7 @@
 //! Table-slot allocator tests: layout, slot lookup, next-fit rotation,
 //! reservations, and the used/reserved/free accounting.
 
-use horton::alloc::{MAX_SLOTS, SlotMap};
+use horton::slots::{MAX_SLOTS, SlotMap};
 
 #[test]
 fn layout_divides_the_region_into_equal_slots() {

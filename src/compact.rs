@@ -46,12 +46,12 @@
 
 use core::future::poll_fn;
 
-use crate::alloc::MAX_SLOTS;
 use crate::compress::CompressScratch;
 use crate::db::MAX_SNAPSHOTS;
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, TableRef};
+use crate::slots::MAX_SLOTS;
 use crate::sstable::{self, PushOutcome, SstEntry, TableWriter};
 
 /// Maximum tables merged in one compaction job (spec `KMAX = 8`).
@@ -1388,11 +1388,9 @@ async fn read_data_block<
         .ok_or(Error::CorruptBlock {
             id: cur.first_block,
         })?;
-    read_block_into(device, id, raw).await?;
-    sstable::check_block_crc(raw, id)?;
-    if sstable::inflate_data_block::<D::Error, BLOCK>(raw, &mut cur.block, id)? {
-        // Flagged: `cur.block` now holds the inflated logical block.
-    } else {
+    // Compaction reads bypass the block cache: a merge streams each block
+    // once, and its inputs are about to be retired.
+    if !sstable::read_data_block(device, None, 0, id, raw, &mut cur.block, false).await? {
         cur.block.copy_from_slice(raw);
     }
     let rstart = sstable::data_entries_end(&cur.block, id)?;

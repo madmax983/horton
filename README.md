@@ -253,7 +253,7 @@ What the suite covers:
 | `src/compact.rs` | Merge engine, cursors, range-tombstone merger |
 | `src/scan.rs` | `Scan` / `RevScan` merge iterators |
 | `src/manifest.rs` | Manifest encoding and double-buffered commit/recover |
-| `src/alloc.rs` | Table-slot allocator: one table per fixed slot, next-fit, reservations |
+| `src/slots.rs` | Table-slot allocator: one table per fixed slot, next-fit, reservations |
 | `src/cache.rs` | CLOCK block cache |
 | `src/compress.rs` | LZ77 block codec |
 | `src/batch.rs` | `WriteBatch` |

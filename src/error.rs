@@ -129,3 +129,41 @@ pub enum Error<E> {
     /// The underlying block device reported an error.
     Device(E),
 }
+
+impl Error<core::convert::Infallible> {
+    /// Widens a device-free error (from [`WriteBatch`](crate::WriteBatch)
+    /// or [`MemTable`](crate::MemTable), which never touch a device) to
+    /// any device's error type, so it can flow into a `Db` result:
+    /// `batch.put(k, v).map_err(Error::widen)?`.
+    #[must_use]
+    pub const fn widen<E>(self) -> Error<E> {
+        match self {
+            Self::KeyTooLarge { len, max } => Error::KeyTooLarge { len, max },
+            Self::ValueTooLarge { len, max } => Error::ValueTooLarge { len, max },
+            Self::EmptyKey => Error::EmptyKey,
+            Self::TableFull => Error::TableFull,
+            Self::ArenaFull => Error::ArenaFull,
+            Self::BufferTooSmall { need } => Error::BufferTooSmall { need },
+            Self::BadBufferLen => Error::BadBufferLen,
+            Self::CorruptBlock { id } => Error::CorruptBlock { id },
+            Self::CorruptWal { offset } => Error::CorruptWal { offset },
+            Self::CorruptManifest => Error::CorruptManifest,
+            Self::WalFull => Error::WalFull,
+            Self::NeedsCompaction => Error::NeedsCompaction,
+            Self::RegionFull => Error::RegionFull,
+            Self::SnapshotLimit => Error::SnapshotLimit,
+            Self::ManifestFull => Error::ManifestFull,
+            Self::TableTooLarge => Error::TableTooLarge,
+            Self::CounterExhausted => Error::CounterExhausted,
+            Self::BadLevel { level } => Error::BadLevel { level },
+            Self::BatchFull => Error::BatchFull,
+            Self::BatchTooLarge { bytes, max } => Error::BatchTooLarge { bytes, max },
+            Self::WouldResurrect { table } => Error::WouldResurrect { table },
+            Self::IngestConflict { id } => Error::IngestConflict { id },
+            Self::BadConfig => Error::BadConfig,
+            Self::Busy => Error::Busy,
+            Self::NotOpen => Error::NotOpen,
+            Self::Device(e) => match e {},
+        }
+    }
+}

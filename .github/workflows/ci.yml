@@ -100,7 +100,7 @@ jobs:
           --test memtable
           --test manifest
           --test write_batch
-          --test alloc
+          --test slots
 
   bench-build:
     name: bench-build

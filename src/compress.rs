@@ -28,9 +28,11 @@
 //!
 //! `SSTable` data blocks hold sorted keys with shared prefixes and often
 //! repetitive values — exactly what LZ77 eats. The 32 KiB window covers
-//! a whole block at any supported `BLOCK` size, each position probes a
-//! single hash bucket (no chains: bounded encode time, 4 KiB table), and
-//! both directions run in a single pass over caller-owned buffers.
+//! a whole block for `BLOCK <= 32768` (every profile here; larger blocks
+//! still compress, with matches reaching back at most 32 KiB), each
+//! position probes a single hash bucket (no chains: bounded encode time,
+//! 4 KiB table), and both directions run in a single pass over
+//! caller-owned buffers.
 
 /// Minimum bytes a compressor-emitted block must save before the writer
 /// keeps the compressed form.
@@ -41,10 +43,9 @@ pub const COMPRESS_MIN_SAVING: usize = 128;
 
 /// Minimum match length the encoder emits.
 const MIN_MATCH: usize = 4;
-/// Hash-table size: 2^12 entries of u32 (4 KiB). Single-entry buckets
-/// (no chains): each position probes only the most recent same-hash
-/// position, which bounds encode time and keeps the table small.
-/// Hash-table width: 2^10 slots × 4 bytes = 4 KiB, as documented.
+/// Hash-table width: 2^10 single-entry buckets of `u32` (4 KiB). No
+/// chains: each position probes only the most recent same-hash position,
+/// which bounds encode time and keeps the table small.
 const HASH_BITS: u32 = 10;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 /// Longest match the encoder will emit for one token pair; the

@@ -314,12 +314,11 @@ impl<
     /// confirmed, so no crash can lose acknowledged data.
     ///
     /// Tombstone rule: the commit drops the table's tombstones from local
-    /// view. If a deeper level holds an older version of a key the
-    /// archived table deleted, that older version becomes visible locally
-    /// again. With deletes in the workload, archive only from the
-    /// bottommost level (nothing is deeper, so nothing can resurrect);
-    /// insert-only workloads — sensor logs with timestamp keys — are safe
-    /// from any level.
+    /// view, so [`archive_commit`](Db::archive_commit) refuses
+    /// ([`Error::WouldResurrect`]) a table whose point or range tombstones
+    /// still hide a value in any other table, the memtable, or any live
+    /// snapshot. Insert-only workloads — sensor logs with timestamp keys —
+    /// never trip it; with deletes, compact the table down first.
     #[must_use]
     pub fn archive_plan(&self, level: usize, table_id: u32) -> Option<ArchivePlan<KEY_MAX>> {
         let tables = self.manifest.level(level)?;
