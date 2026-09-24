@@ -11,14 +11,28 @@ uncommitted state: the tree comes from the index/working tree listing.
 
 Auth goes through the stored `custom.github` credential via the
 dynamic_credentials surrogate helper; the raw key is never printed.
+
+Scripts note: the helper's location is machine-specific, so it comes from
+the environment.
+    HORTON_GH_SKILL_PATHS  Directories to put at the front of sys.path so
+                           `from gh import api` resolves, separated by
+                           os.pathsep (":" on Unix). Earlier entries take
+                           precedence, as in PATH. Default (the original
+                           dev box):
+                           /opt/hatch/skills/skill-creator/bin:/home/hatch/workspace/skills/github/bin
 """
 import base64
 import json
+import os
 import subprocess
 import sys
 
-sys.path.insert(0, "/home/hatch/workspace/skills/github/bin")
-sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+_DEFAULT_GH_SKILL_PATHS = os.pathsep.join([
+    "/opt/hatch/skills/skill-creator/bin",
+    "/home/hatch/workspace/skills/github/bin",
+])
+sys.path[0:0] = [p for p in os.environ.get(
+    "HORTON_GH_SKILL_PATHS", _DEFAULT_GH_SKILL_PATHS).split(os.pathsep) if p]
 from gh import api  # noqa: E402
 
 
