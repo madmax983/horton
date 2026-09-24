@@ -216,24 +216,20 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
     }
 }
 
-/// One LSM level: a fixed array of table refs with a live count.
-#[derive(Debug, Clone, Copy)]
-pub struct Level<const TABLES: usize, const KEY_MAX: usize> {
-    /// Table refs, `len` of them live, oldest first.
-    pub tables: [TableRef<KEY_MAX>; TABLES],
-    /// Live refs in `tables`.
-    pub len: usize,
-}
-
-impl<const TABLES: usize, const KEY_MAX: usize> Level<TABLES, KEY_MAX> {
-    /// An empty level.
-    pub const EMPTY: Self = Self {
-        tables: [TableRef::EMPTY; TABLES],
-        len: 0,
-    };
-}
-
-/// The manifest: sequence, WAL head, table-id counter, and all levels.
+/// The manifest: sequence, WAL head, table-id counter, the persisted
+/// sequence floors, and every level's tables.
+///
+/// Levels share one pool of `LEVELS * TABLES` table refs
+/// ([`CAPACITY`](Self::CAPACITY)): level 0 holds at most `TABLES` (flush
+/// output, oldest first), and deeper levels take any share of the rest,
+/// kept sorted by first key (disjoint runs). A full pool — not a full
+/// level — is what limits the tree. Each level's refs are contiguous in
+/// the pool, so [`level`](Self::level) is a plain slice.
+///
+/// Past the live refs the pool may hold *pending* refs: the output tables
+/// of the in-flight compaction job, staged until its manifest commit
+/// adopts them. Pending refs count against the capacity (their tables
+/// occupy real slots) but are invisible to every read, and never encoded.
 #[derive(Debug, Clone, Copy)]
 pub struct Manifest<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize> {
     seq: u64,
@@ -249,7 +245,13 @@ pub struct Manifest<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usi
     /// are never reused even after compaction or archival removes the
     /// tables that held them.
     seq_high: u64,
-    levels: [Level<TABLES, KEY_MAX>; LEVELS],
+    /// The table-ref pool, viewed flat: level 0's refs, then level 1's,
+    /// …, then the pending refs.
+    pool: [[TableRef<KEY_MAX>; TABLES]; LEVELS],
+    /// Live refs per level.
+    counts: [usize; LEVELS],
+    /// Pending refs after the live ones.
+    pending: usize,
 }
 
 impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
@@ -264,8 +266,69 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             next_table_id: 0,
             flushed_seq: 0,
             seq_high: 0,
-            levels: [Level::EMPTY; LEVELS],
+            pool: [[TableRef::EMPTY; TABLES]; LEVELS],
+            counts: [0; LEVELS],
+            pending: 0,
         }
+    }
+
+    /// Table refs the pool holds across all levels (live plus pending).
+    pub const CAPACITY: usize = LEVELS * TABLES;
+
+    const fn flat(&self) -> &[TableRef<KEY_MAX>] {
+        self.pool.as_flattened()
+    }
+
+    const fn flat_mut(&mut self) -> &mut [TableRef<KEY_MAX>] {
+        self.pool.as_flattened_mut()
+    }
+
+    /// Pool index where level `level`'s refs begin.
+    fn start(&self, level: usize) -> usize {
+        self.counts[..level].iter().sum()
+    }
+
+    /// Live refs across all levels.
+    fn live(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    /// Every live table ref, level by level.
+    #[must_use]
+    pub fn tables(&self) -> &[TableRef<KEY_MAX>] {
+        &self.flat()[..self.live()]
+    }
+
+    /// The staged output refs of the in-flight compaction job.
+    #[must_use]
+    pub fn pending(&self) -> &[TableRef<KEY_MAX>] {
+        let live = self.live();
+        &self.flat()[live..live + self.pending]
+    }
+
+    /// Pool entries still free (neither live nor pending).
+    #[must_use]
+    pub fn free_refs(&self) -> usize {
+        Self::CAPACITY - self.live() - self.pending
+    }
+
+    /// Inserts `tref` into `level` at pool index `pos`, shifting every
+    /// later ref (later levels and the pending tail) up by one.
+    fn insert_at<E>(
+        &mut self,
+        pos: usize,
+        level: usize,
+        tref: TableRef<KEY_MAX>,
+    ) -> Result<(), Error<E>> {
+        let used = self.live() + self.pending;
+        if used >= Self::CAPACITY {
+            return Err(Error::NoSpace);
+        }
+        let flat = self.flat_mut();
+        flat.copy_within(pos..used, pos + 1);
+        flat[pos] = tref;
+        self.counts[level] += 1;
+        Ok(())
     }
 
     /// Manifest sequence number (bumped per commit).
@@ -357,81 +420,74 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// Finds a live table by id, searching every level.
     #[must_use]
     pub fn find_table(&self, id: u32) -> Option<&TableRef<KEY_MAX>> {
-        for lvl in 0..LEVELS {
-            for t in &self.levels[lvl].tables[..self.levels[lvl].len] {
-                if t.id == id {
-                    return Some(t);
-                }
-            }
-        }
-        None
+        self.tables().iter().find(|t| t.id == id)
     }
 
-    /// True when level 0 already holds `TABLES` tables: flush must fail with
-    /// [`Error::NoSpace`] until compaction (v0.4) drains it.
+    /// True when level 0 already holds `TABLES` tables: flush must wait
+    /// for compaction to drain it.
     #[must_use]
     pub const fn l0_is_full(&self) -> bool {
-        self.levels[0].len >= TABLES
+        self.counts[0] >= TABLES
     }
 
     /// Appends a table ref to level 0 (flush output; oldest first).
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when level 0 already holds `TABLES` tables —
-    /// compaction (v0.4) is the only way to drain it.
-    pub const fn add_l0_table<E>(&mut self, tref: TableRef<KEY_MAX>) -> Result<(), Error<E>> {
-        let level = &mut self.levels[0];
-        if level.len >= TABLES {
+    /// [`Error::NoSpace`] when level 0 already holds `TABLES` tables or the
+    /// pool is full.
+    pub fn add_l0_table<E>(&mut self, tref: TableRef<KEY_MAX>) -> Result<(), Error<E>> {
+        if self.counts[0] >= TABLES {
             return Err(Error::NoSpace);
         }
-        level.tables[level.len] = tref;
-        level.len += 1;
-        Ok(())
+        self.insert_at(self.counts[0], 0, tref)
     }
 
     /// Live table refs of level 0, oldest first.
     #[must_use]
     pub fn l0(&self) -> &[TableRef<KEY_MAX>] {
-        &self.levels[0].tables[..self.levels[0].len]
+        &self.flat()[..self.counts[0]]
     }
 
-    /// Live table refs of level `idx`, oldest first, or `None` when `idx`
-    /// is out of range. Level 0 holds overlapping flush output (newest
-    /// last); deeper levels hold disjoint sorted runs once compaction
-    /// (v0.4) populates them.
+    /// Live table refs of level `idx`, or `None` when `idx` is out of
+    /// range. Level 0 holds overlapping flush output, oldest first; deeper
+    /// levels hold disjoint runs sorted by first key.
     #[must_use]
     pub fn level(&self, idx: usize) -> Option<&[TableRef<KEY_MAX>]> {
-        self.levels.get(idx).map(|l| &l.tables[..l.len])
+        if idx >= LEVELS {
+            return None;
+        }
+        let s = self.start(idx);
+        Some(&self.flat()[s..s + self.counts[idx]])
     }
 
-    /// Appends a table ref to level `level` (flush and compaction output;
-    /// oldest first).
-    ///
-    /// Only capacity is checked here. For levels ≥ 1 the caller (compaction,
-    /// v0.4) is responsible for keeping the level's key ranges sorted and
-    /// non-overlapping.
+    /// Adds a table ref to `level`: appended to level 0, inserted in
+    /// first-key order into deeper levels. The caller keeps deeper levels'
+    /// key ranges disjoint (compaction's job selection does).
     ///
     /// # Errors
     ///
-    /// [`Error::NoSpace`] when `level` is out of range or already holds
-    /// `TABLES` tables.
+    /// [`Error::NoSpace`] when `level` is out of range, level 0 is full,
+    /// or the pool is full.
     pub fn add_table_to_level<E>(
         &mut self,
         level: usize,
         tref: TableRef<KEY_MAX>,
     ) -> Result<(), Error<E>> {
-        let l = self.levels.get_mut(level).ok_or(Error::NoSpace)?;
-        if l.len >= TABLES {
+        if level >= LEVELS {
             return Err(Error::NoSpace);
         }
-        l.tables[l.len] = tref;
-        l.len += 1;
-        Ok(())
+        if level == 0 {
+            return self.add_l0_table(tref);
+        }
+        let s = self.start(level);
+        let within = self.flat()[s..s + self.counts[level]]
+            .partition_point(|t| t.first_key.as_slice() < tref.first_key.as_slice());
+        self.insert_at(s + within, level, tref)
     }
 
-    /// Removes the table with `id` from `level`, keeping the remaining refs
-    /// packed. Returns `true` when a table was removed.
+    /// Removes the table with `id` from `level`, keeping the pool packed.
+    /// Returns `true` when a table was removed.
     ///
     /// Removing a table that is not there is not an error — compaction
     /// replays its input set against the live manifest, and a missing input
@@ -441,25 +497,73 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     ///
     /// [`Error::NoSpace`] when `level` is out of range.
     pub fn remove_table_from_level<E>(&mut self, level: usize, id: u32) -> Result<bool, Error<E>> {
-        let l = self.levels.get_mut(level).ok_or(Error::NoSpace)?;
-        let Some(pos) = l.tables[..l.len].iter().position(|t| t.id == id) else {
+        if level >= LEVELS {
+            return Err(Error::NoSpace);
+        }
+        let s = self.start(level);
+        let Some(pos) = self.flat()[s..s + self.counts[level]]
+            .iter()
+            .position(|t| t.id == id)
+        else {
             return Ok(false);
         };
-        l.tables.copy_within(pos + 1..l.len, pos);
-        l.tables[l.len - 1] = TableRef::EMPTY;
-        l.len -= 1;
+        let used = self.live() + self.pending;
+        let flat = self.flat_mut();
+        flat.copy_within(s + pos + 1..used, s + pos);
+        flat[used - 1] = TableRef::EMPTY;
+        self.counts[level] -= 1;
         Ok(true)
     }
 
-    /// True when block `id` is referenced by some table in some level
-    /// (the open-time sweep's liveness query).
+    /// Stages a compaction output ref as pending: it occupies a pool entry
+    /// but stays invisible until [`adopt_pending`](Self::adopt_pending).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when the pool is full.
+    pub fn push_pending<E>(&mut self, tref: TableRef<KEY_MAX>) -> Result<(), Error<E>> {
+        let used = self.live() + self.pending;
+        if used >= Self::CAPACITY {
+            return Err(Error::NoSpace);
+        }
+        self.flat_mut()[used] = tref;
+        self.pending += 1;
+        Ok(())
+    }
+
+    /// Discards every pending ref (an abandoned compaction job).
+    pub fn clear_pending(&mut self) {
+        let live = self.live();
+        let used = live + self.pending;
+        self.flat_mut()[live..used].fill(TableRef::EMPTY);
+        self.pending = 0;
+    }
+
+    /// Moves every pending ref into `level` (in first-key order): the
+    /// compaction commit's staging step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NoSpace`] when `level` is out of range, or is level 0 and
+    /// cannot take them.
+    pub fn adopt_pending<E>(&mut self, level: usize) -> Result<(), Error<E>> {
+        while self.pending > 0 {
+            let used = self.live() + self.pending;
+            let tref = self.flat()[used - 1];
+            self.flat_mut()[used - 1] = TableRef::EMPTY;
+            self.pending -= 1;
+            self.add_table_to_level(level, tref)?;
+        }
+        Ok(())
+    }
+
+    /// True when block `id` is referenced by some live table (the
+    /// open-time sweep's liveness query).
     #[must_use]
     pub fn is_table_block_referenced(&self, id: u64) -> bool {
-        self.levels.iter().any(|l| {
-            l.tables[..l.len].iter().any(|t| {
-                id.checked_sub(t.first_block)
-                    .is_some_and(|d| d < u64::from(t.block_count))
-            })
+        self.tables().iter().any(|t| {
+            id.checked_sub(t.first_block)
+                .is_some_and(|d| d < u64::from(t.block_count))
         })
     }
 
@@ -471,31 +575,14 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// [`seq_high`](Self::seq_high) are for.
     #[must_use]
     pub fn max_seq(&self) -> u64 {
-        let mut max = 0u64;
-        for level in &self.levels {
-            for tref in &level.tables[..level.len] {
-                if tref.max_seq > max {
-                    max = tref.max_seq;
-                }
-            }
-        }
-        max
+        self.tables().iter().map(|t| t.max_seq).max().unwrap_or(0)
     }
 
-    /// One past the highest block id referenced by any table, or `None` when
-    /// the manifest holds no tables (the allocator sweep's resume point).
+    /// One past the highest block id referenced by any live table, or
+    /// `None` when the manifest holds no tables.
     #[must_use]
     pub fn table_region_end(&self) -> Option<u64> {
-        let mut end: Option<u64> = None;
-        for level in &self.levels {
-            for tref in &level.tables[..level.len] {
-                let t_end = tref.end_block();
-                if end.is_none_or(|e| t_end > e) {
-                    end = Some(t_end);
-                }
-            }
-        }
-        end
+        self.tables().iter().map(TableRef::end_block).max()
     }
 
     /// Serializes into `out` (zero-padded to a full block, CRC-terminated).
@@ -521,9 +608,10 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         enc.u64(self.flushed_seq)?;
         enc.u64(self.seq_high)?;
         enc.u32(u32::try_from(LEVELS).map_err(|_| Error::NoSpace)?)?;
-        for level in &self.levels {
-            enc.u32(u32::try_from(level.len).map_err(|_| Error::NoSpace)?)?;
-            for tref in &level.tables[..level.len] {
+        for li in 0..LEVELS {
+            let level = self.level(li).unwrap_or(&[]);
+            enc.u32(u32::try_from(level.len()).map_err(|_| Error::NoSpace)?)?;
+            for tref in level {
                 enc.u32(tref.id)?;
                 enc.u64(tref.first_block)?;
                 enc.u32(tref.block_count)?;
@@ -588,29 +676,30 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         if usize::try_from(nlevels).map_err(|_| corrupt())? != LEVELS {
             return Err(corrupt());
         }
-        let mut levels = [Level::EMPTY; LEVELS];
-        for level in &mut levels {
+        let mut out = Self::new();
+        out.seq = seq;
+        out.wal_head = wal_head;
+        out.next_table_id = next_table_id;
+        out.flushed_seq = flushed_seq;
+        out.seq_high = seq_high;
+        let mut total = 0usize;
+        for li in 0..LEVELS {
             let count =
                 usize::try_from(dec.u32().map_err(|()| corrupt())?).map_err(|_| corrupt())?;
-            if count > TABLES {
+            // Level 0 is capped at TABLES; the whole tree at the pool.
+            if (li == 0 && count > TABLES) || count > Self::CAPACITY - total {
                 return Err(corrupt());
             }
-            for slot in &mut level.tables[..count] {
-                *slot = Self::decode_tableref(&mut dec)?;
+            for i in 0..count {
+                out.flat_mut()[total + i] = Self::decode_tableref(&mut dec)?;
             }
-            level.len = count;
+            out.counts[li] = count;
+            total += count;
         }
         if dec.off != crc_end {
             return Err(corrupt());
         }
-        Ok(Self {
-            seq,
-            wal_head,
-            next_table_id,
-            flushed_seq,
-            seq_high,
-            levels,
-        })
+        Ok(out)
     }
 
     /// Decodes one table ref; any problem is [`Error::CorruptManifest`].
