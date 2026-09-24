@@ -342,3 +342,77 @@ fn f5_reverse_scan_range_delete_and_snapshot_seek() {
         ]
     );
 }
+
+/// F12 — sequence 0 is reserved (the counter issues 1 and up), but an
+/// externally built table can carry it and `ingest_table` accepts such a
+/// table. Point reads already treat a seq-0 version as invisible; scans
+/// yielded an empty key forever (release) or panicked (debug). Every read
+/// path must agree: the version is invisible and the scan terminates.
+#[test]
+fn f12_seq0_entries_are_invisible_and_scans_terminate() {
+    use horton::{KeyBound, SealedTable, SstEntry, bloom_k, write_table};
+
+    let mut remote = MemDevice::<4096>::new();
+    let entries = [
+        SstEntry {
+            key: b"a",
+            val: b"x",
+            seq: 0,
+            tombstone: false,
+            expire_at: 0,
+        },
+        SstEntry {
+            key: b"b",
+            val: b"y",
+            seq: 7,
+            tombstone: false,
+            expire_at: 0,
+        },
+    ];
+    let blocks = block_on(write_table::<_, 4096, 1024, 256>(
+        &mut remote,
+        0,
+        bloom_k(1024 * 8, 2),
+        entries.into_iter(),
+        None,
+        0,
+    ))
+    .unwrap();
+    let sealed = SealedTable {
+        id: 1000,
+        block_count: u32::try_from(blocks).unwrap(),
+        first_key: KeyBound::from_slice(b"a").unwrap(),
+        last_key: KeyBound::from_slice(b"b").unwrap(),
+        max_seq: 7,
+        entry_count: 2,
+        rdel_blocks: 0,
+    };
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    assert_eq!(block_on(db.ingest_table(&sealed, &remote, 0)), Ok(true));
+
+    let mut val = [0u8; 8];
+    assert_eq!(block_on(db.get(b"a", &mut val)), Ok(None));
+    assert_eq!(block_on(db.get(b"b", &mut val)), Ok(Some(1)));
+    let want = vec![(b"b".to_vec(), b"y".to_vec())];
+    for reverse in [false, true] {
+        let mut key = [0u8; 8];
+        let mut got = Vec::new();
+        if reverse {
+            let mut s = Box::new(RevScan::new(&db));
+            block_on(s.seek_prev(b"", None, u64::MAX)).unwrap();
+            while let Some((kl, vl)) = block_on(s.prev(&mut key, &mut val)).unwrap() {
+                got.push((key[..kl].to_vec(), val[..vl].to_vec()));
+                assert!(got.len() <= 4, "reverse scan does not terminate: {got:?}");
+            }
+        } else {
+            let mut s = Box::new(Scan::new(&db));
+            block_on(s.seek(b"", None, u64::MAX)).unwrap();
+            while let Some((kl, vl)) = block_on(s.next(&mut key, &mut val)).unwrap() {
+                got.push((key[..kl].to_vec(), val[..vl].to_vec()));
+                assert!(got.len() <= 4, "forward scan does not terminate: {got:?}");
+            }
+        }
+        assert_eq!(got, want, "reverse={reverse}");
+    }
+}

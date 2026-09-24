@@ -357,7 +357,10 @@ impl<
             let mut winner_src = min_src;
             let mut winner_seq = 0u64;
             let mut winner_tombstone = false;
-            let mut winner_key_len = 0usize;
+            // Seeded from the leader's key, so a key whose only versions
+            // carry the reserved sequence 0 still has its bytes (and is
+            // skipped below) instead of yielding an empty key forever.
+            let mut winner_key_len = min_key.len();
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
             for src in 0..=total {
@@ -409,7 +412,11 @@ impl<
                 .is_some_and(|q| q > winner_seq);
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
-            if winner_tombstone || covered || expired {
+            // Sequence 0 is reserved (the counter issues 1 and up): a
+            // version carrying it — only possible in an externally built,
+            // ingested table — is invisible, exactly as on the point-read
+            // path.
+            if winner_seq == 0 || winner_tombstone || covered || expired {
                 // Hidden: advance past the key without yielding it and
                 // without demanding caller buffer space for it.
                 self.advance_past_key(wkey, total).await?;
@@ -1279,7 +1286,10 @@ impl<
             let mut winner_src = max_src;
             let mut winner_seq = 0u64;
             let mut winner_tombstone = false;
-            let mut winner_key_len = 0usize;
+            // Seeded from the leader's key, so a key whose only versions
+            // carry the reserved sequence 0 still has its bytes (and is
+            // skipped below) instead of yielding an empty key forever.
+            let mut winner_key_len = max_key.len();
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
             for src in 0..=total {
@@ -1331,7 +1341,11 @@ impl<
                 .is_some_and(|q| q > winner_seq);
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
-            if winner_tombstone || covered || expired {
+            // Sequence 0 is reserved (the counter issues 1 and up): a
+            // version carrying it — only possible in an externally built,
+            // ingested table — is invisible, exactly as on the point-read
+            // path.
+            if winner_seq == 0 || winner_tombstone || covered || expired {
                 // Hidden: advance past the key without yielding it and
                 // without demanding caller buffer space for it.
                 self.advance_past_key_rev(wkey, total).await?;
