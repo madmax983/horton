@@ -840,7 +840,11 @@ impl<
         let max_seq = self.max_seq;
         let db = self.db;
         let mut best: Option<u64> = db.memtable().max_covering_rdel(key, max_seq);
-        let mut scratch = [0u8; BLOCK];
+        // Most tables carry no range tombstones, so this call is usually a
+        // no-op below: lazily allocate the block-sized scratch only once a
+        // table actually needs it, instead of zeroing BLOCK bytes up front
+        // on every call regardless of whether anything ever reads it.
+        let mut scratch: Option<[u8; BLOCK]> = None;
         for li in 0..LEVELS {
             let tables = db.manifest_ref().level(li).unwrap_or(&[]);
             for tref in tables {
@@ -854,7 +858,12 @@ impl<
                     db.device(),
                     Some(db.cache_port()),
                     tref.id,
-                    &mut scratch,
+                    // clippy wants `get_or_insert` (eager), but that zeroes
+                    // BLOCK bytes on every call regardless of whether
+                    // `scratch` is already populated — measured with
+                    // callgrind (see PR), not decorative.
+                    #[allow(clippy::unnecessary_lazy_evaluations)]
+                    scratch.get_or_insert_with(|| [0u8; BLOCK]),
                     tref.first_block,
                     tref.rdel_blocks,
                     key,
