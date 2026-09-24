@@ -490,3 +490,106 @@ fn f17_writes_after_a_reopen_survive_the_next_reopen() {
         );
     }
 }
+
+/// F14 — a compaction job only *reserves* its output run; nothing stops a
+/// flush between two `compact_step` calls from allocating the same blocks.
+/// The flushed table and the job's output then overlap on device: a key
+/// written mid-job reads as `CorruptBlock` and compacted keys vanish.
+#[test]
+#[ignore = "F14: a flush during an in-flight compaction job reuses the job's reserved blocks"]
+fn f14_flush_during_inflight_compaction_keeps_tables_disjoint() {
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    let v = [9u8; 1000];
+    // Four disjoint L1 tables, each several data blocks.
+    for round in 0..4u8 {
+        for f in 0..4u8 {
+            for i in 0..3u8 {
+                block_on(db.put(&[b'a' + round, f, i], &v)).unwrap();
+            }
+            block_on(db.flush()).unwrap();
+        }
+        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    }
+    assert!(db.compaction_pending(), "setup: L1 should be full");
+    // Start the L1 -> L2 job, then do real-time work mid-job.
+    assert_eq!(block_on(db.compact_step(&mut c)), Ok(Progress::More));
+    block_on(db.put(b"zz", b"mid-job")).unwrap();
+    block_on(db.flush()).unwrap();
+    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    assert_eq!(db.check_invariants(), Ok(()));
+    let mut buf = [0u8; 1024];
+    assert_eq!(block_on(db.get(b"zz", &mut buf)), Ok(Some(7)));
+    for round in 0..4u8 {
+        for f in 0..4u8 {
+            for i in 0..3u8 {
+                assert_eq!(
+                    block_on(db.get(&[b'a' + round, f, i], &mut buf)),
+                    Ok(Some(1000)),
+                    "key {round}/{f}/{i} lost"
+                );
+            }
+        }
+    }
+}
+
+/// F15 — compaction dropped a bottommost tombstone whenever nothing *deeper*
+/// overlapped it, ignoring shallower tables. A re-ingested table sits at
+/// L0 but can hold versions older than tombstones below it; dropping such
+/// a tombstone resurrects the value it was hiding.
+#[test]
+fn f15_tombstone_drop_respects_older_ingested_tables() {
+    use core::task::{Context, Poll};
+    use horton::BlockDevice;
+
+    let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    // T1 holds b@1; archive it (upload, then forget locally).
+    block_on(db.put(b"b", b"old")).unwrap();
+    block_on(db.flush()).unwrap();
+    let t1 = db.level_tables(0).unwrap()[0];
+    let sealed = db.archive_plan(0, t1.id).unwrap().sealed();
+    let mut remote = MemDevice::<4096>::new();
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut buf = [0u8; 4096];
+    for (k, id) in (t1.first_block..t1.end_block()).enumerate() {
+        assert!(matches!(
+            db.device().poll_read_block(&mut cx, id, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            remote.poll_write_block(&mut cx, u64::try_from(k).unwrap(), &buf),
+            Poll::Ready(Ok(()))
+        ));
+    }
+    assert_eq!(block_on(db.archive_commit(0, t1.id)), Ok(true));
+
+    // Delete b; a snapshot keeps the tombstone alive on its way into L1.
+    block_on(db.delete(b"b")).unwrap();
+    let snap = db.snapshot().unwrap();
+    // Four compaction rounds of disjoint key ranges fill L1 with four
+    // tables; the first (oldest) holds the tombstone.
+    for round in 0..4u8 {
+        for f in 0..4u8 {
+            block_on(db.put(&[b'b', b'0' + round, b'0' + f], b"x")).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    }
+    assert_eq!(db.level_tables(1).unwrap().len(), 4, "setup: L1 full");
+    // Re-attach T1 at L0, release the snapshot, and let the L1 -> L2 job
+    // (which does not include L0) run.
+    assert_eq!(block_on(db.ingest_table(&sealed, &remote, 0)), Ok(true));
+    db.release_snapshot(snap);
+    let mut val = [0u8; 8];
+    assert_eq!(block_on(db.get(b"b", &mut val)), Ok(None), "deleted before");
+    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    assert_eq!(
+        block_on(db.get(b"b", &mut val)),
+        Ok(None),
+        "the delete must still hide the older ingested version"
+    );
+}

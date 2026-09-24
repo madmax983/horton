@@ -1455,6 +1455,79 @@ impl<
     const CACHE: usize,
 > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
 {
+    /// Structural self-check: verifies the invariants every operation must
+    /// preserve and returns the first one violated, or `Ok(())`.
+    ///
+    /// - Live tables lie inside the table region and no two share a block.
+    /// - No free-list block and no block at or past the bump pointer
+    ///   belongs to a live table.
+    /// - Levels 1 and deeper hold pairwise disjoint key ranges.
+    /// - Each table is well-formed (room for bloom, index, and footer after
+    ///   its sections; `min_seq <= max_seq`), and the sequence counter
+    ///   dominates every stored sequence and both persisted floors.
+    /// - The manifest encodes into one block.
+    ///
+    /// Pure and synchronous: it reads only in-memory state (no device I/O),
+    /// in `O(tables² + free blocks · tables)`. Tests call it after every
+    /// operation; firmware can call it after `open()` as a cheap sanity
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// A static description of the first violated invariant.
+    pub fn check_invariants(&self) -> Result<(), &'static str> {
+        let (lo, hi) = (self.cfg.tbl_start, self.cfg.tbl_end);
+        for li in 0..LEVELS {
+            let tables = self.manifest.level(li).unwrap_or(&[]);
+            for (i, t) in tables.iter().enumerate() {
+                if t.first_block < lo || t.end_block() > hi {
+                    return Err("a live table lies outside the table region");
+                }
+                if t.data_blocks().is_none() {
+                    return Err("a table has no room for bloom, index, and footer");
+                }
+                if t.entry_count > 0 && t.min_seq > t.max_seq {
+                    return Err("a table's min_seq exceeds its max_seq");
+                }
+                if t.max_seq > self.next_seq {
+                    return Err("a table holds a sequence above the counter");
+                }
+                if li >= 1 {
+                    for u in &tables[i + 1..] {
+                        if ranges_overlap(t.first_key, t.last_key, u.first_key, u.last_key) {
+                            return Err("two tables in a level >= 1 overlap in key range");
+                        }
+                    }
+                }
+                for lj in li..LEVELS {
+                    let others = self.manifest.level(lj).unwrap_or(&[]);
+                    let from = if lj == li { i + 1 } else { 0 };
+                    for u in &others[from..] {
+                        if t.first_block < u.end_block() && u.first_block < t.end_block() {
+                            return Err("two live tables share a device block");
+                        }
+                    }
+                }
+                if t.end_block() > self.tbl_bump.next() {
+                    return Err("a live table extends past the bump pointer");
+                }
+            }
+        }
+        if self.manifest.flushed_seq() > self.next_seq || self.manifest.seq_high() > self.next_seq {
+            return Err("a persisted sequence floor exceeds the counter");
+        }
+        for &id in self.tbl_free.ids() {
+            if self.manifest.is_table_block_referenced(id) {
+                return Err("a free-list block belongs to a live table");
+            }
+        }
+        let mut buf = [0u8; BLOCK];
+        if self.manifest.encode::<D::Error, BLOCK>(&mut buf).is_err() {
+            return Err("the manifest no longer fits one block");
+        }
+        Ok(())
+    }
+
     /// Reports whether [`compact_step`](Db::compact_step) would select a
     /// compaction job right now: some level below the top holds `>= TABLES`
     /// tables. Unlike [`Progress::Done`], which a finished job also
@@ -1969,6 +2042,30 @@ impl<
         true
     }
 
+    /// Lowest sequence that a table outside the job's first `n_inputs`
+    /// inputs, or the memtable, could hold for a key in `[first, last]`:
+    /// the floor below which the job may drop a tombstone. Tables at every
+    /// level count — a re-ingested table at L0 can be older than
+    /// tombstones below it.
+    fn outside_min_seq(
+        &self,
+        c: &Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        n_inputs: usize,
+        first: KeyBound<KEY_MAX>,
+        last: KeyBound<KEY_MAX>,
+    ) -> u64 {
+        let mut floor = self.table.min_seq();
+        for lvl in 0..LEVELS {
+            for t in self.manifest.level(lvl).unwrap_or(&[]) {
+                let in_job = c.inputs[..n_inputs].iter().any(|i| i.tref.id == t.id);
+                if !in_job && ranges_overlap(first, last, t.first_key, t.last_key) {
+                    floor = floor.min(t.min_seq);
+                }
+            }
+        }
+        floor
+    }
+
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -2015,6 +2112,7 @@ impl<
             return Err(Error::NoSpace);
         }
         let bottommost = self.is_bottommost_output(tgt, job.first, job.last);
+        let outside_min_seq = self.outside_min_seq(c, job.n_inputs, job.first, job.last);
         // The output's range-tombstone section is fully determined by the
         // inputs, so its exact block budget is counted first with a
         // dry-run of the merge. A sorted cross-input merge is not a
@@ -2053,6 +2151,7 @@ impl<
         c.from_free = from_free;
         c.target_level = tgt;
         c.bottommost = bottommost;
+        c.outside_min_seq = outside_min_seq;
         // The version-retention set: snapshots live at select time pin this
         // compaction's keep-set. Watermarks are stored descending so the
         // merge can walk its thresholds (live view, then each snapshot) in

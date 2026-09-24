@@ -119,6 +119,12 @@ impl<const CAP: usize> FreeList<CAP> {
         self.len
     }
 
+    /// The free block ids, ascending.
+    #[must_use]
+    pub fn ids(&self) -> &[u64] {
+        &self.ids[..self.len]
+    }
+
     /// True when no block ids are held.
     #[must_use]
     pub const fn is_empty(&self) -> bool {

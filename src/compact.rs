@@ -97,6 +97,14 @@ pub struct Compaction<
     /// `seq >=` every version being merged, so it can never observe the
     /// difference.
     pub(crate) oldest_snapshot: u64,
+    /// Lowest sequence any table *outside* this job — at any level,
+    /// shallower ones included — or the memtable could hold for a key in
+    /// the job's range (`u64::MAX` when nothing outside overlaps).
+    /// Captured at `compact_select`. A tombstone at or above it may be
+    /// hiding an older version outside the job (an ingested table
+    /// re-attached at L0, say), so it is never dropped: dropping it would
+    /// resurrect that version.
+    pub(crate) outside_min_seq: u64,
     /// TTL purge cutoff for this job: an emitted value with
     /// `expire_at != 0 && expire_at <= purge_before` is converted to a
     /// point tombstone at the same sequence — never silently dropped
@@ -251,6 +259,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
             oldest_snapshot: u64::MAX,
+            outside_min_seq: u64::MAX,
             purge_before: 0,
             rdel_blocks: 0,
             rdel_first: KeyBound::EMPTY,
@@ -377,13 +386,18 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                 // tombstone predates every live snapshot — then each
                 // snapshot's visible version is the tombstone itself, the
                 // keep-set is just it, and deletion is observationally
-                // identical to absence. A value the TTL purge will convert
+                // identical to absence — and nothing outside the job can
+                // hold an older version it hides (`outside_min_seq`). A value the TTL purge will convert
                 // to a tombstone counts as one here, so the drop matches a
                 // caller-issued delete exactly.
                 let c = &self.cursors[head];
                 let effective_tombstone =
                     c.tombstone || (c.expire_at != 0 && c.expire_at <= self.purge_before);
-                if self.bottommost && effective_tombstone && c.seq < self.oldest_snapshot {
+                if self.bottommost
+                    && effective_tombstone
+                    && c.seq < self.oldest_snapshot
+                    && c.seq < self.outside_min_seq
+                {
                     self.key_state = KeyState::Dropping;
                 }
             }
