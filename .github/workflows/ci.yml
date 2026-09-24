@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Installs the toolchain and components pinned in rust-toolchain.toml.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
+
+  test:
+    name: test (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: debug
+            flags: ""
+          - profile: release
+            flags: --release
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.profile }}
+      - name: cargo test ${{ matrix.flags }}
+        run: cargo test ${{ matrix.flags }}
+      - name: quickstart example
+        if: matrix.profile == 'debug'
+        run: cargo run --example quickstart
+      - name: no ignored review-finding tests
+        if: matrix.profile == 'debug'
+        run: |
+          if [ -f tests/review_findings.rs ]; then
+            if grep -n '#\[ignore' tests/review_findings.rs; then
+              echo "unfixed review findings remain"
+              exit 1
+            fi
+          fi
+
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: -Zmiri-strict-provenance
+      # Keep bare cargo/rustc (e.g. rust-cache's key probe) on nightly
+      # instead of the 1.97.0 pin in rust-toolchain.toml.
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly miri setup
+      # A fast subset. The full suite under miri takes too long for every push.
+      - run: >-
+          cargo +nightly miri test
+          --test crc
+          --test wal
+          --test memtable
+          --test manifest
+          --test write_batch
+          --test compress
+
+  bench-build:
+    name: bench-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --benches
