@@ -34,6 +34,10 @@ jobs:
           rustflags: ""
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
+      - name: rustdoc (warnings are errors)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   test:
     name: test (${{ matrix.profile }})
@@ -64,7 +68,8 @@ jobs:
         if: matrix.profile == 'debug'
         run: |
           if [ -f tests/review_findings.rs ]; then
-            if grep -n '#\[ignore' tests/review_findings.rs; then
+            # Attribute lines only: the module docs mention the attribute.
+            if grep -nE '^[[:space:]]*#\[ignore' tests/review_findings.rs; then
               echo "unfixed review findings remain"
               exit 1
             fi
