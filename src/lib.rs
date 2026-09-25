@@ -53,6 +53,8 @@ pub mod manifest;
 pub mod memtable;
 pub mod model;
 pub mod profile;
+#[cfg(feature = "multiwriter")]
+pub mod ring;
 pub mod scan;
 pub mod sstable;
 pub mod wal;
