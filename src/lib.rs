@@ -74,4 +74,4 @@ pub use sstable::{
     Lookup as SstLookup, SSTABLE_MAGIC, SstEntry, TablePlan, TableReader, bloom_k,
     bloom_maybe_contains, plan_table, write_table,
 };
-pub use wal::{Op, RecoverState, WalWriter};
+pub use wal::{BatchRecord, BatchReport, Op, RecoverState, WalWriter};

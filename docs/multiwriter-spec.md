@@ -268,6 +268,53 @@ interacts badly with cooperative draining (spike 3 sim: 7× flushes).
 it is also the single biggest benchmark win available. The sweep drains
 up to `max_writes`, appends the batch, flushes once.
 
+### Batch API (`WalWriter::append_batch`)
+
+The batch is **prefix-atomic** — forced, not chosen: once a full staging
+block lands on the device it cannot be unwritten, so a failed batch can
+only ever resolve to a durable prefix. The single-record `append` /
+`commit` path is unchanged; the batch is a convenience over it with
+batch-granularity error semantics.
+
+- `append_batch(&[BatchRecord]) -> BatchReport`: stages each record in
+  order (writing full blocks as the staging fills, exactly like the
+  single-record path), then commits — one device flush for the whole
+  batch. An empty batch is a no-op (no flush).
+- `BatchRecord { seq, op, key, val, expire_at }`: `expire_at` is used
+  only for `Op::PutTtl` (0 = never, stored as `Op::Put`, matching
+  `append_ttl`).
+- `BatchReport { durable, consumed, error }`:
+  - `durable`: `records[..durable]` are flush-acknowledged. The drainer
+    advances the durable watermark over exactly these tickets (O1).
+  - `consumed`: `records[..consumed]` have their seqnums consumed —
+    either durable or possibly-replayed (blocks landed, flush failed:
+    the "device lied" case, same rule as the single-put
+    `rollback_commit`). Never reuse them. `records[consumed..]` never
+    touched the device and may be retried with fresh seqnums. Always
+    `consumed >= durable`.
+  - `error`: `None` iff the whole batch is durable; otherwise the error
+    that determined the outcome — a commit failure subsumes an earlier
+    append failure, because the commit is the durability step.
+- Failure matrix (all covered by `tests/wal_batch.rs`):
+
+  | append      | commit | blocks landed | report                                            |
+  |-------------|--------|---------------|---------------------------------------------------|
+  | ok          | ok     | —             | durable=len, consumed=len, no error               |
+  | fail at k   | ok     | —             | durable=k, consumed=k, append error               |
+  | fail at k   | fail   | no            | durable=0, consumed=0 (stage truncated; seqnums reusable), commit error |
+  | fail at k   | fail   | yes           | durable=0, consumed=k (may replay), commit error  |
+  | ok          | fail   | no            | durable=0, consumed=0, commit error               |
+  | ok          | fail   | yes           | durable=0, consumed=len (may replay), commit error|
+
+- Crash semantics: unchanged from the single-record path. A torn batch
+  tail truncates at record boundaries via CRC; the acknowledgment
+  granularity is the batch, but the WAL itself stays prefix-consistent
+  (existing rule, §7).
+
+The single-writer `put` path is untouched: per-put durability is its
+contract, and group commit would weaken it. The benchmark win lands in
+the drainer sweep (and already exists for `WriteBatch`).
+
 ## 12. Fairness
 
 None in-crate — stated, not hidden. Under immediate retry, a writer can
