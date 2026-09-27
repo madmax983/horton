@@ -80,6 +80,15 @@ misread.
 - The RAM gate measures every public future (`tests/profile.rs`).
 - CI (fmt, clippy pedantic + nursery, rustdoc, debug and release tests,
   miri subset, bench build), a pinned toolchain, license texts, ADRs.
+- A way in for newcomers: `db_types!` needs only `block`, `key_max`
+  and `val_max`; the tuning parameters are optional and take the
+  defaults in `horton::defaults`. `Config::whole_device(n)` lays the
+  manifest, WAL and tables out over blocks `0..n`,
+  `Db::MIN_DEVICE_BLOCKS` is the smallest `n` a shape fits, and
+  `Db::config` shows the layout in use. The README's "Sizing" section
+  explains every parameter and region in plain terms, and the quick start
+  prints its RAM use and layout.
+- CI builds, lints and tests the `multiwriter` and `loom` features.
 
 ### Changed
 
@@ -94,6 +103,11 @@ misread.
   overlapping regions with `BadConfig`.
 - **Breaking:** two `get` futures polled concurrently on one `Db`: the
   second returns `Error::Busy` instead of using fallback buffers.
+- **Breaking:** a shape whose `memtable_arena` is smaller than
+  `key_max + val_max` no longer compiles: a maximal write could never
+  fit, not even right after a flush.
+- **Breaking:** `Config` has a new public field, `device_blocks` (0 for
+  a hand-placed layout); code that builds a `Config` literal must set it.
 - **Breaking:** `horton::alloc` is renamed `horton::slots` (it shadowed
   the `alloc` crate). `model` and the low-level table builders
   (`plan_table`, `write_table`, …) are `#[doc(hidden)]`.
@@ -106,7 +120,7 @@ misread.
 - Scans' range-tombstone check skips tables whose `max_seq` cannot beat
   the winning version and stops at the first hit.
 - The ESP32-S3 budget is 112 KiB and now covers structs plus peak
-  futures (112,200 bytes measured).
+  futures (112,256 bytes measured).
 - `db.rs` is split into `db/{mod,read,flush,archive,compaction,invariants}.rs`;
   point reads and the archive resurrection review share one read rule,
   the single-op writes share one path, every data-block read goes

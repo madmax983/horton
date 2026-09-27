@@ -36,15 +36,30 @@ mod read;
 
 pub use archive::{ArchivePlan, SealedTable};
 
-/// Placement of the database regions on the device.
+/// Where the database lives on the device, in block ids.
 ///
-/// Three disjoint regions: the WAL, the table region, and the manifest's
-/// copies. Each manifest copy spans `Manifest::max_blocks` blocks (a
-/// compile-time function of the `Db` shape — one block for small shapes):
-/// by default two copies, starting at `manifest_a` and `manifest_b`; with
-/// [`with_manifest_ring`](Config::with_manifest_ring), `n` copies back to
-/// back from `manifest_a`. [`Db::open`] refuses overlapping regions with
-/// [`Error::BadConfig`].
+/// horton splits its part of the device into three regions that must not
+/// overlap:
+///
+/// - **Manifest:** the root record of what is stored where, kept in two
+///   copies (or a ring of copies) so a crash mid-update always leaves one
+///   whole. Each copy spans
+///   [`Manifest::max_blocks`](crate::Manifest::max_blocks) blocks, one for
+///   small shapes.
+/// - **WAL** (write-ahead log): every write lands here before the call
+///   returns, so it survives a crash. [`Db::flush`] moves the writes into
+///   a table and lets the WAL start over. Each write (or [`WriteBatch`])
+///   uses one block until the next flush; when the WAL runs out, writes
+///   fail with [`Error::WalFull`].
+/// - **Tables:** the sorted, read-only files that flushes and compaction
+///   write. The region is split into `levels × tables_per_level` equal
+///   slots, one table each, and a slot must hold a full memtable's table.
+///
+/// Most programs use [`Config::whole_device`], which places all three for
+/// a device of a given size. [`Config::new`] places them by hand, for
+/// example to leave room on the device for other data. [`Db::open`]
+/// refuses overlapping or too-small regions with [`Error::BadConfig`], and
+/// [`Db::config`] shows the layout in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
     /// First block id of the WAL region.
@@ -61,10 +76,52 @@ pub struct Config {
     pub manifest_b: u64,
     /// Manifest copies in a ring from `manifest_a`; 0 for the default pair.
     pub manifest_ring: u32,
+    /// Device size in blocks for a [`whole_device`](Config::whole_device)
+    /// layout; 0 when the regions are placed by hand.
+    pub device_blocks: u64,
 }
 
 impl Config {
-    /// Describes the WAL region, the `SSTable` region, and the manifest slots.
+    /// Uses blocks `0..device_blocks` for the database and lets it choose
+    /// the layout.
+    ///
+    /// [`Db::new`] resolves the layout from the database's shape: the
+    /// manifest copies come first, then the WAL (about an eighth of the
+    /// remaining blocks, at least two), then the table region, which runs
+    /// to the end of the device in whole slots. Blocks left over from
+    /// rounding the slots go to the WAL. [`Db::config`] shows the result.
+    ///
+    /// The layout depends only on `device_blocks` and the manifest's size
+    /// (`block`, `key_max`, `levels`, `tables_per_level`, and the number
+    /// of copies from [`with_manifest_ring`](Config::with_manifest_ring)),
+    /// so reopening with the same values always finds the data where it
+    /// was. Changing the memtable size does not move anything.
+    ///
+    /// `device_blocks` is the device's size divided by its block size: for
+    /// a 1 MiB flash partition of 4096-byte sectors, 256. It must be at
+    /// least [`Db::MIN_DEVICE_BLOCKS`] for the shape, or [`Db::open`]
+    /// returns [`Error::BadConfig`].
+    #[must_use]
+    pub const fn whole_device(device_blocks: u64) -> Self {
+        Self {
+            wal_start: 0,
+            wal_end: 0,
+            tbl_start: 0,
+            tbl_end: 0,
+            manifest_a: 0,
+            manifest_b: 0,
+            manifest_ring: 0,
+            device_blocks,
+        }
+    }
+
+    /// Places the regions by hand: the WAL at `wal_start..wal_end`, the
+    /// tables at `tbl_start..tbl_end`, and the two manifest copies at
+    /// `manifest_a` and `manifest_b` (each
+    /// [`Manifest::max_blocks`](crate::Manifest::max_blocks) blocks long).
+    /// Ranges include the start and exclude the end. Prefer
+    /// [`whole_device`](Config::whole_device) unless the database shares
+    /// the device with other data.
     #[must_use]
     pub const fn new(
         wal_start: u64,
@@ -82,6 +139,7 @@ impl Config {
             manifest_a,
             manifest_b,
             manifest_ring: 0,
+            device_blocks: 0,
         }
     }
 
@@ -145,7 +203,7 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 /// | `KEY_MAX` | longest key | `1..=65535` |
 /// | `VAL_MAX` | longest value | `..=65535` |
 /// | `CAP` | memtable entry slots | |
-/// | `ARENA` | memtable key/value bytes | |
+/// | `ARENA` | memtable key/value bytes | at least `KEY_MAX + VAL_MAX` |
 /// | `LEVELS` | LSM levels. `1` disables compaction: level 0 fills, then flush reports [`Error::RegionFull`] | `LEVELS * TABLES` within `1..=64` |
 /// | `TABLES` | tables per level (L0's limit; deeper levels share the pool) | below [`COMPACTION_KMAX`] |
 /// | `BLOOM_BYTES` | bloom filter bytes per table | `1..=BLOCK-4` |
@@ -153,6 +211,33 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 ///
 /// The region layout in [`Config`] is checked by [`open`](Db::open)
 /// ([`Error::BadConfig`]).
+///
+/// A shape that breaks a compile-time rule does not build. For example,
+/// an arena smaller than one largest entry could never accept a maximal
+/// write:
+///
+/// ```compile_fail
+/// # struct Dev;
+/// # impl horton::BlockDevice for Dev {
+/// #     type Error = ();
+/// #     const BLOCK: usize = 4096;
+/// #     fn poll_read_block(&self, _: &mut core::task::Context<'_>, _: u64, _: &mut [u8])
+/// #         -> core::task::Poll<Result<(), ()>> { core::task::Poll::Ready(Ok(())) }
+/// #     fn poll_write_block(&mut self, _: &mut core::task::Context<'_>, _: u64, _: &[u8])
+/// #         -> core::task::Poll<Result<(), ()>> { core::task::Poll::Ready(Ok(())) }
+/// #     fn poll_flush(&mut self, _: &mut core::task::Context<'_>)
+/// #         -> core::task::Poll<Result<(), ()>> { core::task::Poll::Ready(Ok(())) }
+/// # }
+/// horton::db_types! {
+///     block: 4096,
+///     key_max: 64,
+///     val_max: 1024,
+///     memtable_entries: 4,
+///     memtable_arena: 512; // smaller than 64 + 1024
+///     type Db = TooSmallArena;
+/// }
+/// let _db = TooSmallArena::new(Dev, horton::Config::whole_device(512));
+/// ```
 pub struct Db<
     D: BlockDevice,
     const BLOCK: usize,
@@ -271,6 +356,11 @@ impl<
         "KEY_MAX must be within 1..=0xFFFF"
     );
     const ASSERT_VAL: () = assert!(VAL_MAX <= 0xFFFF, "VAL_MAX must fit in u16");
+    const ASSERT_ARENA: () = assert!(
+        ARENA >= KEY_MAX + VAL_MAX,
+        "ARENA must hold one largest entry (KEY_MAX + VAL_MAX bytes), or a maximal \
+         write fails with ArenaFull even into an empty memtable"
+    );
     const ASSERT_REC: () = assert!(
         BLOCK >= 23 + KEY_MAX + VAL_MAX,
         "BLOCK must fit the largest WAL record"
@@ -308,7 +398,62 @@ impl<
     /// write path could wedge on a flush that never fits.
     const MIN_SLOT_BLOCKS: u64 = sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX);
 
-    /// Creates a closed database handle over `device`.
+    /// The smallest device, in blocks, that [`Config::whole_device`]
+    /// accepts for this shape with the default manifest pair. A manifest
+    /// ring of `n` copies needs `n - 2` more
+    /// [`Manifest::max_blocks`](crate::Manifest::max_blocks) blocks.
+    ///
+    /// Most of it is table space: `levels × tables_per_level` slots, each
+    /// large enough for a full memtable's table. A smaller memtable
+    /// (`memtable_arena`), larger blocks or fewer tables lower it.
+    pub const MIN_DEVICE_BLOCKS: u64 = {
+        let need = Self::SLOTS as u64 * Self::MIN_SLOT_BLOCKS;
+        let mut space = need;
+        while space.saturating_sub(Self::wal_share(space)) < need {
+            space += 1;
+        }
+        2 * Manifest::<LEVELS, TABLES, KEY_MAX>::max_blocks::<BLOCK>() + space
+    };
+
+    /// WAL blocks a [`Config::whole_device`] layout sets aside out of the
+    /// `space` left after the manifest: an eighth, and at least two.
+    const fn wal_share(space: u64) -> u64 {
+        if space / 8 > 2 { space / 8 } else { 2 }
+    }
+
+    /// Resolves a [`Config::whole_device`] layout for this shape; a
+    /// hand-placed [`Config`] is returned unchanged. A device too small
+    /// for the shape resolves to regions that [`Db::open`] refuses.
+    const fn resolve_layout(c: Config) -> Config {
+        if c.device_blocks == 0 {
+            return c;
+        }
+        let total = c.device_blocks;
+        let stride = Manifest::<LEVELS, TABLES, KEY_MAX>::max_blocks::<BLOCK>();
+        let copies = if c.manifest_ring == 0 {
+            2
+        } else {
+            c.manifest_ring as u64
+        };
+        let manifest_end = stride.saturating_mul(copies);
+        let space = total.saturating_sub(manifest_end);
+        let slot = space.saturating_sub(Self::wal_share(space)) / Self::SLOTS as u64;
+        let tbl_start = total - slot * Self::SLOTS as u64;
+        Config {
+            wal_start: manifest_end,
+            wal_end: tbl_start,
+            tbl_start,
+            tbl_end: total,
+            manifest_a: 0,
+            manifest_b: if c.manifest_ring == 0 { stride } else { 0 },
+            manifest_ring: c.manifest_ring,
+            device_blocks: total,
+        }
+    }
+
+    /// Creates a closed database handle over `device`. A
+    /// [`Config::whole_device`] layout is resolved here; see
+    /// [`config`](Db::config).
     #[must_use]
     pub const fn new(device: D, config: Config) -> Self {
         // Associated consts are lazy: referencing them here forces the
@@ -316,12 +461,14 @@ impl<
         let () = Self::ASSERT_BLOCK;
         let () = Self::ASSERT_KEY;
         let () = Self::ASSERT_VAL;
+        let () = Self::ASSERT_ARENA;
         let () = Self::ASSERT_REC;
         let () = Self::ASSERT_BLOOM;
         let () = Self::ASSERT_SLOTS;
         let () = Self::ASSERT_JOB;
         let () = Self::ASSERT_RDEL;
         let () = Self::ASSERT_MANIFEST;
+        let config = Self::resolve_layout(config);
         Self {
             wal: WalWriter::new(device, config.wal_start, config.wal_end),
             table: MemTable::new(),
@@ -546,6 +693,13 @@ impl<
     /// it through the same [`CachePort`] view the point-read path uses.
     pub(crate) fn cache_port(&self) -> &dyn CachePort<BLOCK> {
         &self.cache
+    }
+
+    /// The layout in use: the [`Config`] given to [`new`](Db::new), with a
+    /// [`Config::whole_device`] layout resolved to block ranges.
+    #[must_use]
+    pub const fn config(&self) -> Config {
+        self.cfg
     }
 
     /// Table-region occupancy: how many table slots are used, reserved by

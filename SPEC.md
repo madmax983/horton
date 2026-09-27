@@ -93,8 +93,10 @@ array. Every mutation takes a fresh slot (the memtable keeps each key's
 whole version chain, newest first, because snapshots can observe older
 versions). Range tombstones take a slot too (`start` as the key, `end` as
 the value, flagged). A full memtable rejects the write with `TableFull`
-(slots) or `ArenaFull` (bytes); the caller flushes. O(n) insert by
-`copy_within`, O(log n) lookup.
+(slots) or `ArenaFull` (bytes); the caller flushes. `Db` requires
+`ARENA ≥ KEY_MAX + VAL_MAX` at compile time, so a flushed (empty)
+memtable always accepts a maximal entry. O(n) insert by `copy_within`,
+O(log n) lookup.
 
 ### 4.2 WAL — append-only framed log
 
@@ -281,15 +283,20 @@ at L0 (ADR-0005); the sequence counter resumes above it.
 
 ```rust
 horton::db_types! {                      // named parameters (F11)
-    block: 4096, key_max: 32, val_max: 64, memtable_entries: 16,
-    memtable_arena: 2048, levels: 4, tables_per_level: 4, bloom_bytes: 64,
-    cache_blocks: 2;
+    block: 4096, key_max: 32, val_max: 64, // required
+    memtable_entries: 16, memtable_arena: 2048, levels: 4, // optional, in
+    tables_per_level: 4, bloom_bytes: 64, cache_blocks: 2; // this order
     type Db = MyDb; type Scan = MyScan; type RevScan = MyRevScan;
     type Compaction = MyCompaction;
 }
+// Omitted: memtable_entries 64, memtable_arena max(128 × entries,
+// key_max + val_max), levels 4, tables_per_level 4, bloom_bytes 256,
+// cache_blocks 0 (`horton::defaults`).
 
 impl Db<…> {
+    pub const MIN_DEVICE_BLOCKS: u64;     // smallest `Config::whole_device`
     pub const fn new(device: D, config: Config) -> Self;
+    pub const fn config(&self) -> Config; // the resolved layout
     pub async fn open(&mut self) -> Result<OpenReport, Error<D::Error>>;
     pub async fn put(&mut self, key: &[u8], val: &[u8]) -> Result<u64, Error<D::Error>>;
     pub async fn put_with_ttl(&mut self, key: &[u8], val: &[u8], expire_at: u64) -> Result<u64, …>;
@@ -344,8 +351,17 @@ so a compact-then-retry loop always makes progress.
 
 ## 7. Region layout (`Config`)
 
+`Config::whole_device(n)` gives the database blocks `0..n`; `Db::new`
+resolves it for the shape: the manifest copies at block 0, then the WAL,
+then the table region from `n - SLOTS × slot` to `n`, where the WAL takes
+`w = max((n - m) / 8, 2)` of the `n - m` blocks after the manifest's `m`
+and `slot = (n - m - w) / SLOTS` (the rounding remainder joins the WAL).
+The layout depends only on `n`, the manifest's size (including its copy
+count) and `SLOTS`, never on the memtable. `Db::MIN_DEVICE_BLOCKS` is the smallest `n` whose slots hold
+a full memtable's table; below it `open()` returns `BadConfig`.
+
 `Config::new(wal_start, wal_end, tbl_start, tbl_end, manifest_a,
-manifest_b)` places three disjoint regions in block ids;
+manifest_b)` places three disjoint regions in block ids by hand;
 `with_manifest_ring(n)` replaces the pair by `n` copies back to back from
 `manifest_a`. Each manifest copy spans `Manifest::max_blocks` blocks.
 `open()` checks, before any I/O, that no region is empty, that the WAL,
