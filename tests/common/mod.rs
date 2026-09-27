@@ -206,6 +206,12 @@ impl<D, const BLOCK: usize> TornDevice<D, BLOCK> {
     pub fn into_inner(self) -> D {
         self.inner
     }
+
+    /// Writes attempted so far, landed or not.
+    #[allow(dead_code)] // Not every test binary counts writes.
+    pub const fn writes(&self) -> usize {
+        self.writes
+    }
 }
 
 impl<D: BlockDevice, const BLOCK: usize> BlockDevice for TornDevice<D, BLOCK> {

@@ -144,6 +144,20 @@ impl<F: Flash, const BLOCK: usize, const N: usize> FlashBlockDevice<F, BLOCK, N>
         }
     }
 
+    /// The flash chip, for reads outside the database's sectors (other
+    /// partitions, wear counters kept by the board).
+    #[must_use]
+    pub const fn flash(&self) -> &F {
+        &self.flash
+    }
+
+    /// Gives the flash chip back, for example to build a new device over
+    /// the same sectors after [`Db::into_device`](crate::Db::into_device).
+    #[must_use]
+    pub fn into_flash(self) -> F {
+        self.flash
+    }
+
     /// Byte address of block `id`, or the addressing error.
     fn addr_of(&self, id: u64) -> Result<u32, FlashError<F::Error>> {
         if id >= N as u64 {

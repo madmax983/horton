@@ -182,3 +182,24 @@ fn db_runs_on_flash() {
     let n = block_on(db.get(b"flash", &mut buf)).unwrap().unwrap();
     assert_eq!(&buf[..n], b"nor");
 }
+
+/// The device hands its flash back: a board can reach the chip (wear
+/// counters, other partitions) through `flash()`, and reclaim it whole
+/// with `into_flash()`, seeing every block the device wrote.
+#[test]
+fn flash_accessors_expose_the_chip() {
+    let mut d = dev();
+    write(&mut d, 3, &[0x5A; SECTOR]).unwrap();
+    let mut probe = [0u8; 4];
+    let addr = u32::try_from(3 * SECTOR).unwrap();
+    d.flash().read(addr, &mut probe).unwrap();
+    assert_eq!(probe, [0x5A; 4]);
+    let flash = d.into_flash();
+    assert!(!flash.erased[3], "block 3 was programmed");
+    assert_eq!(flash.mem[3 * SECTOR], 0x5A);
+    // A new device over the same chip reads the same bytes.
+    let d = Dev::new(flash, 0);
+    let mut r = [0u8; SECTOR];
+    read(&d, 3, &mut r).unwrap();
+    assert_eq!(r, [0x5A; SECTOR]);
+}

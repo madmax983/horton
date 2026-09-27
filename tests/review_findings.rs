@@ -1028,3 +1028,103 @@ fn f16_range_delete_keeps_what_a_snapshot_sees() {
     }
     assert_eq!(db.check_invariants(), Ok(()));
 }
+
+/// Commits `a` alone, then a four-op batch whose WAL block write is torn
+/// after `torn_len` bytes (power dies there: nothing later lands).
+/// Returns the device as the cut left it.
+fn torn_batch(torn_len: usize) -> MemDevice<4096> {
+    use common::TornDevice;
+    use horton::WriteBatch;
+
+    // Count the writes before the batch block on an identical run.
+    let mut probe: TestDb<TornDevice<MemDevice<4096>, 4096>> = TestDb::new(
+        TornDevice::new(MemDevice::new(), usize::MAX, 0),
+        test_config(),
+    );
+    block_on(probe.open()).unwrap();
+    block_on(probe.put(b"a", b"alone")).unwrap();
+    let batch_write = probe.device().writes();
+
+    let mut db: TestDb<TornDevice<MemDevice<4096>, 4096>> = TestDb::new(
+        TornDevice::new(MemDevice::new(), batch_write, torn_len),
+        test_config(),
+    );
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"a", b"alone")).unwrap();
+    let mut batch = WriteBatch::<256, 1024, 4>::new();
+    for i in 0..4u8 {
+        batch.put(&[b'b', i], b"batched").unwrap();
+    }
+    // The torn write "succeeds" as far as the database can tell.
+    let _ = block_on(db.write(&batch));
+    db.into_device().into_inner()
+}
+
+/// How many of the batch's four keys a reopen sees.
+fn batch_keys_visible(db: &TestDb<MemDevice<4096>>) -> usize {
+    let mut val = [0u8; 16];
+    (0..4u8)
+        .filter(|&i| block_on(db.get(&[b'b', i], &mut val)).unwrap().is_some())
+        .count()
+}
+
+/// F18 — found by the flight recorder demo's power-cut test. A
+/// `WriteBatch` is several CRC-framed WAL records committed in one block
+/// write. On NOR flash (or any device) a torn block write keeps a prefix,
+/// so the batch's first records passed their CRCs and recovery replayed
+/// part of the batch: a four-sensor frame came back with one sensor.
+/// Every tear point must now recover all of the batch or none of it.
+#[test]
+fn f18_a_torn_batch_recovers_all_or_nothing() {
+    let mut whole = None;
+    for torn_len in 1..=4096 {
+        let mut db = TestDb::new(torn_batch(torn_len), test_config());
+        block_on(db.open()).unwrap();
+        let mut val = [0u8; 16];
+        assert_eq!(
+            block_on(db.get(b"a", &mut val)).unwrap(),
+            Some(5),
+            "tear at {torn_len}: `a` lost"
+        );
+        let seen = batch_keys_visible(&db);
+        assert!(
+            seen == 0 || seen == 4,
+            "tear at {torn_len}: {seen} of 4 batch keys recovered"
+        );
+        if seen == 4 {
+            whole.get_or_insert(torn_len);
+        } else {
+            assert!(
+                whole.is_none(),
+                "tear at {torn_len}: a longer write lost the batch again"
+            );
+        }
+    }
+    assert!(whole.is_some(), "a complete batch block must recover");
+}
+
+/// F19 — found with F18. When a torn block held valid records before the
+/// tear, the writer resumed at the next block, but the next recovery
+/// still stopped at the torn block, so acknowledged writes made after the
+/// first reopen were lost at the second. Every tear point of a batch block
+/// must keep the writes that follow the reopen.
+#[test]
+fn f19_writes_after_a_torn_block_survive_the_next_reopen() {
+    for torn_len in (1..=200).chain([300, 1000, 4095]) {
+        let mut db = TestDb::new(torn_batch(torn_len), test_config());
+        block_on(db.open()).unwrap();
+        for i in 0..3u8 {
+            block_on(db.put(&[b'c', i], b"after")).unwrap();
+        }
+        let mut db = TestDb::new(db.into_device(), test_config());
+        block_on(db.open()).unwrap();
+        let mut val = [0u8; 16];
+        for i in 0..3u8 {
+            assert_eq!(
+                block_on(db.get(&[b'c', i], &mut val)).unwrap(),
+                Some(5),
+                "tear at {torn_len}: acknowledged put c{i} lost across the second reopen"
+            );
+        }
+    }
+}

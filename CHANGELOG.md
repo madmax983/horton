@@ -51,6 +51,14 @@ misread.
   nothing it hides is left. Merges also clip each input's range
   tombstones to its live lower bound, so a narrowed table's dead
   tombstones are never re-emitted.
+- **F18** A torn WAL block could replay part of a `WriteBatch`: the
+  batch's first records passed their CRCs. Batch records are now grouped
+  (the op byte's `MORE` bit) and recovery replays a group only when its
+  closing record is intact (found by the flight recorder's power-cut test).
+- **F19** When a torn WAL block still held valid records, writes made
+  after the reopen could be lost at the next reopen: recovery stopped at
+  the torn block. A torn batch block is now overwritten, and recovery reads
+  past a torn block when the next block holds newer records.
 - **F17** WAL writes after a reopen could be silently lost (found by the
   lifecycle fuzzer).
 - A newer range tombstone could be dropped in favour of an older,
