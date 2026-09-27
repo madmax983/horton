@@ -46,6 +46,8 @@ pub mod compress;
 pub mod crc;
 pub mod db;
 pub mod device;
+#[cfg(feature = "multiwriter")]
+pub mod drainer;
 pub mod error;
 pub mod esp32s3;
 pub mod flash;

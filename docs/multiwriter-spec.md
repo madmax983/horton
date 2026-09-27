@@ -191,25 +191,46 @@ unchanged.
 
 ## 7. Completion, durability, proof obligations
 
+> **Implemented** (2026-09-26): `src/drainer.rs` — the `Drainer` owns the
+> `WalWriter`, drains the ring in ticket order, batches through
+> `append_batch` (one flush per sweep), and advances `durable` only over
+> the acknowledged prefix. `tests/drainer.rs` (6 tests) covers the
+> batch+flush+durable flow, WAL content recovery, idle/fence behavior,
+> batch-error poisoning, and `next_seq` reseeding.
+
 - Completion signal: a single `durable: AtomicU32` watermark = the
   contiguous WAL-durable ticket prefix (mod 2³¹; unwrapped by the drainer
   to u64). A writer's put completes when `durable` has advanced past its
-  ticket.
+  ticket (`drainer::is_ticket_durable`).
 - **O1 — acked ⇒ durable.** The watermark advances only via
-  `compare_exchange` **after `poll_flush` returns `Ready(Ok)`** for the
-  WAL unit containing the ticket. A put MUST NOT complete before its
-  entry's WAL unit is flush-acknowledged. Loom-assertable; the spike-5
-  crash composition depends on it.
-- **O2 — drainer is sole device writer.** Holds by ownership: the `Db`
-  (and through it the `Device`) is moved to and exclusively owned by the
-  drainer. No `&Db` is ever shared.
+  `compare_exchange` **after the WAL batch's flush is acknowledged**
+  (`append_batch` returns; the drainer advances over exactly
+  `report.durable`). A put MUST NOT complete before its entry's WAL unit
+  is flush-acknowledged. On batch error the drainer advances `durable`
+  over exactly the durable prefix, burns `consumed` seqnums, and poisons
+  itself (returns the error; the host fails outstanding writers).
+- **O2 — drainer is sole device writer.** Holds by ownership: the
+  `WalWriter` (and through it the `Device`) is moved to and exclusively
+  owned by the drainer. No `&WalWriter` is ever shared. (The full `Db`
+  move is a later slice; the WAL-owning drainer is the device-writer
+  boundary.)
 - **O3 — counter reseed.** On `open()`, the ticket counter reseeds from
   the recovered `next_seq`: `head = (next_seq & TICKET_MASK) as u32`, and
-  the drainer's u64 seqnum base is `next_seq`. Gap sequence numbers (never
-  claimed, or claimed-but-fenced) left no trace and are safe to skip;
-  recovery MUST NOT treat gaps as corruption and MUST NOT ack anything.
+  the drainer's u64 seqnum base is `next_seq` (which is `max_seq + 1`;
+  seqnum 0 is the recovery floor and is never used). Gap sequence numbers
+  (never claimed, or claimed-but-fenced) left no trace and are safe to
+  skip; recovery MUST NOT treat gaps as corruption and MUST NOT ack
+  anything. Fenced/skipped tickets consume no seqnums and advance
+  `durable` immediately (they are dead; their writers were notified via
+  `PublishOutcome::Fenced`).
+- The 32-byte ring payload uses the interim codec
+  (`drainer::payload`: `[op:1][klen:1][vlen:1][key][val]`, 29-byte
+  key+value budget) — a stand-in for the serialized mutation (§14).
 - With WAL batching (§11), the durability granularity is the batch; torn
   tails still truncate at record boundaries via CRC (existing rule).
+- The drainer's stall budget is poll-count based (Horton owns no clock);
+  `fence_cursor` refuses unclaimed head tickets so idle sweeps cannot
+  poison the ring.
 
 ## 8. Backpressure
 

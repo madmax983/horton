@@ -191,7 +191,8 @@ fn fence_kills_stalled_ticket() {
     );
 
     // The fence wins the race: ticket t1 is dead, cursor advances.
-    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced);
+    // `Fenced` carries the dead ticket for the drainer's watermark.
+    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced(t1));
     // t2 was already published — it drains next, in order.
     match r.poll_drain() {
         DrainPoll::Drained(t, p) => {
@@ -252,8 +253,10 @@ fn force_release_stalled_writer() {
         "FREE(t) is releasable"
     );
     // The drainer skips the dead ticket: the slot was released for t+N.
+    // `Skipped` carries the dead ticket so the drainer can advance the
+    // `durable` watermark past it.
     assert!(
-        matches!(r.poll_drain(), DrainPoll::Skipped),
+        matches!(r.poll_drain(), DrainPoll::Skipped(dead) if dead == t),
         "force-released ticket must be skipped, not stalled on"
     );
     // The slot is reusable when the head reaches t+N: claim the live
@@ -305,7 +308,7 @@ fn force_release_fenced_slot() {
 
     let r = Ring::<4>::new();
     let t = claim(&r);
-    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced);
+    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced(t));
     assert_eq!(
         r.force_release_slot(t),
         ForceReleaseOutcome::Released,

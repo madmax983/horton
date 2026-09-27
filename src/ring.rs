@@ -101,8 +101,9 @@ pub enum DrainPoll {
     /// already moved past `c` (host `force_release_slot`, possibly followed
     /// by reuse). The cursor advanced past it; nothing was drained and
     /// nothing needs releasing. The slot's release is the writer's (self)
-    /// or the host's business, never the drainer's.
-    Skipped,
+    /// or the host's business, never the drainer's. Carries the dead ticket
+    /// so the drainer can advance the `durable` watermark past it.
+    Skipped(u32),
 }
 
 /// Outcome of [`Ring::fence_cursor`] (SPEC §6).
@@ -110,8 +111,11 @@ pub enum DrainPoll {
 pub enum FenceOutcome {
     /// The fence CAS won: the ticket is dead and the cursor advanced past
     /// it. The slot stays `FENCED(c)` until the fenced writer self-releases
-    /// or the host force-releases it.
-    Fenced,
+    /// or the host force-releases it. Carries the fenced ticket so the
+    /// drainer can advance the `durable` watermark past it (the fenced
+    /// ticket never produces a `DrainPoll::Skipped` — the cursor already
+    /// moved).
+    Fenced(u32),
     /// The fence CAS lost: the gate was not `FREE(c)` — the writer published
     /// first, or the host force-released the slot. The cursor did NOT
     /// advance; re-poll to observe the actual state.
@@ -395,7 +399,7 @@ impl<const N: usize> Ring<N> {
             // Advance past it; the slot's release belongs to the writer or
             // the host, never the drainer.
             self.cursor.store(next_ticket(c), Ordering::Relaxed);
-            DrainPoll::Skipped
+            DrainPoll::Skipped(c)
         } else {
             DrainPoll::AwaitingPublish
         }
@@ -444,6 +448,14 @@ impl<const N: usize> Ring<N> {
     /// `FREE(c)` — the writer published first or the host force-released —
     /// and the cursor does NOT advance; re-poll to observe the state.
     ///
+    /// The fence targets a **claimed** ticket. If the cursor has caught up
+    /// to the head (`head == cursor`), the cursor ticket was never claimed
+    /// — there is no stalled writer to kill — and this returns
+    /// [`FenceOutcome::NotFenced`] without touching the gate. Fencing an
+    /// unclaimed head ticket would poison the ring: the next `try_claim`
+    /// would see `FENCED(head)` instead of `FREE(head)` and fail on an
+    /// empty ring.
+    ///
     /// The CAS is the arbiter between publish and fence: exactly one wins,
     /// so the fence *policy* (when to call this) may be heuristic without
     /// soundness risk. A timeout MUST NEVER trigger the *release* — only
@@ -451,6 +463,12 @@ impl<const N: usize> Ring<N> {
     #[must_use]
     pub fn fence_cursor(&self) -> FenceOutcome {
         let c = self.cursor.load(Ordering::Relaxed);
+        let h = self.head.load(Ordering::Relaxed);
+        if h == c {
+            // Cursor caught up to the head: every claimed ticket was
+            // processed, and `c` itself was never claimed. Nothing to fence.
+            return FenceOutcome::NotFenced;
+        }
         let slot = &self.slots[(c as usize) % N];
         if slot
             .gate
@@ -458,7 +476,7 @@ impl<const N: usize> Ring<N> {
             .is_ok()
         {
             self.cursor.store(next_ticket(c), Ordering::Relaxed);
-            FenceOutcome::Fenced
+            FenceOutcome::Fenced(c)
         } else {
             FenceOutcome::NotFenced
         }
@@ -504,7 +522,7 @@ impl<const N: usize> Ring<N> {
         loop {
             match self.poll_drain() {
                 DrainPoll::Drained(t, p) => return (t, p),
-                DrainPoll::AwaitingPublish | DrainPoll::Skipped => shim::spin_wait(),
+                DrainPoll::AwaitingPublish | DrainPoll::Skipped(_) => shim::spin_wait(),
             }
         }
     }
