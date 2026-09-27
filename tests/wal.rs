@@ -207,3 +207,60 @@ fn oversize_record_rejected() {
     // record_len = 23 + 1 + 512 = 536 > 512: rejected, never split.
     assert!(block_on(w.append(1, Op::Put, b"k", &big)).is_err());
 }
+
+/// F17 (rollback half): `truncate_stage` discards staged bytes that stay in
+/// the buffer. The dirty mark must cover them, or the next, shorter record
+/// is written with the discarded record's tail after it — a torn tail that
+/// ends recovery early and loses every later block.
+#[test]
+fn truncated_stage_bytes_never_reach_the_device() {
+    let mut w = writer();
+    // Stage a long record, then roll it back (a failed commit).
+    block_on(w.append(1, Op::Put, b"long-key", &[0xAB; 32])).unwrap();
+    w.truncate_stage(0);
+    // A shorter record takes its place, then a second block follows.
+    block_on(w.append(1, Op::Put, b"k", b"v")).unwrap();
+    block_on(w.commit()).unwrap();
+    block_on(w.append(2, Op::Put, b"k2", b"v2")).unwrap();
+    block_on(w.commit()).unwrap();
+
+    let mut r = WalWriter::<MemDevice<512>, 512>::new(w.into_device(), 0, 16);
+    let mut t = T16::new();
+    let state = block_on(r.recover(&mut t)).unwrap();
+    assert_eq!(state.records, 2, "recovery stopped at a garbage tail");
+    assert!(t.get(b"k2").is_some());
+}
+
+/// F17 (recovery half): after recovery the staging buffer holds whatever
+/// block was read last. When recovery ends at `wal_end` (a full region),
+/// that block is not zero, and the first block written afterwards — here
+/// after a wrap back to the region start — must still be zero past its
+/// records.
+#[test]
+fn first_block_after_recovery_is_clean() {
+    // A two-block region, filled: block 0 = seq 1, block 1 = seq 2 (long).
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(MemDevice::<512>::new(), 0, 2);
+    block_on(w.append(1, Op::Put, b"a", b"1")).unwrap();
+    block_on(w.commit()).unwrap();
+    block_on(w.append(2, Op::Put, b"filler", &[0xCD; 32])).unwrap();
+    block_on(w.commit()).unwrap();
+    // Reopen: a fresh writer (nothing staged yet, so nothing marked dirty)
+    // recovers both blocks and stops at wal_end, leaving block 1's bytes in
+    // its staging buffer.
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(w.into_device(), 0, 2);
+    let mut t = T16::new();
+    let state = block_on(w.recover(&mut t)).unwrap();
+    assert_eq!(state.records, 2);
+    // Wrap (everything is flushed) and append two short records.
+    w.reset_to(0);
+    block_on(w.append(3, Op::Put, b"c", b"d")).unwrap();
+    block_on(w.commit()).unwrap();
+    block_on(w.append(4, Op::Put, b"e", b"f")).unwrap();
+    block_on(w.commit()).unwrap();
+    // Recover with the flush floor at 2: both new records must replay.
+    let mut r = WalWriter::<MemDevice<512>, 512>::new(w.into_device(), 0, 2);
+    let mut t2 = T16::new();
+    let state = block_on(r.recover_from(&mut t2, 0, 2)).unwrap();
+    assert_eq!(state.records, 2, "a garbage tail ended recovery early");
+    assert!(t2.get(b"e").is_some());
+}

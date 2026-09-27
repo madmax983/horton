@@ -183,7 +183,7 @@ fn batch_partial_on_value_too_large() {
 /// impossible, so nothing is acked — yet the landed seqnums are consumed
 /// (they may replay on a later flush) and never reusable.
 #[test]
-fn batch_nospace_consumes_seqnums() {
+fn batch_wal_full_consumes_seqnums() {
     let dev: Counting<MemDevice<512>, 512> = Counting::new(MemDevice::<512>::new());
     // Two-block region: room for two full stage writes, then exhaustion.
     let mut w: W512<_> = WalWriter::new(dev, 0, 2);
@@ -198,8 +198,8 @@ fn batch_nospace_consumes_seqnums() {
     assert_eq!(rep.durable, 0, "the flush never happened: nothing acked");
     assert_eq!(rep.consumed, 3, "three records reached the device");
     match rep.error {
-        Some(Error::NoSpace) => {}
-        other => panic!("expected NoSpace, got {other:?}"),
+        Some(Error::WalFull) => {}
+        other => panic!("expected WalFull, got {other:?}"),
     }
     // The failed batch left no staged garbage behind for the next writer:
     // a fresh batch on a fresh region starts clean.

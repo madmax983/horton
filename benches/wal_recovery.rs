@@ -130,7 +130,7 @@ fn make_val(buf: &mut [u8; 256], rng: &mut Lcg, len: usize) -> usize {
     len
 }
 
-type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8192, 8>;
+type BenchDb = Db<MemDevice<4096>, 4096, 64, 256, 512, 65536, 7, 4, 1024, 8>;
 
 const WAL_START: u64 = 8;
 const WAL_END: u64 = 8 + 4000;
@@ -138,7 +138,7 @@ const TBL_START: u64 = WAL_END;
 const TBL_END: u64 = TBL_START + 8000;
 
 const fn config() -> Config {
-    Config::new(WAL_START, WAL_END, TBL_START, TBL_END, 0, 1)
+    Config::new(WAL_START, WAL_END, TBL_START, TBL_END, 0, 2)
 }
 
 const PUT_BATCH: usize = 400;

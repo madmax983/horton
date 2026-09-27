@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use common::{Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::{BlockDevice, Error, Scan};
 
-type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 fn open<D: BlockDevice>(db: &mut TestDb<D>)
 where
@@ -30,14 +30,13 @@ where
 
 /// Flushes, driving compaction first when level 0 is full. The random
 /// workload can fill L0 between explicit drives; the database reports that
-/// as `NoSpace` (the documented flush contract — the caller must compact),
-/// so the test compacts and retries rather than treating it as a failure.
-/// A second `NoSpace` still panics: the table region is genuinely
-/// exhausted.
+/// as `NeedsCompaction` (the documented flush contract — the caller must
+/// compact), so the test compacts and retries rather than treating it as a
+/// failure. A second refusal still panics.
 fn flush(db: &mut TestDb<MemDevice<4096>>) {
     match block_on(db.flush()) {
         Ok(()) => {}
-        Err(horton::Error::NoSpace) => {
+        Err(horton::Error::NeedsCompaction) => {
             drive(db);
             block_on(db.flush()).unwrap();
         }
@@ -260,7 +259,7 @@ fn snapshot_blocks_tombstone_drop() {
 }
 
 #[test]
-fn snapshot_registry_exhaustion_is_no_space() {
+fn snapshot_registry_exhaustion_is_snapshot_limit() {
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
     open(&mut db);
     let mut snaps = Vec::new();
@@ -268,7 +267,7 @@ fn snapshot_registry_exhaustion_is_no_space() {
         snaps.push(db.snapshot().unwrap());
     }
     let err = db.snapshot().unwrap_err();
-    assert!(matches!(err, Error::NoSpace));
+    assert!(matches!(err, Error::SnapshotLimit));
     db.release_snapshot(snaps[0]);
     // A slot freed up: snapshotting works again.
     let s = db.snapshot().unwrap();

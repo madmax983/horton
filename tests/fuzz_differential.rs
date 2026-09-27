@@ -27,7 +27,7 @@
 //!   by flipping `tombstone = true` on purged versions. Purge cutoffs are
 //!   always `<= now`, and `now` never moves backward, so every later read
 //!   is contract-abiding (`now >= purge_before`).
-//! * Rejected mutations (validation errors, `NoSpace`/`TableFull`/
+//! * Rejected mutations (validation errors, `WalFull`/`TableFull`/
 //!   `ArenaFull`) consume no sequence number and leave no trace, so the
 //!   oracle only records `Ok` outcomes — with the db's returned sequence
 //!   asserted equal to the oracle's own counter on every success.
@@ -168,12 +168,12 @@ impl Oracle {
     }
 }
 
-/// Flushes, compacting first when the device reports `NoSpace` — the
-/// documented caller-manages-space contract.
+/// Flushes, compacting first when the database reports `NeedsCompaction`
+/// — the documented caller-manages-space contract.
 fn flush(db: &mut TestDb<TestDev>) {
     match block_on(db.flush()) {
         Ok(()) => {}
-        Err(Error::NoSpace) => {
+        Err(Error::NeedsCompaction) => {
             drive_compaction(db, 0);
             block_on(db.flush()).unwrap();
         }
@@ -189,7 +189,7 @@ fn drive_compaction(db: &mut TestDb<TestDev>, purge_before: u64) {
 }
 
 /// Runs one mutating db op, flushing and retrying once on
-/// `NoSpace`/`TableFull`/`ArenaFull`. A rejected op consumes no sequence
+/// `WalFull`/`TableFull`/`ArenaFull`. A rejected op consumes no sequence
 /// number and leaves no trace, so the retry takes exactly the sequence the
 /// oracle expects. Returns the assigned sequence number, or `None` when
 /// the op was a validation no-op / rejection the oracle must not record.
@@ -212,7 +212,7 @@ fn attempt(
             );
             Some(seq)
         }
-        Err(Error::NoSpace | Error::TableFull | Error::ArenaFull) => {
+        Err(Error::WalFull | Error::TableFull | Error::ArenaFull) => {
             flush(db);
             let seq = op(db).expect("op still failing after flush");
             assert_eq!(

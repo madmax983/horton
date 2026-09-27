@@ -60,7 +60,7 @@ fn wal_wraps_across_many_flush_cycles() {
     }
 
     // The WAL is exactly full after the reopen scan, so the first flush
-    // (empty memtable) wraps it; writes then resume without `NoSpace`.
+    // (empty memtable) wraps it; writes then resume without `WalFull`.
     block_on(db.flush()).expect("wrap flush");
     for n in 192..200u64 {
         put(&mut db, n);

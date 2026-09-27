@@ -127,7 +127,7 @@ fn l0_full_errors() {
     }
     block_on(db.put(b"x", b"v")).unwrap();
     let err = block_on(db.flush()).unwrap_err();
-    assert!(matches!(err, Error::NoSpace));
+    assert!(matches!(err, Error::NeedsCompaction));
     // The failed flush changed nothing: the key is still served from the
     // memtable and the four tables are intact.
     assert_eq!(get(&db, b"x"), Some(b"v".to_vec()));
@@ -137,19 +137,46 @@ fn l0_full_errors() {
 }
 
 #[test]
-fn table_region_exhaustion() {
-    // Table region [136, 140): exactly one 4-block table fits.
-    let cfg = Config::new(8, 136, 136, 140, 0, 1);
+fn table_region_too_small_for_the_slot_layout() {
+    // 7 x 4 = 28 table slots over a 4-block region: no slot could hold a
+    // full memtable's table, so open() refuses the layout up front.
+    let cfg = Config::new(8, 136, 136, 140, 0, 4);
     let mut db = TestDb::new(MemDevice::<4096>::new(), cfg);
-    open(&mut db);
-    block_on(db.put(b"a", b"1")).unwrap();
+    assert!(matches!(block_on(db.open()), Err(Error::BadConfig)));
+    assert!(!db.is_open());
+}
+
+#[test]
+fn table_region_exhaustion() {
+    // 2 levels x 2 tables = 4 slots of 8 blocks, 2 of them the compaction
+    // reserve: two tables fit.
+    type TinyDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 2, 2, 1024, 8>;
+    let cfg = Config::new(8, 136, 136, 136 + 4 * 8, 0, 1);
+    let mut db = TinyDb::new(MemDevice::<4096>::new(), cfg);
+    block_on(db.open()).unwrap();
+    let mut c = horton::Compaction::<4096, 256, 1024, 1024>::new();
+    for k in *b"ab" {
+        block_on(db.put(&[k], b"v")).unwrap();
+        block_on(db.flush()).unwrap();
+    }
+    // L0 is full: the flush of c must wait for compaction.
+    block_on(db.put(b"c", b"v")).unwrap();
+    assert!(matches!(block_on(db.flush()), Err(Error::NeedsCompaction)));
+    while block_on(db.compact_step(&mut c)).unwrap() == horton::Progress::More {}
+    assert_eq!(db.level_tables(1).unwrap().len(), 1);
     block_on(db.flush()).unwrap();
-    block_on(db.put(b"b", b"2")).unwrap();
+    assert_eq!(db.slot_stats().free, 2, "only the compaction reserve left");
+    block_on(db.put(b"d", b"v")).unwrap();
     let err = block_on(db.flush()).unwrap_err();
-    assert!(matches!(err, Error::NoSpace));
-    // State is intact: b from the memtable, a from the table.
-    assert_eq!(get(&db, b"a"), Some(b"1".to_vec()));
-    assert_eq!(get(&db, b"b"), Some(b"2".to_vec()));
+    assert!(matches!(err, Error::RegionFull));
+    // One L0 table is nothing to merge: the region is genuinely full.
+    assert!(!db.compaction_pending());
+    // State is intact: d from the memtable, the rest from tables.
+    assert_eq!(db.check_invariants(), Ok(()));
+    let mut buf = [0u8; 8];
+    for k in *b"abcd" {
+        assert_eq!(block_on(db.get(&[k], &mut buf)), Ok(Some(1)), "key {k}");
+    }
 }
 
 use std::task::{Context, Poll};

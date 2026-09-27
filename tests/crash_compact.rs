@@ -152,7 +152,7 @@ fn post_compaction_state_is_coherent() {
     let dev = run_crashed(count_compaction_writes());
     let mut dev2 = dev;
     let mut scratch = [0u8; BLOCK];
-    let m2 = block_on(TestManifest::recover(&mut dev2, &mut scratch, 0, 1))
+    let m2 = block_on(TestManifest::recover(&mut dev2, &mut scratch, 0, 4))
         .unwrap()
         .0;
     let l1 = m2.level(1).unwrap();
@@ -204,8 +204,12 @@ fn run_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 }
 
 /// Exhaustive: every crash point of one L0→L1 compaction job carrying
-/// range tombstones (exercises the rdel two-pass count/write: the output
-/// reserves and streams rdel blocks before the data merge).
+/// range tombstones.
+///
+/// The output is bottommost and every reader sees the tombstone, so the
+/// merge gives its space back (F16): k1's hidden version is dropped, and
+/// then the tombstone itself — nothing it hides is left anywhere. The
+/// output is the 4-block data-only table, then the manifest commit.
 ///
 /// The manifest commit is the job's last device write, so a crash either
 /// lands it (post-compaction) or drops it (pre-compaction, orphans swept
@@ -215,8 +219,7 @@ fn run_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 #[test]
 fn crash_during_rdel_compaction_is_atomic() {
     let w = count_rdel_compaction_writes();
-    // Sanity: the rdel section adds blocks vs the 5-write data-only job.
-    assert!(w > 5, "rdel output should write more blocks, got {w}");
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
 
     let mut want = BTreeMap::new();
     want.insert(vec![b'k', b'0'], vec![b'v', b'0']);
@@ -231,15 +234,21 @@ fn crash_during_rdel_compaction_is_atomic() {
         assert_eq!(rep.recovered_records, 0, "crash_at={crash_at}");
         if crash_at == w {
             assert_eq!(rep.l0_tables, 0, "crash_at={crash_at}");
+            let l1 = db.level_tables(1).unwrap();
+            assert_eq!(l1.len(), 1, "crash_at={crash_at}");
+            assert_eq!(l1[0].rdel_blocks, 0, "the tombstone was collected");
+            assert_eq!(l1[0].entry_count, 3, "k1's hidden version was dropped");
         } else {
             assert_eq!(rep.l0_tables, 4, "crash_at={crash_at}");
         }
     }
 }
 
-/// Builds a database with two identical range tombstones over k0..=k3
-/// (seq 3 and seq 4) shadowing an older put: the bottommost merge must
-/// emit only the newer tombstone and drop the older shadowed one.
+/// Builds a database with two identical range tombstones over `[k0, k3)`
+/// plus three wider ones, all covering an older put of k0. Five tombstones
+/// cover k0 at once — more than the merge tracks — so the merge keeps the
+/// job's range tombstones, and the bottommost shadow gate must emit only
+/// the newer of the identical pair.
 fn build_with_shadowed_rdel() -> MemDevice<BLOCK> {
     let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
     block_on(db.open()).unwrap();
@@ -248,8 +257,11 @@ fn build_with_shadowed_rdel() -> MemDevice<BLOCK> {
     block_on(db.put(b"k0", b"new")).unwrap();
     block_on(db.flush()).unwrap();
     block_on(db.delete_range(b"k0", b"k3")).unwrap();
-    block_on(db.flush()).unwrap();
     block_on(db.delete_range(b"k0", b"k3")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.delete_range(b"k0", b"k4")).unwrap();
+    block_on(db.delete_range(b"k0", b"k5")).unwrap();
+    block_on(db.delete_range(b"k0", b"k6")).unwrap();
     block_on(db.flush()).unwrap();
     assert!(db.compaction_pending());
     db.into_device()
@@ -283,19 +295,19 @@ fn run_shadowed_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 /// shadowed duplicate range tombstone.
 ///
 /// L1..L6 are empty, so the L0→L1 output is bottommost
-/// ([`Db::is_bottommost_output`]): the newer `[k0,k3]` tombstone (seq 4)
-/// is emitted and the older identical one (seq 3) is dropped by the
-/// shadow gate — while both covered puts stay hidden under the surviving
-/// tombstone. A crash either lands the commit (post: L0 drained, one L1
-/// table carrying exactly the newer tombstone) or drops it (pre: L0
-/// intact). The logical map is empty in every case: k0 was deleted, and
-/// k1..k3 were never written.
+/// ([`Db::is_bottommost_output`]). Both puts of k0 are hidden from every
+/// reader, so they are dropped. Five tombstones cover k0 — more than the
+/// merge tracks at once — so the job's tombstones are kept, and the
+/// shadow gate drops the older of the identical `[k0,k3)` pair. A crash
+/// either lands the commit (post: L0 drained, one range-only L1 table
+/// with four tombstones) or drops it (pre: L0 intact). The logical map is
+/// empty in every case.
 #[test]
 fn crash_during_bottommost_rdel_shadow_drop_is_atomic() {
     let w = count_shadowed_rdel_writes();
-    // Sanity: the surviving tombstone's table is 5 blocks (rdel + data +
-    // index + bloom + footer), then the manifest commit.
-    assert_eq!(w, 6, "write count changed; oracle below needs updating");
+    // Sanity: the range-only table is 4 blocks (rdel + bloom + index +
+    // footer), then the manifest commit.
+    assert_eq!(w, 5, "write count changed; oracle below needs updating");
 
     let want: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
@@ -307,11 +319,10 @@ fn crash_during_bottommost_rdel_shadow_drop_is_atomic() {
         assert_eq!(rep.recovered_records, 0, "crash_at={crash_at}");
         if crash_at == w {
             assert_eq!(rep.l0_tables, 0, "crash_at={crash_at}");
-            assert_eq!(
-                db.level_tables(1).map(<[horton::TableRef<256>]>::len),
-                Some(1),
-                "crash_at={crash_at}"
-            );
+            let l1 = db.level_tables(1).unwrap();
+            assert_eq!(l1.len(), 1, "crash_at={crash_at}");
+            assert_eq!(l1[0].entry_count, 0, "both puts of k0 were dropped");
+            assert_eq!(l1[0].rdel_blocks, 1, "the tombstones were kept");
         } else {
             assert_eq!(rep.l0_tables, 4, "crash_at={crash_at}");
         }
@@ -392,5 +403,136 @@ fn crash_during_bottommost_point_tombstone_drop_is_atomic() {
         drive_one(&mut db);
         assert!(!db.compaction_pending(), "crash_at={crash_at}");
         assert_eq!(live_map(&db), want, "crash_at={crash_at}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-output jobs. Under 8-block slots (`tight_config`) an output holds a
+// few 1000-byte values, so one L0 job writes a string of outputs and commits
+// after each, retiring the inputs it has passed and narrowing the one it is
+// inside. Every one of those commits is a crash boundary: whatever write the
+// crash lands on, the reopened tree must be consistent (invariants hold),
+// read exactly the pre-job logical map, and finish the job cleanly.
+// ---------------------------------------------------------------------------
+
+/// Key `i` of the multi-output workload.
+fn mkey(i: u32) -> Vec<u8> {
+    format!("m{i:03}").into_bytes()
+}
+
+/// Builds a tree whose next job is a many-output L0 -> L1 merge: L1 holds
+/// several split tables of 1000-byte values, L0 four tables that overwrite
+/// and delete across all of them — a point delete and a range delete
+/// spanning several L1 tables among them.
+fn build_multi() -> MemDevice<BLOCK> {
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), common::tight_config());
+    block_on(db.open()).unwrap();
+    let mut c = TestCompaction::new();
+    let val = |i: u32, round: u32| vec![u8::try_from((i + round) % 251).unwrap(); 1000];
+    for round in 0..3u32 {
+        for flush in 0..4u32 {
+            for j in 0..3u32 {
+                let i = (flush * 3 + j) * 3 + round;
+                block_on(db.put(&mkey(i), &val(i, round))).unwrap();
+            }
+            block_on(db.flush()).unwrap();
+        }
+        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    }
+    assert!(db.level_tables(1).unwrap().len() >= 3, "setup: L1 split");
+    // The range delete below spans several L1 tables. (It stays narrow:
+    // the merge gives the deleted values' space back, and the job must
+    // still write several outputs.)
+    let spanned = db
+        .level_tables(1)
+        .unwrap()
+        .iter()
+        .filter(|t| {
+            t.first_key.as_slice() < mkey(20).as_slice()
+                && t.last_key.as_slice() >= mkey(14).as_slice()
+        })
+        .count();
+    assert!(spanned >= 2, "setup: the range spans {spanned} L1 tables");
+    for flush in 0..4u32 {
+        let i = flush * 9;
+        block_on(db.put(&mkey(i), &val(i, 7))).unwrap();
+        block_on(db.put(&mkey(i + 4), &val(i + 4, 7))).unwrap();
+        if flush == 1 {
+            block_on(db.delete(&mkey(3))).unwrap();
+            block_on(db.delete_range(&mkey(14), &mkey(20))).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    assert!(db.compaction_pending(), "setup: L0 full");
+    db.into_device()
+}
+
+/// The live logical map of the multi-output workload's key space.
+fn multi_map<D: BlockDevice>(db: &TestDb<D>) -> BTreeMap<Vec<u8>, Vec<u8>>
+where
+    D::Error: std::fmt::Debug,
+{
+    let mut out = BTreeMap::new();
+    let mut buf = [0u8; 1024];
+    for i in 0..40u32 {
+        if let Some(n) = block_on(db.get(&mkey(i), &mut buf)).unwrap() {
+            out.insert(mkey(i), buf[..n].to_vec());
+        }
+    }
+    out
+}
+
+/// Drains every pending job.
+fn drain_all<D: BlockDevice>(db: &mut TestDb<D>)
+where
+    D::Error: std::fmt::Debug,
+{
+    let mut c = TestCompaction::new();
+    while db.compaction_pending() {
+        while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    }
+}
+
+#[test]
+fn crash_during_multi_output_compaction_leaves_a_consistent_tree() {
+    let (want, job_writes, outputs) = {
+        let mut db = TestDb::new(
+            CountDevice {
+                inner: build_multi(),
+                writes: 0,
+            },
+            common::tight_config(),
+        );
+        block_on(db.open()).unwrap();
+        let want = multi_map(&db);
+        let before = db.into_device();
+        let mut db = TestDb::new(before, common::tight_config());
+        block_on(db.open()).unwrap();
+        let start = db.device().writes;
+        drain_all(&mut db);
+        assert_eq!(multi_map(&db), want, "clean run");
+        let outputs = db.level_tables(1).unwrap().len();
+        (want, db.into_device().writes - start, outputs)
+    };
+    assert!(outputs >= 3, "the job wrote {outputs} outputs");
+    assert!(job_writes > 20, "the job wrote only {job_writes} blocks");
+    for crash_at in 0..job_writes {
+        let mut db = TestDb::new(
+            CrashDevice::<_, BLOCK>::new(build_multi(), crash_at),
+            common::tight_config(),
+        );
+        block_on(db.open()).unwrap();
+        drain_all(&mut db);
+        let dev = db.into_device().into_inner();
+        // Reopen on the bare device: some prefix of the job's commits is
+        // durable, the rest never happened.
+        let mut db = TestDb::new(dev, common::tight_config());
+        block_on(db.open()).unwrap();
+        assert_eq!(db.check_invariants(), Ok(()), "crash_at={crash_at}");
+        assert_eq!(multi_map(&db), want, "crash_at={crash_at}: after the crash");
+        drain_all(&mut db);
+        assert_eq!(db.check_invariants(), Ok(()), "crash_at={crash_at}");
+        assert_eq!(multi_map(&db), want, "crash_at={crash_at}: after finishing");
+        assert_eq!(db.slot_stats().reserved, 0);
     }
 }

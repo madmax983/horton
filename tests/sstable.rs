@@ -36,7 +36,6 @@ fn write(items: &[SstEntry<'_>], dev: &mut MemDevice<BLOCK>) -> (u64, u64) {
             k,
             items.iter().copied(),
             None,
-            0,
         ),
     )
     .unwrap();
@@ -56,7 +55,6 @@ fn get(
         dev,
         &mut scratch,
         footer,
-        BASE,
     ))?;
     let n = block_on(reader.get(&mut scratch, &mut decomp, key, &mut buf))?;
     Ok(n.map(|n| buf[..n].to_vec()))
@@ -198,24 +196,25 @@ fn corrupt_footer_rejected() {
         &dev,
         &mut scratch,
         footer,
-        BASE,
     ));
     assert!(matches!(res, Err(Error::CorruptBlock { id }) if id == footer));
 }
 
 #[test]
-fn corrupt_data_block_reads_as_absent() {
+fn corrupt_data_block_is_an_error() {
     let mut dev = MemDevice::<BLOCK>::new();
     let items = [entry(b"k", b"v", 1), entry(b"k2", b"v2", 2)];
     let (n, data_blocks) = write(&items, &mut dev);
     assert_eq!(data_blocks, 1);
     let footer = BASE + n - 1;
-    // Corrupt the only data block: the key is reported absent, not an error.
+    // Corrupt the only data block: a committed table's bad CRC is media
+    // corruption and must surface — reading it as absent would let an
+    // older version in a deeper table win silently.
     let mut blk = read_block(&dev, BASE);
     blk[0] ^= 0xFF;
     write_block(&mut dev, BASE, &blk);
-    assert_eq!(get(&dev, footer, b"k").unwrap(), None);
-    assert_eq!(get(&dev, footer, b"k2").unwrap(), None);
+    assert!(matches!(get(&dev, footer, b"k"), Err(Error::CorruptBlock { id }) if id == BASE));
+    assert!(matches!(get(&dev, footer, b"k2"), Err(Error::CorruptBlock { id }) if id == BASE));
 }
 
 #[test]
@@ -362,7 +361,6 @@ fn get_at(
         dev,
         &mut scratch,
         footer,
-        BASE,
     ))?;
     let n = block_on(reader.get_at(&mut scratch, &mut decomp, key, &mut buf, max_seq))?;
     Ok(n.map(|n| buf[..n].to_vec()))

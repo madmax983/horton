@@ -277,3 +277,21 @@ fn write_batch_crash_is_atomic() {
         assert_eq!(s, want_seq + 1, "crash_at={crash_at}");
     }
 }
+
+/// A batch's device-free errors flow into any device's result type
+/// through `Error::widen` (architecture review: `WriteBatch` returned a
+/// different error type from `Db`).
+#[test]
+fn batch_errors_widen_into_device_results() {
+    fn stage(batch: &mut WriteBatch<256, 1024, 1>) -> Result<(), Error<std::io::ErrorKind>> {
+        batch.put(b"a", b"1").map_err(Error::widen)?;
+        batch.put(b"b", b"2").map_err(Error::widen)?;
+        Ok(())
+    }
+    let mut batch = WriteBatch::<256, 1024, 1>::new();
+    assert_eq!(stage(&mut batch), Err(Error::BatchFull));
+    assert_eq!(
+        Error::<core::convert::Infallible>::KeyTooLarge { len: 9, max: 8 }.widen::<()>(),
+        Error::KeyTooLarge { len: 9, max: 8 }
+    );
+}

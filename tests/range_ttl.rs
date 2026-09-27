@@ -12,8 +12,8 @@ use common::{Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::model::{VersionTtl, model_visible_value};
 use horton::{Compaction, Progress, RevScan, Scan};
 
-type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
-type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 4096, 8>;
+type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
+type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 
 fn open(db: &mut TestDb<MemDevice<4096>>) {
     block_on(db.open()).unwrap();
@@ -29,7 +29,7 @@ fn drive_purge(db: &mut TestDb<MemDevice<4096>>, purge_before: u64) {
 fn flush(db: &mut TestDb<MemDevice<4096>>) {
     match block_on(db.flush()) {
         Ok(()) => {}
-        Err(horton::Error::NoSpace) => {
+        Err(horton::Error::NeedsCompaction) => {
             drive_purge(db, 0);
             block_on(db.flush()).unwrap();
         }
@@ -41,11 +41,11 @@ fn flush(db: &mut TestDb<MemDevice<4096>>) {
 /// between the sparse explicit flushes. Each mutation burns a whole WAL
 /// block (durable before return), so a flush that lands with the WAL
 /// nearly full can be followed by enough ops to exhaust it before the
-/// next flush — the database reports that as `NoSpace`, the documented
+/// next flush — the database reports that as `WalFull`, the documented
 /// caller-manages-space contract (see `flush` above). A failed mutation
 /// consumes no sequence number and leaves no WAL or memtable trace, so
 /// the retry takes exactly the sequence the model expects; a second
-/// `NoSpace` still panics.
+/// `WalFull` still panics.
 fn mutate(
     db: &mut TestDb<MemDevice<4096>>,
     mut op: impl FnMut(
@@ -54,7 +54,7 @@ fn mutate(
 ) -> u64 {
     match op(db) {
         Ok(seq) => seq,
-        Err(horton::Error::NoSpace) => {
+        Err(horton::Error::WalFull) => {
             flush(db);
             op(db).unwrap()
         }
