@@ -152,6 +152,24 @@ pub fn is_ticket_durable(durable: &AtomicU32, ticket: u32) -> bool {
     dist != 0 && dist < (1 << 30)
 }
 
+/// The drain watermark: the contiguous WAL-durable ticket prefix.
+///
+/// This is what snapshots pin (SPEC §9) — **not** the claim head. Every
+/// ticket `<` the returned value (mod 2³¹) is WAL-durable and safe for a
+/// snapshot reader to observe; tickets `≥` it may be claimed but not yet
+/// drained, or drained but not yet flushed. Pinning the claim head
+/// instead would let a later-drained ticket `≤` the pinned head become
+/// visible to the snapshot — an isolation violation.
+///
+/// The drainer publishes the watermark with Release
+/// ([`Drainer::advance_durable`]); this loads it with Acquire. The value
+/// never moves backward: tickets drain in ticket order and the drainer is
+/// the sole writer.
+#[must_use]
+pub fn drain_watermark(durable: &AtomicU32) -> u32 {
+    durable.load(Ordering::Acquire) & TICKET_MASK
+}
+
 /// Outcome of one [`Drainer::sweep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepOutcome {
@@ -197,10 +215,13 @@ impl<'r, D: BlockDevice, const BLOCK: usize, const N: usize, const MAX_WRITES: u
 {
     /// Creates a drainer over `ring` and `wal`.
     ///
-    /// `durable` must be initialized to `(next_seq & TICKET_MASK)` (the
-    /// reseeded head — SPEC O3); `next_seq` is the recovered WAL
-    /// `next_seq` (`max_seq + 1`; at least 1 for a fresh WAL, since seqnum
-    /// 0 is the recovery floor and is never used). The host owns `durable`
+    /// `durable` must be initialized to the ring's head ticket (0 for a
+    /// fresh ring, or the seeded head): it is the next ticket the drainer
+    /// expects, and tickets `<` it are already resolved. `next_seq` is
+    /// the recovered WAL `next_seq` (`max_seq + 1`; at least 1 for a fresh
+    /// WAL, since seqnum 0 is the recovery floor and is never used).
+    /// Tickets and WAL seqnums are independent counters: the drainer maps
+    /// the i-th drained ticket to `next_seq + i`. The host owns `durable`
     /// and shares it with the writers.
     #[must_use]
     pub const fn new(
@@ -235,6 +256,14 @@ impl<'r, D: BlockDevice, const BLOCK: usize, const N: usize, const MAX_WRITES: u
     #[must_use]
     pub const fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+
+    /// The current drain watermark (see [`drain_watermark`]): the
+    /// contiguous WAL-durable ticket prefix. Snapshot readers pin this
+    /// value (SPEC §9), not the claim head.
+    #[must_use]
+    pub fn durable_watermark(&self) -> u32 {
+        drain_watermark(self.durable)
     }
 
     /// Consumes the drainer and returns the owned [`WalWriter`].

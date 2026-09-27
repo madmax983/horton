@@ -1,8 +1,9 @@
-//! Drainer integration tests (SPEC §§7, 11).
+//! Drainer integration tests (SPEC §§7, 9, 11).
 //!
 //! The drainer owns the [`WalWriter`], drains the ring in ticket order,
-//! batches through one flush per sweep, and advances the `durable`
-//! watermark only over the acknowledged prefix.
+//! batches through one flush per sweep, advances the `durable` watermark
+//! only over the acknowledged prefix, and publishes the drain watermark
+//! that snapshots pin (not the claim head).
 
 #![cfg(feature = "multiwriter")]
 
@@ -12,8 +13,8 @@ use common::{MemDevice, block_on};
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use horton::BlockDevice;
-use horton::drainer::{Drainer, SweepOutcome, is_ticket_durable, payload};
-use horton::ring::Ring;
+use horton::drainer::{Drainer, SweepOutcome, drain_watermark, is_ticket_durable, payload};
+use horton::ring::{PublishOutcome, Ring};
 use horton::wal::WalWriter;
 
 /// Device wrapper that counts `poll_flush` calls.
@@ -289,4 +290,107 @@ fn payload_codec_roundtrip() {
     assert!(payload::encode_put(&[b'k'; 20], &[b'v'; 10]).is_none());
     // Max-size key+value (29 bytes) accepted.
     assert!(payload::encode_put(&[b'k'; 20], &[b'v'; 9]).is_some());
+}
+
+#[test]
+fn watermark_pins_drain_not_claim_head() {
+    // SPEC §9: snapshots pin the drain watermark, not the claim head.
+    // The claim head can run ahead of durability; a snapshot pinned at
+    // the head would claim visibility of tickets that are not WAL-durable.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let wal = WalWriter::new(MemDevice::<512>::new(), 0, 16);
+    // MAX_WRITES=2 so one sweep cannot drain everything claimed.
+    let mut drainer = Drainer::<_, 512, 8, 2>::new(&ring, wal, &durable, 1);
+
+    for i in 0..5u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = payload::encode_put(&[b'k', b'0' + i], &[b'v', b'0' + i]).expect("fits");
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+
+    let outcome = block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(outcome, SweepOutcome::Swept { tickets: 2 });
+    assert_eq!(drainer.durable_watermark(), 2);
+
+    // Claim two more (head advances to 7) but do not sweep.
+    for _ in 0..2 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = payload::encode_put(b"k9", b"v9").expect("fits");
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+
+    // The watermark still pins the drain position: tickets 2..7 are
+    // claimed but not durable. Pinning the head (7) would be wrong.
+    assert_eq!(drain_watermark(&durable), 2);
+    assert_eq!(drainer.durable_watermark(), 2);
+
+    // WAL recovery contains exactly the durable prefix: 2 records.
+    let mem = drainer.into_wal().into_device();
+    let mut w2: WalWriter<_, 512> = WalWriter::new(mem, 0, 16);
+    let mut t = horton::MemTable::<16, 512, 16, 32>::new();
+    let st = block_on(w2.recover(&mut t)).expect("recovery ok");
+    assert_eq!(st.records, 2);
+    assert_eq!(st.max_seq, 2);
+}
+
+#[test]
+fn watermark_is_monotonic_across_sweeps() {
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let wal = WalWriter::new(MemDevice::<512>::new(), 0, 16);
+    let mut drainer = Drainer::<_, 512, 8, 8>::new(&ring, wal, &durable, 1);
+
+    let mut prev = drainer.durable_watermark();
+    assert_eq!(prev, 0);
+    for batch in 0..3u8 {
+        for i in 0..3u8 {
+            let t = ring.try_claim().expect("ring has space");
+            let n = batch * 3 + i;
+            let p = payload::encode_put(&[b'k', b'0' + n], &[b'v', b'0' + n]).expect("fits");
+            assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+        }
+        block_on(drainer.sweep()).expect("sweep ok");
+        let w = drainer.durable_watermark();
+        assert!(w >= prev, "watermark must never move backward");
+        prev = w;
+    }
+    // 9 tickets drained from a 0 base.
+    assert_eq!(prev, 9);
+}
+
+#[test]
+fn fenced_tickets_advance_watermark_without_wal_records() {
+    // A fenced ticket is dead: it advances the watermark (the contiguous
+    // resolved prefix) but leaves no WAL trace. A snapshot at the
+    // watermark sees exactly the durable records.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let wal = WalWriter::new(MemDevice::<512>::new(), 0, 16);
+    let mut drainer = Drainer::<_, 512, 8, 8>::new(&ring, wal, &durable, 1);
+    drainer.set_stall_budget(0);
+
+    // t0 published; t1 claimed but never published (stalled writer).
+    let t0 = ring.try_claim().expect("space");
+    let p0 = payload::encode_put(b"k0", b"v0").expect("fits");
+    assert_eq!(ring.publish(t0, &p0), PublishOutcome::Published);
+    let _t1 = ring.try_claim().expect("space");
+
+    // First sweep drains t0; the stalled t1 is not fenced yet (progress
+    // was made). Second sweep sees only the stalled t1 and fences it.
+    let outcome = block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(outcome, SweepOutcome::Swept { tickets: 1 });
+    assert_eq!(drainer.durable_watermark(), 1);
+    let outcome = block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(outcome, SweepOutcome::Idle);
+    assert_eq!(drainer.durable_watermark(), 2);
+
+    // WAL holds only t0's record; the fenced ticket took no seqnum.
+    assert_eq!(drainer.next_seq(), 2);
+    let mem = drainer.into_wal().into_device();
+    let mut w2: WalWriter<_, 512> = WalWriter::new(mem, 0, 16);
+    let mut t = horton::MemTable::<16, 512, 16, 32>::new();
+    let st = block_on(w2.recover(&mut t)).expect("recovery ok");
+    assert_eq!(st.records, 1);
+    assert_eq!(st.max_seq, 1);
 }

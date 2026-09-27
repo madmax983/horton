@@ -214,14 +214,17 @@ unchanged.
   owned by the drainer. No `&WalWriter` is ever shared. (The full `Db`
   move is a later slice; the WAL-owning drainer is the device-writer
   boundary.)
-- **O3 — counter reseed.** On `open()`, the ticket counter reseeds from
-  the recovered `next_seq`: `head = (next_seq & TICKET_MASK) as u32`, and
-  the drainer's u64 seqnum base is `next_seq` (which is `max_seq + 1`;
-  seqnum 0 is the recovery floor and is never used). Gap sequence numbers
-  (never claimed, or claimed-but-fenced) left no trace and are safe to
-  skip; recovery MUST NOT treat gaps as corruption and MUST NOT ack
-  anything. Fenced/skipped tickets consume no seqnums and advance
-  `durable` immediately (they are dead; their writers were notified via
+- **O3 — counter reseed.** On `open()`, the drainer's u64 seqnum base is
+  the recovered WAL `next_seq` (`max_seq + 1`; seqnum 0 is the recovery
+  floor and is never used). Tickets and WAL seqnums are independent
+  counters: the drainer maps the i-th drained ticket to `next_seq + i`.
+  The `durable` ticket watermark is initialized to the ring's head ticket
+  (0 for a fresh ring); the ring itself starts unseeded unless the host
+  reseeds it via `Ring::new_seeded`. Gap sequence numbers (never claimed,
+  or claimed-but-fenced) left no trace and are safe to skip; recovery
+  MUST NOT treat gaps as corruption and MUST NOT ack anything. Fenced/
+  skipped tickets consume no seqnums and advance `durable` immediately
+  (they are dead; their writers were notified via
   `PublishOutcome::Fenced`).
 - The 32-byte ring payload uses the interim codec
   (`drainer::payload`: `[op:1][klen:1][vlen:1][key][val]`, 29-byte
@@ -256,13 +259,27 @@ unchanged.
 
 ## 9. Snapshots and reads
 
+> **Implemented** (2026-09-26): `drainer::drain_watermark` (free function)
+> and `Drainer::durable_watermark` — the Acquire side of the Release/
+> Acquire watermark publication. `tests/drainer.rs` proves the three
+> invariants: the watermark pins the drain position (not the claim head —
+> the head can run ahead of durability), it never moves backward, and
+> fenced tickets advance it without leaving WAL records.
+
 - **Snapshot watermarks MUST pin the drain watermark, not the claim
   counter** (spike 5): pinning the claim counter lets a later-drained
   ticket `≤` watermark become visible to a snapshot reader — an isolation
   violation. The drainer publishes the watermark with Release; `snapshot()`
   load-Acquires it.
+- The watermark is the contiguous *resolved* ticket prefix: every ticket
+  `<` it is WAL-durable, fenced tickets included (dead tickets resolve
+  the prefix without a WAL record). A snapshot at the watermark observes
+  exactly the WAL-durable records — verified by recovery in the tests.
 - Read-your-writes for the writing thread through the ring is OPEN (spec
   gap, spike 5): undecided whether a writer sees its own un-drained put.
+- Full `Db::snapshot` integration (snapshot reads at the pinned
+  watermark) awaits the Db-owning drainer slice; the watermark API is the
+  boundary it will use.
 
 ## 10. Topology (ownership)
 
