@@ -165,3 +165,176 @@ fn seed_is_masked_to_ticket_space() {
     // 0xFFFF_FFFF & TICKET_MASK == TICKET_MASK.
     assert_eq!(claim(&r), TICKET_MASK, "seed must be masked to 31 bits");
 }
+
+/// Fencing (SPEC §6): a claimed-but-never-published ticket wedges the
+/// in-order drainer. The drainer's `fence_cursor` CAS kills it —
+/// `FREE(t) -> FENCED(t)` — and the cursor advances past the dead ticket.
+/// The late writer's publish observes the fence and self-releases.
+#[test]
+fn fence_kills_stalled_ticket() {
+    use horton::ring::{DrainPoll, FenceOutcome};
+
+    let r = Ring::<4>::new();
+    let t0 = claim(&r);
+    publish(&r, t0);
+    let t1 = claim(&r); // stalled: never published
+    let t2 = claim(&r);
+    publish(&r, t2);
+
+    // Drain t0; then the cursor sits on the stalled t1.
+    let (t, p) = r.drain();
+    assert_eq!(t, t0);
+    assert_payload(&p, t0);
+    assert!(
+        matches!(r.poll_drain(), DrainPoll::AwaitingPublish),
+        "stalled ticket is not published"
+    );
+
+    // The fence wins the race: ticket t1 is dead, cursor advances.
+    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced);
+    // t2 was already published — it drains next, in order.
+    match r.poll_drain() {
+        DrainPoll::Drained(t, p) => {
+            assert_eq!(t, t2);
+            assert_payload(&p, t2);
+        }
+        other => panic!("expected t2 drained, got {other:?}"),
+    }
+
+    // The stalled writer wakes up: its publish loses to the fence and
+    // self-releases the slot for the next lap.
+    assert_eq!(
+        r.publish(t1, &payload_of(t1)),
+        PublishOutcome::Fenced,
+        "late publish must observe the fence"
+    );
+    // t1's slot was self-released to FREE(5); the ring stays live.
+    // (Ticket 3's slot was never touched; ticket 4 reuses t0's slot.)
+    assert_eq!(claim(&r), 3, "ring live after fence");
+    assert_eq!(claim(&r), 4, "next lap reuses drained slots");
+}
+
+/// If the writer published before the fence CAS, the fence loses and the
+/// ticket drains normally — the CAS is the arbiter (SPEC §6).
+#[test]
+fn fence_loses_to_published_ticket() {
+    use horton::ring::{DrainPoll, FenceOutcome};
+
+    let r = Ring::<4>::new();
+    let t = claim(&r);
+    publish(&r, t);
+    assert_eq!(
+        r.fence_cursor(),
+        FenceOutcome::NotFenced,
+        "fence must lose to a publish that won the gate"
+    );
+    match r.poll_drain() {
+        DrainPoll::Drained(dt, p) => {
+            assert_eq!(dt, t);
+            assert_payload(&p, t);
+        }
+        other => panic!("expected drained ticket, got {other:?}"),
+    }
+}
+
+/// Host-forced release (SPEC §6): with proven thread death the host may
+/// release a stalled writer's slot. A late publish (host lied — the thread
+/// was not dead) observes the released gate and reports `Fenced`.
+#[test]
+fn force_release_stalled_writer() {
+    use horton::ring::{DrainPoll, ForceReleaseOutcome};
+
+    let r = Ring::<4>::new();
+    let t = claim(&r);
+    assert_eq!(
+        r.force_release_slot(t),
+        ForceReleaseOutcome::Released,
+        "FREE(t) is releasable"
+    );
+    // The drainer skips the dead ticket: the slot was released for t+N.
+    assert!(
+        matches!(r.poll_drain(), DrainPoll::Skipped),
+        "force-released ticket must be skipped, not stalled on"
+    );
+    // The slot is reusable when the head reaches t+N: claim the live
+    // tickets 1..=3 first (publish/drain them to advance the ring).
+    for t in 1..4u32 {
+        assert_eq!(claim(&r), t);
+        publish(&r, t);
+        let (dt, p) = r.drain();
+        assert_eq!(dt, t);
+        assert_payload(&p, t);
+    }
+    assert_eq!(claim(&r), t + 4, "released slot reused for t+N");
+    // A publish from the supposedly-dead writer finds a foreign gate.
+    assert_eq!(
+        r.publish(t, &payload_of(t)),
+        PublishOutcome::Fenced,
+        "publish after force-release must not corrupt the new owner"
+    );
+}
+
+/// Forcing the release of a published ticket is a no-op: the writer won,
+/// the drainer will drain it (SPEC §6).
+#[test]
+fn force_release_published_is_noop() {
+    use horton::ring::{DrainPoll, ForceReleaseOutcome};
+
+    let r = Ring::<4>::new();
+    let t = claim(&r);
+    publish(&r, t);
+    assert_eq!(
+        r.force_release_slot(t),
+        ForceReleaseOutcome::AlreadyPublished,
+        "published ticket must not be released"
+    );
+    match r.poll_drain() {
+        DrainPoll::Drained(dt, p) => {
+            assert_eq!(dt, t);
+            assert_payload(&p, t);
+        }
+        other => panic!("published ticket must still drain, got {other:?}"),
+    }
+}
+
+/// A fenced-then-force-released slot is reusable (the host path after a
+/// fence when the writer never wakes to self-release).
+#[test]
+fn force_release_fenced_slot() {
+    use horton::ring::{FenceOutcome, ForceReleaseOutcome};
+
+    let r = Ring::<4>::new();
+    let t = claim(&r);
+    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced);
+    assert_eq!(
+        r.force_release_slot(t),
+        ForceReleaseOutcome::Released,
+        "FENCED(t) is releasable"
+    );
+    // The fence already advanced the cursor past t; the ring stays live
+    // and the released slot is reused when the head reaches t+N.
+    for nt in 1..4u32 {
+        assert_eq!(claim(&r), nt);
+        publish(&r, nt);
+        let (dt, _) = r.drain();
+        assert_eq!(dt, nt);
+    }
+    assert_eq!(claim(&r), t + 4, "slot freed for t+N after fence+release");
+}
+
+/// Releasing a ticket the drainer already processed is stale — nothing to do.
+#[test]
+fn force_release_stale_ticket() {
+    use horton::ring::ForceReleaseOutcome;
+
+    let r = Ring::<4>::new();
+    let t = claim(&r);
+    publish(&r, t);
+    let (dt, _) = r.drain();
+    assert_eq!(dt, t);
+    assert_eq!(
+        r.force_release_slot(t),
+        ForceReleaseOutcome::Stale,
+        "already-drained ticket is stale"
+    );
+}

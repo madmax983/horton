@@ -1,8 +1,9 @@
 //! MPMC admission ring for the `multiwriter` feature.
 //!
-//! SPEC: `docs/multiwriter-spec.md`. This module implements SPEC §§1–5:
-//! ticket/gate encoding, the live-window invariants, and the
-//! claim/publish/drain protocol. Fencing (§6), the drainer integration, and
+//! SPEC: `docs/multiwriter-spec.md`. This module implements SPEC §§1–6:
+//! ticket/gate encoding, the live-window invariants, the claim/publish/drain
+//! protocol, and generation fencing (fence CAS, host-forced release, and
+//! the poll-based drain step). The WAL-owning drainer integration and
 //! completion signaling arrive in later slices.
 //!
 //! Design recap: writers concurrently claim ring slots via a single
@@ -83,6 +84,51 @@ pub enum PublishOutcome {
     /// must not touch the slot again. Surfaces as `Error::WriterFenced` at
     /// the `Db` integration layer.
     Fenced,
+}
+
+/// Outcome of one [`Ring::poll_drain`] step (SPEC §6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DrainPoll {
+    /// A ticket was drained: `(ticket, payload)`. The slot was released for
+    /// the next lap and the cursor advanced past the ticket.
+    Drained(u32, [u8; 32]),
+    /// The cursor ticket is live but not published yet (gate is `FREE(c)`).
+    /// The drainer may wait or — after its poll-count stall budget — call
+    /// [`Ring::fence_cursor`]. Horton owns no clock; the budget is
+    /// poll-count based, never wall-clock (SPEC §6).
+    AwaitingPublish,
+    /// The cursor ticket is dead: its gate was `FENCED(c)`, or the slot
+    /// already moved past `c` (host `force_release_slot`, possibly followed
+    /// by reuse). The cursor advanced past it; nothing was drained and
+    /// nothing needs releasing. The slot's release is the writer's (self)
+    /// or the host's business, never the drainer's.
+    Skipped,
+}
+
+/// Outcome of [`Ring::fence_cursor`] (SPEC §6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FenceOutcome {
+    /// The fence CAS won: the ticket is dead and the cursor advanced past
+    /// it. The slot stays `FENCED(c)` until the fenced writer self-releases
+    /// or the host force-releases it.
+    Fenced,
+    /// The fence CAS lost: the gate was not `FREE(c)` — the writer published
+    /// first, or the host force-released the slot. The cursor did NOT
+    /// advance; re-poll to observe the actual state.
+    NotFenced,
+}
+
+/// Outcome of [`Ring::force_release_slot`] (SPEC §6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForceReleaseOutcome {
+    /// The slot was released for ticket `t + N`.
+    Released,
+    /// The gate was `PUBLISHED(t)`: the writer published before dying.
+    /// Untouched — the drainer will drain it.
+    AlreadyPublished,
+    /// The gate belongs to another ticket (already drained and reused, or
+    /// never claimed). Untouched.
+    Stale,
 }
 
 /// One ring slot: a sequence gate plus the fixed-size payload cells.
@@ -314,28 +360,152 @@ impl<const N: usize> Ring<N> {
         }
     }
 
-    /// Drain the next ticket in order: test/drain scaffolding (SPEC §14).
+    /// One poll step of the drainer at the cursor (SPEC §6).
     ///
-    /// Single consumer only. Spins until the cursor ticket's gate reads
-    /// `PUBLISHED(c)`, reads the payload, releases the slot for the ticket
-    /// `N` ahead, and advances the cursor. The poll-based drainer replaces
-    /// the spin with `Poll::Pending` on the device `Context` contract.
+    /// Single consumer only. Unlike [`Ring::drain`], this never blocks: it
+    /// reports the cursor ticket's state and returns, so the poll-based
+    /// drainer can interleave device I/O (and its stall budget) between
+    /// steps.
+    ///
+    /// - `PUBLISHED(c)`: read the payload (`Acquire` pairs with the
+    ///   producer's `Release` publish), release the slot for the ticket `N`
+    ///   ahead, advance the cursor, return [`DrainPoll::Drained`].
+    /// - `FENCED(c)`, or the slot already moved past `c` (host
+    ///   `force_release_slot`, possibly followed by reuse for `c+N`):
+    ///   the ticket is dead — advance the cursor past it, return
+    ///   [`DrainPoll::Skipped`]. Do NOT drain, do NOT release.
+    /// - Otherwise the ticket is live but unpublished: return
+    ///   [`DrainPoll::AwaitingPublish`].
+    #[must_use]
+    pub fn poll_drain(&self) -> DrainPoll {
+        let c = self.cursor.load(Ordering::Relaxed);
+        let slot = &self.slots[(c as usize) % N];
+        // Acquire: synchronizes with the producer's Release publish (drain
+        // path) and with the host's Release force-release store.
+        let g = slot.gate.load(Ordering::Acquire);
+        if g == published_gate(c) {
+            let payload = slot.read_payload();
+            // Release: pairs with the next owner's Acquire gate check —
+            // our reads happen-before their overwrite.
+            slot.gate.store(release_gate::<N>(c), Ordering::Release);
+            self.cursor.store(next_ticket(c), Ordering::Relaxed);
+            DrainPoll::Drained(c, payload)
+        } else if Self::gate_is_past(g, c) {
+            // Dead ticket (fenced, or force-released and possibly reused).
+            // Advance past it; the slot's release belongs to the writer or
+            // the host, never the drainer.
+            self.cursor.store(next_ticket(c), Ordering::Relaxed);
+            DrainPoll::Skipped
+        } else {
+            DrainPoll::AwaitingPublish
+        }
+    }
+
+    /// Whether the gate shows the slot has moved past ticket `c` — i.e.
+    /// ticket `c` is dead and the drainer must skip it (SPEC §6).
+    ///
+    /// The gate encodings that mean "past `c`":
+    /// - `FENCED(c)`: the drainer's fence killed it.
+    /// - `FREE(c+N)` (`release_gate(c)`): the host force-released it (or the
+    ///   fenced writer self-released).
+    /// - Further ahead (`PUBLISHED(c+N)`, `FREE(c+2N)`, …): the host
+    ///   force-released `c` while the drainer was behind, and the slot was
+    ///   already reused. The general rule: decode the gate's ticket (the
+    ///   `FREE`/`PUBLISHED` value ambiguity is resolved by the slot's
+    ///   residue — exactly one of `v`, `v-1` is `≡ c (mod N)`) and skip iff
+    ///   it is strictly ahead of `c` in 31-bit order. `FREE(c)` itself
+    ///   (`v == c`) is the live ticket, never a skip: `PUBLISHED(c-1)` is
+    ///   impossible here — the drainer already processed `c-1`.
+    const fn gate_is_past(g: u32, c: u32) -> bool {
+        if g & FENCED_BIT != 0 {
+            return (g & TICKET_MASK) == c;
+        }
+        let v = g & TICKET_MASK;
+        if v == c {
+            return false;
+        }
+        // `v` is `FREE(v)` or `PUBLISHED(v-1)`; the slot's residue picks one.
+        let slot_res = (c as usize) % N;
+        let ticket = if (v as usize) % N == slot_res {
+            v
+        } else {
+            v.wrapping_sub(1) & TICKET_MASK
+        };
+        // Strictly ahead in 31-bit order: a small positive distance. A
+        // behind-or-equal ticket yields a distance ≥ 2³⁰ (or zero).
+        ticket != c && (ticket.wrapping_sub(c) & TICKET_MASK) < (1 << 30)
+    }
+
+    /// Attempt the generation fence at the cursor (SPEC §6).
+    ///
+    /// Single consumer only. `compare_exchange(FREE(c) -> FENCED(c))`: on
+    /// success the ticket is dead — the cursor advances past `c` (do not
+    /// drain, do not release the slot). On failure the gate was not
+    /// `FREE(c)` — the writer published first or the host force-released —
+    /// and the cursor does NOT advance; re-poll to observe the state.
+    ///
+    /// The CAS is the arbiter between publish and fence: exactly one wins,
+    /// so the fence *policy* (when to call this) may be heuristic without
+    /// soundness risk. A timeout MUST NEVER trigger the *release* — only
+    /// the fence.
+    #[must_use]
+    pub fn fence_cursor(&self) -> FenceOutcome {
+        let c = self.cursor.load(Ordering::Relaxed);
+        let slot = &self.slots[(c as usize) % N];
+        if slot
+            .gate
+            .compare_exchange(c, c | FENCED_BIT, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.cursor.store(next_ticket(c), Ordering::Relaxed);
+            FenceOutcome::Fenced
+        } else {
+            FenceOutcome::NotFenced
+        }
+    }
+
+    /// Host-forced slot release (SPEC §6).
+    ///
+    /// The host asserts **proven thread death** (join semantics, never a
+    /// timeout) for the owner of `ticket`. If the gate reads `FREE(t)` or
+    /// `FENCED(t)`, stores `FREE(t+N)` and returns
+    /// [`ForceReleaseOutcome::Released`]. If it reads `PUBLISHED(t)`, the
+    /// writer published before dying — returns [`AlreadyPublished`] and
+    /// touches nothing; the drainer will drain it. Any other gate means the
+    /// ticket is not in a releasable state — returns [`Stale`].
+    ///
+    /// Calling this without proven death is a host bug and voids the
+    /// protocol guarantees (stated, not hidden).
+    #[must_use]
+    pub fn force_release_slot(&self, ticket: u32) -> ForceReleaseOutcome {
+        let t = ticket & TICKET_MASK;
+        let slot = &self.slots[(t as usize) % N];
+        // Acquire: observes the dead writer's Release publish, if any.
+        let g = slot.gate.load(Ordering::Acquire);
+        if g == t || g == (t | FENCED_BIT) {
+            // Release: pairs with the next lap's Acquire claim check.
+            slot.gate.store(release_gate::<N>(t), Ordering::Release);
+            ForceReleaseOutcome::Released
+        } else if g == published_gate(t) {
+            ForceReleaseOutcome::AlreadyPublished
+        } else {
+            ForceReleaseOutcome::Stale
+        }
+    }
+
+    /// Drain the next live ticket in order: test/drain scaffolding (SPEC §14).
+    ///
+    /// Single consumer only. Spins on [`Ring::poll_drain`]: dead tickets
+    /// (fenced or force-released) are skipped, live ones drained. The
+    /// poll-based drainer replaces the spin with `Poll::Pending` on the
+    /// device `Context` contract.
     #[must_use]
     pub fn drain(&self) -> (u32, [u8; 32]) {
         loop {
-            let c = self.cursor.load(Ordering::Relaxed);
-            let slot = &self.slots[(c as usize) % N];
-            // Acquire: synchronizes with the producer's Release publish, so
-            // the payload reads happen-after the producer's cell writes.
-            if slot.gate.load(Ordering::Acquire) == published_gate(c) {
-                let payload = slot.read_payload();
-                // Release: pairs with the next owner's Acquire gate check —
-                // our reads happen-before their overwrite.
-                slot.gate.store(release_gate::<N>(c), Ordering::Release);
-                self.cursor.store(next_ticket(c), Ordering::Relaxed);
-                return (c, payload);
+            match self.poll_drain() {
+                DrainPoll::Drained(t, p) => return (t, p),
+                DrainPoll::AwaitingPublish | DrainPoll::Skipped => shim::spin_wait(),
             }
-            shim::spin_wait();
         }
     }
 }

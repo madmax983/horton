@@ -137,3 +137,71 @@ fn two_producers_one_put_cap_two() {
 fn one_producer_three_puts_cap_two() {
     model::<2>(1, 3);
 }
+
+/// Fence vs publish race (SPEC §6): the claimer publishes ticket 0 while the
+/// fencer attempts the fence. The gate CAS is the arbiter — exactly one
+/// wins, and the ring stays consistent either way:
+/// - publish wins → fence reports `NotFenced`, the ticket drains intact;
+/// - fence wins → publish reports `Fenced` (and self-releases), the ticket
+///   is skipped, the ring stays live.
+///
+/// The fencer waits for the claim (a fence before any claim would kill
+/// ticket 0 before it exists — a host bug, not a race).
+#[test]
+fn fence_vs_publish_race() {
+    use horton::ring::{DrainPoll, FenceOutcome};
+    use loom::sync::atomic::{AtomicBool, Ordering as LoomOrdering};
+
+    run_model(|| {
+        let ring = Arc::new(Ring::<4>::new());
+        let claimed = Arc::new(AtomicBool::new(false));
+
+        let r1 = ring.clone();
+        let c1 = claimed.clone();
+        let writer = loom::thread::spawn(move || {
+            let t = claim_blocking(&r1);
+            assert_eq!(t, 0, "single claimer gets ticket 0");
+            c1.store(true, LoomOrdering::Release);
+            r1.publish(t, &payload_of(t))
+        });
+
+        let r2 = ring.clone();
+        let fencer = loom::thread::spawn(move || {
+            while !claimed.load(LoomOrdering::Acquire) {
+                loom::thread::yield_now();
+            }
+            r2.fence_cursor()
+        });
+
+        let pub_outcome = writer.join().expect("writer panicked");
+        let fence_outcome = fencer.join().expect("fencer panicked");
+
+        match (pub_outcome, fence_outcome) {
+            (PublishOutcome::Published, FenceOutcome::NotFenced) => {
+                // Publish won the gate: the ticket drains intact, in order.
+                match ring.poll_drain() {
+                    DrainPoll::Drained(t, p) => {
+                        assert_eq!(t, 0);
+                        assert_eq!(p, payload_of(0), "payload intact after lost fence");
+                    }
+                    other => panic!("published ticket must drain, got {other:?}"),
+                }
+            }
+            (PublishOutcome::Fenced, FenceOutcome::Fenced) => {
+                // Fence won: the ticket is dead — skipped, never drained —
+                // and the ring stays live (cursor advanced past it, head
+                // untouched, slot self-released by the losing publish).
+                assert!(
+                    matches!(ring.poll_drain(), DrainPoll::AwaitingPublish),
+                    "cursor advanced past the fenced ticket"
+                );
+                assert_eq!(
+                    ring.try_claim(),
+                    Some(1),
+                    "head still hands out ticket 1 after a fence"
+                );
+            }
+            other => panic!("CAS arbiter violated: impossible outcome pair {other:?}"),
+        }
+    });
+}
