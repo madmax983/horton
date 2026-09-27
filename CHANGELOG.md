@@ -97,6 +97,13 @@ misread.
   explains every parameter and region in plain terms, and the quick start
   prints its RAM use and layout.
 - CI builds, lints and tests the `multiwriter` and `loom` features.
+- `examples/flight_recorder`: a sensor logger on simulated NOR flash that
+  exercises the whole API, survives `kill -9` and simulated power cuts
+  (`torture N`, run in CI), and streams cold tables to a directory or to
+  S3 (`--s3`, signed by `curl --aws-sigv4`), with a `restore` ground
+  station that re-ingests the archive.
+- `FlashBlockDevice::flash` and `into_flash`: reach the chip behind the
+  device.
 
 ### Changed
 
