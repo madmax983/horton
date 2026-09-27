@@ -47,6 +47,8 @@ pub mod compress;
 pub mod crc;
 pub mod db;
 pub mod device;
+#[cfg(feature = "multiwriter")]
+pub mod drainer;
 pub mod error;
 pub mod esp32s3;
 pub mod flash;
@@ -64,6 +66,8 @@ pub mod scan;
 pub mod slots;
 pub mod sstable;
 pub mod wal;
+#[cfg(feature = "multiwriter")]
+pub mod writer;
 
 pub use batch::WriteBatch;
 pub use cache::{BlockCache, CachePort, CacheStats};
