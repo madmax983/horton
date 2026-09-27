@@ -315,14 +315,13 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
     }
 
     /// Appends `src[lo..hi]` as literals. `false` on staging overflow.
-    const fn emit_literals(&mut self, src: &[u8], lo: usize, hi: usize) -> bool {
-        let mut p = lo;
-        while p < hi {
-            if !self.emit(src[p]) {
-                return false;
-            }
-            p += 1;
+    fn emit_literals(&mut self, src: &[u8], lo: usize, hi: usize) -> bool {
+        let n = hi - lo;
+        if self.out_len + n > self.out.len() {
+            return false;
         }
+        self.out[self.out_len..self.out_len + n].copy_from_slice(&src[lo..hi]);
+        self.out_len += n;
         true
     }
 
