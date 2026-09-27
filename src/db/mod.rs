@@ -1055,7 +1055,13 @@ impl<
             // Unreachable in practice: sizes were validated when the batch
             // was built and the block fit was checked above. Roll back
             // anyway — atomicity is never best-effort here.
-            if let Err(e) = self.wal.append(seq, op.kind(), op.key(), op.val()).await {
+            // One atomic group: recovery replays all of it or none of it.
+            let more = i + 1 < n;
+            if let Err(e) = self
+                .wal
+                .append_grouped(seq, op.kind(), op.key(), op.val(), more)
+                .await
+            {
                 self.rollback_commit(mark, 0)?;
                 return Err(e);
             }

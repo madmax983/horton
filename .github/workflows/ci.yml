@@ -64,6 +64,9 @@ jobs:
       - name: quickstart example
         if: matrix.profile == 'debug'
         run: cargo run --example quickstart
+      - name: flight recorder power-cut test
+        if: matrix.profile == 'release'
+        run: cargo run --release --example flight_recorder -- torture 300
       - name: no ignored review-finding tests
         if: matrix.profile == 'debug'
         run: |

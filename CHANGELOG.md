@@ -51,6 +51,14 @@ misread.
   nothing it hides is left. Merges also clip each input's range
   tombstones to its live lower bound, so a narrowed table's dead
   tombstones are never re-emitted.
+- **F18** A torn WAL block could replay part of a `WriteBatch`: the
+  batch's first records passed their CRCs. Batch records are now grouped
+  (the op byte's `MORE` bit) and recovery replays a group only when its
+  closing record is intact (found by the flight recorder's power-cut test).
+- **F19** When a torn WAL block still held valid records, writes made
+  after the reopen could be lost at the next reopen: recovery stopped at
+  the torn block. A torn batch block is now overwritten, and recovery reads
+  past a torn block when the next block holds newer records.
 - **F17** WAL writes after a reopen could be silently lost (found by the
   lifecycle fuzzer).
 - A newer range tombstone could be dropped in favour of an older,
@@ -89,6 +97,13 @@ misread.
   explains every parameter and region in plain terms, and the quick start
   prints its RAM use and layout.
 - CI builds, lints and tests the `multiwriter` and `loom` features.
+- `examples/flight_recorder`: a sensor logger on simulated NOR flash that
+  exercises the whole API, survives `kill -9` and simulated power cuts
+  (`torture N`, run in CI), and streams cold tables to a directory or to
+  S3 (`--s3`, signed by `curl --aws-sigv4`), with a `restore` ground
+  station that re-ingests the archive.
+- `FlashBlockDevice::flash` and `into_flash`: reach the chip behind the
+  device.
 
 ### Changed
 

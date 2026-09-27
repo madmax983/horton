@@ -12,6 +12,12 @@
 //! in v0.1. Recovery replays records in order and stops at the first
 //! corrupt/truncated record — the torn tail is the expected crash boundary,
 //! not an error.
+//!
+//! The `op` byte's high bit ([`MORE`]) groups records: a record with it set
+//! is followed by more records of the same atomic group, and the group ends
+//! at the first record without it. Recovery replays a group only once its
+//! closing record is intact, so a torn block write can never replay part of
+//! a [`WriteBatch`](crate::WriteBatch). A group is committed in one block.
 
 use core::future::poll_fn;
 
@@ -22,6 +28,10 @@ use crate::memtable::MemTable;
 
 /// Record magic: ASCII "ls".
 pub const WAL_MAGIC: u16 = 0x6C73;
+
+/// The `op` byte's group flag: more records of this record's atomic group
+/// follow it. See the module docs.
+pub const MORE: u8 = 0x80;
 /// Fixed header bytes before the key: magic + len + seq + op + `key_len` + `val_len`.
 pub const WAL_HEADER_LEN: usize = 19;
 /// Trailing CRC32 bytes.
@@ -90,6 +100,7 @@ fn encode_record(
     out: &mut [u8],
     seq: u64,
     op: Op,
+    more: bool,
     key: &[u8],
     key_len: u16,
     val: &[u8],
@@ -112,7 +123,7 @@ fn encode_record(
     out[0..2].copy_from_slice(&WAL_MAGIC.to_le_bytes());
     out[2..6].copy_from_slice(&len.to_le_bytes());
     out[6..14].copy_from_slice(&seq.to_le_bytes());
-    out[14] = op.to_u8();
+    out[14] = op.to_u8() | if more { MORE } else { 0 };
     out[15..17].copy_from_slice(&key_len.to_le_bytes());
     out[17..19].copy_from_slice(&val_len.to_le_bytes());
     out[19..19 + kl].copy_from_slice(&key[..kl]);
@@ -128,6 +139,8 @@ fn encode_record(
 struct Decoded<'a> {
     seq: u64,
     op: Op,
+    /// More records of this record's atomic group follow ([`MORE`]).
+    more: bool,
     key: &'a [u8],
     val: &'a [u8],
     /// For [`Op::PutTtl`]: the absolute expiry tick; 0 otherwise.
@@ -185,7 +198,8 @@ fn decode_record(buf: &[u8]) -> Option<Decoded<'_>> {
     let seq = u64::from_le_bytes([
         buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13],
     ]);
-    let op = Op::from_u8(buf[14])?;
+    let op = Op::from_u8(buf[14] & !MORE)?;
+    let more = buf[14] & MORE != 0;
     let kl = usize::from(u16::from_le_bytes([buf[15], buf[16]]));
     let vl = usize::from(u16::from_le_bytes([buf[17], buf[18]]));
     // A PutTtl record carries 8 expiry bytes after the value.
@@ -209,6 +223,7 @@ fn decode_record(buf: &[u8]) -> Option<Decoded<'_>> {
     Some(Decoded {
         seq,
         op,
+        more,
         key,
         val,
         expire_at,
@@ -285,6 +300,9 @@ pub struct WalWriter<D: BlockDevice, const BLOCK: usize> {
     dirty_to: usize,
     next_block: u64,
     max_seq: u64,
+    /// The last staged record opened a group (its [`MORE`] flag is set), so
+    /// the stage must not be written until the group closes.
+    group_open: bool,
 }
 
 impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
@@ -309,6 +327,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             dirty_to: 0,
             next_block: wal_start,
             max_seq: 0,
+            group_open: false,
         }
     }
 
@@ -359,6 +378,8 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             self.dirty_to = self.stage_len;
         }
         self.stage_len = len;
+        // Whatever group was open is discarded with its records.
+        self.group_open = false;
     }
 
     /// Repositions the append pointer to `block` (the WAL wrap).
@@ -400,7 +421,29 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         val: &[u8],
     ) -> Result<(), Error<D::Error>> {
         debug_assert_ne!(op, Op::PutTtl, "PutTtl needs append_ttl");
-        self.append_inner(seq, op, key, val, 0).await
+        self.append_inner(seq, op, key, val, 0, false).await
+    }
+
+    /// Appends one record of an atomic group: pass `more = true` for every
+    /// record but the last. Recovery replays the group only if its last
+    /// record is intact, so a torn write never replays part of it. The
+    /// whole group must fit the staging block ([`Db::write`](crate::Db::write)
+    /// drains the stage and checks the size first).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`append`](WalWriter::append), plus [`Error::BatchTooLarge`]
+    /// when the group would not fit one block.
+    pub async fn append_grouped(
+        &mut self,
+        seq: u64,
+        op: Op,
+        key: &[u8],
+        val: &[u8],
+        more: bool,
+    ) -> Result<(), Error<D::Error>> {
+        debug_assert_ne!(op, Op::PutTtl, "PutTtl needs append_ttl");
+        self.append_inner(seq, op, key, val, 0, more).await
     }
 
     /// Appends a [`Op::PutTtl`] record: like [`append`](WalWriter::append)
@@ -419,10 +462,11 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         expire_at: u64,
     ) -> Result<(), Error<D::Error>> {
         let op = if expire_at == 0 { Op::Put } else { Op::PutTtl };
-        self.append_inner(seq, op, key, val, expire_at).await
+        self.append_inner(seq, op, key, val, expire_at, false).await
     }
 
-    /// Shared append path; `expire_at` is used only for [`Op::PutTtl`].
+    /// Shared append path; `expire_at` is used only for [`Op::PutTtl`], and
+    /// `more` marks a record that is not the last of its group.
     async fn append_inner(
         &mut self,
         seq: u64,
@@ -430,6 +474,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         key: &[u8],
         val: &[u8],
         expire_at: u64,
+        more: bool,
     ) -> Result<(), Error<D::Error>> {
         let key_len = u16::try_from(key.len()).map_err(|_| Error::KeyTooLarge {
             len: key.len(),
@@ -452,6 +497,13 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             });
         }
         if self.stage_len + rlen > BLOCK {
+            // A group commits in one block: never write part of one.
+            if self.group_open {
+                return Err(Error::BatchTooLarge {
+                    bytes: self.stage_len + rlen,
+                    max: BLOCK,
+                });
+            }
             self.write_stage().await?;
         }
         let expiry = expire_at.to_le_bytes();
@@ -460,6 +512,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             &mut self.stage[self.stage_len..],
             seq,
             op,
+            more,
             key,
             key_len,
             &val[..vlen],
@@ -468,6 +521,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         );
         debug_assert_eq!(n, rlen);
         self.stage_len += n;
+        self.group_open = more;
         if seq > self.max_seq {
             self.max_seq = seq;
         }
@@ -638,6 +692,14 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// `max_seq`; it is always a no-op when the WAL never wrapped, because
     /// live records all have `seq > max_seq`.
     ///
+    /// A group of records ([`append_grouped`](WalWriter::append_grouped))
+    /// replays only when its closing record is intact; a torn write never
+    /// replays part of one. A block torn before any group completed ends the
+    /// log, and the writer resumes on that block. A block torn after
+    /// complete groups ends the log too, unless the next block starts with
+    /// a newer record: an earlier recovery resumed past it, and the writes
+    /// that followed are live.
+    ///
     /// A torn tail is the expected crash boundary, not an error. So is the
     /// first block holding only stale records: appends run sequentially
     /// from `wal_head`, and a wrap moves `wal_head` back to `wal_start` in
@@ -666,6 +728,10 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             max_seq: 0,
             blocks_used: 0,
         };
+        // Set after a torn block that still held complete groups: the log
+        // goes on only if the next block holds newer records (writes made
+        // after an earlier recovery resumed past the torn block).
+        let mut newer_than: Option<u64> = None;
         loop {
             let id = from + state.blocks_used;
             if id >= self.wal_end {
@@ -676,68 +742,90 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             poll_fn(|cx| device.poll_read_block(cx, id, block))
                 .await
                 .map_err(Error::Device)?;
+            // Pass 1: find where the block's last complete group ends. A
+            // group whose closing record never landed is torn, even when
+            // what did land reads as clean padding.
             let mut off = 0usize;
-            let mut corrupt = false;
-            let mut live = 0u64;
+            let mut complete = 0usize;
+            let mut torn = false;
+            let mut first_seq = None;
             while off < BLOCK {
                 match scan_record(&block[off..]) {
                     Scan::Record(rec) => {
-                        if rec.seq > state.max_seq {
-                            state.max_seq = rec.seq;
-                        }
-                        // Stale pre-wrap records: already in a table, never
-                        // replayed (see the `seq_floor` docs above).
-                        if rec.seq > seq_floor {
-                            match rec.op {
-                                Op::RangeDelete => {
-                                    table
-                                        .insert_range_del::<D::Error>(rec.key, rec.val, rec.seq)
-                                        .map_err(|_| Error::CorruptWal { offset: id })?;
-                                }
-                                Op::PutTtl => {
-                                    table
-                                        .insert_ttl::<D::Error>(
-                                            rec.key,
-                                            rec.val,
-                                            rec.seq,
-                                            rec.expire_at,
-                                        )
-                                        .map_err(|_| Error::CorruptWal { offset: id })?;
-                                }
-                                _ => {
-                                    let tombstone = rec.op == Op::Delete;
-                                    table
-                                        .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
-                                        .map_err(|_| Error::CorruptWal { offset: id })?;
-                                }
-                            }
-                            state.records += 1;
-                            live += 1;
-                        }
+                        first_seq.get_or_insert(rec.seq);
                         off += rec.total_len;
+                        if !rec.more {
+                            complete = off;
+                        }
                     }
                     // Clean zero padding: this block is done; the log may
                     // continue in the next block.
                     Scan::CleanEnd => break,
-                    // Non-zero data that is not a valid record: the torn
-                    // tail. Stop recovery here.
+                    // Non-zero data that is not a valid record: torn.
                     Scan::Corrupt => {
-                        corrupt = true;
+                        torn = true;
                         break;
                     }
                 }
             }
-            if off == 0 {
-                break; // Unwritten block: end of log.
+            torn |= complete < off;
+            if let Some(floor) = newer_than.take()
+                && first_seq.is_none_or(|seq| seq <= floor)
+            {
+                break; // The torn block was the tail after all.
             }
-            if live == 0 && !corrupt {
+            if complete == 0 {
+                // Unwritten, or torn before any group completed: the log
+                // ends here, and the writer resumes on this block, so no
+                // write ever lands behind a torn block without a group.
+                break;
+            }
+            // Pass 2: replay the complete groups.
+            let mut at = 0usize;
+            let mut live = 0u64;
+            while at < complete {
+                let Scan::Record(rec) = scan_record(&block[at..]) else {
+                    return Err(Error::CorruptWal { offset: id });
+                };
+                if rec.seq > state.max_seq {
+                    state.max_seq = rec.seq;
+                }
+                // Stale pre-wrap records: already in a table, never
+                // replayed (see the `seq_floor` docs above).
+                if rec.seq > seq_floor {
+                    match rec.op {
+                        Op::RangeDelete => {
+                            table
+                                .insert_range_del::<D::Error>(rec.key, rec.val, rec.seq)
+                                .map_err(|_| Error::CorruptWal { offset: id })?;
+                        }
+                        Op::PutTtl => {
+                            table
+                                .insert_ttl::<D::Error>(rec.key, rec.val, rec.seq, rec.expire_at)
+                                .map_err(|_| Error::CorruptWal { offset: id })?;
+                        }
+                        _ => {
+                            let tombstone = rec.op == Op::Delete;
+                            table
+                                .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
+                                .map_err(|_| Error::CorruptWal { offset: id })?;
+                        }
+                    }
+                    state.records += 1;
+                    live += 1;
+                }
+                at += rec.total_len;
+            }
+            if live == 0 && !torn {
                 // Only stale (already flushed) records: the live log ended
                 // at the previous block. Resume appending here.
                 break;
             }
             state.blocks_used += 1;
-            if corrupt {
-                break; // Torn tail: expected crash boundary, not an error.
+            if torn {
+                // A torn tail after complete groups: the crash boundary,
+                // unless newer writes follow (see `newer_than`).
+                newer_than = Some(state.max_seq);
             }
         }
         self.next_block = from + state.blocks_used;
@@ -746,6 +834,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         // any more, so the next `write_stage` must zero the whole tail.
         self.dirty_to = BLOCK;
         self.max_seq = state.max_seq;
+        self.group_open = false;
         Ok(state)
     }
 }

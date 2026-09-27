@@ -108,8 +108,9 @@ magic: u16 = 0x6C73 | len: u32 | seq: u64 | op: u8 | key_len: u16
 ```
 
 Ops: 1 put, 2 delete, 3 range delete (`key` = start, `val` = end),
-4 put with TTL. `crc32` covers everything after `magic`. Records never
-span blocks.
+4 put with TTL. The op byte's high bit (`MORE`, `0x80`) groups records: it
+is set on every record of a `WriteBatch` but the last. `crc32` covers
+everything after `magic`. Records never span blocks.
 
 - Each durable write commits one whole block (zero-padded) and moves on;
   a block holding acknowledged records is never rewritten. A
@@ -119,6 +120,13 @@ span blocks.
   corrupt or truncated record: the torn tail is the crash boundary, not an
   error. Records at or below the manifest's `flushed_seq` are stale
   pre-wrap blocks and are skipped.
+- A group replays only when its closing record (the first without `MORE`)
+  is intact, so a torn block write never replays part of a batch, even
+  when the tear lands on a record boundary and the rest reads as padding.
+  A block torn before any group completed ends the log and the writer
+  resumes on it. A block torn after complete groups ends the log unless
+  the next block starts with a newer sequence number: an earlier recovery
+  resumed past the tear, and the writes after it are live.
 - When the region is exhausted the next flush wraps it: `wal_head`
   returns to `wal_start` in the same manifest commit.
 

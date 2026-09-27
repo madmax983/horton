@@ -111,6 +111,50 @@ Capacity errors name their remedy:
 `NeedsCompaction` is only returned while `compaction_pending()` is true, so
 a compact-then-retry loop always makes progress.
 
+## Demo: a flight recorder that survives power cuts
+
+[`examples/flight_recorder`](examples/flight_recorder) is a sensor logger
+built the way firmware would use horton, and it exercises the whole API.
+It runs on a simulated NOR flash chip that counts erases and can lose power
+in the middle of any erase or program. Each tick it commits a four-sensor
+frame as one `WriteBatch`, writes a debug trace that expires, and runs one
+bounded compaction step. Every 1000 ticks it purges a glitch window with a
+range delete, checking that a snapshot taken before the purge still sees
+it. Tables older than the hot window stream to object storage and are
+committed away locally.
+
+```sh
+cargo run --release --example flight_recorder                  # record; Ctrl-C or kill -9 any time, run again
+cargo run --release --example flight_recorder -- torture 1000  # 1000 power cuts, each tearing a write
+cargo run --release --example flight_recorder -- restore       # rebuild the history from the archive
+```
+
+`record` keeps its flash image and archive under `target/flight_recorder/`.
+Kill it whenever you like; the next run recovers, proves every
+acknowledged frame is still there (on flash or in the archive), and
+resumes. `torture` does the same after every simulated power cut:
+
+```text
+power cuts             1000, each tearing an erase or program partway
+acknowledged frames    144494 ticks, every one present (on flash or in the archive)
+frames cut mid-write   716 landed whole, the rest not at all; never in part
+lost or corrupt        0
+snapshots, TTLs        139 snapshot and 2864 TTL checks passed
+archive                212 tables, 21340 KiB, each re-ingested and checked
+```
+
+To archive to S3 or any S3-compatible store (MinIO, Cloudflare R2,
+LocalStack), add `--s3 s3://bucket/prefix`. The example signs requests
+with `curl --aws-sigv4`, so it needs no extra crates; it reads
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and, for a
+non-AWS endpoint, `AWS_ENDPOINT_URL`. `restore --s3 …` rebuilds the
+history from the bucket on a "ground station".
+
+This demo found two WAL bugs, F18 and F19 in the
+[review status](docs/ARCHITECTURE_REVIEW.md): a torn block could replay
+part of a batch, and writes after a reopen could be lost behind a torn
+block. Both are fixed.
+
 ## Architecture
 
 ```mermaid
@@ -351,7 +395,9 @@ What the suite covers:
 | `src/crc.rs` | Slicing-by-8 CRC-32 |
 | `src/model.rs` | Executable models used as test oracles |
 | `src/device.rs`, `src/flash.rs`, `src/esp32s3.rs` | `BlockDevice` trait, NOR flash adapter, ESP32-S3 SPI flash driver |
-| `src/profile.rs`, `src/macros.rs` | Measured ESP32-S3 profile; the `db_types!` macro |
+| `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
+| `examples/quickstart.rs` | The quick start, complete |
+| `examples/flight_recorder/` | The flight recorder demo: simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |
 | `xtensa-smoke/` | Bare-metal ESP32-S3 QEMU smoke test |

@@ -264,3 +264,111 @@ fn first_block_after_recovery_is_clean() {
     assert_eq!(state.records, 2, "a garbage tail ended recovery early");
     assert!(t2.get(b"e").is_some());
 }
+
+/// Tears block 0 after its first `keep` bytes: the rest of the block reads
+/// as garbage, the way a torn NOR program or erase leaves it.
+fn tear_block0(dev: &mut MemDevice<512>, keep: usize) {
+    let block = &mut dev.blocks_mut()[0];
+    for b in &mut block[keep..] {
+        *b = 0xA5;
+    }
+}
+
+/// F19 (writer half): a torn block that still holds complete records ends
+/// recovery, and the writer resumes on the next block. Records written
+/// there after the reopen are newer than anything before the tear, so the
+/// next recovery must read past the torn block to them.
+#[test]
+fn recovery_reads_past_a_torn_block_to_newer_records() {
+    // Block 0: two single records, then the start of a torn third.
+    let mut w = writer();
+    block_on(w.append(1, Op::Put, b"a", b"1")).unwrap();
+    block_on(w.append(2, Op::Put, b"b", b"2")).unwrap();
+    block_on(w.append(3, Op::Put, b"c", b"3")).unwrap();
+    block_on(w.commit()).unwrap();
+    let mut dev = w.into_device();
+    let two = 2 * horton::wal::WAL_RECORD_OVERHEAD + 4;
+    tear_block0(&mut dev, two + 5);
+
+    // First reopen: two records, and the writer resumes on block 1.
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(dev, 0, 16);
+    let mut t = T16::new();
+    assert_eq!(block_on(w.recover(&mut t)).unwrap().records, 2);
+    block_on(w.append(4, Op::Put, b"d", b"4")).unwrap();
+    block_on(w.commit()).unwrap();
+
+    // Second reopen: the acknowledged record behind the torn block is live.
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(w.into_device(), 0, 16);
+    let mut t = T16::new();
+    let state = block_on(w.recover(&mut t)).unwrap();
+    assert_eq!(state.records, 3);
+    assert!(t.get(b"d").is_some(), "record 4 lost behind the torn block");
+    assert!(t.get(b"c").is_none(), "the torn record must not replay");
+}
+
+/// The other side of that rule: a block of *older* records after a torn
+/// block is stale data from before a wrap, and recovery stops at the tear.
+#[test]
+fn recovery_stops_at_a_torn_block_before_stale_records() {
+    let mut w = writer();
+    // Block 1 holds an old record (seq 1) from an earlier pass over the log.
+    block_on(w.append(9, Op::Put, b"pad", b"0")).unwrap();
+    block_on(w.commit()).unwrap();
+    block_on(w.append(1, Op::Put, b"old", b"1")).unwrap();
+    block_on(w.commit()).unwrap();
+    // Block 0 is rewritten by the current pass: seqs 10, 11, then torn.
+    w.reset_to(0);
+    block_on(w.append(10, Op::Put, b"x", b"1")).unwrap();
+    block_on(w.append(11, Op::Put, b"y", b"2")).unwrap();
+    block_on(w.append(12, Op::Put, b"z", b"3")).unwrap();
+    block_on(w.commit()).unwrap();
+    let mut dev = w.into_device();
+    tear_block0(&mut dev, 2 * horton::wal::WAL_RECORD_OVERHEAD + 4 + 5);
+
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(dev, 0, 16);
+    let mut t = T16::new();
+    let state = block_on(w.recover(&mut t)).unwrap();
+    assert_eq!(state.records, 2);
+    assert!(
+        t.get(b"old").is_none(),
+        "a stale record replayed past the tear"
+    );
+}
+
+/// A group replays only with its closing record: every tear point inside
+/// a three-record group recovers all of it or none of it.
+#[test]
+fn a_group_recovers_all_or_nothing_at_every_tear_point() {
+    let rec = horton::wal::WAL_RECORD_OVERHEAD + 2;
+    for keep in 0..=3 * rec {
+        let mut w = writer();
+        block_on(w.append_grouped(1, Op::Put, b"a", b"1", true)).unwrap();
+        block_on(w.append_grouped(2, Op::Put, b"b", b"2", true)).unwrap();
+        block_on(w.append_grouped(3, Op::Put, b"c", b"3", false)).unwrap();
+        block_on(w.commit()).unwrap();
+        let mut dev = w.into_device();
+        // Zero the tail instead of garbage: a tear on a record boundary
+        // then reads as clean padding, the hardest case.
+        for b in &mut dev.blocks_mut()[0][keep..] {
+            *b = 0;
+        }
+        let mut w = WalWriter::<MemDevice<512>, 512>::new(dev, 0, 16);
+        let mut t = T16::new();
+        let n = block_on(w.recover(&mut t)).unwrap().records;
+        let expect = if keep == 3 * rec { 3 } else { 0 };
+        assert_eq!(n, expect, "tear at byte {keep}");
+    }
+}
+
+/// A group that would not fit the block is refused before any of it is
+/// written, so a group can never straddle two blocks.
+#[test]
+fn a_group_never_straddles_blocks() {
+    let mut w = writer();
+    block_on(w.append_grouped(1, Op::Put, b"k", &[7u8; 300], true)).unwrap();
+    let err = block_on(w.append_grouped(2, Op::Put, b"k", &[7u8; 300], false)).unwrap_err();
+    assert!(
+        matches!(err, horton::Error::BatchTooLarge { .. }),
+        "got {err:?}"
+    );
+}

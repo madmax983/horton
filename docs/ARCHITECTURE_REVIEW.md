@@ -22,7 +22,8 @@ Every finding below is fixed on the `claude/adoring-brahmagupta-1iqn35`
 branch. Each confirmed defect's test in
 [`tests/review_findings.rs`](../tests/review_findings.rs) was un-ignored in
 the commit that fixed it and is now its regression guard; CI fails if any
-is ignored again. Fixing them turned up four more (F14–F17), fixed the
+is ignored again. Fixing them turned up four more (F14–F17), and the flight recorder
+demo's power-cut test two more (F18, F19), all fixed the
 same way. The rest of this document is the original review, unchanged.
 
 | # | Fix | Regression tests |
@@ -44,6 +45,8 @@ same way. The rest of this document is the original review, unchanged.
 | F15 | *(found while fixing F6)* A bottommost tombstone was dropped while an older re-ingested table still needed it: the drop now checks every table outside the job | `f15_*` |
 | F16 | *(found while fixing F6)* `delete_range` never gave space back: merges drop versions hidden by a range tombstone every reader sees, and a bottommost merge drops the tombstone once nothing it hides is left | `f16_*`, `tests/crash_compact.rs` |
 | F17 | *(found by the lifecycle fuzzer)* WAL writes after a reopen could be silently lost | `f17_*` |
+| F18 | *(found by the flight recorder demo's power-cut test)* a torn WAL block replayed part of a `WriteBatch` | `f18_*` |
+| F19 | *(found with F18)* writes after a reopen were lost behind a torn block that still held records | `f19_*` |
 
 Structure and process items:
 
