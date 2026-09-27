@@ -54,23 +54,20 @@ runs with `cargo run --example quickstart`:
 ```rust
 use horton::{BlockDevice, Config, Progress, Scan};
 
-// Every size is a named const generic; `MyDb<D>` works over any device.
+// The sizes horton compiles in. It allocates nothing, so every buffer is
+// a fixed size chosen here. Only these three are required; the tuning
+// knobs have defaults (see "Sizing" below for what each one means).
 horton::db_types! {
-    block: 4096,           // device block size
-    key_max: 64,           // longest key
-    val_max: 256,          // longest value
-    memtable_entries: 64,  // memtable slots
-    memtable_arena: 8192,  // memtable key+value bytes
-    levels: 4,
-    tables_per_level: 4,
-    bloom_bytes: 256,      // per-table bloom filter
-    cache_blocks: 4;       // block cache (0 = off)
+    block: 4096,  // bytes per device block (your flash sector size)
+    key_max: 64,  // longest key you will store, in bytes
+    val_max: 256; // longest value you will store, in bytes
     type Db = MyDb;
     type Compaction = MyCompaction;
 }
 
-// Block-id layout: manifest slots 0 and 1, WAL [2, 66), tables [66, 512).
-let config = Config::new(2, 66, 66, 512, 0, 1);
+// Tell horton how many blocks the device has; it decides where the
+// manifest, the WAL and the tables go.
+let config = Config::whole_device(512);
 let mut db = MyDb::new(RamDisk::new(512), config); // `const fn`: fine in a `static`
 db.open().await?; // recover manifest, rebuild table slots, replay WAL
 
@@ -109,7 +106,7 @@ Capacity errors name their remedy:
 | `TableTooLarge` | an entry, index, or range-tombstone section does not fit | smaller entries, bigger blocks or slots |
 | `BatchTooLarge` | a batch does not fit one WAL block | split it |
 | `Busy` | another `get` on this handle holds the read buffers | finish it, retry |
-| `BadConfig` | regions overlap or are too small (from `open`) | fix the `Config` |
+| `BadConfig` | regions overlap or are too small, or the device is below `MIN_DEVICE_BLOCKS` (from `open`) | fix the `Config`, or use a bigger device |
 
 `NeedsCompaction` is only returned while `compaction_pending()` is true, so
 a compact-then-retry loop always makes progress.
@@ -193,28 +190,82 @@ The full format and protocol spec is [`SPEC.md`](SPEC.md) §4.
 
 ## Sizing
 
-Everything is a const generic on `Db`:
+horton allocates nothing, so you choose every buffer size when you
+compile, and you tell it how much of the device it may use. Both have
+defaults; this section explains what they mean when you want to change
+them.
 
-| Param | Meaning |
-|---|---|
-| `BLOCK` | Device block size in bytes. Must equal `D::BLOCK`, and must be at least 512 and fit the largest WAL record |
-| `KEY_MAX`, `VAL_MAX` | Maximum key and value lengths |
-| `CAP`, `ARENA` | Memtable slots (versions) and key/value arena bytes |
-| `LEVELS`, `TABLES` | Level count and tables per level. `LEVELS × TABLES` (at most 64) is also the number of table slots the region is split into; each slot must hold a full memtable's table, which `open()` checks |
-| `BLOOM_BYTES` | Bloom filter size per table (bits = 8 × bytes) |
-| `CACHE` | Block cache slots. `0` disables the cache |
+### How horton stores data
 
-Declare a shape with `horton::db_types!` (named parameters, as in the
-quick start) rather than spelling ten positional const generics.
+New writes go to two places: a log on the device (the **WAL**, so they
+survive a crash) and a sorted buffer in RAM (the **memtable**, so they can
+be read back fast). When the memtable fills up, `flush()` writes it to the
+device as one sorted, read-only **table**. Tables are grouped into
+**levels**: new tables land in level 0, and **compaction** merges them
+into deeper levels, which keeps reads fast and frees the space of
+overwritten and deleted data. The **manifest** is the record of which
+tables exist and where.
+
+### The sizes in `db_types!`
+
+| Parameter | What it is | How to choose | Default |
+|---|---|---|---|
+| `block` | Bytes the device reads or writes at once | Your device's block size: the erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and `key_max + val_max + 23` must fit | required |
+| `key_max` | Longest key, in bytes | Longer keys fail with `KeyTooLarge`. RAM buffers are sized for it, so do not round up much | required |
+| `val_max` | Longest value, in bytes | Longer values fail with `ValueTooLarge` | required |
+| `memtable_entries` | Writes held in RAM before they must be flushed. Every `put` or `delete` takes one until the next flush | More means fewer flushes and less flash wear, but more RAM. When full, writes fail with `TableFull`: call `flush()` | 64 |
+| `memtable_arena` | RAM bytes for those writes' keys and values | About `memtable_entries` × your typical key + value size. When full, writes fail with `ArenaFull`: call `flush()` | 128 per entry, at least `key_max + val_max` |
+| `levels` | Levels of tables on the device | 4 suits most uses | 4 |
+| `tables_per_level` | Tables each level holds | Below 8. `levels × tables_per_level` (at most 64) is how many tables exist. More tables mean more data between compactions, but more tables to check per read and smaller table slots | 4 |
+| `bloom_bytes` | Per-table filter that lets a read skip tables that cannot hold the key | About 1.25 bytes per key in a table gives about 1% wasted reads | 256 |
+| `cache_blocks` | Recently read blocks kept in RAM, `block` bytes each | 0 turns it off. A few blocks speed up repeated reads | 0 |
+
+Give the parameters in this order and leave out any tuning knob to keep
+its default. A misspelled, repeated or misordered name does not compile,
+and neither does a shape that breaks a rule above (for example an arena
+smaller than one largest entry).
+
+**What it costs in RAM:** the structs are the whole bill. Print
+`size_of::<MyDb<YourDevice>>()` and the same for your `Scan` and
+`Compaction` types; `cargo run --example quickstart` does. With the quick
+start's sizes that is about 25 KiB for `Db`, 11 KiB for a `Scan` and
+61 KiB for `Compaction` (you only need one while compacting). The
+`async` calls' futures add at most about 18 KiB more (`flush()`,
+`archive_commit()`).
 
 `horton::profile` has a measured ESP32-S3 instantiation (4 KiB blocks,
 32-byte keys, 64-byte values, 16-entry memtable, 4 × 4 levels, 2-slot
-cache): `Db` 25,248 + `Scan` 10,536 + `Compaction` 58,840 = 94,624 bytes
-of structs, plus at most 17.6 KiB of live futures (`flush()`), for a
-measured peak of 112,200 bytes under a 112 KiB budget asserted by
+cache): `Db` 25,256 + `Scan` 10,536 + `Compaction` 58,840 = 94,632 bytes
+of structs, plus at most 17.6 KiB of live futures (`archive_commit()`),
+for a measured peak of 112,256 bytes under a 112 KiB budget asserted by
 `tests/profile.rs`. See [`BUDGET.md`](BUDGET.md).
 
-Region sizing (checked by `open()`, `BadConfig` otherwise):
+### Mapping it onto your device
+
+horton addresses the device in blocks, numbered from 0. It needs three
+regions that do not overlap:
+
+| Region | What it holds | Size |
+|---|---|---|
+| Manifest | The record of which tables exist, in two copies so a crash mid-update always leaves one whole | `Manifest::max_blocks` blocks per copy (one for small shapes) |
+| WAL | Every write, until the next flush | One block per write or `WriteBatch` between flushes; when it runs out, writes fail with `WalFull` (call `flush()`) |
+| Tables | The flushed and compacted tables | `levels × tables_per_level` equal slots, each big enough for a full memtable's table |
+
+**The easy way:** `Config::whole_device(n)` gives horton blocks `0..n` and
+lets it place the regions: manifest first, then the WAL (about an eighth
+of the rest), then the tables to the end of the device. `n` is your
+device's (or flash partition's) size divided by `block`: a 1 MiB
+partition of 4 KiB sectors is 256 blocks. `MyDb::<D>::MIN_DEVICE_BLOCKS`
+is the smallest `n` the shape fits (166 for the quick start); below it,
+`open()` returns `BadConfig`. `db.config()` shows where everything went.
+The layout depends only on `n` and the manifest's size, so reopening finds
+the data where it left it.
+
+**By hand:** `Config::new(wal_start, wal_end, tbl_start, tbl_end,
+manifest_a, manifest_b)` places each region yourself (ranges include the
+start and exclude the end), for example to leave part of the device to
+other data or to give the WAL more room for wear. `open()` checks it,
+returning `BadConfig` otherwise:
 
 - **Manifest:** each copy is `Manifest::max_blocks::<BLOCK>()` blocks, the
   worst case for `LEVELS × TABLES` tables with `KEY_MAX` bounds (1 block
@@ -223,6 +274,10 @@ Region sizing (checked by `open()`, `BadConfig` otherwise):
   slot must hold a full memtable's table. A table never outgrows its slot,
   so the region holds `LEVELS × TABLES × slot_blocks` blocks of tables.
 - **WAL:** one block per durable commit between flushes.
+
+The const generics behind `db_types!` (`BLOCK`, `KEY_MAX`, `VAL_MAX`,
+`CAP`, `ARENA`, `LEVELS`, `TABLES`, `BLOOM_BYTES`, `CACHE`) and the rules
+each must meet are listed on `Db` in the API docs.
 
 ### Flash endurance
 

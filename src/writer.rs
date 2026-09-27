@@ -52,7 +52,7 @@ impl<const N: usize> Future for Put<'_, N> {
 
 /// Claim a ticket, publish `payload`, and return a [`Put`] future.
 ///
-/// - Ring full at claim time → [`Error::NoSpace`] immediately: no ticket
+/// - Ring full at claim time → [`Error::RingFull`] immediately: no ticket
 ///   consumed, no sequence number consumed, safe to retry (SPEC §8).
 /// - `publish` returns `Fenced` → the ticket died while claimed (the
 ///   writer stalled past the drainer's budget); transparently re-claim a
@@ -66,14 +66,14 @@ impl<const N: usize> Future for Put<'_, N> {
 ///
 /// # Errors
 ///
-/// [`Error::NoSpace`] when the ring is full at claim time.
+/// [`Error::RingFull`] when the ring is full at claim time.
 pub fn put<'r, const N: usize>(
     ring: &'r Ring<N>,
     durable: &'r AtomicU32,
     payload: &[u8; 32],
 ) -> Result<Put<'r, N>, Error<Infallible>> {
     loop {
-        let ticket = ring.try_claim().ok_or(Error::NoSpace)?;
+        let ticket = ring.try_claim().ok_or(Error::RingFull)?;
         match ring.publish(ticket, payload) {
             PublishOutcome::Published => {
                 return Ok(Put { durable, ticket });

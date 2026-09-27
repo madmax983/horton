@@ -124,7 +124,7 @@ Instead of making the memtable itself lock-free (months of proof burden), put a
 - The ring is DRAM-only staging; durability still comes from the WAL blocks the
   drainer writes. `put` doesn't return until its entry is drained *and* WAL-durable —
   the poll-based API already models exactly this await.
-- Fixed capacity via const generic: ring full → `Error::NoSpace`, returned
+- Fixed capacity via const generic: ring full → `Error::RingFull`, returned
   **immediately** — no `Poll::Pending` on a full ring (spike 4 verdict: an
   in-crate `Pending` there is a liveness lie, since storing `Waker`s needs
   interior mutability, the forbidden thing). `Pending` is returned only
@@ -172,7 +172,7 @@ All five spikes completed. Verdicts (full synthesis:
    concurrent drainers admit an interleaving that loses an acknowledged
    write at recovery. Single in-order drainer preserves every existing
    proof untouched.
-4. **Backpressure semantics — DONE: immediate `Error::NoSpace`.** No
+4. **Backpressure semantics — DONE: immediate `Error::RingFull`.** No
    `Pending`-on-full (unhonorable in-crate: no `Waker` storage without
    `UnsafeCell`). `Pending` only post-acceptance, under the device wake
    contract. Fairness: none in-crate (stated; host's job).

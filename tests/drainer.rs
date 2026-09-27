@@ -167,7 +167,6 @@ type TestDrainer<'r, const N: usize, const MAX_WRITES: usize> = Drainer<
     2,    // LEVELS
     4,    // TABLES
     64,   // BLOOM_BYTES
-    32,   // FREELIST
     0,    // CACHE
     N,
     MAX_WRITES,
@@ -298,11 +297,10 @@ fn fenced_ticket_skipped_and_durable_advances() {
 fn batch_error_poisons_and_acks_nothing() {
     let (ring, durable) = setup::<8>();
     let device = FailFlush::<512>::new();
-    let mut db =
-        horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 32, 0>::new(device, test_config());
+    let mut db = horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0>::new(device, test_config());
     block_on(db.open()).expect("db open must succeed");
     let mut drainer =
-        Drainer::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 32, 0, 8, 8>::new(&ring, db, &durable);
+        Drainer::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0, 8, 8>::new(&ring, db, &durable);
 
     let t0 = publish(&ring, b"k0", b"v0");
     let _t1 = publish(&ring, b"k1", b"v1");
@@ -393,7 +391,7 @@ fn malformed_payload_poisons_drainer() {
     assert_eq!(ring.publish(t, &bad), PublishOutcome::Published);
 
     let err = block_on(drainer.sweep()).expect_err("malformed must error");
-    assert_eq!(err, horton::Error::NoSpace);
+    assert_eq!(err, horton::Error::BadPayload);
     assert!(drainer.is_poisoned());
     assert_eq!(durable.load(Ordering::Acquire), 0);
 }
@@ -563,11 +561,10 @@ fn ordered_prefix_durable_only_after_flush() {
     // Flush pends once: Db::open does not flush, so the first flush poll
     // is the sweep's Db::write.
     let device = PendingFlush::<_, 512>::new(MemDevice::<512>::new(), 1);
-    let mut db =
-        horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 32, 0>::new(device, test_config());
+    let mut db = horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0>::new(device, test_config());
     block_on(db.open()).expect("db open must succeed");
     let mut drainer =
-        Drainer::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 32, 0, 8, 8>::new(&ring, db, &durable);
+        Drainer::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0, 8, 8>::new(&ring, db, &durable);
 
     // t0 published (WAL-bearing).
     let t0 = ring.try_claim().expect("space");

@@ -97,7 +97,7 @@ unchanged.
   On CAS failure return `None` — no retry in-crate (the host may retry;
   see §8).
 - A failed claim consumes **nothing**: no ticket, no sequence number, no
-  slot state changes. This is what makes `Error::NoSpace` honest (§8).
+  slot state changes. This is what makes `Error::RingFull` honest (§8).
 - The check-then-CAS race (gate freed between another producer's check
   and ours) resolves in the CAS: at most one producer wins a ticket, and
   the winner's gate observation is still valid — the gate can only leave
@@ -105,7 +105,7 @@ unchanged.
   both of which the winner survives correctly (§4, §6).
 - **Error precedence:** argument validation (key/value lengths, batch
   well-formedness, closed-DB, etc.) is checked **before** the claim. A
-  caller MUST NOT observe `NoSpace` for a request that would have failed
+  caller MUST NOT observe `RingFull` for a request that would have failed
   validation anyway.
 
 ## 4. Publish protocol
@@ -244,7 +244,7 @@ unchanged.
 ## 8. Backpressure
 
 - Ring full at claim time → the `put` future resolves
-  `Ready(Err(Error::NoSpace))` **immediately**: no ticket consumed (§3),
+  `Ready(Err(Error::RingFull))` **immediately**: no ticket consumed (§3),
   no sequence number consumed, safe to retry. (Spike 4: a `Pending`-on-full
   promise cannot be honored in-crate — the only entity that observes "slot
   freed" is the drainer, and storing `Waker`s needs interior mutability,
@@ -257,16 +257,19 @@ unchanged.
   abandons *observation*, not the write — the entry was accepted and will
   be drained and made durable; the caller simply stops waiting for the
   completion signal.
-- A full ring is morally identical to 8 live snapshots → `NoSpace`:
-  bounded exhaustion → explicit error → caller retries. No thundering
-  herd is possible (no wakes exist on the full path).
-- Whether `NoSpace` is reused or a dedicated `RingFull` variant is added
-  is OPEN (observability call, Mark's).
+- A full ring is bounded exhaustion, like 8 live snapshots
+  (`SnapshotLimit`) → its own explicit error, `RingFull` → caller
+  retries. No thundering herd is possible (no wakes exist on the full
+  path).
+- **Decided** (2026-09-27, Mark): a dedicated `Error::RingFull`. v0.17
+  removed `NoSpace`; every capacity error names its remedy (ADR-0013),
+  and `RingFull`'s is "let the drainer sweep, then retry". A payload the
+  drainer cannot decode is `Error::BadPayload` (the drainer poisons).
 
 > **Implemented** (2026-09-26): `src/writer.rs` — `put(ring, durable,
 > payload)` claims a ticket, publishes the 32-byte payload, and returns a
 > `Put` future resolving to the ticket once WAL-durable. Ring-full at
-> claim → `Err(Error::NoSpace)` immediately (no ticket consumed).
+> claim → `Err(Error::RingFull)` immediately (no ticket consumed).
 > `publish` → `Fenced` transparently re-claims a fresh ticket (silent
 > re-claim; §16 Q4). `Put` polls the `durable` watermark and returns
 > `Pending` post-acceptance only, per the rule above; dropping it
@@ -438,7 +441,8 @@ single-CAS).
 ## 16. Open questions (Mark's calls)
 
 1. Read-your-writes for the writing thread through the ring.
-2. `NoSpace` reuse vs. dedicated `RingFull` variant.
+2. ~~`NoSpace` reuse vs. dedicated `RingFull` variant.~~ Decided:
+  `RingFull` (§8).
 3. `WriteBatch` / range-delete / TTL through the ring: one slot per batch
   vs. consecutive tickets with drainer-side atomicity.
 4. `WriterFenced` surfacing: silent transparent re-claim vs. surfaced
@@ -459,11 +463,13 @@ single-CAS).
   write-through cache in front of `put` is the right layer — not the
   ring.
 
-2. **`NoSpace`: keep it.** A full ring is already documented (§8) as
-  morally identical to snapshot exhaustion. A dedicated `RingFull`
-  variant adds churn for no behavioral difference — the caller retries
-  either way. If observability is wanted later, a `u32` full-count
-  metric beats a new variant.
+2. **`NoSpace`: keep it.** *Superseded (2026-09-27): v0.17 removed
+  `NoSpace` (ADR-0013), and snapshot exhaustion became its own
+  `SnapshotLimit`, so the ring got `RingFull` (§8).* A full ring is
+  already documented (§8) as morally identical to snapshot exhaustion.
+  A dedicated `RingFull` variant adds churn for no behavioral
+  difference — the caller retries either way. If observability is
+  wanted later, a `u32` full-count metric beats a new variant.
 
 3. **Batches: consecutive tickets, drainer-side atomicity.** The 32-byte
   slot cannot hold a batch. The writer claims N tickets and publishes N

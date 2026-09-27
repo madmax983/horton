@@ -43,7 +43,7 @@ fn payload_of(ticket: u32) -> [u8; 32] {
 }
 
 /// Test-side blocking claim: spins on the SPEC's non-blocking `try_claim`.
-/// In-crate, a failed claim returns `None` (→ `Error::NoSpace`); only the
+/// In-crate, a failed claim returns `None` (→ `Error::RingFull`); only the
 /// test harness retries.
 fn claim_blocking<const N: usize>(r: &Ring<N>) -> u32 {
     loop {
@@ -187,7 +187,7 @@ fn fence_vs_publish_race() {
                     other => panic!("published ticket must drain, got {other:?}"),
                 }
             }
-            (PublishOutcome::Fenced, FenceOutcome::Fenced) => {
+            (PublishOutcome::Fenced, FenceOutcome::Fenced(_)) => {
                 // Fence won: the ticket is dead — skipped, never drained —
                 // and the ring stays live (cursor advanced past it, head
                 // untouched, slot self-released by the losing publish).

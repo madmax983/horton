@@ -75,6 +75,32 @@ jobs:
             fi
           fi
 
+  # The default-off `multiwriter` feature (and `loom`, which models its
+  # ring) is compiled nowhere else, so API changes elsewhere in the crate
+  # could break it unnoticed.
+  features:
+    name: features (multiwriter, loom)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (multiwriter)
+        run: cargo clippy --all-targets --features multiwriter -- -D warnings -W clippy::pedantic -W clippy::nursery
+      - name: clippy (loom)
+        run: cargo clippy --all-targets --features loom -- -D warnings -W clippy::pedantic -W clippy::nursery
+      - name: rustdoc (multiwriter, warnings are errors)
+        run: cargo doc --no-deps --features multiwriter
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: cargo test --features multiwriter
+        run: cargo test --features multiwriter
+      - name: loom models
+        run: cargo test --release --features loom --test loom_ring
+
   miri:
     name: miri
     runs-on: ubuntu-latest

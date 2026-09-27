@@ -26,6 +26,8 @@ with `compaction_pending()` (architecture review F10).
 | `BadLevel { level }` | pass a level below `LEVELS` |
 | `BadConfig` | fix the `Config` (from `open`) |
 | `Busy` | finish the other `get`, retry |
+| `RingFull` | let the multiwriter drainer sweep, retry (added 2026-09-27) |
+| `BadPayload` | build ring payloads with `drainer::payload::encode_*`; the drainer is poisoned (added 2026-09-27) |
 
 `NeedsCompaction` is returned only while `compaction_pending()` is
 true, and `compaction_pending()` also reports an in-flight job. So a

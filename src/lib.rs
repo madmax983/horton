@@ -4,6 +4,12 @@
 //! nothing but `core`. All memory is caller-provided and compile-time sized
 //! via const generics; every fallible operation returns [`Error`].
 //!
+//! **Start here:** [`db_types!`] chooses the sizes (only the block size
+//! and the longest key and value are required; its docs explain every
+//! tuning knob), [`Config::whole_device`] lays the database out on your
+//! device, and [`BlockDevice`] is the one trait you implement.
+//! `examples/quickstart.rs` is a complete program.
+//!
 //! v0.17 surface: [`MemTable`], the [`wal`] write-ahead log, the async
 //! [`BlockDevice`] trait, [`sstable`] immutable sorted runs, the
 //! [`manifest`] crash-safe root pointer (multi-block copies, an optional
@@ -46,6 +52,7 @@ pub mod compact;
 pub mod compress;
 pub mod crc;
 pub mod db;
+pub mod defaults;
 pub mod device;
 #[cfg(feature = "multiwriter")]
 pub mod drainer;

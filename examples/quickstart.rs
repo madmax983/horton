@@ -11,28 +11,30 @@ use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
-use horton::{BlockDevice, Config, Error, Progress, Scan};
+use horton::{BlockDevice, Config, Error, Progress};
 
-/// Block size shared by the device and the database (`D::BLOCK == BLOCK`
-/// is a compile-time check).
+/// Bytes per device block. The database and the device must agree
+/// (`D::BLOCK == BLOCK` is checked at compile time). On SPI NOR flash this
+/// is the erase sector size, usually 4096.
 const BLOCK: usize = 4096;
 
-// The database types: every size is a const generic, so the whole thing
-// is one fixed-size value with no heap behind it. `db_types!` names each
-// parameter, so two swapped sizes cannot compile.
+/// How many blocks the device has: 512 × 4 KiB = 2 MiB. For a flash
+/// partition, its size divided by `BLOCK`.
+const DEVICE_BLOCKS: u64 = 512;
+
+// The sizes horton compiles in. It allocates nothing, so every buffer is
+// a fixed size chosen here. Only these three are required; the tuning
+// knobs (memtable size, levels, bloom filter, block cache) have defaults,
+// explained in the `db_types!` docs and the README's "Sizing" section.
 horton::db_types! {
-    block: BLOCK,
-    key_max: 64,
-    val_max: 256,
-    memtable_entries: 64,
-    memtable_arena: 8192,
-    levels: 4,
-    tables_per_level: 4,
-    bloom_bytes: 256,
-    cache_blocks: 4;
+    block: BLOCK, // bytes per device block
+    key_max: 64,  // longest key you will store, in bytes
+    val_max: 256; // longest value you will store, in bytes
 
     /// The database (`MyDb<D>` for any device `D`).
     type Db = MyDb;
+    /// A forward range scan over a `MyDb`.
+    type Scan = MyScan;
     /// Caller-owned compaction scratch for `MyDb`.
     type Compaction = MyCompaction;
 }
@@ -44,9 +46,9 @@ struct RamDisk {
 }
 
 impl RamDisk {
-    fn new(n: usize) -> Self {
+    fn new(n: u64) -> Self {
         Self {
-            blocks: vec![[0u8; BLOCK]; n],
+            blocks: vec![[0u8; BLOCK]; usize::try_from(n).expect("device fits in memory")],
         }
     }
 }
@@ -106,21 +108,26 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 }
 
 fn main() -> Result<(), Error<OutOfRange>> {
-    // Device layout, in block ids: two manifest slots, a WAL region, and
-    // a table region. The regions must not overlap.
-    let config = Config::new(
-        2,   // wal_start
-        66,  // wal_end   (64 WAL blocks)
-        66,  // tbl_start
-        512, // tbl_end   (446 table blocks)
-        0,   // manifest slot A
-        1,   // manifest slot B
+    // Where the data goes: tell horton how many blocks the device has and
+    // it places the manifest, the WAL and the tables. `Config::new` places
+    // them by hand instead, for a device shared with other data.
+    let config = Config::whole_device(DEVICE_BLOCKS);
+    println!(
+        "this shape needs at least {} blocks; the device has {DEVICE_BLOCKS}",
+        MyDb::<RamDisk>::MIN_DEVICE_BLOCKS
     );
 
-    // `Db` is ~45 KiB with these parameters (`Scan` ~11 KiB, `Compaction`
-    // ~58 KiB). On a microcontroller they live in `static`s; on a host, box
-    // them so they don't sit on the stack.
-    let mut db = Box::new(MyDb::new(RamDisk::new(512), config));
+    // On a microcontroller these live in `static`s; on a host, box them so
+    // they don't sit on the stack. Their sizes, plus the futures of the
+    // calls in flight, are the whole RAM bill.
+    let mut db = Box::new(MyDb::new(RamDisk::new(DEVICE_BLOCKS), config));
+    println!(
+        "RAM: Db {} bytes, Scan {} bytes, Compaction {} bytes",
+        size_of::<MyDb<RamDisk>>(),
+        size_of::<MyScan<'_, RamDisk>>(),
+        size_of::<MyCompaction>()
+    );
+    println!("layout: {:?}", db.config());
     let report = block_on(db.open())?;
     println!("opened: {report:?}");
 
@@ -144,7 +151,7 @@ fn main() -> Result<(), Error<OutOfRange>> {
     // Range scan over [sensor/, sensor0) at the latest sequence number.
     // The scan borrows `db`, so writes can't move data under it.
     {
-        let mut scan = Box::new(Scan::new(&db));
+        let mut scan = Box::new(MyScan::new(&db));
         block_on(scan.seek(b"sensor/", Some(b"sensor0"), u64::MAX))?;
         let mut key = [0u8; 64];
         while let Some((kl, vl)) = block_on(scan.next(&mut key, &mut val))? {

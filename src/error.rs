@@ -126,6 +126,14 @@ pub enum Error<E> {
     /// `open()` first. (Writing before recovery would append over live WAL
     /// blocks and destroy acknowledged mutations.)
     NotOpen,
+    /// The multiwriter admission ring has no free slot. No ticket and no
+    /// sequence number were consumed. **Remedy:** let the drainer sweep
+    /// (it frees slots as it drains), then retry.
+    RingFull,
+    /// A multiwriter ring payload did not decode: it was not built by
+    /// `drainer::payload::encode_put` / `encode_delete`. The drainer is
+    /// poisoned and nothing was written.
+    BadPayload,
     /// The underlying block device reported an error.
     Device(E),
 }
@@ -163,6 +171,8 @@ impl Error<core::convert::Infallible> {
             Self::BadConfig => Error::BadConfig,
             Self::Busy => Error::Busy,
             Self::NotOpen => Error::NotOpen,
+            Self::RingFull => Error::RingFull,
+            Self::BadPayload => Error::BadPayload,
             Self::Device(e) => match e {},
         }
     }

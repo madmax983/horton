@@ -26,7 +26,7 @@ fn poll_put<const N: usize>(f: &mut horton::writer::Put<'_, N>) -> Poll<u32> {
 fn make_drainer<'r>(
     ring: &'r Ring<8>,
     durable: &'r AtomicU32,
-) -> Drainer<'r, MemDevice<512>, 512, 32, 32, 16, 1024, 2, 4, 64, 32, 0, 8, 8> {
+) -> Drainer<'r, MemDevice<512>, 512, 32, 32, 16, 1024, 2, 4, 64, 0, 8, 8> {
     let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
     block_on(db.open()).expect("db open must succeed");
     Drainer::new(ring, db, durable)
@@ -69,10 +69,10 @@ fn put_returns_no_space_when_full() {
         assert_eq!(poll_put(pm), Poll::Pending);
     }
 
-    // Ring full: NoSpace, no ticket consumed.
+    // Ring full: RingFull, no ticket consumed.
     match put(&ring, &durable, &p) {
-        Err(horton::Error::NoSpace) => {}
-        other => panic!("expected NoSpace, got {:?}", other.is_ok()),
+        Err(horton::Error::RingFull) => {}
+        other => panic!("expected RingFull, got {:?}", other.is_ok()),
     }
 }
 

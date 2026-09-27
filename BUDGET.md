@@ -26,10 +26,10 @@ not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 25,248 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache |
+| `Db` | 25,256 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache, the region layout |
 | `Scan` | 10,536 | logical block buffer, physical read buffer, cursors |
 | `Compaction` | 58,840 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,096 bytes: F16) |
-| **Structs** | **94,624** | |
+| **Structs** | **94,632** | |
 
 ## Measured futures
 
@@ -39,15 +39,15 @@ future, and the executor stores the future: in a static task arena
 
 | Future | Bytes | Notes |
 |---|---|---|
+| `archive_commit()` | 17,624 | the resurrection review's entry stream over the candidate |
 | `flush()` | 17,576 | table writer (data + index blocks) and trial-compression scratch |
-| `archive_commit()` | 17,496 | the resurrection review's entry stream over the candidate |
 | `open()` | 6,824 | WAL recovery |
-| `compact_step()` | 2,056 | merge state lives in the caller's `Compaction` |
-| `get()` | 1,056 | blocks are read through the `Db`'s shared buffers |
+| `compact_step()` | 2,320 | merge state lives in the caller's `Compaction` |
+| `get()` | 1,064 | blocks are read through the `Db`'s shared buffers |
 | `ingest_table()` | 560 | copies through the `Db`'s block scratch |
-| `put()`, `delete()`, `write()`, … | ≤ 384 | |
-| `Scan::next()`, `RevScan::prev()` | 4,752 | |
-| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,104 | |
+| `put()`, `delete()`, `write()`, … | ≤ 488 | |
+| `Scan::next()`, `RevScan::prev()` | ≤ 1,200 | |
+| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,184 | |
 
 At most one `&mut self` call runs at a time, and it excludes scans
 (a `Scan` borrows the `Db`). A `get` can run alongside a scan step. The
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 94,624 + max(17,576, 1,056 + 4,752) = 112,200 bytes
+= 94,632 + max(17,624, 1,064 + 1,200) = 112,256 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
