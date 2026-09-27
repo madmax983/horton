@@ -227,6 +227,48 @@ pub struct RecoverState {
     pub blocks_used: u64,
 }
 
+/// One record in a WAL batch: the drainer sweep's unit of work.
+///
+/// `expire_at` is used only for [`Op::PutTtl`] (0 = never, stored as
+/// [`Op::Put`], matching [`WalWriter::append_ttl`]); every other op
+/// ignores it.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchRecord<'a> {
+    /// Sequence number of the record.
+    pub seq: u64,
+    /// Mutation kind.
+    pub op: Op,
+    /// Key bytes; for [`Op::RangeDelete`], the inclusive start.
+    pub key: &'a [u8],
+    /// Value bytes; for [`Op::RangeDelete`], the exclusive end; for
+    /// [`Op::Delete`], ignored.
+    pub val: &'a [u8],
+    /// Absolute expiry tick for [`Op::PutTtl`].
+    pub expire_at: u64,
+}
+
+/// Report from [`WalWriter::append_batch`]: the batch is prefix-atomic —
+/// a prefix of the input is durable, and the records after it never
+/// became durable.
+#[derive(Debug)]
+#[must_use]
+pub struct BatchReport<E> {
+    /// Records flush-acknowledged: `records[..durable]` are durable. The
+    /// drainer advances its durable watermark over exactly these tickets.
+    pub durable: usize,
+    /// Records whose sequence numbers are consumed: `records[..consumed]`
+    /// are either durable or may replay after a crash (blocks landed but
+    /// the flush failed — the "device lied" case, same rule as the
+    /// single-put rollback). Never reuse their seqnums.
+    /// `records[consumed..]` never touched the device and may be retried
+    /// with fresh seqnums. Always `consumed >= durable`.
+    pub consumed: usize,
+    /// `None` iff the whole batch is durable. Otherwise the error that
+    /// determined the outcome: a commit failure subsumes an earlier append
+    /// failure, because the commit is the durability step.
+    pub error: Option<Error<E>>,
+}
+
 /// WAL writer: owns the device, a `[u8; BLOCK]` staging buffer, and the
 /// append position. Records are staged in RAM and become durable on
 /// [`commit`](WalWriter::commit).
@@ -448,6 +490,88 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             .await
             .map_err(Error::Device)?;
         Ok(())
+    }
+
+    /// Appends `records` as one batch and flushes once.
+    ///
+    /// Staging, full-block writes, and record encoding are exactly the
+    /// single-record path's; the batch only changes the flush granularity
+    /// and the error semantics. An empty batch is a no-op (no flush).
+    ///
+    /// The batch is prefix-atomic (SPEC §11): once a full staging block
+    /// lands on the device it cannot be unwritten, so a failed batch
+    /// resolves to a durable prefix, never to a hole. See [`BatchReport`]
+    /// for the exact `durable` / `consumed` / `error` contract. This is the
+    /// primitive the multiwriter drainer sweep is built on: drain up to
+    /// `max_writes` tickets, `append_batch`, flush once.
+    ///
+    /// # Errors
+    ///
+    /// The returned [`BatchReport::error`] carries [`Error::KeyTooLarge`]
+    /// / [`Error::ValueTooLarge`] for a bad record, [`Error::BatchTooLarge`]
+    /// when a record exceeds `BLOCK`, [`Error::WalFull`] when the WAL
+    /// region is exhausted, or [`Error::Device`] on I/O failure — the same
+    /// variants as
+    /// [`append`](WalWriter::append).
+    pub async fn append_batch(&mut self, records: &[BatchRecord<'_>]) -> BatchReport<D::Error> {
+        if records.is_empty() {
+            return BatchReport {
+                durable: 0,
+                consumed: 0,
+                error: None,
+            };
+        }
+        let mark_len = self.stage_len;
+        let mark_block = self.next_block;
+        let mut appended = 0;
+        let mut append_err = None;
+        for rec in records {
+            // `append` debug-asserts against `PutTtl`; TTL records go
+            // through `append_ttl`, which stores `expire_at == 0` as a
+            // plain `Put`.
+            let r = if rec.op == Op::PutTtl {
+                self.append_ttl(rec.seq, rec.key, rec.val, rec.expire_at)
+                    .await
+            } else {
+                self.append(rec.seq, rec.op, rec.key, rec.val).await
+            };
+            if let Err(e) = r {
+                append_err = Some(e);
+                break;
+            }
+            appended += 1;
+        }
+        match self.commit().await {
+            Ok(()) => BatchReport {
+                durable: appended,
+                consumed: appended,
+                error: append_err,
+            },
+            Err(commit_err) => {
+                // The commit is the durability step: its error determines
+                // the outcome, subsuming any earlier append error.
+                if self.next_block == mark_block {
+                    // Nothing reached the device: truncate the staged
+                    // prefix; every seqnum is reusable.
+                    self.truncate_stage(mark_len);
+                    BatchReport {
+                        durable: 0,
+                        consumed: 0,
+                        error: Some(commit_err),
+                    }
+                } else {
+                    // Blocks landed but the flush failed — the device lied,
+                    // indistinguishable from a crash at that instant: the
+                    // appended prefix may replay, so its seqnums are
+                    // consumed, never reused.
+                    BatchReport {
+                        durable: 0,
+                        consumed: appended,
+                        error: Some(commit_err),
+                    }
+                }
+            }
+        }
     }
 
     /// Writes the current staging buffer as one zero-padded block.

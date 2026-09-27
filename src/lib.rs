@@ -58,6 +58,8 @@ pub mod memtable;
 #[doc(hidden)]
 pub mod model;
 pub mod profile;
+#[cfg(feature = "multiwriter")]
+pub mod ring;
 pub mod scan;
 pub mod slots;
 pub mod sstable;
@@ -79,4 +81,4 @@ pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
 // tables itself.
 #[doc(hidden)]
 pub use sstable::{SstEntry, TablePlan, bloom_k, bloom_maybe_contains, plan_table, write_table};
-pub use wal::{Op, RecoverState, WalWriter};
+pub use wal::{BatchRecord, BatchReport, Op, RecoverState, WalWriter};
