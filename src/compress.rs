@@ -264,10 +264,15 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         if pos >= ip || ip - pos > 32768 {
             return (0, 0, h);
         }
-        // Count the match, capped so one token pair stays sane.
-        let mut len = 0usize;
+        // Count the match, capped so one token pair stays sane. Slicing
+        // both windows to exactly `cap` first proves the range once,
+        // instead of bounds-checking each indexed access against the
+        // much larger `src` on every iteration.
         let cap = (body - ip).min(MAX_MATCH);
-        while len < cap && src[pos + len] == src[ip + len] {
+        let a = &src[pos..pos + cap];
+        let b = &src[ip..ip + cap];
+        let mut len = 0usize;
+        while len < cap && a[len] == b[len] {
             len += 1;
         }
         (pos, len, h)
@@ -407,14 +412,27 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
         if match_len > out_len - dp {
             return Err(DecompressError::Invalid);
         }
-        // Byte-by-byte: matches may overlap the write frontier.
-        let mut mp = dp - offset;
+        let mp = dp - offset;
         let end = dp + match_len;
-        while dp < end {
-            dst[dp] = dst[mp];
-            dp += 1;
-            mp += 1;
+        if offset >= match_len {
+            // Source and destination ranges are disjoint (source ends at
+            // or before `dp`): a single bulk copy is equivalent to the
+            // byte-by-byte loop below, since no destination byte is read
+            // as a source byte.
+            dst.copy_within(mp..mp + match_len, dp);
+        } else {
+            // Overlapping (e.g. run-length patterns like offset == 1):
+            // must go byte-by-byte so each newly written byte becomes
+            // visible as a source byte for the bytes after it.
+            let mut mp = mp;
+            let mut dp = dp;
+            while dp < end {
+                dst[dp] = dst[mp];
+                dp += 1;
+                mp += 1;
+            }
         }
+        dp = end;
     }
     Ok(out_len)
 }
