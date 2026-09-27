@@ -278,7 +278,7 @@ impl<const N: usize> Ring<N> {
     /// `None`; else one `compare_exchange` to advance the head.
     ///
     /// A failed claim consumes nothing — no ticket, no sequence number, no
-    /// slot state changes — which is what makes `Error::NoSpace` honest.
+    /// slot state changes — which is what makes `Error::RingFull` honest.
     /// No retry in-crate; the host may retry (see SPEC §8).
     #[must_use]
     pub fn try_claim(&self) -> Option<u32> {
@@ -488,9 +488,10 @@ impl<const N: usize> Ring<N> {
     /// timeout) for the owner of `ticket`. If the gate reads `FREE(t)` or
     /// `FENCED(t)`, stores `FREE(t+N)` and returns
     /// [`ForceReleaseOutcome::Released`]. If it reads `PUBLISHED(t)`, the
-    /// writer published before dying — returns [`AlreadyPublished`] and
-    /// touches nothing; the drainer will drain it. Any other gate means the
-    /// ticket is not in a releasable state — returns [`Stale`].
+    /// writer published before dying — returns
+    /// [`ForceReleaseOutcome::AlreadyPublished`] and touches nothing; the
+    /// drainer will drain it. Any other gate means the ticket is not in a
+    /// releasable state — returns [`ForceReleaseOutcome::Stale`].
     ///
     /// Calling this without proven death is a host bug and voids the
     /// protocol guarantees (stated, not hidden).

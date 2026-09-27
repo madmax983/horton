@@ -6,11 +6,11 @@
 //! writer threads ──atomics──▶ ring ──drainer──▶ Db ──▶ Device
 //! ```
 //!
-//! The drainer exclusively owns the [`Db`](crate::db::Db) (SPEC O2: sole
+//! The drainer exclusively owns the [`Db`] (SPEC O2: sole
 //! device writer — writers share only the atomic ring, and no
 //! `BlockDevice` signature changes). Each [`Drainer::sweep`] drains the
 //! ring's published tickets in order, converts the 32-byte payloads to a
-//! [`WriteBatch`](crate::batch::WriteBatch), applies it through
+//! [`WriteBatch`], applies it through
 //! [`Db::write`](crate::db::Db::write) (one WAL flush per sweep, memtable
 //! updated atomically), and advances the `durable` ticket watermark
 //! **only after the write is acknowledged** (SPEC O1: acked ⇒ durable).
@@ -206,7 +206,7 @@ pub fn is_ticket_durable(durable: &AtomicU32, ticket: u32) -> bool {
 /// a seqnum watermark for snapshot pinning is a future slice.
 ///
 /// The drainer publishes the watermark with Release
-/// ([`Drainer::advance_durable`]); this loads it with Acquire. The value
+/// (in [`Drainer::sweep`]); this loads it with Acquire. The value
 /// never moves backward: tickets drain in ticket order and the drainer is
 /// the sole writer.
 #[must_use]
@@ -237,7 +237,7 @@ pub enum SweepOutcome {
 
 /// The single Db-owning drainer.
 ///
-/// Owns the [`Db`](crate::db::Db); shares `&Ring` and `&AtomicU32
+/// Owns the [`Db`]; shares `&Ring` and `&AtomicU32
 /// durable` with the host and the writers. `durable` is the contiguous
 /// WAL-durable ticket prefix (mod 2³¹); the drainer is its sole writer.
 /// All batch scratch is caller-sized (`MAX_WRITES`); no allocation, no
@@ -258,13 +258,12 @@ pub struct Drainer<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
     const N: usize,
     const MAX_WRITES: usize,
 > {
     ring: &'r Ring<N>,
-    db: Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>,
+    db: Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     durable: &'r AtomicU32,
     /// Tickets drained but not yet Db-durable (memtable was full on the
     /// last sweep). In drain order; `pending_len` entries are valid.
@@ -297,7 +296,6 @@ impl<
     const LEVELS: usize,
     const TABLES: usize,
     const BLOOM_BYTES: usize,
-    const FREELIST: usize,
     const CACHE: usize,
     const N: usize,
     const MAX_WRITES: usize,
@@ -313,7 +311,6 @@ impl<
         LEVELS,
         TABLES,
         BLOOM_BYTES,
-        FREELIST,
         CACHE,
         N,
         MAX_WRITES,
@@ -330,19 +327,7 @@ impl<
     #[must_use]
     pub const fn new(
         ring: &'r Ring<N>,
-        db: Db<
-            D,
-            BLOCK,
-            KEY_MAX,
-            VAL_MAX,
-            CAP,
-            ARENA,
-            LEVELS,
-            TABLES,
-            BLOOM_BYTES,
-            FREELIST,
-            CACHE,
-        >,
+        db: Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
         durable: &'r AtomicU32,
     ) -> Self {
         Self {
@@ -386,12 +371,11 @@ impl<
         drain_watermark(self.durable)
     }
 
-    /// Consumes the drainer and returns the owned [`Db`](crate::db::Db).
+    /// Consumes the drainer and returns the owned [`Db`].
     #[must_use]
     pub fn into_db(
         self,
-    ) -> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, FREELIST, CACHE>
-    {
+    ) -> Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE> {
         self.db
     }
 
@@ -434,7 +418,7 @@ impl<
     /// Drains up to `MAX_WRITES` published tickets in ticket order into
     /// the pending buffer (unless a previous sweep left pending tickets
     /// from a full memtable — those are retried first and no new tickets
-    /// are drained). Builds a [`WriteBatch`](crate::batch::WriteBatch)
+    /// are drained). Builds a [`WriteBatch`]
     /// from the WAL-bearing payloads and applies it via `Db::write` (one
     /// WAL flush, memtable updated atomically), then advances `durable`
     /// over the entire contiguous resolved prefix — WAL-bearing,
@@ -516,7 +500,7 @@ impl<
                 // Malformed payload: never silently reinterpret as a
                 // valid mutation. Poison — the host must intervene.
                 self.poisoned = true;
-                return Err(Error::NoSpace);
+                return Err(Error::BadPayload);
             };
             // The payload codec only produces Put/Delete; RangeDelete and
             // PutTtl are rejected by decode (handled defensively).
@@ -525,7 +509,7 @@ impl<
                 Op::Delete => batch.delete(key),
                 Op::RangeDelete | Op::PutTtl => {
                     self.poisoned = true;
-                    return Err(Error::NoSpace);
+                    return Err(Error::BadPayload);
                 }
             };
             if let Err(e) = res {
@@ -533,17 +517,11 @@ impl<
                 // KEY_MAX/VAL_MAX) or a logic bug (batch overfull):
                 // configuration error, not a device error. Poison — the
                 // host must intervene.
+                // `BatchFull` is unreachable (at most MAX_WRITES ops in a
+                // MAX_WRITES-capacity batch); `widen` keeps whatever
+                // variant the batch reported.
                 self.poisoned = true;
-                return Err(match e {
-                    Error::EmptyKey => Error::EmptyKey,
-                    Error::KeyTooLarge { len, max } => Error::KeyTooLarge { len, max },
-                    Error::ValueTooLarge { len, max } => Error::ValueTooLarge { len, max },
-                    // BatchFull is unreachable (at most MAX_WRITES ops in
-                    // a MAX_WRITES-capacity batch); any other variant is a
-                    // logic bug. NoSpace is the closest explicit-exhaustion
-                    // signal.
-                    _ => Error::NoSpace,
-                });
+                return Err(e.widen());
             }
             n_ops += 1;
         }

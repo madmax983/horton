@@ -55,6 +55,9 @@ misread.
   lifecycle fuzzer).
 - A newer range tombstone could be dropped in favour of an older,
   identical one when merging.
+- The `multiwriter` feature did not build once v0.17 landed: the drainer
+  and writer still used `Error::NoSpace` and `Db`'s removed `FREELIST`
+  parameter. The `loom` ring model did not compile either.
 
 ### Added
 
@@ -82,6 +85,10 @@ misread.
 
 - **Breaking:** `Error::NoSpace` is gone; each capacity condition has
   its own variant naming the remedy (ADR-0013).
+- Multiwriter errors (feature `multiwriter`): a full ring at claim time
+  is `Error::RingFull` (let the drainer sweep, then retry), and a ring
+  payload the drainer cannot decode is `Error::BadPayload` (the drainer
+  poisons). A batch error during a drainer sweep keeps its own variant.
 - **Breaking:** `Config::new`'s second manifest position must leave room
   for a whole copy (`Manifest::max_blocks` blocks); `open()` rejects
   overlapping regions with `BadConfig`.
