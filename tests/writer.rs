@@ -7,14 +7,13 @@
 
 mod common;
 
-use common::{MemDevice, block_on, noop_waker};
+use common::{MemDevice, block_on, noop_waker, test_config};
 use core::future::Future;
 use core::pin::pin;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use horton::drainer::{Drainer, payload};
 use horton::ring::{PublishOutcome, Ring};
-use horton::wal::WalWriter;
 use horton::writer::put;
 
 fn poll_put<const N: usize>(f: &mut horton::writer::Put<'_, N>) -> Poll<u32> {
@@ -23,12 +22,21 @@ fn poll_put<const N: usize>(f: &mut horton::writer::Put<'_, N>) -> Poll<u32> {
     pin!(f).poll(&mut cx)
 }
 
+/// Builds a Db-owning drainer for writer tests.
+fn make_drainer<'r>(
+    ring: &'r Ring<8>,
+    durable: &'r AtomicU32,
+) -> Drainer<'r, MemDevice<512>, 512, 32, 32, 16, 1024, 2, 4, 64, 32, 0, 8, 8> {
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    Drainer::new(ring, db, durable)
+}
+
 #[test]
 fn put_completes_when_durable() {
     let ring = Ring::<8>::new();
     let durable = AtomicU32::new(0);
-    let wal = WalWriter::new(MemDevice::<512>::new(), 0, 16);
-    let mut drainer = Drainer::<_, 512, 8, 8>::new(&ring, wal, &durable, 1);
+    let mut drainer = make_drainer(&ring, &durable);
 
     let p = payload::encode_put(b"k", b"v").expect("fits");
     let mut pending = put(&ring, &durable, &p).expect("ring has space");
@@ -87,4 +95,39 @@ fn fenced_ticket_reclaim_pattern() {
     let t1 = ring.try_claim().expect("space");
     assert_ne!(t0, t1);
     assert_eq!(ring.publish(t1, &p), PublishOutcome::Published);
+}
+
+#[test]
+fn dropped_put_abandons_observation_not_the_write() {
+    // Dropping a pending `Put` stops observation; the accepted write is
+    // still drained and made durable by the drainer.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer(&ring, &durable);
+
+    let p = payload::encode_put(b"k", b"v").expect("fits");
+    // Scope the observer: dropping it abandons observation, not the write.
+    let ticket = {
+        let mut pending = put(&ring, &durable, &p).expect("ring has space");
+        let ticket = pending.ticket();
+        // Pending before the drain.
+        assert_eq!(poll_put(&mut pending), Poll::Pending);
+        ticket
+    };
+
+    // The write was accepted and must still complete.
+
+    block_on(drainer.sweep()).expect("sweep ok");
+    assert!(
+        horton::drainer::is_ticket_durable(&durable, ticket),
+        "dropped put's ticket must still become durable"
+    );
+
+    // And the data is in the Db.
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    let len = block_on(db.get(b"k", &mut buf))
+        .expect("get ok")
+        .expect("k present");
+    assert_eq!(&buf[..len], b"v");
 }

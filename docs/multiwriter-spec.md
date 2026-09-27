@@ -191,12 +191,17 @@ unchanged.
 
 ## 7. Completion, durability, proof obligations
 
-> **Implemented** (2026-09-26): `src/drainer.rs` — the `Drainer` owns the
-> `WalWriter`, drains the ring in ticket order, batches through
-> `append_batch` (one flush per sweep), and advances `durable` only over
-> the acknowledged prefix. `tests/drainer.rs` (6 tests) covers the
-> batch+flush+durable flow, WAL content recovery, idle/fence behavior,
-> batch-error poisoning, and `next_seq` reseeding.
+> **Implemented** (2026-09-27): `src/drainer.rs` — the `Drainer` owns the
+> complete `Db`, drains the ring in ticket order, batches through
+> `Db::write` (one WAL flush per sweep), and advances `durable` only over
+> the acknowledged prefix. `tests/drainer.rs` covers the batch+flush+
+> durable flow, idle/fence behavior, flush-error poisoning, memtable-full
+> stalling with retry, malformed-payload poisoning, the pending-flush
+> ordering regression, and the dropped-observer guarantee.
+>
+> *Supersedes the 2026-09-26 WAL-owning note: the drainer no longer owns a
+> `WalWriter`; it owns the `Db`, which assigns WAL/database sequence
+> numbers internally.*
 
 - Completion signal: a single `durable: AtomicU32` watermark = the
   contiguous WAL-durable ticket prefix (mod 2³¹; unwrapped by the drainer
@@ -214,17 +219,18 @@ unchanged.
   owned by the drainer. No `&WalWriter` is ever shared. (The full `Db`
   move is a later slice; the WAL-owning drainer is the device-writer
   boundary.)
-- **O3 — counter reseed.** On `open()`, the drainer's u64 seqnum base is
-  the recovered WAL `next_seq` (`max_seq + 1`; seqnum 0 is the recovery
-  floor and is never used). Tickets and WAL seqnums are independent
-  counters: the drainer maps the i-th drained ticket to `next_seq + i`.
-  The `durable` ticket watermark is initialized to the ring's head ticket
-  (0 for a fresh ring); the ring itself starts unseeded unless the host
-  reseeds it via `Ring::new_seeded`. Gap sequence numbers (never claimed,
-  or claimed-but-fenced) left no trace and are safe to skip; recovery
-  MUST NOT treat gaps as corruption and MUST NOT ack anything. Fenced/
-  skipped tickets consume no seqnums and advance `durable` immediately
-  (they are dead; their writers were notified via
+- **O3 — counters are independent.** Tickets (31-bit, mod 2³¹) and
+  Db/WAL sequence numbers (u64) are independent counters. The Db owns
+  sequence assignment: `Db::write` returns the batch's base seqnum, and
+  the i-th op in the batch receives `base + i`. Fenced/skipped tickets
+  consume no seqnums — they advance the *ticket* watermark without ever
+  touching the Db's sequence space. The `durable` ticket watermark is
+  initialized to the ring's head ticket (0 for a fresh ring); the ring
+  itself starts unseeded unless the host reseeds it via `Ring::new_seeded`.
+  Gap sequence numbers (never claimed, or claimed-but-fenced) left no
+  trace and are safe to skip; recovery MUST NOT treat gaps as corruption
+  and MUST NOT ack anything. Fenced/skipped tickets advance `durable`
+  immediately (they are dead; their writers were notified via
   `PublishOutcome::Fenced`).
 - The 32-byte ring payload uses the interim codec
   (`drainer::payload`: `[op:1][klen:1][vlen:1][key][val]`, 29-byte
@@ -269,27 +275,37 @@ unchanged.
 
 ## 9. Snapshots and reads
 
-> **Implemented** (2026-09-26): `drainer::drain_watermark` (free function)
+> **Implemented** (2026-09-27): `drainer::drain_watermark` (free function)
 > and `Drainer::durable_watermark` — the Acquire side of the Release/
-> Acquire watermark publication. `tests/drainer.rs` proves the three
-> invariants: the watermark pins the drain position (not the claim head —
-> the head can run ahead of durability), it never moves backward, and
-> fenced tickets advance it without leaving WAL records.
+> Acquire watermark publication. These are the **writer-completion**
+> watermark: a writer's put completes when `durable` advances past its
+> ticket. `tests/drainer.rs` proves the invariants: the watermark tracks
+> the drain position (not the claim head — the head can run ahead of
+> durability), it never moves backward, and fenced tickets advance it
+> without leaving WAL records.
+>
+> *Correction (2026-09-27): the ticket watermark is NOT a snapshot
+> sequence. Horton snapshots (`Db::snapshot`) use the Db's own u64
+> sequence numbers, which are independent of tickets — fenced tickets
+> advance the ticket watermark without receiving a sequence number. The
+> ticket→seqnum mapping for snapshot pinning comes from `Db::write`'s
+> return (base seqnum); exposing it as a drainer API is a future slice.*
 
-- **Snapshot watermarks MUST pin the drain watermark, not the claim
-  counter** (spike 5): pinning the claim counter lets a later-drained
-  ticket `≤` watermark become visible to a snapshot reader — an isolation
-  violation. The drainer publishes the watermark with Release; `snapshot()`
-  load-Acquires it.
-- The watermark is the contiguous *resolved* ticket prefix: every ticket
-  `<` it is WAL-durable, fenced tickets included (dead tickets resolve
-  the prefix without a WAL record). A snapshot at the watermark observes
-  exactly the WAL-durable records — verified by recovery in the tests.
+- **Writer completion uses the ticket watermark** (spike 5): a put
+  completes when `durable` has advanced past its ticket
+  (`drainer::is_ticket_durable`). The drainer publishes the watermark
+  with Release after the WAL batch's flush is acknowledged.
+- **Snapshots pin the Db's sequence watermark, not the ticket
+  watermark.** `Db::snapshot()` returns the Db's current sequence number;
+  readers use that, never the ticket counter. Pinning the claim head (or
+  conflating tickets with seqnums) would let a later-drained ticket
+  become visible to a snapshot reader — an isolation violation.
+- The ticket watermark is the contiguous *resolved* ticket prefix: every
+  ticket `<` it is WAL-durable, fenced tickets included (dead tickets
+  resolve the prefix without a WAL record) — verified by recovery in the
+  tests.
 - Read-your-writes for the writing thread through the ring is OPEN (spec
   gap, spike 5): undecided whether a writer sees its own un-drained put.
-- Full `Db::snapshot` integration (snapshot reads at the pinned
-  watermark) awaits the Db-owning drainer slice; the watermark API is the
-  boundary it will use.
 
 ## 10. Topology (ownership)
 
@@ -374,13 +390,20 @@ single-CAS).
 
 ## 13. Ticket → seqnum mapping
 
-- The ticket IS the sequence order. The drainer unwraps the 31-bit ticket
-  to a u64 seqnum: the unique `s ≥ seq_base` with
-  `(s & TICKET_MASK as u64) == t`, where `seq_base` advances with the
-  drain cursor. Unique by I1 (`N << 2³¹`).
-- Fenced tickets create seqnum gaps. Gaps are benign: recovery, snapshots,
-  and compaction key on seqnum comparison, never density. (Spike 5: gap
-  seqs left no trace.)
+> *Rewritten 2026-09-27 for the Db-owning drainer. The pre-2026-09-27
+> design (drainer unwraps tickets to seqnums) is obsolete.*
+
+- Tickets and Db sequence numbers are **independent counters**. The Db
+  owns sequence assignment entirely: `Db::write` assigns the batch's
+  seqnums and returns the base seqnum; the i-th op in the batch receives
+  `base + i`.
+- Fenced tickets create no seqnums at all. The divergence is benign:
+  recovery, snapshots, and compaction key on seqnum comparison, never
+  density. (Spike 5: gap seqs left no trace.)
+- The drainer learns the mapping from `Db::write`'s return value. A
+  future slice will expose the highest durable Db seqnum alongside the
+  ticket watermark so hosts can pin `Db::snapshot` consistently with the
+  drain position.
 
 ## 14. API surface (initial)
 
@@ -426,3 +449,44 @@ single-CAS).
 6. Dual-core `s32c1i` cross-core behavior on ESP32-S3: TRM/hardware
   confirmation still wanted (spike 2: instruction selection verified,
   silicon behavior not).
+
+### Recommendations (2026-09-27; Mark to confirm or veto)
+
+1. **Read-your-writes: no.** The writer awaits the `Put` future for
+  durability, then reads via the normal `Db::get` path. Making the ring
+  searchable by key would break the fixed-size slot design and add a
+  second lookup path. If a host needs it, a small caller-owned
+  write-through cache in front of `put` is the right layer — not the
+  ring.
+
+2. **`NoSpace`: keep it.** A full ring is already documented (§8) as
+  morally identical to snapshot exhaustion. A dedicated `RingFull`
+  variant adds churn for no behavioral difference — the caller retries
+  either way. If observability is wanted later, a `u32` full-count
+  metric beats a new variant.
+
+3. **Batches: consecutive tickets, drainer-side atomicity.** The 32-byte
+  slot cannot hold a batch. The writer claims N tickets and publishes N
+  payloads; the Db-owning drainer applies consecutive tickets as one
+  `Db::write` (already atomic). Range-delete/TTL ride as payload op
+  kinds when the payload codec grows beyond the 29-byte MVP — same
+  mechanism, no new slot format.
+
+4. **`WriterFenced`: silent re-claim (implemented).** `put` already
+  re-claims transparently when `publish` returns `Fenced`. Rationale:
+  the fence only kills stalled tickets; an active writer hit by the race
+  has nothing useful to do with the dead ticket, and surfacing it would
+  force every caller to handle a race that resolves itself. Veto and
+  I'll surface it.
+
+5. **Ack: host re-poll (implemented).** The §8 rule stands — `Pending`
+  only post-acceptance, host owns the re-poll. A fixed waiter array
+  needs interior mutability (the forbidden thing) or lock-free ABA
+  gymnastics for marginal gain on a target whose executor already
+  polls. Revisit only with measured wake-latency pain.
+
+6. **`s32c1i`: needs hardware.** No code recommendation possible —
+  this is a TRM/silicon question. The ring uses `core::sync::atomic`
+  (which the Xtensa backend lowers to `s32c1i`); if the hardware proves
+  it non-cross-core-safe, the fallback is a ticket spinlock, not a
+  redesign. Flagged for Mark's hardware pass.
