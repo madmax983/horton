@@ -257,6 +257,16 @@ unchanged.
 - Whether `NoSpace` is reused or a dedicated `RingFull` variant is added
   is OPEN (observability call, Mark's).
 
+> **Implemented** (2026-09-26): `src/writer.rs` — `put(ring, durable,
+> payload)` claims a ticket, publishes the 32-byte payload, and returns a
+> `Put` future resolving to the ticket once WAL-durable. Ring-full at
+> claim → `Err(Error::NoSpace)` immediately (no ticket consumed).
+> `publish` → `Fenced` transparently re-claims a fresh ticket (silent
+> re-claim; §16 Q4). `Put` polls the `durable` watermark and returns
+> `Pending` post-acceptance only, per the rule above; dropping it
+> abandons observation, not the write. If the drainer is poisoned the
+> watermark never advances and the host owns failing abandoned puts.
+
 ## 9. Snapshots and reads
 
 > **Implemented** (2026-09-26): `drainer::drain_watermark` (free function)

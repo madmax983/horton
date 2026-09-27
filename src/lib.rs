@@ -60,6 +60,8 @@ pub mod ring;
 pub mod scan;
 pub mod sstable;
 pub mod wal;
+#[cfg(feature = "multiwriter")]
+pub mod writer;
 
 pub use alloc::{Bump, FreeList};
 pub use batch::WriteBatch;
