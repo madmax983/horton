@@ -30,8 +30,8 @@
 use super::{Db, MAX_SNAPSHOTS};
 use crate::cache::CachePort;
 use crate::compact::{
-    Compaction, Input, MergeOutcome, Progress, RdelMerger, RdelStats, State, TargetView,
-    count_rdel_merge, init_cursor, ranges_overlap, rdel_blocks_bound,
+    COMPACTION_KMAX, Compaction, Input, MergeOutcome, Progress, RdelDrop, RdelMerger, RdelStats,
+    State, TargetView, count_rdel_merge, init_cursor, ranges_overlap,
 };
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -515,22 +515,26 @@ impl<
         // range-tombstone section. A dry run counts the merged entries;
         // an output's clipped share is at most that many, which bounds its
         // blocks (`rdel_blocks_bound`).
-        let rdel_entries = {
+        let rdel = {
             let targets = TargetView {
                 level: self.manifest.level(tgt).unwrap_or(&[]),
                 ids: &c.tgt[..c.n_tgt],
             };
+            // The last cursor's block is idle until the cursors are
+            // positioned below: the dry run tracks open ends in it.
             count_rdel_merge(
                 self.wal.device(),
                 &c.inputs[..c.n_src],
                 &targets,
                 &mut c.raw,
+                c.cursors[COMPACTION_KMAX - 1].block_mut(),
                 c.bottommost,
                 c.oldest_snapshot,
             )
             .await?
         };
-        let rdel_budget = rdel_blocks_bound::<BLOCK, KEY_MAX>(rdel_entries);
+        let rdel_entries = rdel.entries;
+        let rdel_budget = rdel.blocks_bound::<BLOCK, KEY_MAX>();
         // The data section gets the rest of the slot. It must hold at
         // least one key's worst case or no output could end.
         let margin = Compaction::<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>::key_run_blocks(n);
@@ -644,7 +648,12 @@ impl<
             .out_base
             .checked_add(data_blocks)
             .ok_or(Error::TableTooLarge)?;
-        let drop_below = c.rdel_drop_floor();
+        let drop = RdelDrop::new(
+            c.bottommost,
+            c.oldest_snapshot.min(c.outside_min_seq),
+            &c.inexact,
+            c.n_inexact,
+        );
         // The writer's data buffer is idle until `finish_meta`: the rdel
         // section stages there.
         let mut rdel_out = sstable::RdelWriter::<BLOCK>::new(rdel_base, c.writer.spare_block())
@@ -667,7 +676,7 @@ impl<
             );
             while merger.next_merged(&*device, &mut c.raw, &targets).await? {
                 if let Some(piece) = clip(merger.current_entry(), Some(&lo), hi.as_ref())
-                    && piece.seq >= drop_below
+                    && !drop.drops(piece.start, piece.end, piece.seq)
                 {
                     rdel_out.push(&mut *device, piece).await?;
                     rdel_stats.observe::<D::Error>(&piece, rdel_base)?;

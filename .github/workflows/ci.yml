@@ -158,6 +158,53 @@ jobs:
           node browser-test.mjs
           node live-browser-test.mjs
 
+  # The host key-value store: horton the way LevelDB is used, on a real
+  # file, from many threads, killed with SIGKILL (TerminateProcess on
+  # Windows) mid-write. On each desktop OS, since the file device is
+  # platform code.
+  kvstore:
+    name: kvstore (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+      - name: store unit tests
+        run: cargo test --release --example kvstore
+      - name: demo
+        run: cargo run --release --example kvstore -- demo
+      - name: command line
+        run: |
+          kv() { cargo run -q --release --example kvstore -- --db target/kvstore/cli.db "$@"; }
+          kv put hello world
+          test "$(kv get hello)" = world
+          kv put a 1 && kv put b 2 && kv put c 3
+          test "$(kv scan a c)" = "$(printf 'a = 1\nb = 2')"
+          test "$(kv scan --reverse --limit 1)" = "hello = world"
+          kv del hello
+          if kv get hello; then exit 1; fi
+          kv delrange a c
+          test "$(kv scan)" = "c = 3"
+          kv compact
+      - name: crash test (fdatasync on)
+        run: cargo run --release --example kvstore -- crash 25
+      - name: crash test (no fdatasync, so more flushes and compactions per kill)
+        run: cargo run --release --example kvstore -- --no-sync crash 25
+      - name: benchmark
+        # Unsynced, as a smoke test: runners' fsync (F_FULLFSYNC on macOS)
+        # is too slow to time here.
+        run: cargo run --release --example kvstore -- --no-sync bench --num 30000
+
   miri:
     name: miri
     runs-on: ubuntu-latest

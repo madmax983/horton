@@ -245,10 +245,12 @@ fn crash_during_rdel_compaction_is_atomic() {
 }
 
 /// Builds a database with two identical range tombstones over `[k0, k3)`
-/// plus three wider ones, all covering an older put of k0. Five tombstones
-/// cover k0 at once — more than the merge tracks — so the merge keeps the
-/// job's range tombstones, and the bottommost shadow gate must emit only
-/// the newer of the identical pair.
+/// plus a staircase of eight older ones, each reaching further than every
+/// newer one, all covering an older put of k0. No tombstone over k0 is
+/// dominated by a newer one reaching as far (bar the older of the pair),
+/// so nine decide k0's cover at once — more than the merge tracks — and
+/// the merge keeps the tombstones reaching k0; the bottommost shadow gate
+/// must emit only the newer of the identical pair.
 fn build_with_shadowed_rdel() -> MemDevice<BLOCK> {
     let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
     block_on(db.open()).unwrap();
@@ -256,12 +258,21 @@ fn build_with_shadowed_rdel() -> MemDevice<BLOCK> {
     block_on(db.flush()).unwrap();
     block_on(db.put(b"k0", b"new")).unwrap();
     block_on(db.flush()).unwrap();
-    block_on(db.delete_range(b"k0", b"k3")).unwrap();
-    block_on(db.delete_range(b"k0", b"k3")).unwrap();
+    for end in [
+        &b"k9"[..],
+        b"k8",
+        b"k7",
+        b"k6",
+        b"k5",
+        b"k4",
+        b"k35",
+        b"k34",
+    ] {
+        block_on(db.delete_range(b"k0", end)).unwrap();
+    }
     block_on(db.flush()).unwrap();
-    block_on(db.delete_range(b"k0", b"k4")).unwrap();
-    block_on(db.delete_range(b"k0", b"k5")).unwrap();
-    block_on(db.delete_range(b"k0", b"k6")).unwrap();
+    block_on(db.delete_range(b"k0", b"k3")).unwrap();
+    block_on(db.delete_range(b"k0", b"k3")).unwrap();
     block_on(db.flush()).unwrap();
     assert!(db.compaction_pending());
     db.into_device()
@@ -296,12 +307,12 @@ fn run_shadowed_rdel_crashed(crash_at: usize) -> MemDevice<BLOCK> {
 ///
 /// L1..L6 are empty, so the L0→L1 output is bottommost
 /// ([`Db::is_bottommost_output`]). Both puts of k0 are hidden from every
-/// reader, so they are dropped. Five tombstones cover k0 — more than the
-/// merge tracks at once — so the job's tombstones are kept, and the
-/// shadow gate drops the older of the identical `[k0,k3)` pair. A crash
-/// either lands the commit (post: L0 drained, one range-only L1 table
-/// with four tombstones) or drops it (pre: L0 intact). The logical map is
-/// empty in every case.
+/// reader, so they are dropped. Nine tombstones decide k0's cover — more
+/// than the merge tracks at once — so the tombstones reaching k0 are kept,
+/// and the shadow gate drops the older of the identical `[k0,k3)` pair. A
+/// crash either lands the commit (post: L0 drained, one range-only L1
+/// table with nine tombstones) or drops it (pre: L0 intact). The logical
+/// map is empty in every case.
 #[test]
 fn crash_during_bottommost_rdel_shadow_drop_is_atomic() {
     let w = count_shadowed_rdel_writes();

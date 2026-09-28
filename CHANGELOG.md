@@ -20,6 +20,16 @@ misread.
 
 ### Added
 
+- **Key-value store example** (`examples/kvstore`): horton on a host the
+  way LevelDB is used. A file-backed `BlockDevice` (`pread`/`pwrite`,
+  `fdatasync`), a store thread that owns the `Db` behind a cloneable
+  handle, group commit of concurrent writers into one WAL block, capacity
+  errors handled and compaction run in the background, snapshots and
+  paging iterators. `demo` tours the API, `put`/`get`/`scan`/… make it a
+  command-line store, `bench` runs db_bench's workloads, and `crash` kills
+  a multi-threaded writer process mid-write and checks the reopened store
+  against every acknowledged write. CI runs all of it on Linux, macOS and
+  Windows. The README lists where horton stops at host scale.
 - **Ground station example** (`examples/ground_station`): the flight
   recorder's horton compiled to `wasm32-unknown-unknown` as a `no_std`,
   import-free `cdylib`, and a web page that opens a recorder's flash dump
@@ -96,6 +106,17 @@ misread.
   part: the older batch's closing record, left behind the tear, closed
   the torn group (found by the live logger's power-cut test). Recovery
   ends a block at the first record no newer than the one before it.
+- **F22** Overlapping range deletes wedged compaction for good (found by
+  the kvstore example's crash test). Past four tombstones overlapping at
+  a key the merge kept every range tombstone of the job, so a range
+  deleted again and again piled them up; and every job reserved room for
+  all of them at the `12 + 2 * KEY_MAX`-byte worst case. Once that
+  outgrew a slot, every L0 job failed with `TableTooLarge` before it
+  began, level 0 stayed full, and no flush could land. The merge now
+  tracks only tombstones no newer, wider one dominates (eight at once,
+  +632 bytes of `Compaction`), and where it still overflows it keeps only
+  the tombstones reaching there. The reservation counts the tombstones'
+  real bytes, plus what clipping at the output bounds can add.
 - The flight recorder's `restore` failed on archives of more than a few
   dozen tables (`IngestConflict`, then `RegionFull`): it ingested the
   whole history into one database, whose shape has 16 table slots. It

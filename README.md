@@ -188,6 +188,93 @@ examples/ground_station/build.sh
 python3 -m http.server -d examples/ground_station/web 8000   # then open /live.html
 ```
 
+## Demo: a key-value store on a host, the way LevelDB is used
+
+[`examples/kvstore`](examples/kvstore) is horton on x86-64 (or any
+desktop OS) in the role LevelDB and RocksDB usually fill: a store in one
+file, a handle any thread can clone, and compaction that runs by itself.
+
+```sh
+cargo run --release --example kvstore -- demo              # a checked tour of the API
+cargo run --release --example kvstore -- put hello world   # a command-line store, like LevelDB's `ldb`
+cargo run --release --example kvstore -- scan --limit 10
+cargo run --release --example kvstore -- bench             # db_bench's workloads
+cargo run --release --example kvstore -- crash 25          # kill -9 the writer 25 times, check everything
+```
+
+horton's `Db` is one value with `&mut self` writes and no locks, which
+suits firmware. The example puts it on a **store thread** and gives other
+threads a `Handle` that sends requests over a channel:
+
+| LevelDB | here |
+|---|---|
+| `DB::Open` on a directory | `Store::open` on one file, created sparse at `--size-mb` (256 MiB); a `BlockDevice` over `pread`/`pwrite` and `fdatasync` ([`device.rs`](examples/kvstore/device.rs)) |
+| `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
+| `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
+| writer queue, group commit | the store thread commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
+| background compaction | one bounded `compact_step` between requests, back to back when idle; full memtables, WALs and level 0s are handled on the store thread, so callers never see those errors |
+| `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
+| `NewIterator` | `range(start, end, reverse)`: pins a snapshot, pages through horton's `Scan` or `RevScan` |
+| `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
+
+`crash` runs a writer process with several threads (puts, deletes,
+atomic batches, range deletes, each thread on its own keys) that prints
+each write once acknowledged, kills it at a random moment, reopens, and
+compares the whole store with a model of the acknowledged writes. A
+reader thread meanwhile checks through snapshots that no batch is ever
+half visible. It tests process crashes on a real file system; the flight
+recorder's `torture` covers torn writes on simulated flash.
+
+```text
+process kills          25
+acknowledged writes    208710, every one present
+in flight at the kill  20 landed whole, the rest not at all; never in part
+WAL records replayed   22048
+after compacting       1151 keys, unchanged
+```
+
+This test found F22 in the [review status](docs/ARCHITECTURE_REVIEW.md):
+range deletes that overlap again and again piled up tombstones compaction
+never collected, until every compaction job failed with `TableTooLarge`
+and the store could not flush again. It is fixed; the crash test now
+prints the tombstone blocks as they come and go.
+
+`bench` runs db_bench's workloads (16-byte keys, 100-byte values that
+compress by half, four client threads). On a CI-class Linux container:
+
+| | fdatasync on | `--no-sync` |
+|---|---|---|
+| `fillrandom` | 10.6 K ops/s (2.4 writes per commit) | 55.6 K ops/s |
+| `readrandom` | 10.8 K ops/s | 10.7 K ops/s |
+| `readseq` | 478 K entries/s | 342 K entries/s |
+| `fillrandom`, 1 M entries | | 42.5 K ops/s, 15 of 28 tables used |
+
+### Where horton stops at host scale
+
+The example is also a measurement of how far a firmware store stretches.
+These are the limits it meets, and each is a property of the library:
+
+- **Point reads are slow: about 100 µs.** Each table a read probes costs a
+  full-block CRC of its footer and its bloom filter, and a hit costs the
+  index and the data block too, even when they come from the block cache
+  (the cache stores raw images, and every read re-verifies them). With
+  16 KiB blocks and up to 10 tables to probe, that is most of the time.
+  8 KiB blocks halve it, at a quarter of the capacity.
+- **Capacity is at most `levels × tables_per_level` (64) tables**, and a
+  table's index is one block, so the block size bounds a table: about
+  7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
+  200 MiB compressed; 1 M db_bench entries take 15. A fuller store gets
+  `RegionFull`: the flight recorder's answer is to archive cold tables.
+- **A bloom filter is one block** (16 K bytes, about 13 K keys at 1%
+  false positives), so large tables filter poorly.
+- **One thread does all the work.** Reads queue behind writes and
+  compaction steps on the store thread; there are no concurrent readers.
+- **Batches are one WAL block**, keys and values have compile-time
+  maximums (128 B and 4 KiB here), and at most eight snapshots (so eight
+  iterators) are live at once.
+- **`compact` finishes pending work**; horton has no call that forces
+  every level down to the bottom, like LevelDB's `CompactRange`.
+
 ## Architecture
 
 ```mermaid
@@ -306,15 +393,15 @@ smaller than one largest entry).
 `size_of::<MyDb<YourDevice>>()` and the same for your `Scan` and
 `Compaction` types; `cargo run --example quickstart` does. With the quick
 start's sizes that is about 25 KiB for `Db`, 11 KiB for a `Scan` and
-61 KiB for `Compaction` (you only need one while compacting). The
+62 KiB for `Compaction` (you only need one while compacting). The
 `async` calls' futures add at most about 18 KiB more (`flush()`,
 `archive_commit()`).
 
 `horton::profile` has a measured ESP32-S3 instantiation (4 KiB blocks,
 32-byte keys, 64-byte values, 16-entry memtable, 4 × 4 levels, 2-slot
-cache): `Db` 25,256 + `Scan` 10,536 + `Compaction` 58,840 = 94,632 bytes
+cache): `Db` 25,264 + `Scan` 10,568 + `Compaction` 59,472 = 95,304 bytes
 of structs, plus at most 17.6 KiB of live futures (`archive_commit()`),
-for a measured peak of 112,256 bytes under a 112 KiB budget asserted by
+for a measured peak of 112,928 bytes under a 112 KiB budget asserted by
 `tests/profile.rs`. See [`BUDGET.md`](BUDGET.md).
 
 ### Mapping it onto your device
@@ -366,8 +453,9 @@ region. See [ADR-0012](docs/adr/0012-nor-flash-endurance.md).
 
 ## Platforms
 
-- **Host (x86_64 / macOS / Linux):** where the test suite runs. `std`
-  appears only in tests, benches, and examples.
+- **Host (x86_64 / macOS / Linux / Windows):** CI runs the test suite on
+  Linux, and the kvstore example on a real file on Linux, macOS and
+  Windows. `std` appears only in tests, benches, and examples.
 - **WebAssembly (`wasm32-unknown-unknown`):** the library builds
   unchanged, `multiwriter` included. The ground station example runs it in
   the browser and in Node, and CI tests it on real recordings.
@@ -391,6 +479,8 @@ cargo build --release --benches                 # callgrind instruction-count ha
 ./xtensa-check.sh                               # ESP32-S3 build gate (needs the esp toolchain)
 examples/ground_station/build.sh && node examples/ground_station/test.mjs target/flight_recorder/flash.img
 node examples/ground_station/live-test.mjs 300                # live logger: 300 power cuts
+cargo run --release --example kvstore -- crash 25             # host store: 25 kill -9s of a writer process
+cargo run --release --example kvstore -- demo                 # host store: a checked API tour
 ```
 
 What the suite covers:
@@ -436,6 +526,7 @@ What the suite covers:
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
 | `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
+| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the store thread with group commit and background compaction (`store.rs`), db_bench's workloads (`bench.rs`), and the kill -9 crash test (`crash.rs`) |
 | `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |

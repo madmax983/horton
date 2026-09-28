@@ -38,9 +38,11 @@
 //! it hides is left: every older version in its range was dropped by this
 //! job, and nothing outside the job is older (`outside_min_seq`). The
 //! merge learns which tombstones cover each key from a second, streaming
-//! rdel merge that runs alongside the key merge, with room for a few
-//! overlapping tombstones at once; when more overlap, the job keeps its
-//! tombstones (dropping hidden versions stays sound either way).
+//! rdel merge that runs alongside the key merge. It tracks only the
+//! tombstones that can decide a key's cover (none newer and at least as
+//! long covers them), with room for a few at once; where more are needed
+//! it remembers the key range, and the tombstones reaching it are kept
+//! (dropping hidden versions stays sound either way).
 //!
 //! [`Db::compact_step`]: crate::db::Db::compact_step
 
@@ -57,10 +59,15 @@ use crate::sstable::{self, PushOutcome, SstEntry, TableWriter};
 /// Maximum tables merged in one compaction job (spec `KMAX = 8`).
 pub const COMPACTION_KMAX: usize = 8;
 
-/// Range tombstones the merge tracks as covering the current key at once.
-/// More than this overlapping at one key is legal; the merge then keeps
-/// every range tombstone of the job (see `Compaction::gc_exact`).
-const COVER_ACTIVE: usize = 4;
+/// Range tombstones the merge tracks as deciding the current key's cover
+/// at once (the undominated ones: see `Compaction::cover_key`). More is
+/// legal; the merge then keeps the range tombstones that reach the keys
+/// where it overflowed (see `Compaction::inexact`).
+const COVER_ACTIVE: usize = 8;
+
+/// Key ranges a job remembers as inexact (see `Compaction::inexact`).
+/// More are merged into the last one, which only widens it.
+const INEXACT_RANGES: usize = 4;
 
 /// What [`Db::compact_step`](crate::db::Db::compact_step) accomplished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,18 +227,25 @@ pub struct Compaction<
     /// [`CoverState::Look`]).
     cover_look: OwnedRdel<KEY_MAX>,
     /// Tombstones older than every live snapshot that cover the current
-    /// key (start at or below it, end above it).
+    /// key (start at or below it, end above it), less any that a newer
+    /// one reaching at least as far dominates.
     active: [OwnedRdel<KEY_MAX>; COVER_ACTIVE],
     n_active: usize,
     /// Highest sequence among the tombstones covering [`key`](Self::key)
     /// that every reader sees (`0`: none). Versions below it are hidden
     /// from every reader and are dropped.
     key_cover: u64,
-    /// True while the coverage stream has tracked every such tombstone
-    /// (the active set never overflowed). Then every version a tombstone
-    /// hides was dropped, and a bottommost output may drop the tombstone
-    /// too; once false, every range tombstone of the job is kept.
-    pub(crate) gc_exact: bool,
+    /// Key ranges `[from, to)` where the coverage stream may have lost
+    /// track of a tombstone deciding a key's cover: where the active set
+    /// overflowed, from the key it overflowed at to the end of the
+    /// tombstone it let go of. Everywhere else the stream tracked each
+    /// tombstone that decides a key's cover (the undominated ones: see
+    /// `cover_key`), so every version a tombstone hides there was dropped,
+    /// and a bottommost output may drop a tombstone that misses these
+    /// ranges (see [`RdelDrop`]). In key order;
+    /// the last one widens to take any that do not fit.
+    pub(crate) inexact: [(KeyBound<KEY_MAX>, KeyBound<KEY_MAX>); INEXACT_RANGES],
+    pub(crate) n_inexact: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +314,12 @@ pub(crate) struct Cursor<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX
 impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize>
     Cursor<BLOCK, KEY_MAX, VAL_MAX>
 {
+    /// The cursor's block buffer, lent out as scratch while the cursor is
+    /// not positioned (the job's dry run, before `init_cursor`).
+    pub(crate) const fn block_mut(&mut self) -> &mut [u8; BLOCK] {
+        &mut self.block
+    }
+
     pub(crate) const EMPTY: Self = Self {
         first_block: 0,
         data_blocks: 0,
@@ -382,7 +402,8 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             active: [OwnedRdel::empty(); COVER_ACTIVE],
             n_active: 0,
             key_cover: 0,
-            gc_exact: false,
+            inexact: [(KeyBound::EMPTY, KeyBound::EMPTY); INEXACT_RANGES],
+            n_inexact: 0,
         }
     }
 
@@ -407,7 +428,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         self.cover_state = CoverState::Done;
         self.n_active = 0;
         self.key_cover = 0;
-        self.gc_exact = false;
+        self.n_inexact = 0;
     }
 
     /// Starts the coverage stream over every input's range-tombstone
@@ -428,23 +449,39 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         };
         self.n_active = 0;
         self.key_cover = 0;
-        self.gc_exact = true;
+        self.n_inexact = 0;
     }
 
-    /// Range-tombstone pieces below this sequence are dropped from the
-    /// current output (`0`: none are). A piece may go when the output is
-    /// bottommost, every reader sees it, nothing outside the job is older,
-    /// and the job tracked coverage exactly — so every version it hides
-    /// in the output's range was already dropped.
-    pub(crate) const fn rdel_drop_floor(&self) -> u64 {
-        if self.bottommost && self.gc_exact {
-            if self.oldest_snapshot < self.outside_min_seq {
-                self.oldest_snapshot
-            } else {
-                self.outside_min_seq
+    /// Records that the active set let go, at key `from`, of a tombstone
+    /// ending at `to`: versions it hides in `[from, to)` may have been
+    /// kept. Calls come in key order, so a range that meets the last one
+    /// extends it, and one that does not fit widens the last to reach it.
+    /// (Takes the fields, not `self`: the caller holds a borrow of the
+    /// targets.)
+    fn evict(
+        inexact: &mut [(KeyBound<KEY_MAX>, KeyBound<KEY_MAX>); INEXACT_RANGES],
+        n: &mut usize,
+        from: &[u8],
+        to: &[u8],
+    ) {
+        let (Some(from), Some(to)) = (KeyBound::from_slice(from), KeyBound::from_slice(to)) else {
+            // Keys and ends are at most `KEY_MAX` bytes: unreachable.
+            // Stay sound anyway: everything is inexact.
+            inexact[0] = (KeyBound::EMPTY, KeyBound::EMPTY);
+            *n = usize::MAX;
+            return;
+        };
+        if *n == usize::MAX {
+            return;
+        }
+        if *n > 0 && (*n == INEXACT_RANGES || from.as_slice() <= inexact[*n - 1].1.as_slice()) {
+            let last = &mut inexact[*n - 1].1;
+            if to.as_slice() > last.as_slice() {
+                *last = to;
             }
         } else {
-            0
+            inexact[*n] = (from, to);
+            *n += 1;
         }
     }
 
@@ -503,13 +540,37 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                 // Some snapshot cannot see it, or it ends before the key.
                 continue;
             }
+            // From here on every tracked tombstone covers each key up to
+            // its end, and a key's cover is the highest such sequence. A
+            // tombstone that a newer one reaching at least as far already
+            // covers can never decide it, so only the undominated ones
+            // are tracked: `r` if nothing dominates it, minus whatever it
+            // dominates. Every version a dominated tombstone hides is
+            // hidden (and dropped) by its dominator, so exactness holds.
+            let r_end = &r.end[..r.end_len];
+            if self.active[..self.n_active]
+                .iter()
+                .any(|a| a.seq >= r.seq && a.end[..a.end_len] >= *r_end)
+            {
+                continue;
+            }
+            let mut i = 0;
+            while i < self.n_active {
+                let a = &self.active[i];
+                if a.seq <= r.seq && a.end[..a.end_len] <= *r_end {
+                    self.n_active -= 1;
+                    self.active[i] = self.active[self.n_active];
+                } else {
+                    i += 1;
+                }
+            }
             if self.n_active < COVER_ACTIVE {
                 self.active[self.n_active] = r;
                 self.n_active += 1;
             } else {
-                // Too many at once: keep the newest (the drop stays
-                // sound for any subset), and stop collecting tombstones.
-                self.gc_exact = false;
+                // Too many at once: keep the newest (dropping hidden
+                // versions stays sound for any subset) and let the oldest
+                // go; the outputs it reaches keep their tombstones.
                 let mut min = 0;
                 for j in 1..COVER_ACTIVE {
                     if self.active[j].seq < self.active[min].seq {
@@ -517,7 +578,21 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                     }
                 }
                 if r.seq > self.active[min].seq {
+                    let old = self.active[min];
                     self.active[min] = r;
+                    Self::evict(
+                        &mut self.inexact,
+                        &mut self.n_inexact,
+                        &self.key[..key_len],
+                        &old.end[..old.end_len],
+                    );
+                } else {
+                    Self::evict(
+                        &mut self.inexact,
+                        &mut self.n_inexact,
+                        &self.key[..key_len],
+                        r_end,
+                    );
                 }
             }
         }
@@ -1298,11 +1373,104 @@ impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
     }
 }
 
-/// Dry-run pass of the range-tombstone merge over a whole job: returns how
-/// many merged entries it yields. Every output's clipped share of the
-/// merged section is at most that many entries (clipping only cuts
-/// entries to the output's range), each at most `12 + 2 * KEY_MAX` bytes,
-/// so [`rdel_blocks_bound`] of it bounds every output's rdel section.
+/// When a merged range-tombstone piece may leave a bottommost output: it
+/// is older than every live snapshot and than anything outside the job,
+/// and it misses every key range where the coverage stream may have lost
+/// track of a tombstone (`Compaction::inexact`), so every version it
+/// hides in its range was already dropped by the job.
+#[derive(Clone, Copy)]
+pub(crate) struct RdelDrop<'a, const KEY_MAX: usize> {
+    /// Pieces at or above this sequence stay (`0`: every piece stays).
+    floor: u64,
+    inexact: &'a [(KeyBound<KEY_MAX>, KeyBound<KEY_MAX>)],
+}
+
+impl<'a, const KEY_MAX: usize> RdelDrop<'a, KEY_MAX> {
+    /// The rule from the job's fields (a free constructor so a caller can
+    /// hold other fields of the scratch mutably meanwhile).
+    pub(crate) fn new(
+        bottommost: bool,
+        floor: u64,
+        inexact: &'a [(KeyBound<KEY_MAX>, KeyBound<KEY_MAX>); INEXACT_RANGES],
+        n_inexact: usize,
+    ) -> Self {
+        // `usize::MAX`: the stream lost track everywhere.
+        let floor = if bottommost && n_inexact != usize::MAX {
+            floor
+        } else {
+            0
+        };
+        Self {
+            floor,
+            inexact: &inexact[..n_inexact.min(INEXACT_RANGES)],
+        }
+    }
+
+    /// Whether the piece `[start, end)` at `seq` may be dropped.
+    pub(crate) fn drops(&self, start: &[u8], end: &[u8], seq: u64) -> bool {
+        seq < self.floor
+            && self
+                .inexact
+                .iter()
+                .all(|(from, to)| end <= from.as_slice() || to.as_slice() <= start)
+    }
+}
+
+/// What the dry run of a job's range-tombstone merge found: enough to
+/// bound every output's range-tombstone section (see
+/// [`RdelDryRun::blocks_bound`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RdelDryRun {
+    /// Merged entries.
+    pub(crate) entries: u64,
+    /// Their encoded bytes, unclipped: `12 + start + end` each.
+    pub(crate) bytes: u64,
+    /// An upper bound on how many merged entries contain any one key (the
+    /// overlap depth): exact while the end tracker had room.
+    pub(crate) depth: u64,
+}
+
+impl RdelDryRun {
+    /// Upper bound on the blocks any one output's clipped share of the
+    /// merged section needs. Two bounds hold, and the smaller is used:
+    ///
+    /// - every piece is at most `12 + 2 * KEY_MAX` bytes, and an output
+    ///   holds at most `entries` pieces ([`rdel_blocks_bound`]);
+    /// - clipping only shortens a piece, except where it replaces a start
+    ///   by the output's lower bound or an end by its upper bound (each at
+    ///   most `KEY_MAX` bytes). A piece is cut at the lower bound only if
+    ///   its entry contains that key, so at most `depth` pieces are cut at
+    ///   each end: the output's bytes are at most
+    ///   `bytes + 2 * depth * KEY_MAX`, packed greedily.
+    pub(crate) fn blocks_bound<const BLOCK: usize, const KEY_MAX: usize>(&self) -> u64 {
+        let by_entries = rdel_blocks_bound::<BLOCK, KEY_MAX>(self.entries);
+        let (Ok(n), Ok(bytes), Ok(depth)) = (
+            usize::try_from(self.entries),
+            usize::try_from(self.bytes),
+            usize::try_from(self.depth),
+        ) else {
+            return by_entries;
+        };
+        let clipped = depth.saturating_mul(2).saturating_mul(KEY_MAX);
+        let by_bytes = sstable::packed_blocks_bound(
+            bytes.saturating_add(clipped),
+            n,
+            12 + 2 * KEY_MAX,
+            BLOCK.saturating_sub(sstable::RDEL_TRAILER),
+            usize::MAX,
+        );
+        by_entries.min(by_bytes)
+    }
+}
+
+/// Dry-run pass of the range-tombstone merge over a whole job: counts the
+/// merged entries and their bytes, and bounds their overlap depth.
+///
+/// The depth bound tracks the ends of the entries still open at each
+/// start in `ends`, a scratch block idle until the job's cursors are
+/// positioned (`BLOCK / (KEY_MAX + 2)` ends fit). When it is full, an
+/// entry is counted as never ending, so the bound only grows: it stays
+/// sound, just looser. It is kept holding the ends that come soonest.
 ///
 /// # Errors
 ///
@@ -1314,9 +1482,10 @@ pub(crate) async fn count_rdel_merge<D, const BLOCK: usize, const KEY_MAX: usize
     sources: &[Input<KEY_MAX>],
     targets: &TargetView<'_, KEY_MAX>,
     raw: &mut [u8; BLOCK],
+    ends: &mut [u8; BLOCK],
     bottommost: bool,
     oldest_snapshot: u64,
-) -> Result<u64, Error<D::Error>>
+) -> Result<RdelDryRun, Error<D::Error>>
 where
     D: BlockDevice,
 {
@@ -1327,11 +1496,85 @@ where
         bottommost,
         oldest_snapshot,
     );
-    let mut n = 0u64;
+    let mut run = RdelDryRun::default();
+    let mut open = OpenEnds::<KEY_MAX>::default();
     while merger.next_merged(device, raw, targets).await? {
-        n += 1;
+        let e = merger.current_entry();
+        run.entries += 1;
+        run.bytes = run
+            .bytes
+            .saturating_add((12 + e.start.len() + e.end.len()) as u64);
+        open.expire(ends, e.start);
+        open.insert(ends, e.end);
+        run.depth = run.depth.max(open.depth());
     }
-    Ok(n)
+    Ok(run)
+}
+
+/// The ends of the range tombstones open at the dry run's position, in
+/// fixed slots of a borrowed block (`u16` length, then `KEY_MAX` bytes),
+/// plus a count of open ones it had no room to track.
+#[derive(Default)]
+struct OpenEnds<const KEY_MAX: usize> {
+    stored: usize,
+    untracked: u64,
+}
+
+impl<const KEY_MAX: usize> OpenEnds<KEY_MAX> {
+    const STRIDE: usize = KEY_MAX + 2;
+
+    fn end(buf: &[u8], i: usize) -> &[u8] {
+        let at = i * Self::STRIDE;
+        let len = usize::from(u16::from_le_bytes([buf[at], buf[at + 1]]));
+        &buf[at + 2..at + 2 + len]
+    }
+
+    /// Forgets the tracked ends at or below `start`: those entries hold
+    /// no key from here on.
+    fn expire(&mut self, buf: &mut [u8], start: &[u8]) {
+        let mut i = 0;
+        while i < self.stored {
+            if Self::end(buf, i) <= start {
+                self.stored -= 1;
+                let (from, to) = (self.stored * Self::STRIDE, i * Self::STRIDE);
+                buf.copy_within(from..from + Self::STRIDE, to);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Tracks `end`. When full, the latest-ending of the tracked ends and
+    /// `end` is counted as untracked instead.
+    fn insert(&mut self, buf: &mut [u8], end: &[u8]) {
+        let capacity = buf.len() / Self::STRIDE;
+        let slot = if self.stored < capacity {
+            self.stored += 1;
+            self.stored - 1
+        } else {
+            self.untracked += 1;
+            let mut max = None::<usize>;
+            for i in 0..self.stored {
+                if max.is_none_or(|m| Self::end(buf, i) > Self::end(buf, m)) {
+                    max = Some(i);
+                }
+            }
+            match max {
+                Some(m) if Self::end(buf, m) > end => m,
+                _ => return,
+            }
+        };
+        let at = slot * Self::STRIDE;
+        // `end.len() <= KEY_MAX <= 0xFFFF` (a decoded rdel key).
+        let len = u16::try_from(end.len().min(KEY_MAX)).unwrap_or(0);
+        buf[at..at + 2].copy_from_slice(&len.to_le_bytes());
+        buf[at + 2..at + 2 + usize::from(len)].copy_from_slice(&end[..usize::from(len)]);
+    }
+
+    /// Entries open here, the untracked counted as never ending.
+    const fn depth(&self) -> u64 {
+        (self.stored as u64).saturating_add(self.untracked)
+    }
 }
 
 /// Upper bound on the blocks `entries` range tombstones occupy, each at
@@ -1992,6 +2235,146 @@ mod tests {
         assert_eq!(u64::from(block_on(w.finish(&mut dev)).unwrap()), 3);
         assert_eq!(rdel_blocks_bound::<64, 8>(5), 3);
         assert_eq!(rdel_blocks_bound::<64, 8>(0), 0);
+    }
+
+    /// Random range tombstones over short keys, sorted by start as the
+    /// merge yields them: `(start, end)` with `start < end`, at most 8
+    /// bytes each.
+    fn random_rdels(rng: &mut u64, n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut next = || {
+            *rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            *rng >> 33
+        };
+        let mut key = |len_bits: u64| {
+            let len = 1 + usize::try_from(next() % len_bits).unwrap();
+            (0..len)
+                .map(|_| b'a' + u8::try_from(next() % 4).unwrap())
+                .collect::<Vec<u8>>()
+        };
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = (0..n)
+            .filter_map(|_| {
+                let (a, b) = (key(8), key(8));
+                match a.cmp(&b) {
+                    core::cmp::Ordering::Less => Some((a, b)),
+                    core::cmp::Ordering::Greater => Some((b, a)),
+                    core::cmp::Ordering::Equal => None,
+                }
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The most entries containing any one key, by brute force.
+    fn true_depth(rdels: &[(Vec<u8>, Vec<u8>)]) -> u64 {
+        rdels
+            .iter()
+            .map(|(p, _)| {
+                rdels
+                    .iter()
+                    .filter(|(s, e)| s.as_slice() <= p.as_slice() && p.as_slice() < e.as_slice())
+                    .count() as u64
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn open_ends_bound_the_overlap_depth() {
+        // F22: the dry run's depth may only overestimate, and is exact
+        // while the tracker has room.
+        let mut rng = 11u64;
+        for round in 0..200 {
+            let rdels = random_rdels(&mut rng, 1 + round % 40);
+            let want = true_depth(&rdels);
+            // Room for 64 ends of up to 8 bytes: exact here.
+            let mut roomy = [0u8; 640];
+            // Room for 3: counts the rest as never ending.
+            let mut tight = [0u8; 30];
+            let (mut a, mut b) = (OpenEnds::<8>::default(), OpenEnds::<8>::default());
+            let (mut da, mut db) = (0, 0);
+            for (s, e) in &rdels {
+                a.expire(&mut roomy, s);
+                a.insert(&mut roomy, e);
+                da = da.max(a.depth());
+                b.expire(&mut tight, s);
+                b.insert(&mut tight, e);
+                db = db.max(b.depth());
+            }
+            assert_eq!(da, want, "{rdels:?}");
+            assert!(db >= want, "{db} < {want}: {rdels:?}");
+        }
+    }
+
+    #[test]
+    fn dry_run_bound_covers_every_clipped_output() {
+        // F22: `RdelDryRun::blocks_bound` sizes each output's range-
+        // tombstone section from the entries' real lengths. Clipping can
+        // lengthen a piece to a bound of up to KEY_MAX bytes, at most
+        // `depth` times at each end: whatever the output boundaries, the
+        // writer never packs more blocks than the bound.
+        let mut rng = 5u64;
+        for round in 0..300 {
+            let rdels = random_rdels(&mut rng, 1 + round % 60);
+            let run = RdelDryRun {
+                entries: rdels.len() as u64,
+                bytes: rdels
+                    .iter()
+                    .map(|(s, e)| (12 + s.len() + e.len()) as u64)
+                    .sum(),
+                depth: true_depth(&rdels),
+            };
+            let bound = run.blocks_bound::<64, 8>();
+            // Output boundaries: long (KEY_MAX-byte) keys, sorted.
+            let mut cuts: Vec<Vec<u8>> = random_rdels(&mut rng, 4)
+                .into_iter()
+                .map(|(s, _)| {
+                    let mut k = s;
+                    k.resize(8, b'b');
+                    k
+                })
+                .collect();
+            cuts.dedup();
+            let mut lo: Option<Vec<u8>> = None;
+            for i in 0..=cuts.len() {
+                let hi = cuts.get(i).cloned();
+                let mut dev = TestDevice::<64>::new();
+                let mut buf = [0u8; 64];
+                let mut w = sstable::RdelWriter::<64>::new(200, &mut buf);
+                for (s, e) in &rdels {
+                    let start = match &lo {
+                        Some(l) if l > s => l.clone(),
+                        _ => s.clone(),
+                    };
+                    let end = match &hi {
+                        Some(h) if h < e => h.clone(),
+                        _ => e.clone(),
+                    };
+                    if start < end {
+                        block_on(w.push(
+                            &mut dev,
+                            sstable::RdelEntry {
+                                start: &start,
+                                end: &end,
+                                seq: 1,
+                            },
+                        ))
+                        .unwrap();
+                    }
+                }
+                let written = u64::from(block_on(w.finish(&mut dev)).unwrap());
+                assert!(written <= bound, "{written} > {bound}: {run:?}");
+                lo = hi;
+            }
+            assert!(bound <= rdel_blocks_bound::<64, 8>(run.entries));
+        }
+        // Short keys: far below the KEY_MAX worst case.
+        let short = RdelDryRun {
+            entries: 1000,
+            bytes: 1000 * 14,
+            depth: 3,
+        };
+        assert!(short.blocks_bound::<4096, 256>() < rdel_blocks_bound::<4096, 256>(1000) / 10);
     }
 
     #[test]

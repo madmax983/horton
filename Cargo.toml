@@ -29,6 +29,12 @@ multiwriter = []
 # `multiwriter`; never enabled in shipping builds.
 loom = ["dep:loom", "multiwriter"]
 
+# The host key-value store example carries unit tests for its store
+# layer; `cargo test` runs them.
+[[example]]
+name = "kvstore"
+test = true
+
 [[bench]]
 name = "write_path"
 harness = false
