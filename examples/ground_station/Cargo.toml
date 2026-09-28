@@ -1,0 +1,22 @@
+[package]
+name = "horton-ground-station"
+version = "0.1.0"
+edition = "2024"
+description = "Browser ground station for the flight recorder: horton compiled to wasm reads a flash dump in the page"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+horton = { path = "../.." }
+
+# The page downloads this module: build it small. `panic = "abort"` because
+# wasm32-unknown-unknown cannot unwind; horton itself does not panic.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -104,6 +104,52 @@ jobs:
       - name: loom models
         run: cargo test --release --features loom --test loom_ring
 
+  # The flight recorder's horton, compiled to wasm, reading real
+  # recordings: in Node, then in headless Chromium through the page.
+  ground-station:
+    name: ground station (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            examples/ground_station -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: fmt and clippy (wasm32)
+        working-directory: examples/ground_station
+        run: |
+          cargo fmt --check
+          cargo clippy --release --target wasm32-unknown-unknown -- -D warnings -W clippy::pedantic -W clippy::nursery
+      - name: record a flight
+        run: cargo run --release --example flight_recorder -- --fresh --fast --ticks 12000
+      - name: build the module
+        run: examples/ground_station/build.sh
+      - name: read the recording
+        run: node examples/ground_station/test.mjs target/flight_recorder/flash.img --newest 11999
+      - name: read a recording killed mid-write
+        run: |
+          # Paced recording, SIGKILLed three times: each run resumes the
+          # image the last one left.
+          for i in 1 2 3; do
+            timeout -s KILL 1.$i target/release/examples/flight_recorder --dir target/gs-cut || true
+          done
+          node examples/ground_station/test.mjs target/gs-cut/flash.img
+      - name: browser test
+        working-directory: examples/ground_station
+        run: |
+          npm install --no-save playwright@1.56.1
+          npx playwright install --with-deps chromium
+          node browser-test.mjs
+
   miri:
     name: miri
     runs-on: ubuntu-latest

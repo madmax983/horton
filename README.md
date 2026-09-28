@@ -155,6 +155,24 @@ This demo found two WAL bugs, F18 and F19 in the
 part of a batch, and writes after a reopen could be lost behind a torn
 block. Both are fixed.
 
+## Demo: the same recorder, read in a browser
+
+[`examples/ground_station`](examples/ground_station) is a web page that
+opens the flight recorder's flash dump with the same horton that wrote it,
+compiled to `wasm32-unknown-unknown`. The format changes between versions,
+so the writer's own code is the only reader sure to understand a device's
+flash. Drop a `flash.img` on the page and it runs the device's real
+recovery (manifest, table slots, WAL replay up to a torn tail), checks
+every entry against the recorder's key hash, and charts the sensors. It
+needs no server and no second implementation of the format. The module is
+a `no_std` `cdylib` with no imports, 125 KB (46 KB gzipped).
+
+```sh
+rustup target add wasm32-unknown-unknown
+examples/ground_station/build.sh
+python3 -m http.server -d examples/ground_station/web 8000
+```
+
 ## Architecture
 
 ```mermaid
@@ -335,6 +353,9 @@ region. See [ADR-0012](docs/adr/0012-nor-flash-endurance.md).
 
 - **Host (x86_64 / macOS / Linux):** where the test suite runs. `std`
   appears only in tests, benches, and examples.
+- **WebAssembly (`wasm32-unknown-unknown`):** the library builds
+  unchanged, `multiwriter` included. The ground station example runs it in
+  the browser and in Node, and CI tests it on real recordings.
 - **ESP32-S3 (`xtensa-esp32s3-none-elf`):** the library builds with the ESP
   Rust fork (`./xtensa-check.sh`). A bare-metal smoke binary
   (`xtensa-smoke/`) boots under QEMU and exercises
@@ -353,6 +374,7 @@ cargo run --example quickstart
 cargo +nightly miri test --test <name>          # UB check (the crate has no unsafe)
 cargo build --release --benches                 # callgrind instruction-count harnesses
 ./xtensa-check.sh                               # ESP32-S3 build gate (needs the esp toolchain)
+examples/ground_station/build.sh && node examples/ground_station/test.mjs target/flight_recorder/flash.img
 ```
 
 What the suite covers:
@@ -397,7 +419,8 @@ What the suite covers:
 | `src/device.rs`, `src/flash.rs`, `src/esp32s3.rs` | `BlockDevice` trait, NOR flash adapter, ESP32-S3 SPI flash driver |
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
-| `examples/flight_recorder/` | The flight recorder demo: simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
+| `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
+| `examples/ground_station/` | The browser ground station: the recorder's horton as a wasm module, the page, and its Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |
 | `xtensa-smoke/` | Bare-metal ESP32-S3 QEMU smoke test |
