@@ -611,3 +611,89 @@ fn ordered_prefix_durable_only_after_flush() {
         .expect("k0 present");
     assert_eq!(&buf[..len], b"v0");
 }
+
+/// Seeded reopen across the 31-bit wrap: the ring is reseeded from the
+/// recovered `durable` watermark (the `Drainer::new` contract), tickets
+/// drain across `TICKET_MASK -> 0`, and the watermark advances through
+/// the boundary with every ticket's data landing in the Db.
+#[test]
+fn sweep_advances_watermark_across_ticket_wrap() {
+    use horton::ring::TICKET_MASK;
+
+    let seed: u32 = TICKET_MASK - 2;
+    let ring = Ring::<8>::new_seeded(seed);
+    // Reopen: `durable` is recovered from the WAL, the ring reseeded from it.
+    let durable = AtomicU32::new(seed);
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+
+    // Six tickets across the wrap: seed, seed+1, TICKET_MASK, 0, 1, 2.
+    let mut tickets = [0u32; 6];
+    for (i, t) in tickets.iter_mut().enumerate() {
+        let key = [b'k', b'0' + i as u8];
+        *t = publish(&ring, &key, b"v");
+    }
+    assert_eq!(
+        tickets,
+        [seed, seed + 1, TICKET_MASK, 0, 1, 2],
+        "tickets must cross the wrap in order"
+    );
+    for &t in &tickets {
+        assert!(
+            !is_ticket_durable(&durable, t),
+            "t{t} not durable before sweep"
+        );
+    }
+
+    let outcome = block_on(drainer.sweep()).expect("sweep must succeed");
+    assert_eq!(outcome, SweepOutcome::Swept { tickets: 6 });
+
+    // The watermark stepped through the wrap: TICKET_MASK -> 0 -> 1 -> 2 -> 3.
+    assert_eq!(drain_watermark(&durable), 3);
+    assert_eq!(durable.load(Ordering::Acquire), 3);
+    for &t in &tickets {
+        assert!(is_ticket_durable(&durable, t), "t{t} durable after sweep");
+    }
+    // A ticket from the far side of the wrap is not durable.
+    assert!(!is_ticket_durable(&durable, 3));
+
+    // Every ticket's data landed — including the pre-wrap tickets.
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    for i in 0..6usize {
+        let key = [b'k', b'0' + i as u8];
+        let len = block_on(db.get(&key, &mut buf))
+            .expect("get ok")
+            .expect("key present");
+        assert_eq!(&buf[..len], b"v", "k{i} must hold its value");
+    }
+}
+
+/// `is_ticket_durable` is modular arithmetic: the wrap boundary must not
+/// confuse "just durable" with "a whole lap behind".
+#[test]
+fn durable_check_wraps_modular() {
+    use horton::ring::TICKET_MASK;
+
+    // Just across the wrap: durable advanced past the boundary.
+    let d = AtomicU32::new(0);
+    assert!(is_ticket_durable(&d, TICKET_MASK), "dist 1 across the wrap");
+    let d = AtomicU32::new(1);
+    assert!(is_ticket_durable(&d, TICKET_MASK), "dist 2 across the wrap");
+    assert!(is_ticket_durable(&d, 0), "dist 1");
+
+    // The long way around is not durable.
+    let d = AtomicU32::new(TICKET_MASK);
+    assert!(!is_ticket_durable(&d, 0), "dist 2^31-1 is behind");
+    assert!(!is_ticket_durable(&d, TICKET_MASK), "dist 0 is not durable");
+    let d = AtomicU32::new(0);
+    assert!(!is_ticket_durable(&d, 1), "dist 2^31-1 across the wrap");
+
+    // A few ticks past the wrap still see the pre-wrap tickets as durable.
+    let d = AtomicU32::new(5);
+    assert!(is_ticket_durable(&d, TICKET_MASK - 1), "dist 6");
+    assert!(!is_ticket_durable(&d, 6), "dist 2^31-1");
+
+    // The watermark load masks to the 31-bit ticket space.
+    let d = AtomicU32::new(0x8000_0005);
+    assert_eq!(drain_watermark(&d), 5, "bit 31 is never a ticket");
+}

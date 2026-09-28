@@ -341,3 +341,76 @@ fn force_release_stale_ticket() {
         "already-drained ticket is stale"
     );
 }
+
+/// Fencing at the 31-bit wrap boundary: the fence CAS, the cursor advance,
+/// and the watermark ticket must all survive `TICKET_MASK -> 0`.
+#[test]
+fn fence_at_wrap_boundary() {
+    use horton::ring::{DrainPoll, FenceOutcome};
+
+    let seed: u32 = TICKET_MASK - 1;
+    let r = Ring::<4>::new_seeded(seed);
+
+    let t0 = claim(&r);
+    assert_eq!(t0, seed, "seeded head");
+    publish(&r, t0);
+    let t1 = claim(&r); // stalled at TICKET_MASK: never published
+    assert_eq!(t1, TICKET_MASK, "last ticket of the 31-bit space");
+
+    // Drain t0; the cursor sits on the stalled TICKET_MASK.
+    let (t, _) = r.drain();
+    assert_eq!(t, seed);
+    assert!(
+        matches!(r.poll_drain(), DrainPoll::AwaitingPublish),
+        "TICKET_MASK is live but unpublished"
+    );
+
+    // The fence kills TICKET_MASK and the cursor wraps to 0.
+    assert_eq!(r.fence_cursor(), FenceOutcome::Fenced(TICKET_MASK));
+    // The ring stays live across the wrap: ticket 0 claims and drains.
+    let t2 = claim(&r);
+    assert_eq!(t2, 0, "head wraps to 0 after the fence");
+    publish(&r, t2);
+    let (dt, p) = r.drain();
+    assert_eq!(dt, 0);
+    assert_payload(&p, 0);
+}
+
+/// A host force-release just below the wrap: `gate_is_past` must resolve
+/// the modular strictly-ahead check when the released gate value itself
+/// wrapped (`FREE(TICKET_MASK+8)` reads as ticket 7).
+#[test]
+fn force_release_skip_across_wrap() {
+    use horton::ring::{DrainPoll, ForceReleaseOutcome};
+
+    let seed: u32 = TICKET_MASK - 1;
+    let r = Ring::<4>::new_seeded(seed);
+
+    let t0 = claim(&r);
+    publish(&r, t0);
+    let t1 = claim(&r); // never published; the host proves thread death
+    assert_eq!(t1, TICKET_MASK);
+    assert_eq!(
+        r.force_release_slot(t1),
+        ForceReleaseOutcome::Released,
+        "FREE(TICKET_MASK) is releasable"
+    );
+
+    // t0 drains normally.
+    let (t, _) = r.drain();
+    assert_eq!(t, seed);
+    // t1's gate reads FREE(wrapped): the drainer skips it and the cursor
+    // wraps to 0 — nothing drained, nothing double-released.
+    assert!(
+        matches!(r.poll_drain(), DrainPoll::Skipped(TICKET_MASK)),
+        "released TICKET_MASK must skip, not drain"
+    );
+    // The slot was released for ticket TICKET_MASK+4 = 3; the ring is
+    // live and the next fresh ticket is 0.
+    let t2 = claim(&r);
+    assert_eq!(t2, 0, "head wraps to 0");
+    publish(&r, t2);
+    let (dt, p) = r.drain();
+    assert_eq!(dt, 0);
+    assert_payload(&p, 0);
+}

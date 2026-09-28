@@ -131,3 +131,46 @@ fn dropped_put_abandons_observation_not_the_write() {
         .expect("k present");
     assert_eq!(&buf[..len], b"v");
 }
+
+/// `put` claims tickets across the 31-bit wrap and the `Put` future
+/// resolves as the `durable` watermark steps through `TICKET_MASK -> 0`.
+/// This exercises `is_ticket_durable` inside `Put::poll` on both sides of
+/// the boundary — the writer-completion path, not just the drain path.
+#[test]
+fn put_completes_across_ticket_wrap() {
+    use horton::ring::TICKET_MASK;
+
+    let seed: u32 = TICKET_MASK - 1;
+    let ring = Ring::<8>::new_seeded(seed);
+    let durable = AtomicU32::new(seed);
+    let mut drainer = make_drainer(&ring, &durable);
+    let p = payload::encode_put(b"k", b"v").expect("fits");
+
+    // Ticket TICKET_MASK - 1: Pending until the sweep, then Ready.
+    let mut pending = put(&ring, &durable, &p).expect("ring has space");
+    assert_eq!(pending.ticket(), seed);
+    assert_eq!(poll_put(&mut pending), Poll::Pending);
+    block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(poll_put(&mut pending), Poll::Ready(seed));
+
+    // Ticket TICKET_MASK: the watermark steps onto the boundary.
+    let mut pending = put(&ring, &durable, &p).expect("ring has space");
+    assert_eq!(pending.ticket(), TICKET_MASK);
+    assert_eq!(poll_put(&mut pending), Poll::Pending);
+    block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(durable.load(Ordering::Acquire), 0, "watermark wraps to 0");
+    assert_eq!(poll_put(&mut pending), Poll::Ready(TICKET_MASK));
+
+    // Ticket 0: claimed after the wrap, resolves normally.
+    let mut pending = put(&ring, &durable, &p).expect("ring has space");
+    assert_eq!(pending.ticket(), 0);
+    assert_eq!(poll_put(&mut pending), Poll::Pending);
+    block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(poll_put(&mut pending), Poll::Ready(0));
+    assert_eq!(drain_watermark_for(&durable), 1);
+}
+
+/// Test-local read of the drain watermark (writer.rs has no drainer import).
+fn drain_watermark_for(durable: &AtomicU32) -> u32 {
+    durable.load(Ordering::Acquire) & horton::ring::TICKET_MASK
+}
