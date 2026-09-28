@@ -45,12 +45,8 @@ pub use format::*;
 /// The recorder's flash as horton sees it.
 type Chip = FlashBlockDevice<SimFlash, BLOCK, SECTORS>;
 
-/// An alarm event joins the frame every this many ticks.
-pub const EVENT_EVERY: u64 = 250;
 /// A glitch window is purged once per this many ticks.
 pub const PURGE_EVERY: u64 = 1000;
-/// Tables holding only ticks older than this go to the archive.
-pub const HOT_TICKS: u64 = 3000;
 
 /// The ticks `[a, b)` of epoch `k`'s glitch window, purged at tick
 /// `k * PURGE_EVERY + 500`.
@@ -417,6 +413,14 @@ fn torture(args: &Args) -> Result<(), String> {
 }
 
 /// `restore`: a ground station rebuilding the history from the archive.
+///
+/// Each table is read back through its own throwaway database of the
+/// recorder's shape, exactly as the recorder would read it. One database
+/// for the whole history would not do: the shape has `LEVELS × TABLES`
+/// table slots whatever the device size, and archived tables hold
+/// disjoint ticks, so compaction has nothing to merge and the slots run
+/// out after a few dozen tables. Tables can overlap (a table merged while
+/// it was being archived leaves a spare copy), so each reading counts once.
 fn restore(store: &dyn ObjectStore) -> Result<(), String> {
     header("ground station");
     let keys = store.list("tables/").map_err(|e| e.to_string())?;
@@ -427,56 +431,66 @@ fn restore(store: &dyn ObjectStore) -> Result<(), String> {
         );
         return Ok(());
     }
-    let tables: Vec<_> = keys
-        .iter()
-        .map(|k| fetch(store, k))
-        .collect::<Result<_, _>>()?;
-    let blocks: u64 = tables.iter().map(|t| u64::from(t.sealed.block_count)).sum();
-    let size = (blocks * 8).max(RecorderDb::<RamDevice>::MIN_DEVICE_BLOCKS);
-    let mut db = Box::new(RecorderDb::new(
-        RamDevice::new(size),
-        Config::whole_device(size),
-    ));
-    block_on(db.open()).map_err(|e| format!("open: {e:?}"))?;
-    let mut scratch = Box::new(RecorderCompaction::new());
-    for t in &tables {
-        ingest(&mut db, &mut scratch, t)
-            .map_err(|e| format!("ingest table {}: {e:?}", t.sealed.id))?;
-    }
-    println!(
-        "ingested {} tables ({} KiB) into a {} MiB RAM disk",
-        tables.len(),
-        blocks * 4,
-        size * 4 / 1024
-    );
-
-    // One pass over the whole history.
-    let mut scan = Box::new(RecorderScan::new(&db));
-    block_on(scan.seek(&[], Some(&[0x01]), u64::MAX)).map_err(|e| format!("{e:?}"))?;
-    let (mut key_buf, mut val_buf) = ([0u8; KEY_MAX], [0u8; VAL_MAX]);
+    // Which readings (bits 0-3) and alarm (bit 4) each tick has so far.
+    let mut seen: Vec<u8> = Vec::new();
     let mut sensors = [SensorStats::default(); SENSORS as usize];
-    let (mut events, mut first, mut last) = (0u64, u64::MAX, 0u64);
-    let (mut gaps, mut prev) = (Vec::new(), None::<u64>);
-    while let Some((kl, vl)) =
-        block_on(scan.next(&mut key_buf, &mut val_buf)).map_err(|e| format!("{e:?}"))?
-    {
-        let tick = tick_of(&key_buf[..kl]);
-        (first, last) = (first.min(tick), last.max(tick));
-        match key_buf[8] {
-            b'r' => {
-                if let Some(p) = prev
-                    && tick > p + 1
-                {
-                    gaps.push(format!("{}..{tick}", p + 1));
-                }
-                prev = Some(tick);
-                sensors[usize::from(key_buf[9])].add(celsius(&val_buf[..vl]));
+    let (mut events, mut first, mut last, mut blocks) = (0u64, u64::MAX, 0u64, 0u64);
+    let mut problems = Vec::new();
+    let mut cov = Coverage::default();
+    let mut scratch = Box::new(RecorderCompaction::new());
+    for key in &keys {
+        let table = fetch(store, key)?;
+        blocks += u64::from(table.sealed.block_count);
+        let size = ((u64::from(table.sealed.block_count) + 1) * 64)
+            .max(RecorderDb::<RamDevice>::MIN_DEVICE_BLOCKS);
+        let mut db = Box::new(RecorderDb::new(
+            RamDevice::new(size),
+            Config::whole_device(size),
+        ));
+        block_on(db.open()).map_err(|e| format!("open: {e:?}"))?;
+        ingest(&mut db, &mut scratch, &table)
+            .map_err(|e| format!("ingest table {}: {e:?}", table.sealed.id))?;
+
+        let mut scan = Box::new(RecorderScan::new(&db));
+        block_on(scan.seek(&[], Some(&[0x01]), u64::MAX)).map_err(|e| format!("{e:?}"))?;
+        let (mut key_buf, mut val_buf) = ([0u8; KEY_MAX], [0u8; VAL_MAX]);
+        while let Some((kl, vl)) =
+            block_on(scan.next(&mut key_buf, &mut val_buf)).map_err(|e| format!("{e:?}"))?
+        {
+            let tick = tick_of(&key_buf[..kl]);
+            let bit = match key_buf[8] {
+                b'r' => 1 << key_buf[9],
+                b'e' => 1 << 4,
+                _ => continue,
+            };
+            let i = usize::try_from(tick).map_err(|e| e.to_string())?;
+            if seen.len() <= i {
+                seen.resize(i + 1, 0);
             }
-            b'e' => events += 1,
-            _ => {}
+            if seen[i] & bit != 0 {
+                continue; // already counted from an overlapping table
+            }
+            seen[i] |= bit;
+            (first, last) = (first.min(tick), last.max(tick));
+            if key_buf[8] == b'r' {
+                sensors[usize::from(key_buf[9])].add(celsius(&val_buf[..vl]));
+            } else {
+                events += 1;
+            }
+        }
+        drop(scan);
+        verify::scan(&db, &mut cov, &mut problems);
+        if let Err(e) = db.check_invariants() {
+            problems.push(format!("{key}: {e}"));
         }
     }
-    drop(scan);
+    println!(
+        "read back {} tables ({} KiB), each through its own database",
+        keys.len(),
+        blocks * 4
+    );
+
+    let gaps = purged_windows(&seen, first, last);
     println!("\nhistory  ticks {first}..={last}, {events} alarm events");
     println!(
         "purged   {} glitch windows the recorder deleted before archiving: {}",
@@ -494,12 +508,6 @@ fn restore(store: &dyn ObjectStore) -> Result<(), String> {
             );
         }
     }
-    let mut problems = Vec::new();
-    let mut cov = Coverage::default();
-    verify::scan(&db, &mut cov, &mut problems);
-    if let Err(e) = db.check_invariants() {
-        problems.push(e.into());
-    }
     if problems.is_empty() {
         println!(
             "\nevery archived value checks out ({} entries)",
@@ -509,6 +517,29 @@ fn restore(store: &dyn ObjectStore) -> Result<(), String> {
     } else {
         Err(problems.join("\n"))
     }
+}
+
+/// Runs of ticks with no readings between `first` and `last`, as
+/// `a..b` (`seen[t]` bits 0-3 are the readings found for tick `t`): the
+/// glitch windows the recorder purged before archiving.
+fn purged_windows(seen: &[u8], first: u64, last: u64) -> Vec<String> {
+    let mut gaps = Vec::new();
+    let mut run: Option<u64> = None;
+    for t in first..=last.max(first) {
+        let empty = usize::try_from(t)
+            .ok()
+            .and_then(|i| seen.get(i))
+            .is_none_or(|b| b.trailing_zeros() >= 4);
+        match (empty, run) {
+            (true, None) => run = Some(t),
+            (false, Some(a)) => {
+                gaps.push(format!("{a}..{t}"));
+                run = None;
+            }
+            _ => {}
+        }
+    }
+    gaps
 }
 
 /// One sensor's readings across the history.

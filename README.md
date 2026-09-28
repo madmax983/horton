@@ -155,22 +155,37 @@ This demo found two WAL bugs, F18 and F19 in the
 part of a batch, and writes after a reopen could be lost behind a torn
 block. Both are fixed.
 
-## Demo: the same recorder, read in a browser
+## Demo: the same recorder, in a browser
 
-[`examples/ground_station`](examples/ground_station) is a web page that
-opens the flight recorder's flash dump with the same horton that wrote it,
-compiled to `wasm32-unknown-unknown`. The format changes between versions,
-so the writer's own code is the only reader sure to understand a device's
-flash. Drop a `flash.img` on the page and it runs the device's real
-recovery (manifest, table slots, WAL replay up to a torn tail), checks
-every entry against the recorder's key hash, and charts the sensors. It
-needs no server and no second implementation of the format. The module is
-a `no_std` `cdylib` with no imports, 125 KB (46 KB gzipped).
+[`examples/ground_station`](examples/ground_station) compiles the flight
+recorder's horton to `wasm32-unknown-unknown` for two web pages:
+
+- **Open a dump.** Drop a recorder's `flash.img` on the page and it runs
+  the device's real recovery (manifest, table slots, WAL replay up to a
+  torn tail), checks every entry against the recorder's key hash, and
+  charts the sensors. The format changes between versions, so the
+  writer's own code is the only reader sure to understand a device's
+  flash. The module is a `no_std` `cdylib` with no imports, 46 KB
+  gzipped.
+- **Live telemetry.** A simulated recorder streams frames to a Web
+  Worker, where horton logs each one durably before acknowledging it.
+  The flash is an OPFS file behind the sync access handle, and cold tables
+  go to IndexedDB through the archive API, whose asynchronous `await` falls
+  between two horton calls. Kill the Worker or crash the tab: nothing
+  acknowledged is lost, and a *Verify* button proves the whole history is
+  on flash or in IndexedDB.
+
+The logger writes the recorder's own formats, so its flash opens in the
+dump viewer and the native recorder's `restore` reads its archive. Its
+power-cut test found two bugs, F20 and F21 in the
+[review status](docs/ARCHITECTURE_REVIEW.md): scans panicked on a level
+holding more than `TABLES` tables, and on a device that overwrites in
+place a torn batch could recover in part. Both are fixed.
 
 ```sh
 rustup target add wasm32-unknown-unknown
 examples/ground_station/build.sh
-python3 -m http.server -d examples/ground_station/web 8000
+python3 -m http.server -d examples/ground_station/web 8000   # then open /live.html
 ```
 
 ## Architecture
@@ -375,6 +390,7 @@ cargo +nightly miri test --test <name>          # UB check (the crate has no uns
 cargo build --release --benches                 # callgrind instruction-count harnesses
 ./xtensa-check.sh                               # ESP32-S3 build gate (needs the esp toolchain)
 examples/ground_station/build.sh && node examples/ground_station/test.mjs target/flight_recorder/flash.img
+node examples/ground_station/live-test.mjs 300                # live logger: 300 power cuts
 ```
 
 What the suite covers:
@@ -420,7 +436,7 @@ What the suite covers:
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
 | `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
-| `examples/ground_station/` | The browser ground station: the recorder's horton as a wasm module, the page, and its Node and browser tests |
+| `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |
 | `xtensa-smoke/` | Bare-metal ESP32-S3 QEMU smoke test |

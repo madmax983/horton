@@ -15,14 +15,20 @@ use common::{Lcg, MemDevice, TestDb, block_on, noop_waker, test_config, tight_co
 type TestCompaction = Compaction<4096, 256, 1024, 1024>;
 
 /// Drives compaction until no level is full.
-fn drain_compaction(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction) {
+fn drain_compaction<D: horton::BlockDevice>(db: &mut TestDb<D>, c: &mut TestCompaction)
+where
+    D::Error: core::fmt::Debug,
+{
     while db.compaction_pending() {
         while block_on(db.compact_step(c)).unwrap() == Progress::More {}
     }
 }
 
 /// Flushes, compacting first whenever level 0 is full.
-fn flush_retrying(db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction) {
+fn flush_retrying<D: horton::BlockDevice>(db: &mut TestDb<D>, c: &mut TestCompaction)
+where
+    D::Error: core::fmt::Debug,
+{
     loop {
         match block_on(db.flush()) {
             Ok(()) => return,
@@ -1127,4 +1133,205 @@ fn f19_writes_after_a_torn_block_survive_the_next_reopen() {
             );
         }
     }
+}
+
+/// F21 — *(found by the ground station's live logger)* F18's all-or-nothing
+/// recovery trusted every well-formed record in a block. On a device that
+/// overwrites in place (a file, an SD card, a disk; NOR flash erases
+/// first), a torn block write keeps the block's *previous* bytes after the
+/// tear. When the previous write was a batch of the same shape (the WAL
+/// wrapped, and the next batch reused the block), the old batch's closing
+/// record sits exactly where the new one's should be, with a valid CRC, so
+/// it closed the new, torn group and part of a batch replayed. Records in
+/// one block are written with strictly increasing sequence numbers, and
+/// stale bytes always carry older ones, so recovery now ends the block at
+/// the first record that is not newer than the one before it.
+#[test]
+fn f21_a_batch_torn_in_place_over_an_older_batch_recovers_all_or_nothing() {
+    use common::TornDevice;
+    use horton::WriteBatch;
+
+    type Torn = TestDb<TornDevice<MemDevice<4096>, 4096>>;
+    let batch = |tag: u8, n: u8| {
+        let mut b = WriteBatch::<256, 1024, 4>::new();
+        for i in 0..4u8 {
+            b.put(&[tag, n, i], b"batched").unwrap();
+        }
+        b
+    };
+    // Batch `b` takes the WAL's first block and 127 fillers of the same
+    // shape take the rest; the next write finds no room, and the flush
+    // that makes it wraps the WAL, so batch `c` lands on `b`'s block.
+    // Returns the database just before `c`'s block write.
+    let fill = |db: &mut Torn, c: &mut TestCompaction| {
+        block_on(db.open()).unwrap();
+        block_on(db.write(&batch(b'b', 0))).unwrap();
+        for n in 0..127u8 {
+            loop {
+                match block_on(db.write(&batch(b'f', n))) {
+                    Ok(_) => break,
+                    Err(Error::TableFull | Error::ArenaFull) => flush_retrying(db, c),
+                    Err(e) => panic!("filler {n}: {e:?}"),
+                }
+            }
+        }
+        // The WAL is exhausted (and the memtable full): no room for `c`
+        // until a flush, which wraps the WAL.
+        assert!(matches!(
+            block_on(db.write(&batch(b'c', 0))),
+            Err(Error::WalFull | Error::TableFull)
+        ));
+        flush_retrying(db, c);
+    };
+    let mut c = Box::new(TestCompaction::new());
+    let mut probe: Torn = TestDb::new(
+        TornDevice::in_place(MemDevice::new(), usize::MAX, 0),
+        test_config(),
+    );
+    fill(&mut probe, &mut c);
+    let c_write = probe.device().writes();
+    block_on(probe.write(&batch(b'c', 0))).unwrap();
+    // The premise: `c` really went over `b`, in the WAL's first block.
+    let wal_start = usize::try_from(test_config().wal_start).unwrap();
+    let block = probe.into_device().into_inner().blocks_mut()[wal_start];
+    assert!(
+        block.windows(3).any(|w| w == [b'c', 0, 0]),
+        "batch c did not reuse the WAL's first block"
+    );
+
+    let mut whole = None;
+    for torn_len in 1..=4096 {
+        let mut db: Torn = TestDb::new(
+            TornDevice::in_place(MemDevice::new(), c_write, torn_len),
+            test_config(),
+        );
+        fill(&mut db, &mut c);
+        let _ = block_on(db.write(&batch(b'c', 0)));
+
+        let mut db = TestDb::new(db.into_device().into_inner(), test_config());
+        block_on(db.open()).unwrap();
+        let mut val = [0u8; 16];
+        let seen = (0..4u8)
+            .filter(|&i| block_on(db.get(&[b'c', 0, i], &mut val)).unwrap().is_some())
+            .count();
+        assert!(
+            seen == 0 || seen == 4,
+            "tear at {torn_len}: {seen} of 4 batch keys recovered"
+        );
+        for i in 0..4u8 {
+            assert_eq!(
+                block_on(db.get(&[b'b', 0, i], &mut val)).unwrap(),
+                Some(7),
+                "tear at {torn_len}: flushed key b{i} lost"
+            );
+        }
+        if seen == 4 {
+            whole.get_or_insert(torn_len);
+        } else {
+            assert!(
+                whole.is_none(),
+                "tear at {torn_len}: a longer write lost the batch again"
+            );
+        }
+    }
+    assert!(whole.is_some(), "a complete batch block must recover");
+}
+
+// The flight recorder's keys and values (examples/flight_recorder) with a
+// small memtable, so tables and region pressure come quickly.
+horton::db_types! {
+    block: 4096,
+    key_max: 10,
+    val_max: 8,
+    memtable_entries: 16,
+    memtable_arena: 512;
+    type Db = F20Db;
+    type Scan = F20Scan;
+    type RevScan = F20RevScan;
+    type Compaction = F20Compaction;
+}
+
+/// F20 — *(found by the ground station's live logger)* a level below 0 may
+/// hold more than `TABLES` tables: the manifest caps level 0 at `TABLES`
+/// but lets deeper levels share the whole `LEVELS × TABLES` pool, and
+/// split-output compaction under region pressure fills them. `Scan` and
+/// `RevScan` kept `TABLES` cursors per level, so a scan overlapping such a
+/// level indexed past its row and panicked. The cursor rows are now one
+/// pool, level-major, sized like the manifest's.
+#[test]
+fn f20_scans_cover_a_level_holding_more_than_tables_per_level() {
+    const TABLES: usize = horton::defaults::TABLES_PER_LEVEL;
+    let mut db = Box::new(F20Db::new(
+        MemDevice::<4096>::new(),
+        horton::Config::whole_device(F20Db::<MemDevice<4096>>::MIN_DEVICE_BLOCKS),
+    ));
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(F20Compaction::new());
+    let key = |t: u64, s: u8| {
+        let mut k = [0u8; 10];
+        k[..8].copy_from_slice(&t.to_be_bytes());
+        k[8] = b'r';
+        k[9] = s;
+        k
+    };
+    let crowded = |db: &F20Db<MemDevice<4096>>| {
+        (1..horton::defaults::LEVELS).any(|l| db.level_tables(l).is_some_and(|t| t.len() > TABLES))
+    };
+    // Four-reading frames, one batch each, one compaction step per frame,
+    // and nothing archived: the live logger's write pattern.
+    let mut ticks = 0u64;
+    while !crowded(&db) {
+        assert!(
+            ticks < 40_000,
+            "no level ever held more than {TABLES} tables"
+        );
+        let mut frame = horton::WriteBatch::<10, 8, 4>::new();
+        for s in 0..4 {
+            frame
+                .put(&key(ticks, s), &(ticks * 4 + u64::from(s)).to_le_bytes())
+                .unwrap();
+        }
+        loop {
+            match block_on(db.write(&frame)) {
+                Ok(_) => break,
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
+                    match block_on(db.flush()) {
+                        Ok(()) | Err(Error::NeedsCompaction) => {}
+                        Err(e) => panic!("flush at tick {ticks}: {e:?}"),
+                    }
+                }
+                Err(Error::NeedsCompaction) => {
+                    while db.compaction_pending() {
+                        block_on(db.compact_step(&mut c)).unwrap();
+                    }
+                }
+                Err(e) => panic!("write at tick {ticks}: {e:?}"),
+            }
+        }
+        if db.compaction_pending() {
+            block_on(db.compact_step(&mut c)).unwrap();
+        }
+        ticks += 1;
+    }
+    db.check_invariants().unwrap();
+
+    // Every reading, forward and in reverse, in order.
+    let (mut k, mut v) = ([0u8; 10], [0u8; 8]);
+    let mut scan = Box::new(F20Scan::new(&db));
+    block_on(scan.seek(b"", None, u64::MAX)).unwrap();
+    let mut n = 0u64;
+    while let Some((kl, _)) = block_on(scan.next(&mut k, &mut v)).unwrap() {
+        assert_eq!(&k[..kl], &key(n / 4, (n % 4) as u8), "forward entry {n}");
+        assert_eq!(u64::from_le_bytes(v), n);
+        n += 1;
+    }
+    assert_eq!(n, ticks * 4);
+    drop(scan);
+    let mut rev = Box::new(F20RevScan::new(&db));
+    block_on(rev.seek_prev(&[0xFF], None, u64::MAX)).unwrap();
+    while let Some((kl, _)) = block_on(rev.prev(&mut k, &mut v)).unwrap() {
+        n -= 1;
+        assert_eq!(&k[..kl], &key(n / 4, (n % 4) as u8), "reverse entry {n}");
+    }
+    assert_eq!(n, 0);
 }

@@ -22,9 +22,10 @@ Every finding below is fixed on the `claude/adoring-brahmagupta-1iqn35`
 branch. Each confirmed defect's test in
 [`tests/review_findings.rs`](../tests/review_findings.rs) was un-ignored in
 the commit that fixed it and is now its regression guard; CI fails if any
-is ignored again. Fixing them turned up four more (F14–F17), and the flight recorder
-demo's power-cut test two more (F18, F19), all fixed the
-same way. The rest of this document is the original review, unchanged.
+is ignored again. Fixing them turned up four more (F14–F17), the flight recorder
+demo's power-cut test two more (F18, F19), and the ground station's live
+logger two more (F20, F21), all fixed the same way. The rest of this
+document is the original review, unchanged.
 
 | # | Fix | Regression tests |
 |---|---|---|
@@ -47,6 +48,8 @@ same way. The rest of this document is the original review, unchanged.
 | F17 | *(found by the lifecycle fuzzer)* WAL writes after a reopen could be silently lost | `f17_*` |
 | F18 | *(found by the flight recorder demo's power-cut test)* a torn WAL block replayed part of a `WriteBatch` | `f18_*` |
 | F19 | *(found with F18)* writes after a reopen were lost behind a torn block that still held records | `f19_*` |
+| F20 | *(found by the ground station's live logger)* `Scan` and `RevScan` panicked on a level below 0 holding more than `TABLES` tables, which the manifest allows (deeper levels share the `LEVELS × TABLES` pool): their cursors are now one pool, level-major | `f20_*` |
+| F21 | *(found by the live logger's power-cut test)* on a device that overwrites in place (a file, an SD card, a disk), a batch torn over an older batch of the same shape recovered in part: the old closing record, left behind the tear, closed the new group. Recovery now ends a block at the first record no newer than the one before it | `f21_*` |
 
 Structure and process items:
 

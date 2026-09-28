@@ -749,10 +749,23 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             let mut complete = 0usize;
             let mut torn = false;
             let mut first_seq = None;
+            let mut last_seq = None;
             while off < BLOCK {
                 match scan_record(&block[off..]) {
+                    // A block's records carry strictly increasing sequence
+                    // numbers, and sequence numbers are never reused, so a
+                    // record no newer than the one before it is a previous
+                    // write's bytes left behind a torn in-place write (a
+                    // file or disk keeps them; NOR flash erases first).
+                    // Taking it would let an old group's closing record
+                    // close a new, torn group (F21).
+                    Scan::Record(rec) if last_seq.is_some_and(|last| rec.seq <= last) => {
+                        torn = true;
+                        break;
+                    }
                     Scan::Record(rec) => {
                         first_seq.get_or_insert(rec.seq);
+                        last_seq = Some(rec.seq);
                         off += rec.total_len;
                         if !rec.more {
                             complete = off;

@@ -35,16 +35,21 @@ cargo test --release --features loom --test loom_ring
 cargo run --release --example flight_recorder -- torture 300
 ```
 
-The ground station (`examples/ground_station`, its own crate, wasm32):
+The ground station (`examples/ground_station` and `examples/ground_station/live`,
+two crates of their own, wasm32):
 
 ```sh
 rustup target add wasm32-unknown-unknown
-(cd examples/ground_station && cargo fmt --check &&
-  cargo clippy --release --target wasm32-unknown-unknown -- $L)
+for c in examples/ground_station examples/ground_station/live; do
+  (cd "$c" && cargo fmt --check &&
+    cargo clippy --release --target wasm32-unknown-unknown -- $L)
+done
 cargo run --release --example flight_recorder -- --fresh --fast --ticks 12000
 examples/ground_station/build.sh
 node examples/ground_station/test.mjs target/flight_recorder/flash.img --newest 11999
-(cd examples/ground_station && node browser-test.mjs)   # needs playwright
+node examples/ground_station/live-test.mjs 300 --export target/live-export
+cargo run --release --example flight_recorder -- restore --dir target/live-export
+(cd examples/ground_station && node browser-test.mjs && node live-browser-test.mjs)   # need playwright
 ```
 
 `.github/workflows/ci.yml` is the source of truth. If this list and CI
@@ -59,5 +64,6 @@ disagree, CI wins; update this file.
   `tests/review_findings.rs`; CI fails if one is `#[ignore]`d.
 - The on-disk format may change between minor versions before 1.0, but
   old images must be rejected, never misread.
-- `examples/flight_recorder/format.rs` is shared with the ground station.
-  Change the recorder's shape there, and both follow.
+- `examples/flight_recorder/format.rs` is shared with the ground station's
+  two modules. Change the recorder's shape or archive format there, and
+  all three follow.

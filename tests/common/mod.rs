@@ -188,6 +188,7 @@ pub struct TornDevice<D, const BLOCK: usize> {
     torn_at: usize,
     torn_len: usize,
     writes: usize,
+    in_place: bool,
 }
 
 impl<D, const BLOCK: usize> TornDevice<D, BLOCK> {
@@ -199,6 +200,21 @@ impl<D, const BLOCK: usize> TornDevice<D, BLOCK> {
             torn_at,
             torn_len,
             writes: 0,
+            in_place: false,
+        }
+    }
+
+    /// Like [`TornDevice::new`], but the torn block keeps its old bytes
+    /// after the tear, as a device that overwrites in place does (a file,
+    /// an SD card, a disk) instead of erasing first (NOR flash).
+    #[allow(dead_code)] // Not every test binary tears in place.
+    pub const fn in_place(inner: D, torn_at: usize, torn_len: usize) -> Self {
+        Self {
+            inner,
+            torn_at,
+            torn_len,
+            writes: 0,
+            in_place: true,
         }
     }
 
@@ -239,8 +255,15 @@ impl<D: BlockDevice, const BLOCK: usize> BlockDevice for TornDevice<D, BLOCK> {
             return Poll::Ready(Ok(())); // power died: the write never lands
         }
         if n == self.torn_at {
-            // The torn block: leading bytes land, the tail stays zeros.
+            // The torn block: leading bytes land; the tail is zeros, or
+            // whatever the block held before when tearing in place.
             let mut torn = [0u8; BLOCK];
+            if self.in_place {
+                match self.inner.poll_read_block(cx, id, &mut torn) {
+                    Poll::Ready(Ok(())) => {}
+                    other => return other,
+                }
+            }
             let k = self.torn_len.min(buf.len()).min(BLOCK);
             torn[..k].copy_from_slice(&buf[..k]);
             return self.inner.poll_write_block(cx, id, &torn);

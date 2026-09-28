@@ -1,0 +1,21 @@
+[package]
+name = "horton-live-logger"
+version = "0.1.0"
+edition = "2024"
+description = "The flight recorder's horton as a live logger in a browser Worker: OPFS for flash, IndexedDB for the archive"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+horton = { path = "../../.." }
+
+# Same reasoning as the viewer: small download, no unwinding on wasm32.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

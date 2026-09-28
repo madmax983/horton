@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live telemetry</title>
+<link rel="icon" href="data:,">
+<meta name="description" content="Log a flight recorder's live telemetry in the browser with horton: a Web Worker over OPFS, cold tables archived to IndexedDB, nothing acknowledged ever lost.">
+<link rel="stylesheet" href="station.css">
+<style>
+  .run { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 24px; }
+  .run .group { display: flex; gap: 4px; }
+  .run .label { color: var(--ink-2); font-size: 13px; }
+  button.danger { color: var(--critical); }
+  #state { margin-top: 12px; color: var(--ink-2); font-size: 13px; }
+  #log { list-style: none; margin: 0; padding: 0; font-size: 13px; max-height: 240px; overflow: auto; }
+  #log li { padding: 4px 0; border-bottom: 1px solid var(--grid); display: flex; gap: 12px; }
+  #log time { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+  #verify-out:empty { display: none; }
+  #verify-out { margin-top: 12px; }
+  .how { color: var(--ink-2); font-size: 14px; }
+  .how li + li { margin-top: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <nav><a href="index.html">Open a dump</a><a href="live.html" aria-current="page">Live telemetry</a></nav>
+  <h1>Live telemetry</h1>
+  <p class="lede">
+    A flight recorder streams frames to this tab. horton, the same code the
+    device runs, logs each one durably in a Web Worker before acknowledging
+    it: the flash is a file in your browser's private file system (OPFS),
+    and tables older than the hot window move to IndexedDB. Crash the
+    logger or close the tab at any moment; nothing acknowledged is lost.
+  </p>
+
+  <div class="run" role="group" aria-label="Stream">
+    <button type="button" id="toggle" class="primary">Start the stream</button>
+    <span class="label">Rate</span>
+    <span class="group" role="group" aria-label="Frames per second">
+      <button type="button" data-rate="50">50/s</button>
+      <button type="button" data-rate="500">500/s</button>
+      <button type="button" data-rate="0">As fast as it acknowledges</button>
+    </span>
+    <button type="button" id="crash" class="danger">Crash the logger</button>
+  </div>
+  <p id="state" aria-live="polite">Starting the logger…</p>
+  <p id="error" role="alert"></p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section class="card" style="margin-top:16px;position:relative">
+    <h2>The newest 600 ticks</h2>
+    <div id="charts"></div>
+    <div class="legend">
+      <span><i class="swatch-alarm"></i>alarm</span>
+      <span id="band-note"></span>
+    </div>
+    <div id="tip" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>Proof</h2>
+    <p class="how">Checks every tick from the first to the newest: each frame
+      must be whole on flash or in IndexedDB, read back through horton.</p>
+    <div class="run" style="margin-top:12px">
+      <button type="button" id="verify">Verify the whole history</button>
+      <button type="button" id="export">Download flash.img</button>
+      <a href="index.html" class="how">…then open it in the dump viewer</a>
+    </div>
+    <div id="verify-out"></div>
+  </section>
+
+  <section class="card">
+    <h2>What happened</h2>
+    <ul id="log"></ul>
+  </section>
+
+  <section class="card">
+    <h2>How it works</h2>
+    <ol class="how">
+      <li>The simulated device sends frames and keeps every one the logger has not acknowledged. After a crash it sends them again.</li>
+      <li>The Worker records each frame as one horton <code>WriteBatch</code>: one WAL block, written and flushed to OPFS before the acknowledgement goes back.</li>
+      <li>Every tick, one bounded compaction step. When tables hold only ticks older than 3,000, they are archived: staged by horton, stored in IndexedDB (a <code>strict</code> transaction), and only then committed away from flash. The wait for IndexedDB falls between two horton calls.</li>
+      <li>On start, horton recovers the flash as the device would after a power cut: the newest manifest copy, then the WAL up to any torn tail.</li>
+    </ol>
+    <div class="run">
+      <button type="button" id="reset" class="danger">Erase everything and start over</button>
+    </div>
+  </section>
+
+  <footer>horton ground station · <code>examples/ground_station</code></footer>
+</main>
+<script type="module" src="live.mjs"></script>
+</body>
+</html>

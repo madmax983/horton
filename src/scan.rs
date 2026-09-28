@@ -126,11 +126,17 @@ pub struct Scan<
     mem_live: bool,
     /// Absolute expiry tick of the memtable head; 0 = no expiry.
     mem_expire_at: u64,
-    /// One cursor row per level; `cursor_counts[li]` says how many of row
-    /// `li` are in use. (Nested rather than flat: stable Rust forbids
-    /// const-generic products like `LEVELS * TABLES` in array lengths.)
+    /// One pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
+    /// capacity, used level-major: level `li`'s cursors are the
+    /// `cursor_counts[li]` slots from `level_base[li]` of the flattened
+    /// pool. A level below 0 may hold more than `TABLES` tables (they
+    /// share the pool; F20), so rows per level would overflow. (Declared
+    /// nested because stable Rust forbids const-generic products like
+    /// `LEVELS * TABLES` in array lengths.)
     cursors: [[ScanCursor<KEY_MAX>; TABLES]; LEVELS],
     cursor_counts: [usize; LEVELS],
+    /// Where each level's cursors start in the flattened pool.
+    level_base: [usize; LEVELS],
 }
 
 impl<
@@ -176,6 +182,7 @@ impl<
             mem_expire_at: 0,
             cursors: [[ScanCursor::empty(); TABLES]; LEVELS],
             cursor_counts: [0; LEVELS],
+            level_base: [0; LEVELS],
         }
     }
 
@@ -260,7 +267,9 @@ impl<
         // One cursor per table overlapping [start, end). The merge resolves
         // L0 overlaps and cross-level duplication; order here is irrelevant.
         self.cursor_counts = [0; LEVELS];
+        let mut base = 0;
         for li in 0..LEVELS {
+            self.level_base[li] = base;
             let tables = db.manifest_ref().level(li).unwrap_or(&[]);
             for tref in tables {
                 // Key-range prune: no I/O for tables outside the scan.
@@ -274,10 +283,9 @@ impl<
                 // compaction already merged them into a newer table): the
                 // cursor starts at the bound at the earliest.
                 let from = start.max(tref.first_key.as_slice());
-                // `level()` slices a `[TableRef; TABLES]`, so the row below
-                // cannot overflow.
                 self.add_cursor(tref, li, from).await?;
             }
+            base += self.cursor_counts[li];
         }
         Ok(())
     }
@@ -362,7 +370,7 @@ impl<
                 (0u32, 0u64, 0usize, 0usize)
             } else {
                 let (wli, wti) = self.cursor_pos(winner_src);
-                let c = &self.cursors[wli][wti];
+                let c = &self.cursors.as_flattened()[self.level_base[wli] + wti];
                 (c.table_id, c.block_id, c.off, c.end)
             };
             // The winner key is materialized into a local buffer first, so a
@@ -376,7 +384,7 @@ impl<
                     &self.mem_key[..winner_key_len]
                 } else {
                     let (wli, wti) = self.cursor_pos(winner_src);
-                    &self.cursors[wli][wti].key[..winner_key_len]
+                    &self.cursors.as_flattened()[self.level_base[wli] + wti].key[..winner_key_len]
                 };
                 wkey[..winner_key_len].copy_from_slice(wk);
             }
@@ -458,10 +466,11 @@ impl<
         for src in 1..=total {
             let (li, ti) = self.cursor_pos(src);
             loop {
-                if !self.cursors[li][ti].live {
+                if !self.cursors.as_flattened()[self.level_base[li] + ti].live {
                     break;
                 }
-                let tied = &self.cursors[li][ti].key[..self.cursors[li][ti].key_len] == minkey;
+                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+                let tied = &c.key[..c.key_len] == minkey;
                 if !tied {
                     break;
                 }
@@ -586,7 +595,14 @@ impl<
             return Err(Error::CorruptBlock { id: bid });
         }
         let ti = self.cursor_counts[li];
-        self.cursors[li][ti] = ScanCursor {
+        // The manifest holds at most the pool's worth of tables, so this
+        // never fails; if it did, the manifest is what is wrong.
+        let slot = self
+            .cursors
+            .as_flattened_mut()
+            .get_mut(self.level_base[li] + ti)
+            .ok_or(Error::CorruptManifest)?;
+        *slot = ScanCursor {
             table_id: tref.id,
             first_block: data_first,
             data_blocks,
@@ -621,7 +637,7 @@ impl<
         let max_seq = self.max_seq;
         loop {
             let (tid, bid, off, end, idx, first, nblocks) = {
-                let c = &self.cursors[li][ti];
+                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
                 if !c.live {
                     return Ok(());
                 }
@@ -670,7 +686,7 @@ impl<
                 off = next;
             };
             if let Some((key, klen, seq, tomb, vlen, exp, eoff, next)) = parked {
-                let c = &mut self.cursors[li][ti];
+                let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
                 c.key = key;
                 c.key_len = klen;
                 c.seq = seq;
@@ -684,7 +700,7 @@ impl<
             }
             // Block exhausted: move to the next data block, if any.
             if idx + 1 >= nblocks {
-                self.cursors[li][ti].live = false;
+                self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                 return Ok(());
             }
             let nid = first
@@ -695,7 +711,7 @@ impl<
             if nend == 0 {
                 return Err(Error::CorruptBlock { id: nid });
             }
-            let c = &mut self.cursors[li][ti];
+            let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
             c.block_id = nid;
             c.block_idx = idx + 1;
             c.end = nend;
@@ -766,7 +782,7 @@ impl<
             }
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors[li][ti];
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
             if c.live {
                 Some(&c.key[..c.key_len])
             } else {
@@ -791,7 +807,7 @@ impl<
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors[li][ti];
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
             c.live.then_some((
                 &c.key[..c.key_len],
                 c.seq,
@@ -957,11 +973,17 @@ pub struct RevScan<
     mem_live: bool,
     /// Absolute expiry tick of the memtable head; 0 = no expiry.
     mem_expire_at: u64,
-    /// One cursor row per level; `cursor_counts[li]` says how many of row
-    /// `li` are in use. (Nested rather than flat: stable Rust forbids
-    /// const-generic products like `LEVELS * TABLES` in array lengths.)
+    /// One pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
+    /// capacity, used level-major: level `li`'s cursors are the
+    /// `cursor_counts[li]` slots from `level_base[li]` of the flattened
+    /// pool. A level below 0 may hold more than `TABLES` tables (they
+    /// share the pool; F20), so rows per level would overflow. (Declared
+    /// nested because stable Rust forbids const-generic products like
+    /// `LEVELS * TABLES` in array lengths.)
     cursors: [[RevCursor<KEY_MAX>; TABLES]; LEVELS],
     cursor_counts: [usize; LEVELS],
+    /// Where each level's cursors start in the flattened pool.
+    level_base: [usize; LEVELS],
 }
 
 impl<
@@ -1007,6 +1029,7 @@ impl<
             mem_expire_at: 0,
             cursors: [[RevCursor::empty(); TABLES]; LEVELS],
             cursor_counts: [0; LEVELS],
+            level_base: [0; LEVELS],
         }
     }
 
@@ -1108,7 +1131,9 @@ impl<
         // resolves L0 overlaps and cross-level duplication; order here is
         // irrelevant.
         self.cursor_counts = [0; LEVELS];
+        let mut base = 0;
         for li in 0..LEVELS {
+            self.level_base[li] = base;
             let tables = db.manifest_ref().level(li).unwrap_or(&[]);
             for tref in tables {
                 // Key-range prune: no I/O for tables outside the scan.
@@ -1118,10 +1143,9 @@ impl<
                 if self.has_lower && tref.last_key.as_slice() <= &self.lower[..self.lower_len] {
                     continue;
                 }
-                // `level()` slices a `[TableRef; TABLES]`, so the row below
-                // cannot overflow.
                 self.add_cursor_rev(tref, li, from).await?;
             }
+            base += self.cursor_counts[li];
         }
         Ok(())
     }
@@ -1191,7 +1215,7 @@ impl<
                 (0u32, 0u64, 0usize, 0usize)
             } else {
                 let (wli, wti) = self.cursor_pos(winner_src);
-                let c = &self.cursors[wli][wti];
+                let c = &self.cursors.as_flattened()[self.level_base[wli] + wti];
                 (c.table_id, c.block_id, c.off, c.end)
             };
             // The winner key is materialized into a local buffer first, so a
@@ -1205,7 +1229,7 @@ impl<
                     &self.mem_key[..winner_key_len]
                 } else {
                     let (wli, wti) = self.cursor_pos(winner_src);
-                    &self.cursors[wli][wti].key[..winner_key_len]
+                    &self.cursors.as_flattened()[self.level_base[wli] + wti].key[..winner_key_len]
                 };
                 wkey[..winner_key_len].copy_from_slice(wk);
             }
@@ -1318,7 +1342,7 @@ impl<
             let (li, ti) = self.cursor_pos(src);
             loop {
                 let tied = {
-                    let c = &self.cursors[li][ti];
+                    let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
                     c.live && &c.key[..c.key_len] == maxkey
                 };
                 if !tied {
@@ -1452,7 +1476,14 @@ impl<
             return Err(Error::CorruptBlock { id: bid });
         }
         let ti = self.cursor_counts[li];
-        self.cursors[li][ti] = RevCursor {
+        // The manifest holds at most the pool's worth of tables, so this
+        // never fails; if it did, the manifest is what is wrong.
+        let slot = self
+            .cursors
+            .as_flattened_mut()
+            .get_mut(self.level_base[li] + ti)
+            .ok_or(Error::CorruptManifest)?;
+        *slot = RevCursor {
             table_id: tref.id,
             first_block: data_first,
             block_idx,
@@ -1513,7 +1544,7 @@ impl<
         let max_seq = self.max_seq;
         loop {
             let (tid, bid, end, idx, first) = {
-                let c = &self.cursors[li][ti];
+                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
                 if !c.live {
                     return Ok(());
                 }
@@ -1538,7 +1569,7 @@ impl<
                     .find_table(tid)
                     .is_some_and(|t| key[..klen] < *t.first_key.as_slice())
                 {
-                    self.cursors[li][ti].live = false;
+                    self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                     return Ok(());
                 }
                 let fkey = self.block_first_key(end, bid)?;
@@ -1550,7 +1581,7 @@ impl<
                     } else {
                         (key, klen, seq, tomb, vlen, exp, off, bid, end, idx)
                     };
-                let c = &mut self.cursors[li][ti];
+                let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
                 c.key = key;
                 c.key_len = klen;
                 c.seq = seq;
@@ -1567,7 +1598,7 @@ impl<
             // Block yielded nothing: step to the previous data block, if
             // any.
             if idx == 0 {
-                self.cursors[li][ti].live = false;
+                self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                 return Ok(());
             }
             let nid = first
@@ -1578,7 +1609,7 @@ impl<
             if nend == 0 {
                 return Err(Error::CorruptBlock { id: nid });
             }
-            let c = &mut self.cursors[li][ti];
+            let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
             c.block_id = nid;
             c.block_idx = idx - 1;
             c.end = nend;
@@ -1943,7 +1974,7 @@ impl<
             }
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors[li][ti];
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
             if c.live {
                 Some(&c.key[..c.key_len])
             } else {
@@ -1968,7 +1999,7 @@ impl<
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors[li][ti];
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
             c.live.then_some((
                 &c.key[..c.key_len],
                 c.seq,

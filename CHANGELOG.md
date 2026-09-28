@@ -27,9 +27,20 @@ misread.
   against the recorder's key hash, and charts the sensors. CI records a
   flight, reads it (and one killed three times with SIGKILL), and drives
   the page in headless Chromium.
-- The flight recorder's format (`db_types!` shape, layout, key schema)
-  moved to `examples/flight_recorder/format.rs`, shared with the ground
-  station so the two cannot drift apart.
+- **Live telemetry** (`examples/ground_station/live`, `web/live.html`):
+  the recorder's horton logging a live stream in a browser Web Worker.
+  Its flash is an OPFS file behind the sync access handle, and cold
+  tables go to IndexedDB through the archive API (stage, a `strict`
+  IndexedDB transaction, then `archive_commit`). The simulated device
+  resends every frame not yet acknowledged. A Node test cuts the power
+  300 times (torn in-place writes, and cuts on either side of an archive
+  store) and proves every durable tick whole across flash and archive; a
+  Chromium test kills the Worker, then crashes the tab, and proves nothing
+  acknowledged was lost. The logger's flash opens in the dump viewer, and
+  the native recorder's `restore` reads its archive.
+- The flight recorder's formats (`db_types!` shape, layout, key schema,
+  archive object) live in `examples/flight_recorder/format.rs`, shared
+  with the ground station and the live logger so none can drift apart.
 
 ### Fixed
 
@@ -76,6 +87,23 @@ misread.
   lifecycle fuzzer).
 - A newer range tombstone could be dropped in favour of an older,
   identical one when merging.
+- **F20** `Scan` and `RevScan` panicked when a level below 0 held more
+  than `TABLES` tables, which the manifest allows once region pressure
+  pushes tables down (found by the live logger). Their cursors are one
+  pool now, level-major.
+- **F21** On a device that overwrites in place (a file, an SD card, a
+  disk), a batch torn over an older batch of the same shape recovered in
+  part: the older batch's closing record, left behind the tear, closed
+  the torn group (found by the live logger's power-cut test). Recovery
+  ends a block at the first record no newer than the one before it.
+- The flight recorder's `restore` failed on archives of more than a few
+  dozen tables (`IngestConflict`, then `RegionFull`): it ingested the
+  whole history into one database, whose shape has 16 table slots. It
+  reads each table back through its own database now, as `verify` does.
+- The ground station counted frames split with the archive as torn
+  unless they were the oldest on flash; a table boundary can split any
+  frame. A prefix or a suffix of a frame's sensors is now a split, and
+  anything else is torn.
 - The `multiwriter` feature did not build once v0.17 landed: the drainer
   and writer still used `Error::NoSpace` and `Db`'s removed `FREELIST`
   parameter. The `loom` ring model did not compile either.
