@@ -42,7 +42,6 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// In-memory block device: a growable vector of zeroed blocks.
 /// In-memory block device: a sparse map of written blocks. Block ids are
 /// allocated across the whole configured device range (wear-levelling slot
 /// bases can land far apart), so a dense `Vec` indexed by id would have to
