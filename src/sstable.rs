@@ -177,7 +177,7 @@ pub(crate) const MAX_DATA_TAIL: usize = 128 * 2 + 2 + CRC_LEN;
 /// last was sealed because the next entry (at most `emax` bytes) no longer
 /// fit — so it holds more than `room - emax` bytes — or because it reached
 /// `per_block` entries.
-const fn packed_blocks_bound(
+pub(crate) const fn packed_blocks_bound(
     total: usize,
     n: usize,
     emax: usize,
@@ -956,7 +956,7 @@ pub struct RdelEntry<'a> {
 }
 
 /// Trailer bytes of an rdel block: `count u16` + `crc32`.
-const RDEL_TRAILER: usize = 6;
+pub(crate) const RDEL_TRAILER: usize = 6;
 
 /// Planned shape of a table's range-tombstone section.
 #[derive(Debug, Clone, Copy)]

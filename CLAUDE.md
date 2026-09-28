@@ -32,8 +32,25 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features multiwriter
 cargo test                                   # and --release
 cargo test --features multiwriter
 cargo test --release --features loom --test loom_ring
+cargo run --example quickstart
 cargo run --release --example flight_recorder -- torture 300
 ```
+
+The host key-value store (`examples/kvstore`, CI runs it on Linux, macOS
+and Windows; `cargo test` also runs its unit tests, `test = true` in
+`Cargo.toml`):
+
+```sh
+cargo test --release --example kvstore
+cargo run --release --example kvstore -- demo
+cargo run --release --example kvstore -- crash 25
+cargo run --release --example kvstore -- --no-sync crash 25
+cargo run --release --example kvstore -- --no-sync bench --num 30000
+# plus the put/get/scan/del/delrange/compact checks in ci.yml's kvstore job
+```
+
+The kvstore's `FileDevice` has `cfg(unix)` and `cfg(windows)` halves;
+only one of them builds on your machine. Keep them in step.
 
 The ground station (`examples/ground_station` and `examples/ground_station/live`,
 two crates of their own, wasm32):

@@ -1335,3 +1335,117 @@ fn f20_scans_cover_a_level_holding_more_than_tables_per_level() {
     }
     assert_eq!(n, 0);
 }
+
+/// Runs `op`, making room the way horton's capacity errors say.
+fn with_room<T>(
+    db: &mut TestDb<MemDevice<4096>>,
+    c: &mut TestCompaction,
+    mut op: impl FnMut(&mut TestDb<MemDevice<4096>>) -> Result<T, Error<core::convert::Infallible>>,
+) -> T {
+    loop {
+        match op(db) {
+            Ok(v) => return v,
+            Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => flush_retrying(db, c),
+            Err(Error::NeedsCompaction) => drain_compaction(db, c),
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
+/// Blocks of range tombstones across every table.
+fn rdel_blocks(db: &TestDb<MemDevice<4096>>) -> u64 {
+    (0..7)
+        .flat_map(|l| db.level_tables(l).unwrap_or(&[]))
+        .map(|t| u64::from(t.rdel_blocks))
+        .sum()
+}
+
+/// F22 — *(found by the kvstore example's crash test)* overlapping range
+/// deletes wedged compaction for good. Two faults compounded:
+///
+/// - the coverage stream tracked four tombstones at once and, past that,
+///   kept every range tombstone of the job, so a key range deleted over
+///   and over accumulated tombstones without end;
+/// - a job reserved room in every output for all its merged tombstones at
+///   the `12 + 2 * KEY_MAX`-byte worst case, however short their keys.
+///
+/// Once the reservation outgrew a slot, every L0 job failed with
+/// `TableTooLarge` before it began, level 0 stayed full, and no flush
+/// could ever land again. The stream now tracks only tombstones no newer,
+/// wider one dominates (eight at once), remembers where it overflowed and
+/// keeps only the tombstones reaching there; the reservation counts the
+/// tombstones' real bytes plus what clipping at the output bounds can add.
+#[test]
+fn f22_overlapping_range_deletes_never_wedge_compaction() {
+    let mut db = Box::new(TestDb::new(MemDevice::<4096>::new(), tight_config()));
+    block_on(db.open()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    let mut rng = Lcg::new(22);
+    let mut oracle = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    let key = |i: usize| format!("k{i:03}").into_bytes();
+    // The kvstore crash test's mix, on 200 keys: puts, deletes, and range
+    // deletes of 1 to 20 keys, which overlap dozens deep.
+    for n in 0..6000u32 {
+        let i = rng.next_bounded(200);
+        match rng.next_bounded(8) {
+            0..=4 => {
+                let v = n.to_le_bytes();
+                with_room(&mut db, &mut c, |db| block_on(db.put(&key(i), &v)));
+                oracle.insert(key(i), v.to_vec());
+            }
+            5 => {
+                with_room(&mut db, &mut c, |db| block_on(db.delete(&key(i))));
+                oracle.remove(&key(i));
+            }
+            _ => {
+                let (a, b) = (i.min(180), i.min(180) + 1 + rng.next_bounded(20));
+                with_room(&mut db, &mut c, |db| {
+                    block_on(db.delete_range(&key(a), &key(b)))
+                });
+                oracle.retain(|k, _| *k < key(a) || *k >= key(b));
+            }
+        }
+        if n % 500 == 0 {
+            db.check_invariants().unwrap();
+        }
+    }
+    flush_retrying(&mut db, &mut c);
+    drain_compaction(&mut db, &mut c);
+    db.check_invariants().unwrap();
+    let want: Vec<_> = oracle.into_iter().collect();
+    assert_eq!(scan_all(&db, false), want);
+    assert_eq!(scan_all(&db, true), want);
+    // About 1500 range deletes were written; only the newest few, in
+    // level 0 and wherever the stream overflowed, remain.
+    let left = rdel_blocks(&db);
+    assert!(
+        left <= 8,
+        "{left} blocks of range tombstones were never collected"
+    );
+}
+
+/// F22 — a tombstone a newer one reaching at least as far dominates never
+/// decides a key's cover, so five nested tombstones over one key, newest
+/// widest, no longer overflow the stream: the bottommost job drops the
+/// versions they hide and then every tombstone.
+#[test]
+fn f22_dominated_range_tombstones_are_collected() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"k0", b"old")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.put(b"k0", b"new")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.delete_range(b"k0", b"k3")).unwrap();
+    block_on(db.delete_range(b"k0", b"k3")).unwrap();
+    block_on(db.flush()).unwrap();
+    block_on(db.delete_range(b"k0", b"k4")).unwrap();
+    block_on(db.delete_range(b"k0", b"k5")).unwrap();
+    block_on(db.delete_range(b"k0", b"k6")).unwrap();
+    block_on(db.flush()).unwrap();
+    let mut c = Box::new(TestCompaction::new());
+    drain_compaction(&mut db, &mut c);
+    assert_eq!(db.level_tables(0).unwrap().len(), 0);
+    assert_eq!(rdel_blocks(&db), 0, "every tombstone was collected");
+    assert!(scan_all(&db, false).is_empty());
+}

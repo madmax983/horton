@@ -23,8 +23,9 @@ branch. Each confirmed defect's test in
 [`tests/review_findings.rs`](../tests/review_findings.rs) was un-ignored in
 the commit that fixed it and is now its regression guard; CI fails if any
 is ignored again. Fixing them turned up four more (F14–F17), the flight recorder
-demo's power-cut test two more (F18, F19), and the ground station's live
-logger two more (F20, F21), all fixed the same way. The rest of this
+demo's power-cut test two more (F18, F19), the ground station's live
+logger two more (F20, F21), and the kvstore example's crash test one more
+(F22), all fixed the same way. The rest of this
 document is the original review, unchanged.
 
 | # | Fix | Regression tests |
@@ -50,6 +51,7 @@ document is the original review, unchanged.
 | F19 | *(found with F18)* writes after a reopen were lost behind a torn block that still held records | `f19_*` |
 | F20 | *(found by the ground station's live logger)* `Scan` and `RevScan` panicked on a level below 0 holding more than `TABLES` tables, which the manifest allows (deeper levels share the `LEVELS × TABLES` pool): their cursors are now one pool, level-major | `f20_*` |
 | F21 | *(found by the live logger's power-cut test)* on a device that overwrites in place (a file, an SD card, a disk), a batch torn over an older batch of the same shape recovered in part: the old closing record, left behind the tear, closed the new group. Recovery now ends a block at the first record no newer than the one before it | `f21_*` |
+| F22 | *(found by the kvstore example's crash test)* overlapping range deletes wedged compaction for good: past four overlapping tombstones the coverage stream gave up and every job kept all its tombstones, and each job reserved room for all of them at the `12 + 2 * KEY_MAX`-byte worst case, so the reservation outgrew a slot, every L0 job failed with `TableTooLarge`, and no flush could land again. The stream now tracks only undominated tombstones (eight at once) and keeps just those reaching where it overflowed; the reservation counts real bytes plus what clipping can add, bounded by the overlap depth | `f22_*`, `compact::tests`, `tests/crash_compact.rs` |
 
 Structure and process items:
 
