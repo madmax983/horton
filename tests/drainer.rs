@@ -931,9 +931,7 @@ fn sweep_advances_watermark_across_ticket_wrap() {
     // Six tickets across the wrap: seed, seed+1, TICKET_MASK, 0, 1, 2.
     let mut tickets = [0u32; 6];
     for (i, t) in tickets.iter_mut().enumerate() {
-        // `tickets` is fixed at 6 elements, so `i` is always in `[0, 6)`.
-        #[allow(clippy::cast_possible_truncation)]
-        let key = [b'k', b'0' + i as u8];
+        let key = [b'k', b'0' + u8::try_from(i).expect("six tickets")];
         *t = publish(&ring, &key, b"v");
     }
     assert_eq!(
@@ -964,9 +962,7 @@ fn sweep_advances_watermark_across_ticket_wrap() {
     let db = drainer.into_db();
     let mut buf = [0u8; 32];
     for i in 0..6usize {
-        // The loop bound is a literal 6, so `i` is always in `[0, 6)`.
-        #[allow(clippy::cast_possible_truncation)]
-        let key = [b'k', b'0' + i as u8];
+        let key = [b'k', b'0' + u8::try_from(i).expect("six tickets")];
         let len = block_on(db.get(&key, &mut buf))
             .expect("get ok")
             .expect("key present");
