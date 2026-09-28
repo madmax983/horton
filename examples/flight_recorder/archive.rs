@@ -13,84 +13,22 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::task::{Context, Poll};
 
-use horton::{ArchivePlan, BlockDevice, Error, KeyBound, SealedTable, crc32};
+use horton::{ArchivePlan, BlockDevice, Error, SealedTable};
 
-use crate::{BLOCK, KEY_MAX, RecorderCompaction, RecorderDb, block_on, tick_of};
-
-const MAGIC: &[u8; 8] = b"HRTARCH1";
+use crate::{
+    BLOCK, KEY_MAX, ObjectName, RecorderCompaction, RecorderDb, block_on, decode_archive_header,
+    encode_archive_header, tick_of,
+};
 
 /// The object key a table is archived under. Table ids never repeat, so
 /// re-uploading after a crash overwrites the object with the same bytes.
 pub fn object_key(table_id: u32) -> String {
-    format!("tables/{table_id:010}.hrt")
-}
-
-/// Encodes the header block for `sealed`.
-fn header(sealed: &SealedTable<KEY_MAX>) -> [u8; BLOCK] {
-    let mut h = [0u8; BLOCK];
-    let mut at = 0;
-    let mut put = |bytes: &[u8]| {
-        h[at..at + bytes.len()].copy_from_slice(bytes);
-        at += bytes.len();
-    };
-    put(MAGIC);
-    put(&sealed.id.to_le_bytes());
-    put(&sealed.block_count.to_le_bytes());
-    put(&sealed.max_seq.to_le_bytes());
-    put(&sealed.min_seq.to_le_bytes());
-    put(&sealed.entry_count.to_le_bytes());
-    put(&sealed.rdel_blocks.to_le_bytes());
-    for bound in [&sealed.first_key, &sealed.last_key] {
-        put(&bound.len.to_le_bytes());
-        put(&bound.bytes);
-    }
-    let crc = crc32(&h[..at]);
-    h[at..at + 4].copy_from_slice(&crc.to_le_bytes());
-    h
+    ObjectName::new(table_id).as_str().to_owned()
 }
 
 /// Decodes a header block, or says why it is not one.
 pub fn parse_header(h: &[u8]) -> Result<SealedTable<KEY_MAX>, String> {
-    if h.len() < BLOCK || &h[..8] != MAGIC {
-        return Err("not an archive object".into());
-    }
-    let mut at = 8;
-    let mut take = |n: usize| {
-        let s = &h[at..at + n];
-        at += n;
-        s
-    };
-    let u32_at = |s: &[u8]| u32::from_le_bytes(s.try_into().expect("4 bytes"));
-    let u64_at = |s: &[u8]| u64::from_le_bytes(s.try_into().expect("8 bytes"));
-    let id = u32_at(take(4));
-    let block_count = u32_at(take(4));
-    let max_seq = u64_at(take(8));
-    let min_seq = u64_at(take(8));
-    let entry_count = u32_at(take(4));
-    let rdel_blocks = u32_at(take(4));
-    let mut bound = || {
-        let len = u16::from_le_bytes(take(2).try_into().expect("2 bytes"));
-        let mut bytes = [0u8; KEY_MAX];
-        bytes.copy_from_slice(take(KEY_MAX));
-        KeyBound { len, bytes }
-    };
-    let first_key = bound();
-    let last_key = bound();
-    let end = at;
-    let crc = u32_at(&h[end..end + 4]);
-    if crc != crc32(&h[..end]) {
-        return Err("header CRC mismatch".into());
-    }
-    Ok(SealedTable {
-        id,
-        block_count,
-        first_key,
-        last_key,
-        max_seq,
-        min_seq,
-        entry_count,
-        rdel_blocks,
-    })
+    decode_archive_header(h).map_err(String::from)
 }
 
 /// Streams one table to `store`: the header, then every block read
@@ -107,7 +45,7 @@ where
     let first = plan.table.first_block;
     let blocks = u64::from(plan.table.block_count);
     store.put(&object_key(sealed.id), &mut |w: &mut dyn Write| {
-        w.write_all(&header(&sealed))?;
+        w.write_all(&encode_archive_header(&sealed))?;
         let mut buf = [0u8; BLOCK];
         for id in first..first + blocks {
             block_on(poll_fn(|cx| db.device().poll_read_block(cx, id, &mut buf)))
