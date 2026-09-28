@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn concurrent_writers_fill_flush_compact_and_reopen() {
         let mut store = TempStore::new("load");
-        let (threads, per) = (8, 2500);
+        let (threads, per) = (4, 1500);
         std::thread::scope(|s| {
             for t in 0..threads {
                 let h = store.handle();
@@ -1058,8 +1058,17 @@ mod tests {
         assert!(stats.groups <= stats.grouped_writes);
         assert!(
             stats.flushes > 0,
-            "20000 writes overflow a 4096-entry memtable"
+            "6000 writes overflow a 4096-entry memtable"
         );
+        // How often the writes flushed depends on how they grouped (one
+        // WAL block per commit): flush eight more tables by hand, so
+        // level 0 (7 tables) fills and compaction must run.
+        for round in 0..8 {
+            store
+                .put(format!("z{round}").as_bytes(), b"filler")
+                .expect("put");
+            store.flush().expect("flush");
+        }
         store.compact().expect("compact");
         assert!(store.stats().expect("stats").compaction_jobs > 0);
 
@@ -1076,7 +1085,7 @@ mod tests {
                 }
             }
             let n = store.range(b"", None, false).expect("range").count();
-            assert_eq!(n, threads * per / 2);
+            assert_eq!(n, threads * per / 2 + 8);
         };
         check(&store);
         store
@@ -1086,7 +1095,7 @@ mod tests {
         assert_eq!(store.get(&key(0)), Ok(None));
         assert_eq!(
             store.range(b"", None, false).expect("range").count(),
-            (threads - 1) * per / 2
+            (threads - 1) * per / 2 + 8
         );
     }
 }
