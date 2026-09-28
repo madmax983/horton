@@ -106,6 +106,72 @@ impl<const BLOCK: usize> BlockDevice for FailFlush<BLOCK> {
     }
 }
 
+/// Device wrapper whose flush fails `failures` times with [`TestError`]
+/// after the first `skip` flushes pass through, then passes through to the
+/// inner device. Lets a test fail one host-initiated `Drainer::flush`
+/// (which issues several device flushes) while earlier sweep WAL flushes
+/// succeed, then succeed on retry.
+struct FailFlushNTimes<D> {
+    inner: D,
+    skip: usize,
+    failures: usize,
+}
+
+impl<D> FailFlushNTimes<D> {
+    fn new(inner: D, skip: usize, failures: usize) -> Self {
+        Self {
+            inner,
+            skip,
+            failures,
+        }
+    }
+}
+
+impl<D: BlockDevice<Error = core::convert::Infallible>> BlockDevice for FailFlushNTimes<D> {
+    type Error = TestError;
+    const BLOCK: usize = D::BLOCK;
+
+    fn poll_read_block(
+        &self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        match self.inner.poll_read_block(cx, id, buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => match e {},
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_write_block(
+        &mut self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &[u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        match self.inner.poll_write_block(cx, id, buf) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => match e {},
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.skip > 0 {
+            self.skip -= 1;
+        } else if self.failures > 0 {
+            self.failures -= 1;
+            return Poll::Ready(Err(TestError));
+        }
+        match self.inner.poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => match e {},
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Device wrapper whose flush returns `Pending` a set number of times
 /// before completing. Lets a test observe the drainer mid-flush.
 struct PendingFlush<D, const BLOCK: usize> {
@@ -547,6 +613,242 @@ fn stalled_on_memtable_full_then_flush_and_retry() {
             .expect("key present");
         assert_eq!(&buf[..len], &[b'v', i]);
     }
+}
+
+#[test]
+fn stalled_sweep_drains_nothing_new() {
+    // While tickets are stalled on a full memtable, later-published tickets
+    // must wait: the sweep drains nothing new until the host flushes and the
+    // stalled tickets are retried first (ticket order is preserved).
+    let ring = Ring::<32>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<32, 8>(&ring, &durable);
+
+    // Fill the memtable (CAP=16) and drain it in two sweeps.
+    for i in 0..16u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 8 }
+    );
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 8 }
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 16);
+
+    // Two more tickets stall on the full memtable.
+    for i in 16..18u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+    assert_eq!(drainer.pending(), 2);
+
+    // Publish two NEW tickets while stalled. The next sweep must not drain
+    // them: the stalled pair still owns the head of the line.
+    for i in 18..20u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+    assert_eq!(
+        drainer.pending(),
+        2,
+        "new tickets must not join the pending set while stalled"
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 16);
+
+    // Host flushes; the stalled pair retries first, then the new pair.
+    block_on(drainer.flush()).expect("flush ok");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 18);
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 20);
+
+    // All 20 keys landed with the right values, in ticket order.
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    for i in 0..20u8 {
+        let len = block_on(db.get(&[b'k', i], &mut buf))
+            .expect("get ok")
+            .expect("key present");
+        assert_eq!(&buf[..len], &[b'v', i]);
+    }
+}
+
+#[test]
+fn stalled_retry_applies_batch_exactly_once() {
+    // After flush + retry, each stalled ticket is applied exactly once: the
+    // watermark advances by exactly the pending count, the pending set
+    // clears, and the next sweep is idle (nothing re-applied).
+    let ring = Ring::<32>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<32, 8>(&ring, &durable);
+
+    for i in 0..16u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    let _ = block_on(drainer.sweep()).expect("sweep ok");
+    let _ = block_on(drainer.sweep()).expect("sweep ok");
+    for i in 16..18u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+
+    block_on(drainer.flush()).expect("flush ok");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    // Exactly the two stalled tickets were acknowledged — no more, no less.
+    assert_eq!(durable.load(Ordering::Acquire), 18);
+    assert_eq!(drainer.pending(), 0);
+    // Nothing left to re-apply: the retry did not duplicate the batch.
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Idle
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 18);
+
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    for i in 0..18u8 {
+        let len = block_on(db.get(&[b'k', i], &mut buf))
+            .expect("get ok")
+            .expect("key present");
+        assert_eq!(&buf[..len], &[b'v', i]);
+    }
+}
+
+#[test]
+fn stalled_flush_failure_acks_nothing() {
+    // A failed host flush while stalled acknowledges nothing: the pending
+    // tickets stay buffered, the watermark does not move, the drainer is
+    // not poisoned, and a retried flush + sweep completes normally.
+    let ring = Ring::<32>::new();
+    let durable = AtomicU32::new(0);
+    // The two drain sweeps each issue one WAL flush first (probed). Fail
+    // the next device flush — the first one inside `Db::flush`, which
+    // aborts the whole host flush at once — then let the retry succeed.
+    let device = FailFlushNTimes::new(MemDevice::<512>::new(), 2, 1);
+    let mut db = horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0>::new(device, test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer =
+        Drainer::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0, 32, 8>::new(&ring, db, &durable);
+
+    for i in 0..16u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 8 }
+    );
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 8 }
+    );
+    for i in 16..18u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 16);
+
+    // The flush fails: nothing is acknowledged.
+    let err = block_on(drainer.flush()).expect_err("flush must fail");
+    assert_eq!(err, horton::Error::Device(TestError));
+    assert!(!drainer.is_poisoned(), "flush failure must not poison");
+    assert_eq!(drainer.pending(), 2, "pending tickets stay buffered");
+    assert_eq!(durable.load(Ordering::Acquire), 16);
+
+    // Retry the flush: it succeeds, and the stalled tickets drain.
+    block_on(drainer.flush()).expect("retry flush ok");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 18);
+
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    for i in 0..18u8 {
+        let len = block_on(db.get(&[b'k', i], &mut buf))
+            .expect("get ok")
+            .expect("key present");
+        assert_eq!(&buf[..len], &[b'v', i]);
+    }
+}
+
+#[test]
+fn poison_with_fenced_ticket_interleaved() {
+    // A malformed payload poisons the drainer even with a fenced (skipped)
+    // ticket interleaved in the batch: the acknowledged prefix is empty —
+    // neither the good put before the fence nor the skipped ticket is
+    // acknowledged — and the pending set is retained, not lost.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+
+    // t0: good put. t1: claimed then force-released (fenced → skipped).
+    // t2: malformed payload.
+    let t0 = ring.try_claim().expect("ring has space");
+    let p0 = put_payload(b"k0", b"v0");
+    assert_eq!(ring.publish(t0, &p0), PublishOutcome::Published);
+    let t1 = ring.try_claim().expect("ring has space");
+    assert_eq!(ring.force_release_slot(t1), ForceReleaseOutcome::Released);
+    let t2 = ring.try_claim().expect("ring has space");
+    let mut bad = [0u8; 32];
+    bad[0] = 0xFF;
+    bad[1] = 1;
+    bad[3] = b'k';
+    assert_eq!(ring.publish(t2, &bad), PublishOutcome::Published);
+    assert_eq!((t0, t1, t2), (0, 1, 2));
+
+    let err = block_on(drainer.sweep()).expect_err("malformed must error");
+    assert_eq!(err, horton::Error::BadPayload);
+    assert!(drainer.is_poisoned());
+    // Nothing was acknowledged: not the good put, not the skipped ticket.
+    assert_eq!(durable.load(Ordering::Acquire), 0);
+    assert!(!is_ticket_durable(&durable, t0));
+    assert!(!is_ticket_durable(&durable, t1));
+    // The pending set is retained (buffered, not lost and not acked).
+    assert_eq!(drainer.pending(), 3);
+
+    // A poisoned drainer stays stopped.
+    let outcome = block_on(drainer.sweep()).expect("poisoned sweep stays idle");
+    assert_eq!(outcome, SweepOutcome::Idle);
+    assert_eq!(durable.load(Ordering::Acquire), 0);
 }
 
 #[test]
