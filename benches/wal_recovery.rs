@@ -14,6 +14,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::collections::HashMap;
 
 use horton::{BlockDevice, Config, Db};
 
@@ -34,13 +35,22 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// In-memory block device: a sparse map of written blocks. Block ids are
+/// allocated across the whole configured device range (wear-levelling slot
+/// bases can land far apart), so a dense `Vec` indexed by id would have to
+/// zero-fill every never-written id up to the highest one touched — on a
+/// real device, writing block id N costs O(1), not O(N). `HashMap` keeps
+/// this device's cost proportional to blocks actually written, matching
+/// real hardware and keeping the profile free of this artifact.
 struct MemDevice<const BLOCK: usize> {
-    blocks: Vec<[u8; BLOCK]>,
+    blocks: HashMap<u64, [u8; BLOCK]>,
 }
 
 impl<const BLOCK: usize> MemDevice<BLOCK> {
-    const fn new() -> Self {
-        Self { blocks: Vec::new() }
+    fn new() -> Self {
+        Self {
+            blocks: HashMap::new(),
+        }
     }
 }
 
@@ -54,12 +64,12 @@ impl<const BLOCK: usize> BlockDevice for MemDevice<BLOCK> {
         id: u64,
         buf: &mut [u8],
     ) -> Poll<Result<(), Self::Error>> {
-        let mut block = [0u8; BLOCK];
-        if let Some(i) = usize::try_from(id).ok().and_then(|i| self.blocks.get(i)) {
-            block.copy_from_slice(i);
-        }
         let n = buf.len().min(BLOCK);
-        buf[..n].copy_from_slice(&block[..n]);
+        if let Some(block) = self.blocks.get(&id) {
+            buf[..n].copy_from_slice(&block[..n]);
+        } else {
+            buf[..n].fill(0);
+        }
         Poll::Ready(Ok(()))
     }
 
@@ -69,13 +79,10 @@ impl<const BLOCK: usize> BlockDevice for MemDevice<BLOCK> {
         id: u64,
         buf: &[u8],
     ) -> Poll<Result<(), Self::Error>> {
-        if let Ok(i) = usize::try_from(id)
-            && buf.len() == BLOCK
-        {
-            while self.blocks.len() <= i {
-                self.blocks.push([0u8; BLOCK]);
-            }
-            self.blocks[i].copy_from_slice(buf);
+        if buf.len() == BLOCK {
+            let mut block = [0u8; BLOCK];
+            block.copy_from_slice(buf);
+            self.blocks.insert(id, block);
         }
         Poll::Ready(Ok(()))
     }
