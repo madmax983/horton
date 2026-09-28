@@ -67,14 +67,14 @@ const v = gs.verify();
 console.log(
   `verify: ${v.entries} entries, ${v.readings} readings, ${v.alarms} alarms, ${v.traces} traces;` +
     ` ${v.wholeFrames} whole frames, ${v.tornFrames} torn` +
-    (v.boundaryReadings ? ` (+${v.boundaryReadings} readings of a frame split with the archive)` : '') +
+    (v.splitFrames ? ` (+${v.splitFrames} split with the archive)` : '') +
     `, ${v.badValues} bad values, invariants ${v.invariants}`,
 );
 ok(v.badValues === 0, 'every value matches its key');
 ok(v.outOfOrder === 0, 'keys come back in order');
 ok(v.tornFrames === 0, 'frames are atomic: all four readings or none');
 ok(v.invariants, `invariants: ${v.invariantError}`);
-ok(v.readings === v.wholeFrames * 4 + v.boundaryReadings, 'readings are whole frames');
+ok(v.readings === v.wholeFrames * 4 + v.splitReadings, 'readings are whole frames or split with the archive');
 
 // 3. The newest window, cross-checked against the hash.
 const window = Math.min(2000, s.newestTick - s.oldestTick + 1);
@@ -85,10 +85,11 @@ let present = 0;
 let gaps = 0;
 for (const r of rows) {
   const have = r.sensors.filter((x) => x !== null).length;
-  // The oldest tick may be split with the archive (see gs_verify).
-  const boundary = r.tick === s.oldestTick && have === v.boundaryReadings;
-  ok(have === 0 || have === 4 || boundary, `tick ${r.tick}: ${have} of 4 readings`);
-  if (have === 0 || boundary) {
+  // A frame split with the archive keeps a prefix or a suffix here.
+  const mask = r.sensors.reduce((m, x, i) => (x === null ? m : m | (1 << i)), 0);
+  const split = have > 0 && have < 4 && ((mask & (mask + 1)) === 0 || (mask | (mask - 1)) === 0b1111);
+  ok(have === 0 || have === 4 || split, `tick ${r.tick}: ${have} of 4 readings`);
+  if (have === 0 || split) {
     gaps++;
     continue;
   }

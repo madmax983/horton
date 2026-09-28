@@ -6,31 +6,12 @@
 //   npm install --no-save playwright # or have it installed globally
 //   node browser-test.mjs
 
-import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { execSync } from 'node:child_process';
-import { join, extname } from 'node:path';
-import { pathToFileURL, fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
+import { chromium as loadChromium, serve } from './serve.mjs';
 
-const { chromium } = await import('playwright').catch(() =>
-  import(pathToFileURL(join(execSync('npm root -g').toString().trim(), 'playwright', 'index.mjs')).href),
-);
-
-const root = fileURLToPath(new URL('./web/', import.meta.url));
-const types = { '.html': 'text/html', '.mjs': 'text/javascript', '.wasm': 'application/wasm' };
-const server = createServer(async (req, res) => {
-  const path = new URL(req.url, 'http://x').pathname.replace(/^\/$/, '/index.html');
-  try {
-    const body = await readFile(join(root, path.slice(1)));
-    res.writeHead(200, { 'content-type': types[extname(path)] ?? 'application/octet-stream' });
-    res.end(req.method === 'HEAD' ? undefined : body);
-  } catch {
-    res.writeHead(404).end();
-  }
-});
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const url = `http://127.0.0.1:${server.address().port}/`;
+const chromium = await loadChromium();
+const server = await serve();
+const { url } = server;
 
 const browser = await chromium.launch();
 let checks = 0;
@@ -68,9 +49,22 @@ try {
     checks++;
 
     // Phone width: no horizontal scroll.
+    // The charts redraw on a debounced ResizeObserver, so wait for the
+    // layout to settle; if it never fits, name what sticks out.
     await page.setViewportSize({ width: 390, height: 800 });
-    await page.waitForTimeout(250);
-    assert.ok((await page.evaluate(() => document.documentElement.scrollWidth)) <= 390, 'fits a phone');
+    const fits = await page
+      .waitForFunction(() => document.documentElement.scrollWidth <= 390, null, { timeout: 5000 })
+      .then(() => true, () => false);
+    const culprit = fits
+      ? ''
+      : await page.evaluate(() =>
+          [...document.querySelectorAll('body *')]
+            .filter((el) => el.getBoundingClientRect().right > 391)
+            .map((el) => `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ''}`)
+            .slice(0, 5)
+            .join(', '),
+        );
+    assert.ok(fits, `fits a phone (overflowing: ${culprit})`);
     checks++;
 
     assert.deepEqual(errors, [], `${colorScheme}: console errors`);

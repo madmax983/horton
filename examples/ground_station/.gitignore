@@ -3,3 +3,4 @@ Cargo.lock
 /web/ground_station.wasm
 /web/flash.img
 /node_modules/
+/web/live.wasm

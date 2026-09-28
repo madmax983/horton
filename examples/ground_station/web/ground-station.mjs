@@ -96,8 +96,9 @@ export class GroundStation {
   }
 
   /**
-   * Checks every entry; see gs_verify in src/lib.rs. `boundaryReadings` is
-   * the oldest frame's readings when the rest of it went to the archive.
+   * Checks every entry; see `verify` in src/common.rs. `splitFrames` are
+   * frames partly archived (a table boundary cut them), holding
+   * `splitReadings` readings here; `tornFrames` are anything else partial.
    */
   verify() {
     const n = this.#check(this.x.gs_verify(), 'verify');
@@ -112,7 +113,8 @@ export class GroundStation {
       outOfOrder: o[5],
       wholeFrames: o[6],
       tornFrames: o[7],
-      boundaryReadings: o[9],
+      splitReadings: o[9],
+      splitFrames: o[10],
       invariants,
       invariantError: invariants ? null : this.#lastError(),
     };
