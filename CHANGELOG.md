@@ -18,6 +18,19 @@ fails if one is ever `#[ignore]`d again. The on-disk format changes
 (manifest `hrtman05`, SSTable `hrtsst02`): v0.16 images are rejected, not
 misread.
 
+### Added
+
+- **Ground station example** (`examples/ground_station`): the flight
+  recorder's horton compiled to `wasm32-unknown-unknown` as a `no_std`,
+  import-free `cdylib`, and a web page that opens a recorder's flash dump
+  in the browser. It runs the device's recovery, checks every entry
+  against the recorder's key hash, and charts the sensors. CI records a
+  flight, reads it (and one killed three times with SIGKILL), and drives
+  the page in headless Chromium.
+- The flight recorder's format (`db_types!` shape, layout, key schema)
+  moved to `examples/flight_recorder/format.rs`, shared with the ground
+  station so the two cannot drift apart.
+
 ### Fixed
 
 - **F1** Compaction output could outgrow its reservation and overwrite
