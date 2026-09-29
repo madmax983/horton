@@ -25,6 +25,7 @@ history keeps it); its §9 milestone log now lives in
 | [0011](0011-multi-block-manifest-and-edits.md) | Multi-block manifest copies, an optional copy ring, and commits staged as small edits |
 | [0012](0012-nor-flash-endurance.md) | NOR endurance: `WriteBatch` group commit and a manifest ring; no page-program path yet |
 | [0013](0013-capacity-errors-name-their-remedy.md) | `NoSpace` split into errors that each name their remedy |
+| [0014](0014-cache-hits-reverify-crc.md) | Block-cache hits re-verify the CRC; no skip-on-hit, correctness over speed |
 
 ## Adding a record
 
