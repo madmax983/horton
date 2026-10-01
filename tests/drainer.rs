@@ -265,6 +265,17 @@ fn publish(ring: &Ring<8>, key: &[u8], val: &[u8]) -> u32 {
     t
 }
 
+/// Claim, publish an arbitrary payload, and return the ticket.
+fn publish_raw(ring: &Ring<8>, p: &[u8; 32]) -> u32 {
+    let t = ring.try_claim().expect("ring must have space");
+    assert_eq!(
+        ring.publish(t, p),
+        horton::ring::PublishOutcome::Published,
+        "publish must succeed"
+    );
+    t
+}
+
 #[test]
 fn sweep_drains_batch_with_one_flush() {
     let (ring, durable) = setup::<8>();
@@ -305,6 +316,104 @@ fn sweep_drains_batch_with_one_flush() {
         .expect("get must succeed")
         .expect("k2 present");
     assert_eq!(&buf[..len], b"v2");
+}
+
+#[test]
+fn sweep_applies_ttl_and_range_delete() {
+    // Mixed op kinds through the ring land as one atomic Db::write, one
+    // flush (SPEC §§11, 14, 16 Q3).
+    let (ring, durable) = setup::<8>();
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+
+    let t0 = publish(&ring, b"a", b"va");
+    let t1 = publish(&ring, b"b", b"vb");
+    let t2 = publish(&ring, b"c", b"vc");
+    let t3 = publish(&ring, b"d", b"vd");
+    let t4 = publish_raw(
+        &ring,
+        &payload::encode_put_ttl(b"e", b"ve", 100).expect("fits"),
+    );
+    // Range delete [b, d): shadows b and c, leaves a and d alone.
+    let t5 = publish_raw(
+        &ring,
+        &payload::encode_range_delete(b"b", b"d").expect("fits"),
+    );
+    assert_eq!((t0, t1, t2, t3, t4, t5), (0, 1, 2, 3, 4, 5));
+
+    let outcome = block_on(drainer.sweep()).expect("sweep must succeed");
+    assert_eq!(outcome, SweepOutcome::Swept { tickets: 6 });
+    for t in [t0, t1, t2, t3, t4, t5] {
+        assert!(is_ticket_durable(&durable, t), "ticket {t} durable");
+    }
+    // Six ops queued, six sequence numbers consumed.
+    assert_eq!(drainer.durable_seqnum(), 6);
+
+    // One flush for the whole mixed sweep (SPEC §11).
+    let db = drainer.into_db();
+    assert_eq!(db.device().flushes(), 1, "one flush per sweep");
+
+    let mut buf = [0u8; 32];
+    let len = block_on(db.get(b"a", &mut buf))
+        .expect("get must succeed")
+        .expect("a present");
+    assert_eq!(&buf[..len], b"va");
+    assert!(
+        block_on(db.get(b"b", &mut buf))
+            .expect("get must succeed")
+            .is_none(),
+        "b range-tombstoned"
+    );
+    assert!(
+        block_on(db.get(b"c", &mut buf))
+            .expect("get must succeed")
+            .is_none(),
+        "c range-tombstoned"
+    );
+    let len = block_on(db.get(b"d", &mut buf))
+        .expect("get must succeed")
+        .expect("d present");
+    assert_eq!(&buf[..len], b"vd");
+
+    // TTL: visible before expiry, suppressed once expire_at <= now.
+    let n = block_on(db.get_at_with_time(b"e", &mut buf, u64::MAX, 99))
+        .expect("get must succeed")
+        .expect("e visible at t=99");
+    assert_eq!(&buf[..n], b"ve");
+    assert!(
+        block_on(db.get_at_with_time(b"e", &mut buf, u64::MAX, 100))
+            .expect("get must succeed")
+            .is_none(),
+        "e expired at t=100"
+    );
+}
+
+#[test]
+fn sweep_inverted_range_delete_is_applied_noop() {
+    // An inverted range encodes fine but applies as a no-op (SPEC §14):
+    // the ticket resolves without queueing an op or consuming a seqnum.
+    let (ring, durable) = setup::<8>();
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+
+    let t0 = publish(&ring, b"k", b"v");
+    let t1 = publish_raw(
+        &ring,
+        &payload::encode_range_delete(b"z", b"a").expect("fits"),
+    );
+
+    let outcome = block_on(drainer.sweep()).expect("sweep must succeed");
+    assert_eq!(outcome, SweepOutcome::Swept { tickets: 2 });
+    assert!(is_ticket_durable(&durable, t0));
+    assert!(is_ticket_durable(&durable, t1));
+
+    // Only the put consumed a sequence number.
+    assert_eq!(drainer.durable_seqnum(), 1);
+
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    let len = block_on(db.get(b"k", &mut buf))
+        .expect("get must succeed")
+        .expect("k present");
+    assert_eq!(&buf[..len], b"v");
 }
 
 #[test]
@@ -387,16 +496,18 @@ fn batch_error_poisons_and_acks_nothing() {
 #[test]
 fn payload_codec_roundtrip() {
     let p = payload::encode_put(b"key", b"value").expect("must fit");
-    let (op, key, val) = payload::decode(&p).expect("valid put decodes");
-    assert_eq!(op, horton::wal::Op::Put);
+    let payload::Decoded::Put { key, val } = payload::decode(&p).expect("valid put decodes") else {
+        panic!("put decoded to wrong variant");
+    };
     assert_eq!(key, b"key");
     assert_eq!(val, b"value");
 
     let p = payload::encode_delete(b"key").expect("must fit");
-    let (op, key, val) = payload::decode(&p).expect("valid delete decodes");
-    assert_eq!(op, horton::wal::Op::Delete);
+    let payload::Decoded::Delete { key } = payload::decode(&p).expect("valid delete decodes")
+    else {
+        panic!("delete decoded to wrong variant");
+    };
     assert_eq!(key, b"key");
-    assert_eq!(val, &[] as &[u8]);
 
     // Oversize key rejected.
     assert!(payload::encode_put(&[b'x'; 30], b"v").is_none());
@@ -406,6 +517,92 @@ fn payload_codec_roundtrip() {
     assert!(payload::encode_put(&[b'k'; 20], &[b'v'; 10]).is_none());
     // Max-size key+value (29 bytes) accepted.
     assert!(payload::encode_put(&[b'k'; 20], &[b'v'; 9]).is_some());
+}
+
+#[test]
+fn payload_codec_roundtrip_range_delete_and_ttl() {
+    // Range delete round-trips, bounds intact.
+    let p = payload::encode_range_delete(b"a", b"z").expect("must fit");
+    let payload::Decoded::RangeDelete { start, end } =
+        payload::decode(&p).expect("valid range delete decodes")
+    else {
+        panic!("range delete decoded to wrong variant");
+    };
+    assert_eq!(start, b"a");
+    assert_eq!(end, b"z");
+
+    // Inverted ranges still encode (they apply as a no-op, SPEC §14).
+    let p = payload::encode_range_delete(b"z", b"a").expect("must fit");
+    assert!(matches!(
+        payload::decode(&p),
+        Ok(payload::Decoded::RangeDelete { .. })
+    ));
+
+    // Max-size bounds (29 bytes together) accepted; 30 rejected.
+    assert!(payload::encode_range_delete(&[b'a'; 20], &[b'z'; 9]).is_some());
+    assert!(payload::encode_range_delete(&[b'a'; 20], &[b'z'; 10]).is_none());
+    // Empty bounds rejected.
+    assert!(payload::encode_range_delete(b"", b"z").is_none());
+    assert!(payload::encode_range_delete(b"a", b"").is_none());
+
+    // TTL put round-trips, expiry intact.
+    let p = payload::encode_put_ttl(b"key", b"value", 12345).expect("must fit");
+    let payload::Decoded::PutTtl {
+        key,
+        val,
+        expire_at,
+    } = payload::decode(&p).expect("valid TTL put decodes")
+    else {
+        panic!("TTL put decoded to wrong variant");
+    };
+    assert_eq!(key, b"key");
+    assert_eq!(val, b"value");
+    assert_eq!(expire_at, 12345);
+
+    // Max-size TTL payload (8 + key + value = 29) accepted; 30 rejected.
+    assert!(payload::encode_put_ttl(&[b'k'; 10], &[b'v'; 11], 7).is_some());
+    assert!(payload::encode_put_ttl(&[b'k'; 10], &[b'v'; 12], 7).is_none());
+    assert!(payload::encode_put_ttl(b"", b"v", 7).is_none());
+
+    // expire_at == 0 encodes a plain Put (mirrors wal::append_ttl):
+    // byte-identical to encode_put, key and value intact.
+    let p = payload::encode_put_ttl(b"key", b"value", 0).expect("must fit");
+    assert_eq!(p, payload::encode_put(b"key", b"value").expect("must fit"));
+    let payload::Decoded::Put { key, val } = payload::decode(&p).expect("decodes") else {
+        panic!("zero-expiry TTL decoded to wrong variant");
+    };
+    assert_eq!(key, b"key");
+    assert_eq!(val, b"value");
+}
+
+#[test]
+fn payload_encode_never_panics_on_oversize() {
+    // Adversarial lengths must return None, never panic (the old
+    // `klen + vlen` u8 addition overflowed here in debug builds).
+    assert!(payload::encode_put(b"k", &[0u8; 255]).is_none());
+    assert!(payload::encode_put(&[0u8; 255], b"v").is_none());
+    assert!(payload::encode_delete(&[0u8; 255]).is_none());
+    assert!(payload::encode_range_delete(&[0u8; 255], b"z").is_none());
+    assert!(payload::encode_range_delete(b"a", &[0u8; 255]).is_none());
+    assert!(payload::encode_put_ttl(b"k", &[0u8; 255], 9).is_none());
+    assert!(payload::encode_put_ttl(&[0u8; 255], b"v", 9).is_none());
+}
+
+#[test]
+fn payload_decode_never_panics() {
+    // Total over adversarial inputs: every op byte × hostile lengths
+    // must yield Ok or Err, never a panic or out-of-bounds slice.
+    for op in 0u8..=255 {
+        for a in [0u8, 1, 21, 22, 29, 30, 255] {
+            for b in [0u8, 1, 29, 30, 255] {
+                let mut p = [0xABu8; 32];
+                p[0] = op;
+                p[1] = a;
+                p[2] = b;
+                let _ = payload::decode(&p);
+            }
+        }
+    }
 }
 
 #[test]
@@ -438,6 +635,28 @@ fn payload_decode_rejects_malformed() {
     let mut p = payload::encode_delete(b"k").expect("fits");
     p[2] = 1;
     assert_eq!(payload::decode(&p), Err(payload::DecodeError::BadValLen));
+
+    // Range delete with bounds exceeding the 29-byte budget.
+    let mut p = payload::encode_range_delete(b"a", b"z").expect("fits");
+    p[1] = 20;
+    p[2] = 10; // 20 + 10 > 29
+    assert_eq!(payload::decode(&p), Err(payload::DecodeError::BadValLen));
+
+    // Range delete with an empty end bound.
+    let mut p = payload::encode_range_delete(b"a", b"z").expect("fits");
+    p[2] = 0;
+    assert_eq!(payload::decode(&p), Err(payload::DecodeError::BadKeyLen));
+
+    // TTL put with 8 + key + value exceeding the 29-byte budget.
+    let mut p = payload::encode_put_ttl(b"k", b"v", 9).expect("fits");
+    p[1] = 21;
+    p[2] = 1; // 8 + 21 + 1 > 29
+    assert_eq!(payload::decode(&p), Err(payload::DecodeError::BadValLen));
+
+    // TTL put with zero key length.
+    let mut p = payload::encode_put_ttl(b"k", b"v", 9).expect("fits");
+    p[1] = 0;
+    assert_eq!(payload::decode(&p), Err(payload::DecodeError::BadKeyLen));
 }
 
 #[test]

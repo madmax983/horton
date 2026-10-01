@@ -60,9 +60,9 @@ impl<const N: usize> Future for Put<'_, N> {
 ///   and immediately publishes is never fenced.
 /// - Otherwise returns the pending put; poll it to await durability.
 ///
-/// `payload` is the 32-byte ring payload — build it with
-/// [`payload::encode_put`](crate::drainer::payload::encode_put) or
-/// [`payload::encode_delete`](crate::drainer::payload::encode_delete).
+/// `payload` is the 32-byte ring payload — build it with one of the
+/// [`payload`](crate::drainer::payload) constructors: `encode_put`,
+/// `encode_delete`, `encode_range_delete`, or `encode_put_ttl`.
 ///
 /// # Errors
 ///

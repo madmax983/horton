@@ -295,3 +295,96 @@ fn batch_errors_widen_into_device_results() {
         Error::KeyTooLarge { len: 9, max: 8 }
     );
 }
+
+#[test]
+fn write_batch_put_ttl_and_range_delete() {
+    let mut db = open_db();
+    // Seed keys the range delete will shadow.
+    let mut seed = Batch::<8>::new();
+    seed.put(b"a", b"va").unwrap();
+    seed.put(b"b", b"vb").unwrap();
+    seed.put(b"c", b"vc").unwrap();
+    seed.put(b"d", b"vd").unwrap();
+    let base = block_on(db.write(&seed)).unwrap();
+    assert_eq!(base, 1);
+
+    let mut b = Batch::<8>::new();
+    b.put(b"e", b"ve").unwrap();
+    b.put_ttl(b"f", b"vf", 100).unwrap();
+    b.delete(b"a").unwrap();
+    b.range_delete(b"b", b"d").unwrap();
+    assert_eq!(b.len(), 4);
+    let base2 = block_on(db.write(&b)).unwrap();
+    assert_eq!(base2, base + 4, "seqs consecutive across batches");
+
+    assert_eq!(get(&db, b"e"), Some(b"ve".to_vec()));
+    assert_eq!(get(&db, b"a"), None, "point tombstone wins");
+    assert_eq!(get(&db, b"b"), None, "range tombstone shadows b");
+    assert_eq!(get(&db, b"c"), None, "range tombstone shadows c");
+    assert_eq!(get(&db, b"d"), Some(b"vd".to_vec()), "d outside [b, d)");
+
+    // TTL expiry is read-time filtering over the stored expire_at.
+    let mut buf = [0u8; 2048];
+    let n = block_on(db.get_at_with_time(b"f", &mut buf, u64::MAX, 99))
+        .unwrap()
+        .expect("f visible at t=99");
+    assert_eq!(&buf[..n], b"vf");
+    assert!(
+        block_on(db.get_at_with_time(b"f", &mut buf, u64::MAX, 100))
+            .unwrap()
+            .is_none(),
+        "f expired at t=100"
+    );
+}
+
+#[test]
+fn write_batch_put_ttl_zero_expiry_is_plain_put() {
+    let mut db = open_db();
+    let mut b = Batch::<4>::new();
+    b.put_ttl(b"k", b"v", 0).unwrap();
+    block_on(db.write(&b)).unwrap();
+    // A real TTL entry with expire_at == 0 would read as expired for any
+    // now >= 0; a plain put stays visible forever.
+    let mut buf = [0u8; 64];
+    let n = block_on(db.get_at_with_time(b"k", &mut buf, u64::MAX, u64::MAX))
+        .unwrap()
+        .expect("zero-expiry TTL is a plain put");
+    assert_eq!(&buf[..n], b"v");
+}
+
+#[test]
+fn write_batch_range_delete_inverted_is_noop() {
+    let mut db = open_db();
+    let mut b = Batch::<4>::new();
+    b.put(b"k", b"v").unwrap();
+    // Empty and inverted ranges queue nothing (mirrors Db::delete_range).
+    b.range_delete(b"z", b"a").unwrap();
+    b.range_delete(b"k", b"k").unwrap();
+    assert_eq!(b.len(), 1);
+    let base = block_on(db.write(&b)).unwrap();
+    assert_eq!(base, 1, "only the put consumed a seqnum");
+    assert_eq!(get(&db, b"k"), Some(b"v".to_vec()));
+}
+
+#[test]
+fn write_batch_range_delete_validates_bounds() {
+    let mut b = Batch::<4>::new();
+    // Empty start with a larger end is an error, not a no-op.
+    assert!(matches!(b.range_delete(b"", b"z"), Err(Error::EmptyKey)));
+    // Overlong bounds are rejected like keys.
+    assert!(matches!(
+        b.range_delete(&[b'k'; KEY_MAX + 1], b"z"),
+        Err(Error::KeyTooLarge { .. })
+    ));
+    assert!(matches!(
+        b.range_delete(b"a", &[b'z'; KEY_MAX + 1]),
+        Err(Error::KeyTooLarge { .. })
+    ));
+    // BatchFull still applies to range deletes.
+    let mut full = Batch::<1>::new();
+    full.put(b"k", b"v").unwrap();
+    assert!(matches!(
+        full.range_delete(b"a", b"z"),
+        Err(Error::BatchFull)
+    ));
+}

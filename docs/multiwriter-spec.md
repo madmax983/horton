@@ -430,10 +430,24 @@ single-CAS).
   `try_claim() -> Option<u32>`, `publish(u32, &[u8; 32]) -> PublishOutcome`
   (`Published` | `Fenced`), `drain() -> (u32, [u8; 32])` (single consumer;
   test/drain scaffolding — the poll-based drainer replaces the spin).
-- Payload is a fixed 32-byte record (stand-in for the serialized
-  mutation; multi-op tickets / `WriteBatch` atomicity through the ring is
-  OPEN — one slot per batch vs. consecutive tickets with a drainer-side
-  atomicity boundary, spike 5).
+- Payload is a fixed 32-byte record carrying one serialized mutation
+  (`drainer::payload` codec; §16 Q3 decided 2026-10-01 — batches are
+  consecutive tickets with drainer-side atomicity, not one slot per
+  batch). Layouts, op bytes matching [`wal::Op`] discriminants:
+  - Put: `[1][klen:1][vlen:1][key: klen][val: vlen]`, `1 <= klen <= 29`,
+    `klen + vlen <= 29`.
+  - Delete: `[2][klen:1][0][key: klen]`, `1 <= klen <= 29`.
+  - RangeDelete: `[3][slen:1][elen:1][start: slen][end: elen]`,
+    `slen >= 1`, `elen >= 1`, `slen + elen <= 29`. `start >= end` is an
+    applied no-op (mirrors `Db::delete_range`): the ticket resolves, no
+    op is queued, no sequence number is consumed.
+  - PutTtl: `[4][klen:1][vlen:1][expiry:8 LE][key: klen][val: vlen]`,
+    `1 <= klen`, `8 + klen + vlen <= 29`. `expiry == 0` normalizes to a
+    plain Put (mirrors `wal::append_ttl`).
+  - Decode is total over every 32-byte slot: unknown op bytes, zero or
+    overlong lengths, or budget overflows yield `DecodeError` — never a
+    panic, never a silent reinterpretation. A decode failure poisons the
+    drainer (`Error::BadPayload`); the host must intervene.
 - Everything is `#[cfg(feature = "multiwriter")]`, const-generic,
   no_alloc, safe Rust. No new `Error` variants are added by the ring
   itself except surfacing `WriterFenced` at the `Db` integration layer
@@ -493,6 +507,16 @@ single-CAS).
   `Db::write` (already atomic). Range-delete/TTL ride as payload op
   kinds when the payload codec grows beyond the 29-byte MVP — same
   mechanism, no new slot format.
+  *Implemented 2026-10-01 (Mark's blessing):* the `drainer::payload`
+  codec now carries all four op kinds (§14) — `encode_range_delete` and
+  `encode_put_ttl` alongside the Put/Delete encoders; the sweep decodes
+  each ticket and queues it into the sweep's `WriteBatch`, so consecutive
+  tickets (including mixed Put/Delete/RangeDelete/PutTtl) still land as
+  one atomic `Db::write`, one WAL flush. `WriteBatch` gained
+  `range_delete` (inverted ranges are an applied no-op, mirroring
+  `Db::delete_range`) and `put_ttl` (`expire_at == 0` normalizes to Put,
+  mirroring `wal::append_ttl`); `Db::write` stages TTL records with
+  `WalWriter::append_grouped_ttl` so grouped atomicity covers them.
 
 4. **`WriterFenced`: silent re-claim (implemented).** `put` already
   re-claims transparently when `publish` returns `Fenced`. Rationale:

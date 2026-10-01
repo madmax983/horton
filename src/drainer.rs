@@ -53,23 +53,41 @@
 use crate::batch::WriteBatch;
 use crate::db::Db;
 use crate::ring::{DrainPoll, FenceOutcome, Ring, TICKET_MASK};
-use crate::wal::Op;
 use crate::{BlockDevice, Error};
+use core::convert::Infallible;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// 32-byte ring payload codec.
 ///
-/// The ring carries a fixed 32-byte payload per slot — a stand-in for the
-/// serialized mutation (SPEC §14: the full encoding is open). This codec
-/// defines the interim layout so the drainer can write real WAL records:
+/// The ring carries a fixed 32-byte payload per slot — one serialized
+/// mutation (SPEC §14). Layouts, with op bytes matching [`Op`]'s
+/// discriminants:
 ///
 /// ```text
-/// [op:1][klen:1][vlen:1][key: klen][val: vlen]
+/// Put:         [1][klen:1][vlen:1][key: klen][val: vlen]
+/// Delete:      [2][klen:1][0][key: klen]
+/// RangeDelete: [3][slen:1][elen:1][start: slen][end: elen]
+/// PutTtl:      [4][klen:1][vlen:1][expiry:8 LE][key: klen][val: vlen]
 /// ```
 ///
-/// `op` is `1` (Put) or `2` (Delete), matching [`Op`]'s discriminants.
-/// `klen` is 1..=29; for `Put`, `klen + vlen <= 29`. For `Delete`, `vlen`
-/// is 0 and the value bytes are absent.
+/// Codec invariants (PROOF):
+/// - Fixed 32-byte slots: the payload bytes after the 3-byte header never
+///   exceed 29 (`klen + vlen <= 29`, `slen + elen <= 29`,
+///   `8 + klen + vlen <= 29`). Length arithmetic is widened past `u8`
+///   before adding, so adversarial lengths return `None`/`Err` instead of
+///   overflowing; every slice is in-bounds by the budget test.
+/// - Op discriminants are [`Op`]'s wire values; no parallel numbering to
+///   drift.
+/// - `decode` is total over all 2²⁵⁶ slot values: unknown op bytes,
+///   zero/overlong lengths, and budget overflows yield `DecodeError` —
+///   never a panic, never a silent reinterpretation as a valid mutation.
+/// - Each `encode_*` is the left inverse of `decode` on well-formed
+///   inputs (round-trip tests below).
+/// - `encode_put_ttl` with `expire_at == 0` encodes a plain Put,
+///   mirroring `wal::append_ttl`.
+/// - A range delete with `start >= end` encodes and decodes fine but
+///   applies as a no-op, mirroring `Db::delete_range`: the ticket
+///   resolves without queueing an op or consuming a sequence number.
 pub mod payload {
     use crate::wal::Op;
 
@@ -77,6 +95,44 @@ pub mod payload {
     pub const PUT: u8 = Op::Put as u8;
     /// Operation byte for a delete payload.
     pub const DELETE: u8 = Op::Delete as u8;
+    /// Operation byte for a range-delete payload.
+    pub const RANGE_DELETE: u8 = Op::RangeDelete as u8;
+    /// Operation byte for a TTL put payload.
+    pub const PUT_TTL: u8 = Op::PutTtl as u8;
+
+    /// One decoded ring payload: a single mutation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Decoded<'a> {
+        /// `key` → `val`.
+        Put {
+            /// The key bytes.
+            key: &'a [u8],
+            /// The value bytes.
+            val: &'a [u8],
+        },
+        /// Tombstone for `key`.
+        Delete {
+            /// The key bytes.
+            key: &'a [u8],
+        },
+        /// Range tombstone for `[start, end)`.
+        RangeDelete {
+            /// The inclusive start bound.
+            start: &'a [u8],
+            /// The exclusive end bound.
+            end: &'a [u8],
+        },
+        /// `key` → `val`; timed reads suppress the value once
+        /// `expire_at <= now`.
+        PutTtl {
+            /// The key bytes.
+            key: &'a [u8],
+            /// The value bytes.
+            val: &'a [u8],
+            /// The absolute expiry tick.
+            expire_at: u64,
+        },
+    }
 
     /// Encode a put into a 32-byte payload. Returns `None` when the key is
     /// empty/longer than 29 bytes or key+value exceed 29 bytes.
@@ -84,10 +140,9 @@ pub mod payload {
     pub fn encode_put(key: &[u8], val: &[u8]) -> Option<[u8; 32]> {
         let klen = u8::try_from(key.len()).ok()?;
         let vlen = u8::try_from(val.len()).ok()?;
-        if klen == 0 || klen > 29 {
-            return None;
-        }
-        if klen + vlen > 29 {
+        // Widened arithmetic: `klen + vlen` as `u8` would overflow on
+        // adversarial lengths instead of returning `None`.
+        if klen == 0 || klen > 29 || u16::from(klen) + u16::from(vlen) > 29 {
             return None;
         }
         let mut p = [0u8; 32];
@@ -115,51 +170,128 @@ pub mod payload {
         Some(p)
     }
 
-    /// Decode a payload into `(op, key, val)`.
+    /// Encode a range delete of `[start, end)` into a 32-byte payload.
+    /// Returns `None` when either bound is empty/longer than 29 bytes or
+    /// the bounds exceed 29 bytes together. An inverted range
+    /// (`start >= end`) still encodes; it applies as a no-op.
+    #[must_use]
+    pub fn encode_range_delete(start: &[u8], end: &[u8]) -> Option<[u8; 32]> {
+        let slen = u8::try_from(start.len()).ok()?;
+        let elen = u8::try_from(end.len()).ok()?;
+        if slen == 0 || elen == 0 || u16::from(slen) + u16::from(elen) > 29 {
+            return None;
+        }
+        let mut p = [0u8; 32];
+        p[0] = RANGE_DELETE;
+        p[1] = slen;
+        p[2] = elen;
+        p[3..3 + start.len()].copy_from_slice(start);
+        p[3 + start.len()..3 + start.len() + end.len()].copy_from_slice(end);
+        Some(p)
+    }
+
+    /// Encode a TTL put into a 32-byte payload. Returns `None` when the key
+    /// is empty or `8 + key.len() + val.len()` exceeds 29 bytes.
+    /// `expire_at == 0` encodes a plain put, mirroring `wal::append_ttl`.
+    #[must_use]
+    pub fn encode_put_ttl(key: &[u8], val: &[u8], expire_at: u64) -> Option<[u8; 32]> {
+        if expire_at == 0 {
+            // No expiry: byte-identical to a plain Put (the TTL layout's
+            // 8-byte hole would otherwise desync the key offset).
+            return encode_put(key, val);
+        }
+        let klen = u8::try_from(key.len()).ok()?;
+        let vlen = u8::try_from(val.len()).ok()?;
+        if klen == 0 || 8 + u16::from(klen) + u16::from(vlen) > 29 {
+            return None;
+        }
+        let mut p = [0u8; 32];
+        p[0] = PUT_TTL;
+        p[1] = klen;
+        p[2] = vlen;
+        p[3..11].copy_from_slice(&expire_at.to_le_bytes());
+        p[11..11 + key.len()].copy_from_slice(key);
+        p[11 + key.len()..11 + key.len() + val.len()].copy_from_slice(val);
+        Some(p)
+    }
+
+    /// Decode a payload into one mutation.
     ///
-    /// Returns `Err` on any malformed input — unknown op byte, zero or
-    /// overlong key length, key+value exceeding the 29-byte budget (for
-    /// `Put`), or nonzero value length (for `Delete`). Malformed payloads
-    /// are never silently reinterpreted as valid mutations: the drainer
-    /// poisons on decode failure rather than writing a clamped mutation.
+    /// Total over every 32-byte input: returns `Err` on any malformed
+    /// input — unknown op byte, zero or overlong length, or a length
+    /// budget overflow — and never panics. Malformed payloads are never
+    /// silently reinterpreted as valid mutations: the drainer poisons on
+    /// decode failure rather than writing a clamped mutation.
     ///
     /// # Errors
     ///
     /// Returns [`DecodeError`] on any malformed input: [`DecodeError::BadOp`]
     /// for an unknown op byte, [`DecodeError::BadKeyLen`] for a zero or
-    /// overlong key length, [`DecodeError::BadValLen`] for a key+value
-    /// length exceeding the 29-byte budget (Put) or a nonzero value length
-    /// (Delete).
-    pub fn decode(p: &[u8; 32]) -> Result<(Op, &[u8], &[u8]), DecodeError> {
+    /// overlong key/bound length, [`DecodeError::BadValLen`] for a length
+    /// budget overflow (key+value, bound+bound, or 8+key+value over 29
+    /// bytes) or a nonzero value length on a delete.
+    pub fn decode(p: &[u8; 32]) -> Result<Decoded<'_>, DecodeError> {
         let op = match p[0] {
             x if x == PUT => Op::Put,
             x if x == DELETE => Op::Delete,
+            x if x == RANGE_DELETE => Op::RangeDelete,
+            x if x == PUT_TTL => Op::PutTtl,
             _ => return Err(DecodeError::BadOp),
         };
-        let klen = p[1] as usize;
-        if klen == 0 || klen > 29 {
-            return Err(DecodeError::BadKeyLen);
-        }
-        let vlen = p[2] as usize;
+        // `usize` arithmetic: no overflow on adversarial bytes.
+        let a = usize::from(p[1]);
+        let b = usize::from(p[2]);
         match op {
             Op::Put => {
-                if klen + vlen > 29 {
+                if a == 0 || a > 29 {
+                    return Err(DecodeError::BadKeyLen);
+                }
+                if a + b > 29 {
                     return Err(DecodeError::BadValLen);
                 }
-                // klen <= 29 and klen+vlen <= 29: all slices in bounds.
-                let key = &p[3..3 + klen];
-                let val = &p[3 + klen..3 + klen + vlen];
-                Ok((op, key, val))
+                // a <= 29 and a+b <= 29: all slices in bounds.
+                Ok(Decoded::Put {
+                    key: &p[3..3 + a],
+                    val: &p[3 + a..3 + a + b],
+                })
             }
             Op::Delete => {
-                if vlen != 0 {
+                if a == 0 || a > 29 {
+                    return Err(DecodeError::BadKeyLen);
+                }
+                if b != 0 {
                     return Err(DecodeError::BadValLen);
                 }
-                let key = &p[3..3 + klen];
-                Ok((op, key, &[]))
+                Ok(Decoded::Delete { key: &p[3..3 + a] })
             }
-            // RangeDelete and PutTtl have no ring payload encoding yet.
-            Op::RangeDelete | Op::PutTtl => Err(DecodeError::BadOp),
+            Op::RangeDelete => {
+                if a == 0 || a > 29 || b == 0 || b > 29 {
+                    return Err(DecodeError::BadKeyLen);
+                }
+                if a + b > 29 {
+                    return Err(DecodeError::BadValLen);
+                }
+                Ok(Decoded::RangeDelete {
+                    start: &p[3..3 + a],
+                    end: &p[3 + a..3 + a + b],
+                })
+            }
+            Op::PutTtl => {
+                if a == 0 || a > 21 {
+                    return Err(DecodeError::BadKeyLen);
+                }
+                if 8 + a + b > 29 {
+                    return Err(DecodeError::BadValLen);
+                }
+                // 8+a+b <= 29: the expiry and both slices are in bounds.
+                let mut expiry = [0u8; 8];
+                expiry.copy_from_slice(&p[3..11]);
+                Ok(Decoded::PutTtl {
+                    key: &p[11..11 + a],
+                    val: &p[11 + a..11 + a + b],
+                    expire_at: u64::from_le_bytes(expiry),
+                })
+            }
         }
     }
 
@@ -168,7 +300,7 @@ pub mod payload {
     pub enum DecodeError {
         /// Unknown operation byte.
         BadOp,
-        /// Key length is zero or exceeds 29 bytes.
+        /// Key (or range bound) length is zero or exceeds its budget.
         BadKeyLen,
         /// Value length is inconsistent with the operation and key length.
         BadValLen,
@@ -536,34 +668,52 @@ impl<
             if !self.pending_has_data[i] {
                 continue;
             }
-            let Ok((op, key, val)) = payload::decode(&self.pending_payloads[i]) else {
-                // Malformed payload: never silently reinterpret as a
-                // valid mutation. Poison — the host must intervene.
-                self.poisoned = true;
-                return Err(Error::BadPayload);
-            };
-            // The payload codec only produces Put/Delete; RangeDelete and
-            // PutTtl are rejected by decode (handled defensively).
-            let res = match op {
-                Op::Put => batch.put(key, val),
-                Op::Delete => batch.delete(key),
-                Op::RangeDelete | Op::PutTtl => {
+            // Queue the decoded mutation. The borrow of the pending
+            // payload ends with this match — `bool` and
+            // `Error<Infallible>` own their data — so poisoning `self`
+            // below is borrowck-clean.
+            let queued: Result<bool, Error<Infallible>> =
+                match payload::decode(&self.pending_payloads[i]) {
+                    Ok(payload::Decoded::Put { key, val }) => batch.put(key, val).map(|()| true),
+                    Ok(payload::Decoded::Delete { key }) => batch.delete(key).map(|()| true),
+                    Ok(payload::Decoded::RangeDelete { start, end }) => {
+                        if start < end {
+                            batch.range_delete(start, end).map(|()| true)
+                        } else {
+                            // Inverted range: applied no-op (mirrors
+                            // `Db::delete_range`). The ticket resolves;
+                            // no op is queued and no sequence number is
+                            // consumed.
+                            Ok(false)
+                        }
+                    }
+                    Ok(payload::Decoded::PutTtl {
+                        key,
+                        val,
+                        expire_at,
+                    }) => batch.put_ttl(key, val, expire_at).map(|()| true),
+                    Err(_) => {
+                        // Malformed payload: never silently reinterpret
+                        // as a valid mutation. Poison — the host must
+                        // intervene.
+                        self.poisoned = true;
+                        return Err(Error::BadPayload);
+                    }
+                };
+            match queued {
+                Ok(true) => n_ops += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    // Oversized for the Db's KEY_MAX/VAL_MAX, or a logic
+                    // bug (batch overfull — unreachable: at most
+                    // MAX_WRITES ops in a MAX_WRITES-capacity batch).
+                    // Configuration error, not a device error: poison —
+                    // the host must intervene. `widen` keeps whatever
+                    // variant the batch reported.
                     self.poisoned = true;
-                    return Err(Error::BadPayload);
+                    return Err(e.widen());
                 }
-            };
-            if let Err(e) = res {
-                // Malformed payload (empty key, oversized for the Db's
-                // KEY_MAX/VAL_MAX) or a logic bug (batch overfull):
-                // configuration error, not a device error. Poison — the
-                // host must intervene.
-                // `BatchFull` is unreachable (at most MAX_WRITES ops in a
-                // MAX_WRITES-capacity batch); `widen` keeps whatever
-                // variant the batch reported.
-                self.poisoned = true;
-                return Err(e.widen());
             }
-            n_ops += 1;
         }
 
         if n_ops == 0 {

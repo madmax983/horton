@@ -446,6 +446,28 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.append_inner(seq, op, key, val, 0, more).await
     }
 
+    /// Appends a [`Op::PutTtl`] record as part of a group: like
+    /// [`append_grouped`](WalWriter::append_grouped), but carrying the
+    /// absolute expiry tick `expire_at` (see
+    /// [`append_ttl`](WalWriter::append_ttl)); `more` marks a record that
+    /// is not the last of its group. `expire_at == 0` degrades to a plain
+    /// [`Op::Put`], mirroring [`append_ttl`](WalWriter::append_ttl).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`append_grouped`](WalWriter::append_grouped).
+    pub async fn append_grouped_ttl(
+        &mut self,
+        seq: u64,
+        key: &[u8],
+        val: &[u8],
+        expire_at: u64,
+        more: bool,
+    ) -> Result<(), Error<D::Error>> {
+        let op = if expire_at == 0 { Op::Put } else { Op::PutTtl };
+        self.append_inner(seq, op, key, val, expire_at, more).await
+    }
+
     /// Appends a [`Op::PutTtl`] record: like [`append`](WalWriter::append)
     /// with [`Op::Put`], plus the absolute expiry tick `expire_at` (a value
     /// with `expire_at <= now` reads as absent; 0 means "never expires" and

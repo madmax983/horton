@@ -130,8 +130,8 @@ pub enum Error<E> {
     /// sequence number were consumed. **Remedy:** let the drainer sweep
     /// (it frees slots as it drains), then retry.
     RingFull,
-    /// A multiwriter ring payload did not decode: it was not built by
-    /// `drainer::payload::encode_put` / `encode_delete`. The drainer is
+    /// A multiwriter ring payload did not decode: it was not built by one
+    /// of the `drainer::payload::encode_*` constructors. The drainer is
     /// poisoned and nothing was written.
     BadPayload,
     /// The underlying block device reported an error.

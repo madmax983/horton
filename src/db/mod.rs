@@ -983,7 +983,9 @@ impl<
 
     /// Applies every op in `batch` atomically: all become durable and
     /// visible together, or none does. Returns the base sequence number;
-    /// op `i` (in queue order) takes `base + i`.
+    /// op `i` (in queue order) takes `base + i`. Every queued kind is
+    /// honored — puts, deletes, range deletes, and TTL puts (whose
+    /// records carry the 8-byte expiry inside the same atomic group).
     ///
     /// Atomicity rides on a single WAL commit: the batch is staged into
     /// the WAL's RAM buffer and made durable by one block write, so the
@@ -1018,11 +1020,13 @@ impl<
         let mut need_arena = 0usize;
         let mut need_wal = 0usize;
         for op in ops {
+            // A TTL record carries its 8-byte expiry after the value.
+            let ttl_extra = if op.kind() == Op::PutTtl { 8 } else { 0 };
             need_arena = need_arena
                 .checked_add(op.key().len() + op.val().len())
                 .ok_or(Error::ArenaFull)?;
             need_wal = need_wal
-                .checked_add(WAL_RECORD_OVERHEAD + op.key().len() + op.val().len())
+                .checked_add(WAL_RECORD_OVERHEAD + op.key().len() + op.val().len() + ttl_extra)
                 .ok_or(Error::BatchTooLarge {
                     bytes: usize::MAX,
                     max: BLOCK,
@@ -1065,11 +1069,16 @@ impl<
             // anyway — atomicity is never best-effort here.
             // One atomic group: recovery replays all of it or none of it.
             let more = i + 1 < n;
-            if let Err(e) = self
-                .wal
-                .append_grouped(seq, op.kind(), op.key(), op.val(), more)
-                .await
-            {
+            let appended = if op.kind() == Op::PutTtl {
+                self.wal
+                    .append_grouped_ttl(seq, op.key(), op.val(), op.expire_at(), more)
+                    .await
+            } else {
+                self.wal
+                    .append_grouped(seq, op.kind(), op.key(), op.val(), more)
+                    .await
+            };
+            if let Err(e) = appended {
                 self.rollback_commit(mark, 0)?;
                 return Err(e);
             }
@@ -1085,8 +1094,25 @@ impl<
             let seq = base
                 .checked_add(u64::try_from(i).map_err(|_| Error::CounterExhausted)?)
                 .ok_or(Error::CounterExhausted)?;
-            self.table
-                .insert::<D::Error>(op.key(), op.val(), seq, op.kind() == Op::Delete)?;
+            // Batch-built validation makes every arm infallible here:
+            // `range_delete` no-ops inverted ranges at queue time, and
+            // `put_ttl` validates like `put`.
+            match op.kind() {
+                Op::Put => self
+                    .table
+                    .insert::<D::Error>(op.key(), op.val(), seq, false)?,
+                Op::Delete => self
+                    .table
+                    .insert::<D::Error>(op.key(), op.val(), seq, true)?,
+                Op::PutTtl => {
+                    self.table
+                        .insert_ttl::<D::Error>(op.key(), op.val(), seq, op.expire_at())?
+                }
+                Op::RangeDelete => {
+                    self.table
+                        .insert_range_del::<D::Error>(op.key(), op.val(), seq)?
+                }
+            }
         }
         Ok(base)
     }
