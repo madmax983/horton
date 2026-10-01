@@ -999,3 +999,143 @@ fn durable_check_wraps_modular() {
     let d = AtomicU32::new(0x8000_0005);
     assert_eq!(drain_watermark(&d), 5, "bit 31 is never a ticket");
 }
+
+#[test]
+fn durable_seqnum_tracks_acked_prefix() {
+    // Tickets and Db seqnums are independent counters (SPEC §13): the
+    // drainer learns the mapping from Db::write's return. Each op in a
+    // drained batch consumes exactly one seqnum; fenced tickets consume
+    // none.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+
+    // Fresh Db: no seqnums issued yet.
+    assert_eq!(drainer.durable_seqnum(), 0);
+
+    // 3 puts → seqnums 1..=3.
+    for i in 0..3u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 3 }
+    );
+    assert_eq!(drainer.durable_seqnum(), 3);
+
+    // A delete consumes a seqnum too; a fenced ticket consumes none.
+    let t = ring.try_claim().expect("ring has space");
+    let p = payload::encode_delete(b"k0").expect("fits");
+    assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    let f = ring.try_claim().expect("ring has space");
+    assert_eq!(ring.force_release_slot(f), ForceReleaseOutcome::Released);
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    // Only the delete took a seqnum: 3 → 4. The fence moved the ticket
+    // watermark (durable == 5) but not the seqnum watermark.
+    assert_eq!(drainer.durable_seqnum(), 4);
+    assert_eq!(durable.load(Ordering::Acquire), 5);
+
+    // An all-skipped sweep moves the ticket watermark but no seqnums.
+    let f2 = ring.try_claim().expect("ring has space");
+    assert_eq!(ring.force_release_slot(f2), ForceReleaseOutcome::Released);
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 1 }
+    );
+    assert_eq!(drainer.durable_seqnum(), 4);
+    assert_eq!(durable.load(Ordering::Acquire), 6);
+}
+
+#[test]
+fn durable_seqnum_frozen_while_stalled() {
+    // A stalled sweep writes nothing, so the seqnum watermark does not
+    // move until the host flushes and the retry lands.
+    let ring = Ring::<32>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<32, 8>(&ring, &durable);
+
+    for i in 0..16u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    let _ = block_on(drainer.sweep()).expect("sweep ok");
+    let _ = block_on(drainer.sweep()).expect("sweep ok");
+    assert_eq!(drainer.durable_seqnum(), 16);
+
+    for i in 16..18u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+    assert_eq!(drainer.durable_seqnum(), 16);
+
+    block_on(drainer.flush()).expect("flush ok");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert_eq!(drainer.durable_seqnum(), 18);
+}
+
+#[test]
+fn snapshot_pins_acked_prefix() {
+    // Drainer::snapshot pins the Db tip, which right after a sweep is
+    // exactly durable_seqnum: reads at the snapshot see precisely the
+    // acknowledged ticket prefix, however much is written afterwards.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+
+    for i in 0..4u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 4 }
+    );
+    assert_eq!(drainer.durable_seqnum(), 4);
+
+    let snap = drainer.snapshot().expect("snapshot ok");
+    assert_eq!(snap, 4, "snapshot pins the acked seqnum watermark");
+
+    // Write more through the drainer; the old snapshot must not see it.
+    for i in 4..6u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert_eq!(drainer.durable_seqnum(), 6);
+
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    // Acked prefix visible at the snapshot...
+    let len = block_on(db.get_at(&[b'k', 2], &mut buf, snap))
+        .expect("get_at ok")
+        .expect("k2 visible at snapshot");
+    assert_eq!(&buf[..len], &[b'v', 2]);
+    // ...later writes invisible at the snapshot, visible at the tip.
+    assert_eq!(
+        block_on(db.get_at(&[b'k', 4], &mut buf, snap)).expect("get_at ok"),
+        None
+    );
+    let len = block_on(db.get_at(&[b'k', 4], &mut buf, 6))
+        .expect("get_at ok")
+        .expect("k4 visible at tip");
+    assert_eq!(&buf[..len], &[b'v', 4]);
+}

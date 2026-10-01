@@ -617,6 +617,14 @@ impl<
         self.wal.into_device()
     }
 
+    /// Highest sequence number issued so far. The next mutation (via any
+    /// write path) receives `next_seq() + 1`. The multiwriter drainer
+    /// seeds its durable-seqnum tracking from this at construction.
+    #[must_use]
+    pub const fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Takes a snapshot: registers the current sequence watermark and
     /// returns it. Reads pinned to the watermark (`get_at`, `Scan::seek`
     /// with `max_seq`) see exactly the mutations with `seq <= watermark`,

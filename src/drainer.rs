@@ -283,6 +283,12 @@ pub struct Drainer<
     /// afterwards. The error itself is returned from [`Drainer::sweep`] —
     /// the host owns propagating it to the writers.
     poisoned: bool,
+    /// Highest Db sequence number covered by the acknowledged ticket
+    /// prefix (SPEC §13). Tickets and Db seqnums are independent counters;
+    /// the Db assigns seqnums and the drainer learns the mapping from
+    /// [`Db::write`](crate::Db::write)'s return value. Seeded from the
+    /// Db's tip at construction; advanced on every sweep that writes.
+    durable_seq: u64,
 }
 
 impl<
@@ -322,14 +328,19 @@ impl<
     /// fresh ring, or the seeded head): it is the next ticket the drainer
     /// expects, and tickets `<` it are already resolved. The `Db` manages
     /// its own WAL sequence numbers (recovered from `open`); tickets and
-    /// WAL seqnums are independent counters. The host owns `durable` and
-    /// shares it with the writers.
+    /// WAL seqnums are independent counters, and the drainer seeds its
+    /// durable-seqnum tracking from the Db's tip here. The host owns
+    /// `durable` and shares it with the writers.
     #[must_use]
     pub const fn new(
         ring: &'r Ring<N>,
         db: Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
         durable: &'r AtomicU32,
     ) -> Self {
+        // Seed the durable-seqnum tracker from the Db's tip before the
+        // Db is moved into the drainer (the borrow must end first: const
+        // fn cannot drop `Db` on any path).
+        let seq = db.next_seq();
         Self {
             ring,
             db,
@@ -341,6 +352,7 @@ impl<
             stall_budget: 1024,
             stall_polls: 0,
             poisoned: false,
+            durable_seq: seq,
         }
     }
 
@@ -365,10 +377,38 @@ impl<
     /// The current drain watermark (see [`drain_watermark`]): the
     /// contiguous WAL-durable ticket prefix, for writer completion.
     /// This is a ticket watermark, not a Db sequence number — snapshot
-    /// readers use `Db::snapshot`, not this value (SPEC §9).
+    /// readers use [`snapshot`](Drainer::snapshot) (pinned at
+    /// [`durable_seqnum`](Drainer::durable_seqnum)), not this value
+    /// (SPEC §9).
     #[must_use]
     pub fn durable_watermark(&self) -> u32 {
         drain_watermark(self.durable)
+    }
+
+    /// Highest Db sequence number covered by the acknowledged ticket
+    /// prefix (SPEC §13). Fenced/skipped tickets create no seqnums, so
+    /// this can lag behind a pure op count; it moves only when a sweep
+    /// actually writes. A host that snapshots right after
+    /// [`sweep`](Drainer::sweep) sees exactly this watermark.
+    #[must_use]
+    pub const fn durable_seqnum(&self) -> u64 {
+        self.durable_seq
+    }
+
+    /// Takes a [`Db`] snapshot pinned at the current Db tip. Called right
+    /// after [`sweep`](Drainer::sweep), the tip is exactly
+    /// [`durable_seqnum`](Drainer::durable_seqnum): reads pinned to the
+    /// returned watermark see precisely the acknowledged ticket prefix,
+    /// however much is written afterwards. Allowed while poisoned — it
+    /// pins whatever the Db tip is, which is the last acked prefix unless
+    /// the failed write consumed sequence numbers.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SnapshotLimit`] when eight snapshots are already live;
+    /// [`Error::NotOpen`] if the Db was never opened.
+    pub fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
+        self.db.snapshot()
     }
 
     /// Consumes the drainer and returns the owned [`Db`].
@@ -536,8 +576,16 @@ impl<
 
         // --- Flush phase: one Db::write, one flush (SPEC §11).
         match self.db.write(&batch).await {
-            Ok(_) => {
+            Ok(base) => {
                 let tickets = self.pending_len;
+                // `Db::write` assigned `base .. base + n_ops`; the batch's
+                // highest seqnum is now durable. `n_ops > 0` here (the
+                // all-skipped case returned above), and `Db::write`
+                // already proved `base + (n_ops - 1)` fits with checked
+                // arithmetic — `CounterExhausted` is unreachable.
+                let span = u64::try_from(n_ops).map_err(|_| Error::CounterExhausted)?;
+                let last = base.checked_add(span - 1).ok_or(Error::CounterExhausted)?;
+                self.durable_seq = last;
                 self.ack_pending();
                 Ok(SweepOutcome::Swept { tickets })
             }

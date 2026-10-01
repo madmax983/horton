@@ -403,10 +403,22 @@ single-CAS).
 - Fenced tickets create no seqnums at all. The divergence is benign:
   recovery, snapshots, and compaction key on seqnum comparison, never
   density. (Spike 5: gap seqs left no trace.)
-- The drainer learns the mapping from `Db::write`'s return value. A
-  future slice will expose the highest durable Db seqnum alongside the
-  ticket watermark so hosts can pin `Db::snapshot` consistently with the
-  drain position.
+- The drainer learns the mapping from `Db::write`'s return value and
+  exposes it:
+  - `Drainer::durable_seqnum() -> u64` — highest Db seqnum covered by the
+    acknowledged ticket prefix. Seeded from `Db::next_seq()` at
+    construction (the Db's tip, recovered from `open`); advanced to
+    `base + n_ops - 1` on every sweep whose `Db::write` succeeds.
+    Frozen while stalled, on the all-skipped path, and on poison — it
+    moves only when a sweep actually writes.
+  - `Drainer::snapshot() -> Result<u64, Error>` — delegates to
+    `Db::snapshot`, pinning the current Db tip. Called right after
+    `sweep()`, the tip is exactly `durable_seqnum()`: reads pinned to the
+    returned watermark see precisely the acknowledged ticket prefix,
+    however much is written afterwards. Allowed while poisoned (pins
+    whatever the tip is).
+  - `Db::next_seq() -> u64` (new) — highest seqnum issued so far; the
+    seed for the drainer's tracker.
 
 ## 14. API surface (initial)
 
