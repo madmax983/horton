@@ -291,6 +291,21 @@ impl<
         Ok(())
     }
 
+    /// The sealed-table inventory: every table currently live at `level`
+    /// (id, block range, key bounds, seq bounds, entry count,
+    /// range-tombstone blocks — see [`TableRef`]). This is the polling
+    /// endpoint for host-side policy loops — the tiered sweeper
+    /// (`docs/tiered-sweeper.md`) and table-shipping replication — which
+    /// enumerate tables to pick archive victims or replication units and
+    /// then call [`Db::archive_plan`] on the chosen `(level, table_id)`.
+    /// Returns `None` when `level` is out of range; an empty slice when
+    /// the level holds no tables. Total: reads the in-memory manifest, no
+    /// I/O, no failure modes.
+    #[must_use]
+    pub fn tables(&self, level: usize) -> Option<&[TableRef<KEY_MAX>]> {
+        self.manifest.level(level)
+    }
+
     /// Plans the archival of one sealed table: returns its level and block
     /// range for upload, or `None` when `table_id` is not at `level`
     /// (already archived, compacted away, or never existed).
