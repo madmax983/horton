@@ -226,7 +226,10 @@ unchanged.
   consume no seqnums — they advance the *ticket* watermark without ever
   touching the Db's sequence space. The `durable` ticket watermark is
   initialized to the ring's head ticket (0 for a fresh ring); the ring
-  itself starts unseeded unless the host reseeds it via `Ring::new_seeded`.
+  itself always starts unseeded via `Ring::new()`. `Ring::new_seeded`
+  exists only for seeded/wrap testing — it is never a recovery
+  mechanism, because tickets and Db seqnums are independent counters
+  and reseeding one from the other is meaningless (§17).
   Gap sequence numbers (never claimed, or claimed-but-fenced) left no
   trace and are safe to skip; recovery MUST NOT treat gaps as corruption
   and MUST NOT ack anything. Fenced/skipped tickets advance `durable`
@@ -422,7 +425,8 @@ single-CAS).
 
 ## 14. API surface (initial)
 
-- `ring::Ring<const N: usize>` — `new()`, `new_seeded(u32)` (O3),
+- `ring::Ring<const N: usize>` — `new()`, `new_seeded(u32)` (seeded/wrap
+  testing only; never a recovery mechanism — §17),
   `try_claim() -> Option<u32>`, `publish(u32, &[u8; 32]) -> PublishOutcome`
   (`Published` | `Fenced`), `drain() -> (u32, [u8; 32])` (single consumer;
   test/drain scaffolding — the poll-based drainer replaces the spin).
@@ -508,3 +512,36 @@ single-CAS).
   (which the Xtensa backend lowers to `s32c1i`); if the hardware proves
   it non-cross-core-safe, the fallback is a ticket spinlock, not a
   redesign. Flagged for Mark's hardware pass.
+
+## 17. Recovery and initialization
+
+> *Decided 2026-09-30 (Mark's call): ring state is never persisted and
+> never reseeded from Db state. The ring is RAM-only; the Db/WAL is the
+> durable source of truth.*
+
+- **Fresh ring on every boot.** After `Db::open()` the host builds a new
+  `Ring::new()` and a new `Drainer::new(&ring, db, &durable)`. Ticket
+  head, cursor, gates, payloads, the ticket watermark, and drainer
+  pending state all die with the process — and none of it needs to
+  survive, because the writers behind the old tickets died too. Ticket
+  continuity across boots has no observer.
+- **`Drainer::new` seeds `durable_seq` from the Db tip.** `Db::next_seq()`
+  after `open()` is the highest seqnum that survived (SSTables plus
+  WAL replay); the drainer's acknowledged-prefix tracker starts there,
+  so the first post-boot sweep's `durable_seqnum()` is exactly the
+  recovered tip (§13).
+- **Correctness arguments** (each covered by `tests/drainer.rs`):
+  - *Acknowledged ⇒ present.* Ack follows a successful `Db::write` WAL
+    flush; after reopen the data is in SSTables or WAL-replayed.
+  - *Fenced ⇒ absent.* A fenced ticket never reaches `Db::write`,
+    consumes no seqnum, and leaves no device trace.
+  - *Unacknowledged ⇒ may or may not be present.* Pending RAM-only
+    batches vanish on crash; a failed write whose block landed may replay
+    from the WAL. This is allowed, and replayed seqnums are never reused.
+  - *Torn grouped batch ⇒ none of the group.* WAL `MORE` grouping replays
+    only complete groups; `Db::write` requires the whole group to fit one
+    block, so a truncation can never surface a torn prefix of a batch.
+  - *No garbage sweep.* Torn WAL tails truncate by CRC; abandoned table
+    blocks are unreferenced slots and reopen treats them as free. There
+    is no `Drop`/close cleanup anywhere in `src/` — dropping the handle
+    honestly models a crash.

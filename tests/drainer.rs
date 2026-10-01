@@ -1,4 +1,4 @@
-//! Drainer integration tests (SPEC §§7, 9, 11).
+//! Drainer integration tests (SPEC §§7, 9, 11, 13, 17).
 //!
 //! The drainer owns the [`Db`](horton::Db), drains the ring in ticket
 //! order, batches through one flush per sweep, advances the `durable`
@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{MemDevice, block_on, noop_waker, test_config};
+use common::{CrashDevice, MemDevice, block_on, noop_waker, test_config};
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use horton::BlockDevice;
@@ -1138,4 +1138,230 @@ fn snapshot_pins_acked_prefix() {
         .expect("get_at ok")
         .expect("k4 visible at tip");
     assert_eq!(&buf[..len], &[b'v', 4]);
+}
+
+// ── SPEC §17: recovery and initialization ─────────────────────────────
+// The ring is RAM-only. A crash is modeled honestly: the ring, the
+// drainer, and the Db are dropped at the end of a phase block — there
+// is no Drop/close cleanup anywhere in src/, so leaving the block is
+// exactly a dead process. Recovery is a fresh `Ring::new()` over
+// `Db::open()` on the same device; ticket state is never reseeded,
+// only the Db tip is recovered (§13).
+
+/// Opens a test-geometry Db on `device` and returns a drainer over it.
+/// The ten-consts annotation lives here once so reopen tests that swap
+/// device wrappers (`CrashDevice`, …) don't repeat it at every site.
+fn open_drainer<'r, D, const N: usize, const MAX_WRITES: usize>(
+    ring: &'r Ring<N>,
+    device: D,
+    durable: &'r AtomicU32,
+) -> Drainer<'r, D, 512, 32, 32, 16, 1024, 2, 4, 64, 0, N, MAX_WRITES>
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+{
+    let mut db = horton::Db::new(device, test_config());
+    block_on(db.open()).expect("db open must succeed");
+    Drainer::new(ring, db, durable)
+}
+
+#[test]
+fn reopen_recovers_acked_prefix() {
+    // Phase 1 (healthy): three puts, swept and acked. Leaving the block
+    // drops the ring, the drainer, and the Db: the crash.
+    let device = {
+        let ring = Ring::<8>::new();
+        let durable = AtomicU32::new(0);
+        let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+        publish(&ring, b"k0", b"v0");
+        publish(&ring, b"k1", b"v1");
+        publish(&ring, b"k2", b"v2");
+        assert_eq!(
+            block_on(drainer.sweep()).expect("sweep ok"),
+            SweepOutcome::Swept { tickets: 3 }
+        );
+        assert_eq!(durable.load(Ordering::Acquire), 3);
+        drainer.into_db().into_device()
+    };
+
+    // Phase 2 (fresh boot): a brand-new ring from ticket 0 on the same
+    // device. No ticket state is reseeded — only the Db tip is recovered.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = open_drainer::<_, 8, 8>(&ring, device, &durable);
+    // durable_seqnum reseeds from the recovered Db tip: the three puts
+    // took seqnums 1..=3 (§13 + §17).
+    assert_eq!(drainer.durable_seqnum(), 3);
+    // The fresh ring writes normally from ticket 0...
+    publish(&ring, b"k3", b"v3");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 1 }
+    );
+    assert_eq!(durable.load(Ordering::Acquire), 1);
+    assert_eq!(drainer.durable_seqnum(), 4);
+
+    // ...and the acknowledged prefix survived the crash.
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    for (key, val) in [
+        (b"k0", b"v0"),
+        (b"k1", b"v1"),
+        (b"k2", b"v2"),
+        (b"k3", b"v3"),
+    ] {
+        let len = block_on(db.get(key, &mut buf))
+            .expect("get ok")
+            .expect("key present after reopen");
+        assert_eq!(&buf[..len], val);
+    }
+}
+
+#[test]
+fn reopen_fenced_writes_absent() {
+    // Phase 1: t0 published and acked; t1 claimed but never published, so
+    // the second sweep fences it. The fenced ticket never reaches
+    // Db::write and must leave no trace across the crash.
+    let device = {
+        let ring = Ring::<8>::new();
+        let durable = AtomicU32::new(0);
+        let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+        drainer.set_stall_budget(0);
+        let t0 = ring.try_claim().expect("space");
+        let p0 = put_payload(b"k0", b"v0");
+        assert_eq!(ring.publish(t0, &p0), PublishOutcome::Published);
+        let _t1 = ring.try_claim().expect("space");
+        assert_eq!(
+            block_on(drainer.sweep()).expect("sweep ok"),
+            SweepOutcome::Swept { tickets: 1 }
+        );
+        assert_eq!(
+            block_on(drainer.sweep()).expect("sweep ok"),
+            SweepOutcome::Idle
+        );
+        assert_eq!(drainer.durable_watermark(), 2);
+        drainer.into_db().into_device()
+    };
+
+    // Phase 2: reopen. The acked put is there; the fenced ticket — which
+    // never even had a payload — left nothing behind.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let drainer = open_drainer::<_, 8, 8>(&ring, device, &durable);
+    // One put took seqnum 1; the fenced ticket took none.
+    assert_eq!(drainer.durable_seqnum(), 1);
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    let len = block_on(db.get(b"k0", &mut buf))
+        .expect("get ok")
+        .expect("acked k0 present after reopen");
+    assert_eq!(&buf[..len], b"v0");
+    assert_eq!(
+        block_on(db.get(b"k1", &mut buf)).expect("get ok"),
+        None,
+        "fenced ticket left no trace"
+    );
+}
+
+#[test]
+fn reopen_drops_unacked() {
+    // Phase 1: publish two puts but never sweep — they exist only in
+    // RAM. The crash drops them; reopen must be clean and operational.
+    let device = {
+        let ring = Ring::<8>::new();
+        let durable = AtomicU32::new(0);
+        let drainer = make_drainer::<8, 8>(&ring, &durable);
+        publish(&ring, b"k0", b"v0");
+        publish(&ring, b"k1", b"v1");
+        assert_eq!(durable.load(Ordering::Acquire), 0);
+        drainer.into_db().into_device()
+    };
+
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = open_drainer::<_, 8, 8>(&ring, device, &durable);
+    assert_eq!(drainer.durable_seqnum(), 0);
+    // The reopened Db takes new writes from the fresh ring...
+    publish(&ring, b"k2", b"v2");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 1 }
+    );
+    // ...while the unacked puts are gone.
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    assert_eq!(block_on(db.get(b"k0", &mut buf)).expect("get ok"), None);
+    assert_eq!(block_on(db.get(b"k1", &mut buf)).expect("get ok"), None);
+    let len = block_on(db.get(b"k2", &mut buf))
+        .expect("get ok")
+        .expect("k2 present");
+    assert_eq!(&buf[..len], b"v2");
+}
+
+#[test]
+fn crash_sweep_truncations_are_durably_linearizable() {
+    // Crash the device at every block-write position of a sweep, then
+    // reopen on the truncated prefix. `CrashDevice` reports Ok for
+    // dropped writes — the lie a dying process tells itself — so the
+    // crashed batch's ack is inside the crash window and means nothing.
+    // What must hold at *every* truncation point is durable
+    // linearizability: everything acked *before* the crash is present,
+    // and the crashed batch is all-or-nothing (WAL groups replay whole;
+    // a truncation can never surface a torn prefix of a batch).
+    for crash_at in 0..16usize {
+        // Phase 1 (healthy): ack k0..k2.
+        let device = {
+            let ring = Ring::<8>::new();
+            let durable = AtomicU32::new(0);
+            let mut drainer = open_drainer::<_, 8, 8>(&ring, MemDevice::<512>::new(), &durable);
+            publish(&ring, b"k0", b"v0");
+            publish(&ring, b"k1", b"v1");
+            publish(&ring, b"k2", b"v2");
+            assert_eq!(
+                block_on(drainer.sweep()).expect("sweep ok"),
+                SweepOutcome::Swept { tickets: 3 }
+            );
+            drainer.into_db().into_device()
+        };
+
+        // Phase 2 (crash): truncate block writes at `crash_at` during
+        // the second sweep, then drop everything mid-flight.
+        let device = {
+            let ring = Ring::<8>::new();
+            let durable = AtomicU32::new(0);
+            let mut drainer = open_drainer::<_, 8, 8>(
+                &ring,
+                CrashDevice::<MemDevice<512>, 512>::new(device, crash_at),
+                &durable,
+            );
+            publish(&ring, b"k3", b"v3");
+            publish(&ring, b"k4", b"v4");
+            publish(&ring, b"k5", b"v5");
+            let _ = block_on(drainer.sweep()).expect("sweep ok");
+            drainer.into_db().into_device().into_inner()
+        };
+
+        // Phase 3 (recovery): reopen on the truncated prefix.
+        let ring = Ring::<8>::new();
+        let durable = AtomicU32::new(0);
+        let drainer = open_drainer::<_, 8, 8>(&ring, device, &durable);
+        let db = drainer.into_db();
+        let mut buf = [0u8; 32];
+        for key in [b"k0", b"k1", b"k2"] {
+            assert!(
+                block_on(db.get(key, &mut buf)).expect("get ok").is_some(),
+                "crash_at={crash_at}: acked key lost"
+            );
+        }
+        let mut surfaced = 0;
+        for key in [b"k3", b"k4", b"k5"] {
+            if block_on(db.get(key, &mut buf)).expect("get ok").is_some() {
+                surfaced += 1;
+            }
+        }
+        assert!(
+            surfaced == 0 || surfaced == 3,
+            "crash_at={crash_at}: torn batch surfaced ({surfaced}/3)"
+        );
+    }
 }
