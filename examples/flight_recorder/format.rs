@@ -199,6 +199,8 @@ pub fn decode_archive_header(h: &[u8]) -> Result<SealedTable<KEY_MAX>, &'static 
         min_seq,
         entry_count,
         rdel_blocks,
+        node_id: 0,
+        seal_wall: 0,
     })
 }
 

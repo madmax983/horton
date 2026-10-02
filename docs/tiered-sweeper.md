@@ -3,6 +3,13 @@
 **Status:** design spec (2026-10-01). Blessed as a direction by Mark;
 details open where marked.
 
+**Implementation status:**
+- 2026-10-01: PG ColdSink done — native `PgTableSink` in `horton-pg-sink`,
+  `horton-sweeper` crate published (pluggable sink trait).
+- 2026-10-02: replica-side LWW merging done in horton core (this doc §7,
+  "Implemented"). Manifest magic `hrtman05` → `hrtman06` (old DBs will
+  not open — accepted pre-1.0 policy).
+
 ## 1. Goal
 
 Run horton on small fixed cloud volumes (1 GiB Fly/Hetzner) with two
@@ -64,7 +71,10 @@ the sweeper needs is public.
 
 - The sweeper keeps a **seq→wall-clock index**: it observes every seal
   (level, table id, max_seq) and stamps it. Tiny, host-side, persisted
-  however the host likes (sqlite, a file, Postgres).
+  however the host likes (sqlite, a file, Postgres). The stamp lands in
+  horton via `Db::stamp_table(id, node_id, seal_wall)` (2026-10-02) —
+  the same observation feeds both the age sweep and the replica LWW
+  merge, so the seal log is observed once and used twice.
 - Policy: tables with `max_seq` older than `age_threshold` (per key-prefix
   if wanted) are archived: `archive_plan` → upload bytes to cold storage →
   verify → `archive_commit`.
@@ -140,6 +150,62 @@ resolution on the write path.
   ingest + local writes. Verify with a dedicated test before calling
   replication done.
 
+### Implemented 2026-10-02: replica-side LWW merging (horton core)
+
+The collision path is no longer host-side: every replica resolves it
+identically inside the read path.
+
+- **Per-table origin.** `TableRef` (and the `SealedTable` ingest
+  descriptor) carries `node_id: u32` + `seal_wall: u64` (seconds). Flush
+  writes `(own_node, 0)`; `ingest_table` records the descriptor's origin
+  into the manifest. `TableRef::EMPTY` is `(0, 0)` = unstamped/legacy.
+  Origin is a manifest attribute — the SSTable format is untouched — and
+  the manifest magic bumped `hrtman05` → `hrtman06`.
+- **`Db::stamp_table(id, node_id, seal_wall)`.** Host-driven post-hoc
+  manifest edit (horton stays clock-free); this is what the sweeper's
+  seal log calls. Idempotent on identical re-stamp; `Error::StampConflict`
+  on conflicting re-stamp (table ids are never reused, so conflict =
+  caller bug). A stamp may fill in a missing piece once — the wall on an
+  own-node `(node, 0)` flush output, or the whole origin on a legacy
+  `(0, 0)` table — but a set `node_id` never changes hands and a set wall
+  never moves. Stamp promptly: unstamped sorts as wall 0, below every
+  stamped table.
+- **Version-based read merge** (`src/version.rs`, pure and unit-tested).
+  Version = `(node_id, seal_wall, seq)`; same node → higher seq wins
+  (bit-identical to the legacy rule); different nodes → higher
+  `(seal_wall, node_id)` wins. `Db` config gains `node_id` (default 0 =
+  legacy single-node); the memtable seeds `(own_node, u64::MAX, seq)`, so
+  read-your-writes is exact. Zero behavior change when nothing is
+  stamped: all `(0, 0)` → every comparison is same-node.
+- **Pure-node compaction jobs.** Job selection partitions inputs by exact
+  `node_id` (L0 tries node groups oldest-first); a foreign target table
+  overlapping the job's range vetoes the job (`Ok(None)` — the foreign
+  side drains down through its own selectable jobs, so the veto always
+  clears; under region pressure deeper levels always want jobs). Outputs
+  inherit `(job_node, max input/target seal_wall)` — grouping-independent.
+- **Version-aware tombstone-drop rule.** The legacy min_seq-only rule is
+  unsound once winners are version-based (tombstone at seq 100 from node
+  A sealed at wall 100 vs overlapping node-B table sealed at wall 50 with
+  `min_seq = 9000`: dropping the tombstone resurrects B's versions). New
+  rule: drop only if the tombstone hides nothing in any overlapping
+  outside table — same node → the legacy seq check; foreign node → drop
+  iff `(tombstone_wall, tombstone_node) < (table_wall, table_node)`.
+- **Snapshots unchanged**: scalar `max_seq` watermarks stay a
+  single-node concept; version-vector snapshots are explicitly out of
+  scope.
+- **Tests** (`tests/lww_merge.rs`, 13): two-node read determinism
+  (both wall orders, node_id tiebreak, unstamped-below-stamped,
+  foreign tombstone shadowing), the derived unsound-drop scenario (must
+  NOT drop — verified to fail under the legacy rule by mutation) plus a
+  positive control (drops when the foreign wall is older), stamp
+  idempotency/conflict/missing, ingest origin preservation,
+  `with_node_id` flush origin. The existing suite passes unmodified
+  (legacy-compat).
+- **Known limitation** (documented honestly): table-level origin is a
+  proxy — two replicas with different compaction histories can transiently
+  diverge on true key collisions (conflation gap); they converge once
+  both compact the colliding range. Rare × rare.
+
 ## 8. Tiered reads
 
 - Hot path: local `Db::get` / scans, unchanged.
@@ -206,3 +272,10 @@ state ever outgrows a log.
    `horton-sweeper` crate holds the contract.
 4. ~~Seq→time index backing~~ **Decided 2026-10-01 (Mark):**
    append-only log.
+5. ~~Replica-side LWW merging~~ **Implemented 2026-10-02** — per-table
+   origin + `Db::stamp_table` + version-based read merge + pure-node
+   compaction jobs with foreign-target veto + version-aware
+   tombstone-drop rule (see §7). Manifest magic `hrtman05` → `hrtman06`.
+6. ~~PG ColdSink~~ **Implemented 2026-10-01** — native `PgTableSink` in
+   `horton-pg-sink`; `horton-sweeper` published with the pluggable sink
+   trait.

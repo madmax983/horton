@@ -277,25 +277,42 @@ impl<
         true
     }
 
-    /// Lowest sequence that a table outside the job, or the memtable, could
-    /// hold for a key in `[first, last]`: the floor below which the job may
-    /// drop a tombstone. Tables at every level count — a re-ingested table
-    /// at L0 can be older than tombstones below it.
-    fn outside_min_seq(
-        &self,
-        c: &Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    /// The tombstone-drop gates for the job in `c`: the minimum `min_seq`
+    /// over same-node outside tables and the minimum `(seal_wall,
+    /// node_id)` over foreign ones (see [`Compaction::outside_same_min`]).
+    /// Tables at every level count — a re-ingested table at L0 can be
+    /// older than tombstones below it. The per-table checks collapse to
+    /// these minima exactly: same-node compares sequence numbers, foreign
+    /// compares `(seal_wall, node_id)`, and a drop must clear every
+    /// outside table, i.e. the minimum.
+    fn outside_set(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         first: KeyBound<KEY_MAX>,
         last: KeyBound<KEY_MAX>,
-    ) -> u64 {
-        let mut floor = self.table.min_seq();
+    ) {
+        let mut same_min = u64::MAX;
+        let mut foreign_min = (u64::MAX, u32::MAX);
+        // The memtable: same-node folds into `same_min`; foreign is
+        // `(u64::MAX, own_node)` — never below a real table's wall.
+        if self.cfg.node_id == c.job_node {
+            same_min = self.table.min_seq();
+        } else {
+            foreign_min = (u64::MAX, self.cfg.node_id);
+        }
         for t in self.manifest.tables() {
             let in_job = c.inputs[..c.n_src].iter().any(|i| i.tref.id == t.id)
                 || c.tgt[..c.n_tgt].contains(&t.id);
             if !in_job && ranges_overlap(first, last, t.first_key, t.last_key) {
-                floor = floor.min(t.min_seq);
+                if t.node_id == c.job_node {
+                    same_min = same_min.min(t.min_seq);
+                } else {
+                    foreign_min = foreign_min.min((t.seal_wall, t.node_id));
+                }
             }
         }
-        floor
+        c.outside_same_min = same_min;
+        c.outside_foreign_min = foreign_min;
     }
 
     /// Whether table `t` fills less than three quarters of a slot: worth
@@ -386,11 +403,53 @@ impl<
     }
 
     /// Selects a job draining level `src` into `c`, or moves a table down
-    /// outright; `None` when the merge would not fit the free slots.
+    /// outright; `None` when no node group yields a job that fits the
+    /// free slots.
+    ///
+    /// Jobs are pure-node: every input and target table shares one
+    /// `node_id`, so table-level origin proxies stay sound (see
+    /// [`crate::version`]). At L0 each node group is tried oldest-first;
+    /// a deeper level tries its cheapest table's node. A foreign target
+    /// table overlapping the job's range vetoes the job (`Ok(None)`): the
+    /// foreign side drains down through its own selectable jobs, so the
+    /// veto always clears — or the sweeper carries the cold range off.
     async fn try_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         src: usize,
+    ) -> Result<Option<Selected>, Error<D::Error>> {
+        // Distinct node_ids at the source level, oldest-first (the level
+        // slice is oldest-first at L0, key-ordered below; either way the
+        // order is deterministic). At most TABLES of them.
+        let mut nodes = [0u32; TABLES];
+        let mut n_nodes = 0usize;
+        {
+            let src_tables = self.manifest.level(src).unwrap_or(&[]);
+            for t in src_tables {
+                if !nodes[..n_nodes].contains(&t.node_id) {
+                    nodes[n_nodes] = t.node_id;
+                    n_nodes += 1;
+                }
+            }
+        }
+        for node in nodes.iter().take(n_nodes).copied() {
+            if let Some(sel) = self.try_select_group(c, src, node).await? {
+                return Ok(Some(sel));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Selects a job for one node group at level `src`: L0's oldest
+    /// tables of that node (all of them when the slots allow), or the one
+    /// table of a deeper level whose range overlaps the fewest target
+    /// tables. `None` when the group has no job: nothing fits, or a
+    /// foreign target table overlaps the range (veto).
+    async fn try_select_group(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        src: usize,
+        node: u32,
     ) -> Result<Option<Selected>, Error<D::Error>> {
         let tgt = src + 1;
         let free = u64::from(self.slots.free_slots());
@@ -399,14 +458,17 @@ impl<
             self.manifest.level(tgt).unwrap_or(&[]),
         );
         let data = |t: &TableRef<KEY_MAX>| u64::from(t.block_count).saturating_sub(3);
-        // Sources: L0's oldest tables — all of them when the slots allow —
-        // or the one table of a deeper level whose range overlaps the
-        // fewest target tables (ties to the lowest key), the cheapest to
-        // push down.
+        // Sources: L0's oldest tables of this node — all of them when the
+        // slots allow — or the one table of a deeper level whose range
+        // overlaps the fewest target tables (ties to the lowest key), the
+        // cheapest to push down.
         c.reset();
         let mut src_data = 0u64;
         if src == 0 {
             for t in src_tables {
+                if t.node_id != node {
+                    continue;
+                }
                 let d = src_data + data(t);
                 if c.n_src > 0 && self.job_need(d) > free {
                     break;
@@ -418,6 +480,7 @@ impl<
         } else {
             let pick = src_tables
                 .iter()
+                .filter(|t| t.node_id == node)
                 .min_by_key(|t| {
                     let (a, b) = Self::overlap_run(tgt_tables, t.first_key, t.last_key);
                     b - a
@@ -431,6 +494,10 @@ impl<
             c.n_src = 1;
             src_data = data(&pick);
         }
+        if c.n_src == 0 {
+            c.reset();
+            return Ok(None);
+        }
         let mut first = c.inputs[0].tref.first_key;
         let mut last = c.inputs[0].tref.last_key;
         for input in &c.inputs[1..c.n_src] {
@@ -438,6 +505,18 @@ impl<
             last = last.max(input.tref.last_key);
         }
         let (mut a, mut b) = Self::overlap_run(tgt_tables, first, last);
+        // Veto: a foreign target table overlapping the job's range means
+        // the two nodes' ranges still interleave at the target level —
+        // merging now would conflate origins. The foreign side drains
+        // down through its own selectable jobs, so the veto always
+        // clears; this group is retried on a later pass.
+        if tgt_tables
+            .iter()
+            .any(|t| t.node_id != node && ranges_overlap(first, last, t.first_key, t.last_key))
+        {
+            c.reset();
+            return Ok(None);
+        }
         if src > 0 && a == b && !self.is_small(&c.inputs[0].tref) {
             // Nothing below overlaps and the table is worth keeping whole:
             // re-parent it with one manifest edit, no data rewritten.
@@ -463,15 +542,15 @@ impl<
             c.reset();
             return Ok(None);
         }
-        // Consolidation: a small neighbour just outside either edge of
-        // the run joins the job, so small tables merge into full ones
-        // instead of each holding a slot forever. The neighbour is
+        // Consolidation: a small same-node neighbour just outside either
+        // edge of the run joins the job, so small tables merge into full
+        // ones instead of each holding a slot forever. The neighbour is
         // adjacent in key order, so the widened range swallows no other
-        // table.
-        if a > 0 && self.is_small(&tgt_tables[a - 1]) {
+        // table; the node filter keeps the job pure-node.
+        if a > 0 && tgt_tables[a - 1].node_id == node && self.is_small(&tgt_tables[a - 1]) {
             a -= 1;
         }
-        if b < tgt_tables.len() && self.is_small(&tgt_tables[b]) {
+        if b < tgt_tables.len() && tgt_tables[b].node_id == node && self.is_small(&tgt_tables[b]) {
             b += 1;
         }
         for (k, t) in tgt_tables[a..b].iter().enumerate() {
@@ -500,7 +579,26 @@ impl<
         // live lower bound (the part a past job already merged).
         c.out_lo = first;
         c.bottommost = self.is_bottommost_output(tgt, first, last);
-        c.outside_min_seq = self.outside_min_seq(c, first, last);
+        // Jobs are pure-node (see `try_select`): every input shares one
+        // node, and the output inherits it. `job_max_wall` is the
+        // conservative wall for dropped pieces (see `RdelDrop`). The
+        // drop gates come after: they are relative to the job's node.
+        c.job_node = if c.n_src > 0 {
+            c.inputs[0].tref.node_id
+        } else {
+            0
+        };
+        let mut max_wall = 0u64;
+        for i in 0..c.n_src {
+            max_wall = max_wall.max(c.inputs[i].tref.seal_wall);
+        }
+        for j in 0..c.n_tgt {
+            if let Some(t) = self.manifest.find_table(c.tgt[j]) {
+                max_wall = max_wall.max(t.seal_wall);
+            }
+        }
+        c.job_max_wall = max_wall;
+        self.outside_set(c, first, last);
         // The version-retention set: snapshots live at select time pin this
         // job's keep-set. Watermarks are stored descending so the merge
         // can walk its thresholds (live view, then each snapshot) in
@@ -650,7 +748,8 @@ impl<
             .ok_or(Error::TableTooLarge)?;
         let drop = RdelDrop::new(
             c.bottommost,
-            c.oldest_snapshot.min(c.outside_min_seq),
+            c.oldest_snapshot,
+            c.drop_origin(),
             &c.inexact,
             c.n_inexact,
         );
@@ -719,6 +818,12 @@ impl<
             min_seq: done.min_seq,
             entry_count: u32::try_from(done.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks,
+            // The job is pure-node and `job_max_wall` is the maximum
+            // `seal_wall` over every table whose versions reach this
+            // output (inputs and overlapping targets): grouping-
+            // independent, and never below a contained version's wall.
+            node_id: c.job_node,
+            seal_wall: c.job_max_wall,
         }))
     }
 

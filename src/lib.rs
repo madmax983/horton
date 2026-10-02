@@ -72,6 +72,7 @@ pub mod ring;
 pub mod scan;
 pub mod slots;
 pub mod sstable;
+pub(crate) mod version;
 pub mod wal;
 #[cfg(feature = "multiwriter")]
 pub mod writer;

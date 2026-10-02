@@ -21,6 +21,7 @@ use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::TableRef;
 use crate::sstable;
+use crate::version::{Version, version_gt};
 
 /// One table's position in a scan. The head entry is cached so the merge
 /// compares keys without reloading blocks; values are re-parsed from the
@@ -29,6 +30,10 @@ use crate::sstable;
 struct ScanCursor<const KEY_MAX: usize> {
     /// Owning table's manifest id: first half of the block-cache key.
     table_id: u32,
+    /// Replica-merge origin of the owning table (see [`crate::version`]).
+    node_id: u32,
+    /// Seal wall-clock (seconds) of the owning table.
+    seal_wall: u64,
     first_block: u64,
     data_blocks: u64,
     block_idx: u64,
@@ -55,6 +60,8 @@ impl<const KEY_MAX: usize> ScanCursor<KEY_MAX> {
     const fn empty() -> Self {
         Self {
             table_id: 0,
+            node_id: 0,
+            seal_wall: 0,
             first_block: 0,
             data_blocks: 0,
             block_idx: 0,
@@ -337,12 +344,13 @@ impl<
             if self.has_end && min_key >= &self.end[..self.end_len] {
                 return Ok(None);
             }
-            // Pass 2: among heads on the minimum key, the highest seq wins.
-            // `min_key` is invariant for this whole pass (computed once by
-            // `min_src` above), so it is compared directly instead of
-            // re-fetched through `cursor_pos` on every iteration.
+            // Pass 2: among heads on the minimum key, the highest version
+            // wins (see [`crate::version`]). `min_key` is invariant for
+            // this whole pass (computed once by `min_src` above), so it is
+            // compared directly instead of re-fetched through `cursor_pos`
+            // on every iteration.
             let mut winner_src = min_src;
-            let mut winner_seq = 0u64;
+            let mut winner_ver = Version::ZERO;
             let mut winner_tombstone = false;
             // Seeded from the leader's key, so a key whose only versions
             // carry the reserved sequence 0 still has its bytes (and is
@@ -351,14 +359,15 @@ impl<
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
             for src in 0..=total {
-                let Some((k, seq, tomb, vlen, exp)) = self.head(src) else {
+                let Some((k, _seq, tomb, vlen, exp)) = self.head(src) else {
                     continue;
                 };
                 if k != min_key {
                     continue;
                 }
-                if seq > winner_seq {
-                    winner_seq = seq;
+                let ver = self.head_version(src);
+                if version_gt(ver, winner_ver) {
+                    winner_ver = ver;
                     winner_src = src;
                     winner_tombstone = tomb;
                     winner_key_len = k.len();
@@ -395,7 +404,7 @@ impl<
             // expired winner never falls through to an older version.
             let covered = self
                 .db
-                .rdel_hides(wkey, self.max_seq, winner_seq, &mut self.raw)
+                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.raw)
                 .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
@@ -403,7 +412,7 @@ impl<
             // version carrying it — only possible in an externally built,
             // ingested table — is invisible, exactly as on the point-read
             // path.
-            if winner_seq == 0 || winner_tombstone || covered || expired {
+            if winner_ver.seq == 0 || winner_tombstone || covered || expired {
                 // Hidden: advance past the key without yielding it and
                 // without demanding caller buffer space for it.
                 self.advance_past_key(wkey, total).await?;
@@ -604,6 +613,8 @@ impl<
             .ok_or(Error::CorruptManifest)?;
         *slot = ScanCursor {
             table_id: tref.id,
+            node_id: tref.node_id,
+            seal_wall: tref.seal_wall,
             first_block: data_first,
             data_blocks,
             block_idx,
@@ -817,6 +828,19 @@ impl<
             ))
         }
     }
+
+    /// The head entry's version under the replica LWW merge rule: the
+    /// memtable's versions are the node's own newest; table heads carry
+    /// their table's origin.
+    fn head_version(&self, src: usize) -> Version {
+        if src == 0 {
+            Version::memtable(self.db.node_id(), self.mem_seq)
+        } else {
+            let (li, ti) = self.cursor_pos(src);
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            Version::table(c.node_id, c.seal_wall, c.seq)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +856,10 @@ impl<
 struct RevCursor<const KEY_MAX: usize> {
     /// Owning table's manifest id: first half of the block-cache key.
     table_id: u32,
+    /// Replica-merge origin of the owning table (see [`crate::version`]).
+    node_id: u32,
+    /// Seal wall-clock (seconds) of the owning table.
+    seal_wall: u64,
     first_block: u64,
     block_idx: u64,
     block_id: u64,
@@ -854,6 +882,8 @@ impl<const KEY_MAX: usize> RevCursor<KEY_MAX> {
     const fn empty() -> Self {
         Self {
             table_id: 0,
+            node_id: 0,
+            seal_wall: 0,
             first_block: 0,
             block_idx: 0,
             block_id: 0,
@@ -1181,13 +1211,13 @@ impl<
             if self.has_lower && max_key <= &self.lower[..self.lower_len] {
                 return Ok(None);
             }
-            // Pass 2: among heads on the maximum key, the highest seq
-            // wins. `max_key` is invariant for this whole pass (computed
-            // once by `max_src` above), so it is compared directly
-            // instead of re-fetched through `cursor_pos` on every
-            // iteration.
+            // Pass 2: among heads on the maximum key, the highest
+            // version wins (see [`crate::version`]). `max_key` is invariant
+            // for this whole pass (computed once by `max_src` above), so it
+            // is compared directly instead of re-fetched through
+            // `cursor_pos` on every iteration.
             let mut winner_src = max_src;
-            let mut winner_seq = 0u64;
+            let mut winner_ver = Version::ZERO;
             let mut winner_tombstone = false;
             // Seeded from the leader's key, so a key whose only versions
             // carry the reserved sequence 0 still has its bytes (and is
@@ -1196,14 +1226,15 @@ impl<
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
             for src in 0..=total {
-                let Some((k, seq, tomb, vlen, exp)) = self.head(src) else {
+                let Some((k, _seq, tomb, vlen, exp)) = self.head(src) else {
                     continue;
                 };
                 if k != max_key {
                     continue;
                 }
-                if seq > winner_seq {
-                    winner_seq = seq;
+                let ver = self.head_version(src);
+                if version_gt(ver, winner_ver) {
+                    winner_ver = ver;
                     winner_src = src;
                     winner_tombstone = tomb;
                     winner_key_len = k.len();
@@ -1240,7 +1271,7 @@ impl<
             // expired winner never falls through to an older version.
             let covered = self
                 .db
-                .rdel_hides(wkey, self.max_seq, winner_seq, &mut self.raw)
+                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.raw)
                 .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
@@ -1248,7 +1279,7 @@ impl<
             // version carrying it — only possible in an externally built,
             // ingested table — is invisible, exactly as on the point-read
             // path.
-            if winner_seq == 0 || winner_tombstone || covered || expired {
+            if winner_ver.seq == 0 || winner_tombstone || covered || expired {
                 // Hidden: advance past the key without yielding it and
                 // without demanding caller buffer space for it.
                 self.advance_past_key_rev(wkey, total).await?;
@@ -1485,6 +1516,8 @@ impl<
             .ok_or(Error::CorruptManifest)?;
         *slot = RevCursor {
             table_id: tref.id,
+            node_id: tref.node_id,
+            seal_wall: tref.seal_wall,
             first_block: data_first,
             block_idx,
             block_id: bid,
@@ -2007,6 +2040,19 @@ impl<
                 c.val_len,
                 c.expire_at,
             ))
+        }
+    }
+
+    /// The head entry's version under the replica LWW merge rule: the
+    /// memtable's versions are the node's own newest; table heads carry
+    /// their table's origin.
+    fn head_version(&self, src: usize) -> Version {
+        if src == 0 {
+            Version::memtable(self.db.node_id(), self.mem_seq)
+        } else {
+            let (li, ti) = self.cursor_pos(src);
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            Version::table(c.node_id, c.seal_wall, c.seq)
         }
     }
 }

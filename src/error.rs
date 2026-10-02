@@ -111,6 +111,14 @@ pub enum Error<E> {
         /// The conflicting table id.
         id: u32,
     },
+    /// A stamp was refused: the table is already stamped with a different
+    /// origin. Table ids are never reused, so a conflicting re-stamp is a
+    /// caller bug — the stamper disagrees with itself about when (or as
+    /// whom) the table sealed. Nothing was read or written.
+    StampConflict {
+        /// The conflicting table id.
+        id: u32,
+    },
     /// The [`Config`](crate::Config) cannot work: a region is empty, or the
     /// WAL, the table region, and the manifest copies overlap (each copy
     /// spans [`Manifest::max_blocks`](crate::Manifest::max_blocks) blocks).
@@ -168,6 +176,7 @@ impl Error<core::convert::Infallible> {
             Self::BatchTooLarge { bytes, max } => Error::BatchTooLarge { bytes, max },
             Self::WouldResurrect { table } => Error::WouldResurrect { table },
             Self::IngestConflict { id } => Error::IngestConflict { id },
+            Self::StampConflict { id } => Error::StampConflict { id },
             Self::BadConfig => Error::BadConfig,
             Self::Busy => Error::Busy,
             Self::NotOpen => Error::NotOpen,

@@ -57,6 +57,14 @@ pub struct SealedTable<const KEY_MAX: usize> {
     /// the copied table's footer on ingest, and needed to locate the data
     /// section when relocating the table.
     pub rdel_blocks: u32,
+    /// Origin node of the table's versions (0 = unstamped): recorded into
+    /// the manifest on ingest so the replica LWW merge orders the table's
+    /// versions against local ones. A replication shipper stamps the
+    /// source table first (see [`Db::stamp_table`]) so this is the sealed
+    /// origin, not a guess.
+    pub node_id: u32,
+    /// Seal wall-clock (seconds) of the table's versions (0 = unstamped).
+    pub seal_wall: u64,
 }
 
 impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
@@ -76,6 +84,8 @@ impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
             min_seq: self.table.min_seq,
             entry_count: self.table.entry_count,
             rdel_blocks: self.table.rdel_blocks,
+            node_id: self.table.node_id,
+            seal_wall: self.table.seal_wall,
         }
     }
 }
@@ -147,7 +157,10 @@ impl<
             return Err(Error::BadBufferLen);
         }
         // Idempotency: the same descriptor attaches exactly once; a
-        // conflicting descriptor under a live id is refused.
+        // conflicting descriptor under a live id is refused. The origin
+        // is part of the descriptor: a shipper stamps the source table
+        // (see Db::stamp_table) before sealing the descriptor, so retries
+        // ship the identical origin.
         if let Some(existing) = self.manifest.find_table(sealed.id) {
             let same = existing.block_count == sealed.block_count
                 && existing.first_key == sealed.first_key
@@ -155,7 +168,9 @@ impl<
                 && existing.max_seq == sealed.max_seq
                 && existing.min_seq == sealed.min_seq
                 && existing.entry_count == sealed.entry_count
-                && existing.rdel_blocks == sealed.rdel_blocks;
+                && existing.rdel_blocks == sealed.rdel_blocks
+                && existing.node_id == sealed.node_id
+                && existing.seal_wall == sealed.seal_wall;
             return if same {
                 Ok(false)
             } else {
@@ -241,6 +256,8 @@ impl<
                 min_seq: sealed.min_seq,
                 entry_count: sealed.entry_count,
                 rdel_blocks: sealed.rdel_blocks,
+                node_id: sealed.node_id,
+                seal_wall: sealed.seal_wall,
             },
         )?;
         let layout = self.manifest_layout();
@@ -304,6 +321,79 @@ impl<
     #[must_use]
     pub fn tables(&self, level: usize) -> Option<&[TableRef<KEY_MAX>]> {
         self.manifest.level(level)
+    }
+
+    /// This handle's node identity (see
+    /// [`Config::with_node_id`]): the node its memtable versions carry in
+    /// the replica LWW merge. `0` = legacy single-node.
+    #[must_use]
+    pub(crate) const fn node_id(&self) -> u32 {
+        self.cfg.node_id
+    }
+
+    /// Stamps a sealed table's replica-merge origin: the `node_id` of the
+    /// primary that sealed it and the `seal_wall` wall-clock (seconds) the
+    /// host observed at the seal. Horton itself is clock-free — the host
+    /// (usually the sweeper's seal log, which already observes every seal)
+    /// supplies the time. Stamp promptly after the seal: until stamped, a
+    /// table sorts as wall-clock 0, below every stamped table.
+    ///
+    /// Flush writes `(own_node, 0)` and ingest carries the sealed
+    /// descriptor's origin, so this call fills in what the device couldn't
+    /// know at write time. A stamp may fill in a missing piece once — the
+    /// wall on an own-node `(node, 0)` flush output, or the whole origin
+    /// on a legacy `(0, 0)` table — but a set `node_id` never changes
+    /// hands and a set wall never moves.
+    ///
+    /// The stamp is a position-preserving manifest edit (one atomic
+    /// manifest write): the table keeps its level and slot. Returns
+    /// `Ok(true)` when stamped, `Ok(false)` when the table id is not
+    /// attached (already archived, compacted away, or never existed —
+    /// idempotent, safe to retry), and `Ok(true)` without a write when
+    /// the identical stamp is already present.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::StampConflict`] when the table is already stamped with a
+    /// *different* origin — table ids are never reused, so this is a
+    /// caller bug. [`Error::Device`] on I/O failure.
+    pub async fn stamp_table(
+        &mut self,
+        table_id: u32,
+        node_id: u32,
+        seal_wall: u64,
+    ) -> Result<bool, Error<D::Error>> {
+        self.ensure_open()?;
+        let Some(cur) = self.manifest.find_table(table_id) else {
+            return Ok(false);
+        };
+        if cur.node_id == node_id && cur.seal_wall == seal_wall {
+            return Ok(true);
+        }
+        // The wall may be filled in once, and a legacy `(0, 0)` table may
+        // be claimed; anything else is a conflicting re-stamp.
+        let wall_fill = cur.node_id == node_id && cur.seal_wall == 0;
+        let legacy_claim = cur.node_id == 0 && cur.seal_wall == 0;
+        if !(wall_fill || legacy_claim) {
+            return Err(Error::StampConflict { id: table_id });
+        }
+        let mut edit = ManifestEdit::new();
+        if !self
+            .manifest
+            .stage_stamp::<D::Error>(&mut edit, table_id, node_id, seal_wall)?
+        {
+            return Ok(false);
+        }
+        let layout = self.manifest_layout();
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
+            .await?;
+        Ok(true)
     }
 
     /// Plans the archival of one sealed table: returns its level and block

@@ -36,7 +36,8 @@
 //! any level: the tombstone is kept and still hides older versions
 //! elsewhere. At the bottom, the tombstone itself is dropped once nothing
 //! it hides is left: every older version in its range was dropped by this
-//! job, and nothing outside the job is older (`outside_min_seq`). The
+//! job, and nothing outside the job holds a version it hides (see
+//! [`Compaction::outside_same_min`]). The
 //! merge learns which tombstones cover each key from a second, streaming
 //! rdel merge that runs alongside the key merge. It tracks only the
 //! tombstones that can decide a key's cover (none newer and at least as
@@ -150,14 +151,31 @@ pub struct Compaction<
     /// `seq >=` every version being merged, so it can never observe the
     /// difference.
     pub(crate) oldest_snapshot: u64,
-    /// Lowest sequence any table *outside* this job — at any level,
-    /// shallower ones included — or the memtable could hold for a key in
-    /// the job's range (`u64::MAX` when nothing outside overlaps).
-    /// Captured at `compact_select`. A tombstone at or above it may be
-    /// hiding an older version outside the job (an ingested table
-    /// re-attached at L0, say), so it is never dropped: dropping it would
-    /// resurrect that version.
-    pub(crate) outside_min_seq: u64,
+    /// Minimum `min_seq` over the job's *same-node* outside tables — at
+    /// any level, shallower ones included — overlapping the job's key
+    /// range, and the memtable when it is same-node (`u64::MAX` when
+    /// none). Captured at `compact_select`. A tombstone-drop must hide
+    /// nothing in any outside table (see [`RdelDrop`]); same-node tables
+    /// compare sequence numbers, so only their minimum matters.
+    pub(crate) outside_same_min: u64,
+    /// Minimum `(seal_wall, node_id)` over the job's *foreign* outside
+    /// tables overlapping its range (`(u64::MAX, u32::MAX)` when none —
+    /// the check then passes vacuously). Foreign tables compare
+    /// `(seal_wall, node_id)` under the replica merge rule (see
+    /// [`crate::version`]), so only their minimum matters. The memtable,
+    /// when foreign, is `(u64::MAX, own_node)` — never below a real
+    /// table's wall, folded in for exactness.
+    pub(crate) outside_foreign_min: (u64, u32),
+    /// The job's origin node. Selection keeps every job pure-node — its
+    /// inputs and targets share one node — so every tombstone piece the
+    /// merge drops is from this node.
+    pub(crate) job_node: u32,
+    /// Maximum `seal_wall` over the job's inputs and targets: a
+    /// conservative upper bound for any dropped piece's wall. Using it in
+    /// place of the piece's true wall can only keep tombstones, never
+    /// drop unsoundly (a drop under the overestimate implies the drop
+    /// under the true wall).
+    pub(crate) job_max_wall: u64,
     /// TTL purge cutoff for this job: an emitted value with
     /// `expire_at != 0 && expire_at <= purge_before` is converted to a
     /// point tombstone at the same sequence — never silently dropped
@@ -378,7 +396,10 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
             oldest_snapshot: u64::MAX,
-            outside_min_seq: u64::MAX,
+            outside_same_min: u64::MAX,
+            outside_foreign_min: (u64::MAX, u32::MAX),
+            job_node: 0,
+            job_max_wall: 0,
             purge_before: 0,
             rdel_budget: 0,
             data_budget: 0,
@@ -429,6 +450,10 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         self.n_active = 0;
         self.key_cover = 0;
         self.n_inexact = 0;
+        self.outside_same_min = u64::MAX;
+        self.outside_foreign_min = (u64::MAX, u32::MAX);
+        self.job_node = 0;
+        self.job_max_wall = 0;
     }
 
     /// Starts the coverage stream over every input's range-tombstone
@@ -883,8 +908,10 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
     /// - the tombstone predates every live snapshot — then each
     ///   snapshot's visible version is the tombstone itself, the keep-set
     ///   is just it, and deletion is observationally identical to absence;
-    /// - nothing outside the job can hold an older version it hides
-    ///   (`outside_min_seq`).
+    /// - nothing outside the job can hold an older version it hides: for
+    ///   every outside table, same node compares sequence numbers and
+    ///   foreign nodes compare `(seal_wall, node_id)` under the replica
+    ///   merge rule (see [`outside_clear`](Self::outside_clear)).
     ///
     /// Inputs holding older versions of the key are no hazard: the
     /// progress commit that makes this output live also retires, or
@@ -896,7 +923,30 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         self.bottommost
             && effective_tombstone
             && c.seq < self.oldest_snapshot
-            && c.seq < self.outside_min_seq
+            && self.outside_clear(self.job_max_wall, c.seq)
+    }
+
+    /// Whether a tombstone version `(wall, seq)` from this job hides
+    /// nothing in any outside table: same node compares `seq` against
+    /// the minimum `min_seq` over same-node outside tables; foreign
+    /// nodes compare `(wall, job_node)` against the minimum
+    /// `(seal_wall, node_id)` over foreign outside tables (see
+    /// [`crate::version`]). `const` so
+    /// [`may_drop_key`](Self::may_drop_key) stays `const`.
+    pub(crate) const fn outside_clear(&self, wall: u64, seq: u64) -> bool {
+        // `(wall, job_node) < (w, n)` spelled out: tuple `<` is not const.
+        let (w, n) = self.outside_foreign_min;
+        seq < self.outside_same_min && (wall < w || (wall == w && self.job_node < n))
+    }
+
+    /// The [`DropOrigin`] for this job's tombstone-drop gates.
+    pub(crate) const fn drop_origin(&self) -> DropOrigin {
+        DropOrigin {
+            node: self.job_node,
+            max_wall: self.job_max_wall,
+            outside_same_min: self.outside_same_min,
+            outside_foreign_min: self.outside_foreign_min,
+        }
     }
 }
 
@@ -1378,10 +1428,28 @@ impl<const KEY_MAX: usize> RdelMerger<KEY_MAX> {
 /// and it misses every key range where the coverage stream may have lost
 /// track of a tombstone (`Compaction::inexact`), so every version it
 /// hides in its range was already dropped by the job.
-#[derive(Clone, Copy)]
+/// The origin context a [`RdelDrop`] needs: the job's node and
+/// conservative wall, plus the collapsed outside-table gates. One
+/// `Copy` struct keeps [`RdelDrop::new`] under clippy's argument limit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DropOrigin {
+    /// The job's origin node (jobs are pure-node).
+    pub node: u32,
+    /// Maximum `seal_wall` over the job's inputs and targets.
+    pub max_wall: u64,
+    /// Minimum `min_seq` over same-node outside tables.
+    pub outside_same_min: u64,
+    /// Minimum `(seal_wall, node_id)` over foreign outside tables.
+    pub outside_foreign_min: (u64, u32),
+}
+
 pub(crate) struct RdelDrop<'a, const KEY_MAX: usize> {
-    /// Pieces at or above this sequence stay (`0`: every piece stays).
-    floor: u64,
+    /// Origin context of the tombstone pieces being dropped.
+    origin: DropOrigin,
+    /// Pieces at or above this sequence stay (`0`: every piece stays):
+    /// the oldest live snapshot. Snapshots are a single-node concept, so
+    /// this floor is unchanged by the merge rule.
+    snapshot_floor: u64,
     inexact: &'a [(KeyBound<KEY_MAX>, KeyBound<KEY_MAX>)],
 }
 
@@ -1390,25 +1458,41 @@ impl<'a, const KEY_MAX: usize> RdelDrop<'a, KEY_MAX> {
     /// hold other fields of the scratch mutably meanwhile).
     pub(crate) fn new(
         bottommost: bool,
-        floor: u64,
+        oldest_snapshot: u64,
+        origin: DropOrigin,
         inexact: &'a [(KeyBound<KEY_MAX>, KeyBound<KEY_MAX>); INEXACT_RANGES],
         n_inexact: usize,
     ) -> Self {
         // `usize::MAX`: the stream lost track everywhere.
-        let floor = if bottommost && n_inexact != usize::MAX {
-            floor
+        let (snapshot_floor, origin) = if bottommost && n_inexact != usize::MAX {
+            (oldest_snapshot, origin)
         } else {
-            0
+            (
+                0,
+                DropOrigin {
+                    outside_same_min: u64::MAX,
+                    outside_foreign_min: (u64::MAX, u32::MAX),
+                    ..origin
+                },
+            )
         };
         Self {
-            floor,
+            origin,
+            snapshot_floor,
             inexact: &inexact[..n_inexact.min(INEXACT_RANGES)],
         }
     }
 
-    /// Whether the piece `[start, end)` at `seq` may be dropped.
+    /// Whether the tombstone piece `[start, end)` at `seq` may be dropped:
+    /// it hides nothing any reader can still see. Same node as an outside
+    /// table compares sequence numbers (the legacy rule, exact); across
+    /// nodes the piece's `(max_wall, node)` must sort below the minimum
+    /// `(seal_wall, node_id)` over foreign outside tables — the replica
+    /// LWW merge rule (see [`crate::version`]).
     pub(crate) fn drops(&self, start: &[u8], end: &[u8], seq: u64) -> bool {
-        seq < self.floor
+        seq < self.snapshot_floor
+            && seq < self.origin.outside_same_min
+            && (self.origin.max_wall, self.origin.node) < self.origin.outside_foreign_min
             && self
                 .inexact
                 .iter()

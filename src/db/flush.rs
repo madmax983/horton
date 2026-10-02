@@ -81,6 +81,7 @@ impl<
     /// cover both sections: range tombstones participate in table pruning
     /// and winner selection.
     fn flush_tref(
+        node_id: u32,
         id: u32,
         base: u64,
         total: u64,
@@ -105,6 +106,11 @@ impl<
             min_seq: plan.min_seq.min(rdel_plan.min_seq),
             entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks: rdel_plan.blocks,
+            // The memtable holds this handle's own mutations; the
+            // wall-clock half of the origin arrives post-seal via
+            // Db::stamp_table (horton is clock-free).
+            node_id,
+            seal_wall: 0,
         })
     }
 
@@ -222,7 +228,7 @@ impl<
         let mut edit = ManifestEdit::new();
         let id = self.manifest.next_table_id();
         edit.advance_next_table_id(id.checked_add(1).ok_or(Error::CounterExhausted)?);
-        let tref = Self::flush_tref(id, base, total, &plan, &rdel_plan)?;
+        let tref = Self::flush_tref(self.cfg.node_id, id, base, total, &plan, &rdel_plan)?;
         edit.add::<D::Error>(0, tref)?;
         // Advance the WAL head past the flushed records; wrap the region
         // when it is exhausted. Folded into this same atomic commit, so no

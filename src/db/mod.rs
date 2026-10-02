@@ -79,6 +79,16 @@ pub struct Config {
     /// Device size in blocks for a [`whole_device`](Config::whole_device)
     /// layout; 0 when the regions are placed by hand.
     pub device_blocks: u64,
+    /// This node's identity for replica-side LWW merging (`0` = legacy
+    /// single-node: every table sorts by sequence number exactly as
+    /// before). A node that replicates — ships its sealed tables to other
+    /// nodes, or ingests theirs — sets a nonzero id (see
+    /// [`Db::stamp_table`]); the memtable's versions then carry it, and
+    /// cross-node conflicts resolve deterministically on
+    /// (`seal_wall`, `node_id`). Not part of the on-device layout: it is
+    /// the *handle's* identity, so reopening under a different id is a
+    /// caller bug, not a format concern.
+    pub node_id: u32,
 }
 
 impl Config {
@@ -112,6 +122,7 @@ impl Config {
             manifest_b: 0,
             manifest_ring: 0,
             device_blocks,
+            node_id: 0,
         }
     }
 
@@ -140,6 +151,7 @@ impl Config {
             manifest_b,
             manifest_ring: 0,
             device_blocks: 0,
+            node_id: 0,
         }
     }
 
@@ -152,6 +164,16 @@ impl Config {
     #[must_use]
     pub const fn with_manifest_ring(mut self, copies: u32) -> Self {
         self.manifest_ring = if copies < 2 { 2 } else { copies };
+        self
+    }
+
+    /// Sets this handle's node identity for replica-side LWW merging (see
+    /// the [`node_id`](Self#structfield.node_id) field). `0` (the default)
+    /// is legacy single-node: every table sorts by sequence number exactly
+    /// as before.
+    #[must_use]
+    pub const fn with_node_id(mut self, node_id: u32) -> Self {
+        self.node_id = node_id;
         self
     }
 }
@@ -448,6 +470,7 @@ impl<
             manifest_b: if c.manifest_ring == 0 { stride } else { 0 },
             manifest_ring: c.manifest_ring,
             device_blocks: total,
+            node_id: c.node_id,
         }
     }
 

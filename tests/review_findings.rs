@@ -399,6 +399,8 @@ fn f12_seq0_entries_are_invisible_and_scans_terminate() {
         min_seq: 0,
         entry_count: 2,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     };
     let mut db: TestDb<MemDevice<4096>> = TestDb::new(MemDevice::new(), test_config());
     block_on(db.open()).unwrap();

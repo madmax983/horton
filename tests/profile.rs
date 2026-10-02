@@ -119,6 +119,8 @@ fn future_sizes() -> Vec<(&'static str, usize)> {
         min_seq: 1,
         entry_count: 1,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     };
     let (mut k, mut v) = ([0u8; 32], [0u8; 64]);
     let mut out = vec![

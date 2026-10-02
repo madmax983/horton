@@ -730,6 +730,8 @@ fn mut_manifest_l0_is_full_reports_full() {
             min_seq: 0,
             entry_count: 5,
             rdel_blocks: 0,
+            node_id: 0,
+            seal_wall: 0,
         }
     }
 
@@ -783,16 +785,16 @@ fn mut_manifest_decode_accepts_exact_fit() {
 
     // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys, as a
     // one-block copy: header 24 (magic, seq, index, count, len), body
-    // 8 + 4 + 8 + 8 + 4 (fixed fields) + 4 (level count) + 46 (the ref)
-    // = 82, total = 24 + 82 + 4 = 110.
-    const BLOCK: usize = 110;
-    const CRC_END: usize = 106;
+    // 8 + 4 + 8 + 8 + 4 (fixed fields) + 4 (level count) + 58 (the ref:
+    // 56 fixed + 2 key bytes) = 94, total = 24 + 94 + 4 = 122.
+    const BLOCK: usize = 122;
+    const CRC_END: usize = 118;
     let mut buf = [0u8; BLOCK];
     buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
     buf[8..16].copy_from_slice(&7u64.to_le_bytes()); // seq
     buf[16..18].copy_from_slice(&0u16.to_le_bytes()); // block index
     buf[18..20].copy_from_slice(&1u16.to_le_bytes()); // block count
-    buf[20..24].copy_from_slice(&82u32.to_le_bytes()); // body bytes
+    buf[20..24].copy_from_slice(&94u32.to_le_bytes()); // body bytes
     let mut off = 24;
     w64(&mut buf, &mut off, 0); // wal_head
     w32(&mut buf, &mut off, 0); // next_table_id
@@ -813,6 +815,8 @@ fn mut_manifest_decode_accepts_exact_fit() {
     w64(&mut buf, &mut off, 3); // min_seq
     w32(&mut buf, &mut off, 5); // entry_count
     w32(&mut buf, &mut off, 0); // rdel_blocks
+    w32(&mut buf, &mut off, 0); // node_id
+    w64(&mut buf, &mut off, 0); // seal_wall
     assert_eq!(off, CRC_END);
     let crc = crc32(&buf[..CRC_END]);
     buf[CRC_END..CRC_END + 4].copy_from_slice(&crc.to_le_bytes());
@@ -821,6 +825,7 @@ fn mut_manifest_decode_accepts_exact_fit() {
         .expect("exact-fit manifest must decode");
     assert_eq!(m.seq(), 7);
     assert_eq!(m.l0().len(), 1);
+    assert_eq!((m.l0()[0].node_id, m.l0()[0].seal_wall), (0, 0));
 }
 
 /// Slot boundary: a table ending exactly at its slot's end fits; one block
@@ -855,6 +860,8 @@ fn mut_manifest_decode_bound_accepts_key_max() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     })
     .unwrap();
     let mut buf = [0u8; 512];
@@ -883,6 +890,8 @@ fn mut_manifest_decode_bound_rejects_overlong() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     })
     .unwrap();
     let mut buf = [0u8; 512];
@@ -913,7 +922,7 @@ fn mut_manifest_decode_bound_rejects_overlong() {
 fn mut_manifest_encode_accepts_exact_fit() {
     use horton::{KeyBound, Manifest, TableRef};
 
-    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 110.
+    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 122.
     let mut m = Manifest::<1, 1, 8>::new();
     m.add_l0_table::<Infallible>(TableRef {
         id: 7,
@@ -925,15 +934,17 @@ fn mut_manifest_encode_accepts_exact_fit() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     })
     .unwrap();
-    let mut buf = [0u8; 110];
-    m.encode::<Infallible, 110>(&mut buf)
+    let mut buf = [0u8; 122];
+    m.encode::<Infallible, 122>(&mut buf)
         .expect("exact-fit manifest must encode");
-    assert_eq!(m.encoded_blocks::<110>(), 1, "exactly one block");
-    assert_eq!(m.encoded_blocks::<109>(), 2, "one byte short spills over");
+    assert_eq!(m.encoded_blocks::<122>(), 1, "exactly one block");
+    assert_eq!(m.encoded_blocks::<121>(), 2, "one byte short spills over");
     // And it must round-trip through decode.
-    let back = Manifest::<1, 1, 8>::decode::<Infallible, 110>(&buf)
+    let back = Manifest::<1, 1, 8>::decode::<Infallible, 122>(&buf)
         .expect("exact-fit manifest must decode");
     assert_eq!(back.seq(), 0);
     assert_eq!(back.l0().len(), 1);
@@ -957,6 +968,8 @@ fn mut_manifest_encode_rejects_oversized() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     })
     .unwrap();
     let mut buf = [0u8; 128];

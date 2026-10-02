@@ -28,6 +28,8 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     }
 }
 
@@ -224,6 +226,8 @@ fn encode_crc_tail_is_bounds_checked() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     })
     .unwrap();
     let mut buf = [0u8; 106];
@@ -408,6 +412,8 @@ fn ref_span(id: u32, lo: u64, hi: u64) -> TableRef<16> {
         min_seq: 1,
         entry_count: 3,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     }
 }
 

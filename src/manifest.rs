@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman05" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman06" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -38,7 +38,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman05".
+/// Manifest block magic: ASCII "hrtman06".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -46,9 +46,11 @@ use crate::error::Error;
 /// layout with length-prefixed key bounds; "hrtman03" is the v0.15 layout
 /// with the per-table `rdel_blocks` count; "hrtman04" added the persisted
 /// sequence floors `flushed_seq` and `seq_high`; "hrtman05" (v0.17) spreads
-/// a copy over as many blocks as it needs. A foreign magic decodes as
-/// [`Error::CorruptManifest`] — old bytes are rejected, never misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman05");
+/// a copy over as many blocks as it needs; "hrtman06" adds the per-table
+/// replica-merge origin (`node_id`, `seal_wall`). A foreign magic decodes
+/// as [`Error::CorruptManifest`] — old bytes are rejected, never
+/// misparsed.
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman06");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.
@@ -264,10 +266,23 @@ pub struct TableRef<const KEY_MAX: usize> {
     /// Range-tombstone blocks, stored after the data blocks (see
     /// [`rdel_first`](Self::rdel_first)).
     pub rdel_blocks: u32,
+    /// Origin node of the table's versions: the primary that sealed it
+    /// (`0` = unstamped — a legacy table, or one the host has not stamped
+    /// yet). Replicas order same-key versions across primaries by
+    /// (`seal_wall`, `node_id`); see [`crate::version`].
+    pub node_id: u32,
+    /// Wall-clock (seconds) the host observed when this table sealed:
+    /// the replica LWW merge's recency half. `0` = unstamped (sorts below
+    /// every stamped table). A compaction output inherits the maximum
+    /// over its inputs; a flush starts at `0` until the host stamps it
+    /// (see `Db::stamp_table`).
+    pub seal_wall: u64,
 }
 
 impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
     /// An empty (zero) reference, used for array initialization.
+    /// Unstamped: `node_id` 0 sorts every comparison into the legacy
+    /// sequence-number rule (see [`crate::version`]).
     pub const EMPTY: Self = Self {
         id: 0,
         first_block: 0,
@@ -278,6 +293,8 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
         min_seq: 0,
         entry_count: 0,
         rdel_blocks: 0,
+        node_id: 0,
+        seal_wall: 0,
     };
 
     /// Data blocks: `block_count - rdel_blocks - 3` (bloom, index,
@@ -678,7 +695,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
 
     /// The largest body any manifest of this shape can encode to: every
     /// pool entry in use, every key bound at `KEY_MAX` bytes.
-    const MAX_BODY: usize = 8 + 4 + 8 + 8 + 4 + 4 * LEVELS + Self::CAPACITY * (44 + 2 * KEY_MAX);
+    const MAX_BODY: usize = 8 + 4 + 8 + 8 + 4 + 4 * LEVELS + Self::CAPACITY * (56 + 2 * KEY_MAX);
 
     /// Blocks one copy of this manifest shape can need, at most: the size
     /// of every copy in a [`ManifestLayout`]. A compile-time function of
@@ -711,7 +728,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let mut refs = 0;
         for li in 0..LEVELS {
             self.view_level(edit, li, |t| {
-                refs += 44 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
+                refs += 56 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
             });
         }
         8 + 4 + 8 + 8 + 4 + 4 * LEVELS + refs
@@ -743,6 +760,19 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 &narrowed
             } else {
                 &self.flat()[pos]
+            };
+            // A stamp rides along with whatever ref the position holds.
+            let stamped;
+            let t = match edit.stamped {
+                Some((id, node_id, seal_wall)) if t.id == id => {
+                    stamped = TableRef {
+                        node_id,
+                        seal_wall,
+                        ..*t
+                    };
+                    &stamped
+                }
+                _ => t,
             };
             if li > 0
                 && let Some(a) = pending
@@ -785,6 +815,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 w.u64(tref.min_seq);
                 w.u32(tref.entry_count);
                 w.u32(tref.rdel_blocks);
+                w.u32(tref.node_id);
+                w.u64(tref.seal_wall);
             });
         }
     }
@@ -936,6 +968,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             min_seq: src.u64().await?,
             entry_count: src.u32().await?,
             rdel_blocks: src.u32().await?,
+            node_id: src.u32().await?,
+            seal_wall: src.u64().await?,
         })
     }
 
@@ -1190,6 +1224,32 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         Ok(true)
     }
 
+    /// Stages stamping table `id`'s replica-merge origin
+    /// (`node_id`, `seal_wall`) into `edit` — the host-driven post-seal
+    /// timestamp (see `Db::stamp_table`). The stamp is
+    /// position-preserving: the table keeps its level and slot. Returns
+    /// `false` (and stages nothing) when the table is not there.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ManifestFull`] when the edit already stamps a table.
+    pub fn stage_stamp<E>(
+        &self,
+        edit: &mut ManifestEdit<KEY_MAX>,
+        id: u32,
+        node_id: u32,
+        seal_wall: u64,
+    ) -> Result<bool, Error<E>> {
+        if self.find_table(id).is_none() {
+            return Ok(false);
+        }
+        if edit.stamped.is_some() {
+            return Err(Error::ManifestFull);
+        }
+        edit.stamped = Some((id, node_id, seal_wall));
+        Ok(true)
+    }
+
     /// Pool position of table `id` at `level`.
     fn position<E>(&self, level: usize, id: u32) -> Result<Option<usize>, Error<E>> {
         const {
@@ -1268,6 +1328,19 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         self.advance_next_table_id(edit.next_table_id);
         let live = self.live();
         let narrow_to = edit.narrow_to;
+        // Stamps address tables by id (never reused), so they survive
+        // position shifts and are position-preserving themselves.
+        if let Some((id, node_id, seal_wall)) = edit.stamped {
+            let found = self.flat_mut()[..live]
+                .iter_mut()
+                .find(|t| t.id == id)
+                .is_some_and(|t| {
+                    t.node_id = node_id;
+                    t.seal_wall = seal_wall;
+                    true
+                });
+            debug_assert!(found, "stage_stamp admitted a missing id");
+        }
         for (pos, t) in self.flat_mut()[..live].iter_mut().enumerate() {
             if bit(edit.narrowed, pos) {
                 t.first_key = narrow_to;
@@ -1329,6 +1402,8 @@ pub struct ManifestEdit<const KEY_MAX: usize> {
     narrowed: u64,
     narrow_to: KeyBound<KEY_MAX>,
     added: Option<(usize, TableRef<KEY_MAX>)>,
+    /// `(id, node_id, seal_wall)`: stamps a table's replica-merge origin.
+    stamped: Option<(u32, u32, u64)>,
 }
 
 impl<const KEY_MAX: usize> ManifestEdit<KEY_MAX> {
@@ -1342,6 +1417,7 @@ impl<const KEY_MAX: usize> ManifestEdit<KEY_MAX> {
         narrowed: 0,
         narrow_to: KeyBound::EMPTY,
         added: None,
+        stamped: None,
     };
 
     /// An empty edit.
