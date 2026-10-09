@@ -60,7 +60,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// 32-byte ring payload codec.
 ///
 /// The ring carries a fixed 32-byte payload per slot — one serialized
-/// mutation (SPEC §14). Layouts, with op bytes matching [`Op`]'s
+/// mutation (SPEC §14). Layouts, with op bytes matching [`Op`](crate::wal::Op)'s
 /// discriminants:
 ///
 /// ```text
@@ -76,7 +76,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 ///   `8 + klen + vlen <= 29`). Length arithmetic is widened past `u8`
 ///   before adding, so adversarial lengths return `None`/`Err` instead of
 ///   overflowing; every slice is in-bounds by the budget test.
-/// - Op discriminants are [`Op`]'s wire values; no parallel numbering to
+/// - Op discriminants are [`Op`](crate::wal::Op)'s wire values; no parallel numbering to
 ///   drift.
 /// - `decode` is total over all 2²⁵⁶ slot values: unknown op bytes,
 ///   zero/overlong lengths, and budget overflows yield `DecodeError` —
@@ -171,6 +171,7 @@ pub mod payload {
     }
 
     /// Encode a range delete of `[start, end)` into a 32-byte payload.
+    ///
     /// Returns `None` when either bound is empty/longer than 29 bytes or
     /// the bounds exceed 29 bytes together. An inverted range
     /// (`start >= end`) still encodes; it applies as a no-op.
@@ -539,7 +540,7 @@ impl<
     ///
     /// [`Error::SnapshotLimit`] when eight snapshots are already live;
     /// [`Error::NotOpen`] if the Db was never opened.
-    pub fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
+    pub const fn snapshot(&mut self) -> Result<u64, Error<D::Error>> {
         self.db.snapshot()
     }
 

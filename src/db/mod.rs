@@ -1129,11 +1129,11 @@ impl<
                     .insert::<D::Error>(op.key(), op.val(), seq, true)?,
                 Op::PutTtl => {
                     self.table
-                        .insert_ttl::<D::Error>(op.key(), op.val(), seq, op.expire_at())?
+                        .insert_ttl::<D::Error>(op.key(), op.val(), seq, op.expire_at())?;
                 }
                 Op::RangeDelete => {
                     self.table
-                        .insert_range_del::<D::Error>(op.key(), op.val(), seq)?
+                        .insert_range_del::<D::Error>(op.key(), op.val(), seq)?;
                 }
             }
         }

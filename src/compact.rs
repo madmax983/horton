@@ -37,7 +37,7 @@
 //! elsewhere. At the bottom, the tombstone itself is dropped once nothing
 //! it hides is left: every older version in its range was dropped by this
 //! job, and nothing outside the job holds a version it hides (see
-//! [`Compaction::outside_same_min`]). The
+//! `Compaction::outside_same_min`). The
 //! merge learns which tombstones cover each key from a second, streaming
 //! rdel merge that runs alongside the key merge. It tracks only the
 //! tombstones that can decide a key's cover (none newer and at least as

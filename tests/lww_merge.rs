@@ -130,7 +130,7 @@ fn lww_cross_node_newer_wall_wins() {
     assert_eq!(get(&db, b"k"), Some(b"v9".to_vec()));
 }
 
-/// Same wall on both sides: the higher node_id breaks the tie,
+/// Same wall on both sides: the higher `node_id` breaks the tie,
 /// deterministically.
 #[test]
 fn lww_node_id_breaks_wall_tie() {
