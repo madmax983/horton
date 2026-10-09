@@ -15,7 +15,7 @@ and protocol) and `docs/adr/` (why it is the way it is).
   the fix in your PR. Do not wait for a separate one.
 - **Red does not merge.** A PR is done when every CI job is green.
 - **Assume your change reaches further than you think.** Code behind a
-  feature flag (`multiwriter`, `loom`) and the separate crates
+  feature flag (`multiwriter`) or the `horton_loom` cfg and the separate crates
   (`examples/ground_station`, `xtensa-smoke`) are not built by a plain
   `cargo clippy` or `cargo test`. Run the commands below before you
   call anything clean.
@@ -27,11 +27,11 @@ L="-D warnings -W clippy::pedantic -W clippy::nursery"
 cargo fmt --all --check
 cargo clippy --all-targets -- $L
 cargo clippy --all-targets --features multiwriter -- $L   # tests/drainer.rs etc. only build here
-cargo clippy --all-targets --features loom -- $L
+RUSTFLAGS="--cfg horton_loom" cargo clippy --all-targets --features multiwriter -- $L
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features multiwriter
 cargo test                                   # and --release
 cargo test --features multiwriter
-cargo test --release --features loom --test loom_ring
+RUSTFLAGS="--cfg horton_loom" cargo test --release --features multiwriter --test loom_ring
 cargo run --example quickstart
 cargo run --release --example flight_recorder -- torture 300
 ```
@@ -75,7 +75,7 @@ disagree, CI wins; update this file.
 ## Rules the code keeps
 
 - The library uses only `core`: no dependencies (except the optional,
-  test-only `loom`), no `alloc`, `#![forbid(unsafe_code)]`, no panics.
+  test-only `loom`, behind `--cfg horton_loom`), no `alloc`, `#![forbid(unsafe_code)]`, no panics.
   Every failure is an `Error` variant.
 - Every architecture-review finding has a regression test in
   `tests/review_findings.rs`; CI fails if one is `#[ignore]`d.

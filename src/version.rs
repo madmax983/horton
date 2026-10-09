@@ -33,7 +33,7 @@
 /// the write (the table's seal time; `u64::MAX` for the memtable), and
 /// the writer's sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Version {
+pub struct Version {
     /// Origin node of the table holding this version (`0` = unstamped).
     pub node: u32,
     /// Seal wall-clock (seconds) of the table holding this version.
@@ -72,7 +72,7 @@ impl Version {
 /// docs). A total order: ties are impossible — same-node sequences are
 /// unique per writer, and cross-node tuples differ in `node`.
 #[must_use]
-pub(crate) const fn version_gt(a: Version, b: Version) -> bool {
+pub const fn version_gt(a: Version, b: Version) -> bool {
     // Sequence 0 is reserved and never wins, whatever the origin.
     if a.seq == 0 {
         return false;

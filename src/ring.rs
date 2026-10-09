@@ -22,13 +22,13 @@ use shim::{AtomicU32, Ordering};
 
 /// Atomic + spin shim.
 ///
-/// With the `loom` feature the ring compiles against Loom's modeled atomics
+/// With `--cfg horton_loom` (test-only) the ring compiles against Loom's modeled atomics
 /// so `tests/loom_ring.rs` exercises the *same* claim/publish/drain code as
 /// production. Otherwise this is plain `core::sync::atomic`.
 mod shim {
-    #[cfg(not(feature = "loom"))]
+    #[cfg(not(horton_loom))]
     pub use core::sync::atomic::{AtomicU32, Ordering};
-    #[cfg(feature = "loom")]
+    #[cfg(horton_loom)]
     pub use loom::sync::atomic::{AtomicU32, Ordering};
 
     /// One spin iteration of a wait loop.
@@ -36,9 +36,9 @@ mod shim {
     /// The test/drain scaffolding spins here; the real poll-based drainer
     /// yields to the poll loop instead. Under Loom this is a scheduler yield
     /// so the model can make progress on other threads.
-    #[cfg(feature = "loom")]
+    #[cfg(horton_loom)]
     pub use loom::thread::yield_now as spin_wait;
-    #[cfg(not(feature = "loom"))]
+    #[cfg(not(horton_loom))]
     #[inline]
     pub fn spin_wait() {
         core::hint::spin_loop();

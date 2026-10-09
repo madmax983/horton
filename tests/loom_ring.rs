@@ -1,11 +1,12 @@
 //! Loom models for the `multiwriter` admission ring (`horton::ring`).
 //!
-//! Run with: `cargo test --release --features loom --test loom_ring`
+//! Run with:
+//! `RUSTFLAGS="--cfg horton_loom" cargo test --release --features multiwriter --test loom_ring`
 //!
 //! Adapted from the spike-1 `loom_ring_a` models to the SPEC's 31-bit
 //! ticket design (`docs/multiwriter-spec.md` §§1–4). The models exercise
 //! the *real* ring code compiled against Loom's modeled atomics (the
-//! `loom` feature swaps the shim in `src/ring.rs`).
+//! `--cfg horton_loom` swaps the shim in `src/ring.rs`).
 //!
 //! Each model: N producer threads claim+publish (split into two steps so
 //! Loom interleaves the claim→publish window), one consumer thread drains
@@ -26,7 +27,7 @@
 //! never exercised here — wrap safety is covered by the seeded unit
 //! tests in `tests/ring.rs`.
 
-#![cfg(all(feature = "multiwriter", feature = "loom"))]
+#![cfg(all(feature = "multiwriter", horton_loom))]
 
 use horton::ring::{PublishOutcome, Ring};
 use std::sync::Arc;

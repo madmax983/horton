@@ -1,33 +1,46 @@
 [package]
 name = "horton"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Zero-dependency, zero-allocation LSM-tree KV store (no_std, no_alloc)"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/madmax983/horton"
+readme = "README.md"
+keywords = ["lsm", "key-value", "no-std", "embedded", "flash"]
+categories = ["no-std::no-alloc", "embedded", "database-implementations", "data-structures"]
+# Ship the library, its docs and tests. Leave out scripts, CI and history.
+exclude = [
+    ".github/",
+    "CLAUDE.md",
+    "push_main.py",
+    "xtensa-check.sh",
+    "rust-toolchain.toml",
+    "MUTATION_TRIAGE.md",
+    "docs/history/",
+    "docs/ARCHITECTURE_REVIEW.md",
+]
+
+[package.metadata.docs.rs]
+features = ["multiwriter"]
 
 [dependencies]
-# Intentionally minimal: the library may only use `core`, plus `loom` as an
-# *optional* dependency enabled solely by the `loom` feature. (It cannot be a
-# dev-dependency: cargo does not link dev-dependencies into the lib target
-# itself, and the `multiwriter` ring shim compiles against Loom's modeled
-# atomics when the feature is on. It is never linked in the default or
-# `multiwriter`-only builds — zero production dependencies preserved.)
-loom = { version = "=0.7.2", optional = true }
+# None. The library uses only `core`.
+
+# Test-only: `RUSTFLAGS="--cfg horton_loom"` compiles the `multiwriter` ring
+# against Loom's modeled atomics so tests/loom_ring.rs checks the real ring
+# code. A custom cfg (not a feature) keeps Loom out of every normal build
+# and out of the public feature set.
+[target.'cfg(horton_loom)'.dependencies]
+loom = "=0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(horton_loom)"] }
 
 [features]
-# Default build is hard no_alloc. `scratch-bump` is a default-off escape hatch
-# (spec §1 refinement, 2026-09-12): a tiny dependency-free bump allocator over
-# caller-provided memory, for internal scratch only. First real need is v0.4
-# compaction; v0.2 does not implement it. It must never be required, never be
-# global, and never pull in `alloc`.
-scratch-bump = []
 # `multiwriter`: default-off MPMC admission ring (docs/multiwriter-spec.md).
 # The default build is byte-identical in behavior with or without the flag.
 multiwriter = []
-# `loom`: compile the `multiwriter` ring against Loom's modeled atomics so the
-# tests/loom_ring.rs models exercise the real ring code. Test-only; implies
-# `multiwriter`; never enabled in shipping builds.
-loom = ["dep:loom", "multiwriter"]
 
 # The host key-value store example carries unit tests for its store
 # layer; `cargo test` runs them.

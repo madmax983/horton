@@ -269,7 +269,7 @@ pub struct TableRef<const KEY_MAX: usize> {
     /// Origin node of the table's versions: the primary that sealed it
     /// (`0` = unstamped — a legacy table, or one the host has not stamped
     /// yet). Replicas order same-key versions across primaries by
-    /// (`seal_wall`, `node_id`); see [`crate::version`].
+    /// (`seal_wall`, `node_id`); see the `version` module.
     pub node_id: u32,
     /// Wall-clock (seconds) the host observed when this table sealed:
     /// the replica LWW merge's recency half. `0` = unstamped (sorts below
@@ -282,7 +282,7 @@ pub struct TableRef<const KEY_MAX: usize> {
 impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
     /// An empty (zero) reference, used for array initialization.
     /// Unstamped: `node_id` 0 sorts every comparison into the legacy
-    /// sequence-number rule (see [`crate::version`]).
+    /// sequence-number rule (see the `version` module).
     pub const EMPTY: Self = Self {
         id: 0,
         first_block: 0,

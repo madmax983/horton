@@ -4,7 +4,10 @@
 ///
 /// `E` is the error type of the caller's [`BlockDevice`](crate::BlockDevice)
 /// implementation and is passed through untouched in [`Error::Device`].
+///
+/// New variants can come in a minor release, so a `match` needs a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error<E> {
     /// Key longer than the table's `KEY_MAX`.
     KeyTooLarge {
@@ -186,3 +189,53 @@ impl Error<core::convert::Infallible> {
         }
     }
 }
+
+impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::KeyTooLarge { len, max } => write!(f, "key is {len} bytes; the limit is {max}"),
+            Self::ValueTooLarge { len, max } => {
+                write!(f, "value is {len} bytes; the limit is {max}")
+            }
+            Self::EmptyKey => f.write_str("key is empty"),
+            Self::TableFull => f.write_str("memtable is full: flush, then retry"),
+            Self::ArenaFull => f.write_str("memtable arena is full: flush, then retry"),
+            Self::BufferTooSmall { need } => write!(f, "buffer is too small: {need} bytes needed"),
+            Self::BadBufferLen => f.write_str("block buffer length is not the device block size"),
+            Self::CorruptBlock { id } => write!(f, "block {id} failed its integrity check"),
+            Self::CorruptWal { offset } => write!(f, "WAL is corrupt at block offset {offset}"),
+            Self::CorruptManifest => f.write_str("no manifest copy is valid"),
+            Self::WalFull => f.write_str("WAL is full: flush, then retry"),
+            Self::NeedsCompaction => f.write_str("compaction is needed: compact, then retry"),
+            Self::RegionFull => {
+                f.write_str("table region is full: delete and compact, archive, or grow it")
+            }
+            Self::SnapshotLimit => f.write_str("eight snapshots are live: release one"),
+            Self::ManifestFull => f.write_str("manifest has no room for the change"),
+            Self::TableTooLarge => f.write_str("table does not fit its block or slot budget"),
+            Self::CounterExhausted => f.write_str("a sequence or id counter overflowed"),
+            Self::BadLevel { level } => write!(f, "level {level} is out of range"),
+            Self::BatchFull => f.write_str("write batch is full"),
+            Self::BatchTooLarge { bytes, max } => {
+                write!(f, "batch is {bytes} bytes; one WAL block holds {max}")
+            }
+            Self::WouldResurrect { table } => {
+                write!(f, "archiving table {table} would bring deleted data back")
+            }
+            Self::IngestConflict { id } => {
+                write!(f, "table {id} is attached with a different descriptor")
+            }
+            Self::StampConflict { id } => {
+                write!(f, "table {id} is stamped with a different origin")
+            }
+            Self::BadConfig => f.write_str("config regions are empty, too small or overlap"),
+            Self::Busy => f.write_str("another read holds the read buffers: retry"),
+            Self::NotOpen => f.write_str("database is not open"),
+            Self::RingFull => f.write_str("admission ring is full: let the drainer sweep"),
+            Self::BadPayload => f.write_str("ring payload did not decode"),
+            Self::Device(e) => write!(f, "device error: {e}"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug + core::fmt::Display> core::error::Error for Error<E> {}

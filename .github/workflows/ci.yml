@@ -94,7 +94,9 @@ jobs:
       - name: clippy (multiwriter)
         run: cargo clippy --all-targets --features multiwriter -- -D warnings -W clippy::pedantic -W clippy::nursery
       - name: clippy (loom)
-        run: cargo clippy --all-targets --features loom -- -D warnings -W clippy::pedantic -W clippy::nursery
+        env:
+          RUSTFLAGS: --cfg horton_loom
+        run: cargo clippy --all-targets --features multiwriter -- -D warnings -W clippy::pedantic -W clippy::nursery
       - name: rustdoc (multiwriter, warnings are errors)
         run: cargo doc --no-deps --features multiwriter
         env:
@@ -102,7 +104,9 @@ jobs:
       - name: cargo test --features multiwriter
         run: cargo test --features multiwriter
       - name: loom models
-        run: cargo test --release --features loom --test loom_ring
+        env:
+          RUSTFLAGS: --cfg horton_loom
+        run: cargo test --release --features multiwriter --test loom_ring
 
   # The flight recorder's horton, compiled to wasm: the dump viewer reading
   # real recordings, and the live logger surviving power cuts, a killed
@@ -243,3 +247,29 @@ jobs:
           rustflags: ""
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --benches
+
+  # The library must build on its declared `rust-version`.
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.88"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - run: cargo +1.88 check --lib
+      - run: cargo +1.88 check --lib --features multiwriter
+
+  # What crates.io gets: the package builds from its own tarball.
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ""
+      - run: cargo publish --dry-run

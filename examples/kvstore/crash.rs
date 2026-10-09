@@ -42,7 +42,7 @@ pub const CHILD: &str = "crash-child";
 const KEYS: u64 = 1000;
 
 /// A child that outlives its parent stops after this long.
-const CHILD_LIFETIME: Duration = Duration::from_mins(2);
+const CHILD_LIFETIME: Duration = Duration::from_secs(120);
 
 /// One step of a thread's operation stream.
 #[derive(Debug, Clone)]
@@ -252,7 +252,7 @@ fn run_child(common: &Common, starts: &[u64], kill_after: Duration) -> Result<Ve
         }
         lines
     });
-    let ready = ready_rx.recv_timeout(Duration::from_mins(1));
+    let ready = ready_rx.recv_timeout(Duration::from_secs(60));
     if ready.is_ok() {
         std::thread::sleep(kill_after);
     }

@@ -286,7 +286,7 @@ impl<
     /// compares `(seal_wall, node_id)`, and a drop must clear every
     /// outside table, i.e. the minimum.
     fn outside_set(
-        &mut self,
+        &self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         first: KeyBound<KEY_MAX>,
         last: KeyBound<KEY_MAX>,
