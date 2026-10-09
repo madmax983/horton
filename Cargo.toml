@@ -1,6 +1,6 @@
 [package]
 name = "horton"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Zero-dependency, zero-allocation LSM-tree KV store (no_std, no_alloc)"
@@ -8,7 +8,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/madmax983/horton"
 readme = "README.md"
 keywords = ["lsm", "key-value", "no-std", "embedded", "flash"]
-categories = ["no-std::no-alloc", "embedded", "database-implementations", "data-structures"]
+categories = [
+    "no-std::no-alloc",
+    "embedded",
+    "database-implementations",
+    "data-structures",
+]
 # Ship the library, its docs and tests. Leave out scripts, CI and history.
 exclude = [
     ".github/",
@@ -71,4 +76,10 @@ harness = false
 # Keep debug symbols in release builds so instruction-count profiles
 # (valgrind --tool=callgrind / cachegrind) can attribute cost to functions.
 [profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.valgriind]
 debug = true
+inherits = "release"
