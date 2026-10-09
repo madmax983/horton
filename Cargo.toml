@@ -73,13 +73,16 @@ harness = false
 name = "scan"
 harness = false
 
-# Keep debug symbols in release builds so instruction-count profiles
-# (valgrind --tool=callgrind / cachegrind) can attribute cost to functions.
+# Release builds: fat LTO and one codegen unit for the smallest, fastest
+# code. Profiles do not reach dependents; they set their own.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 
-[profile.valgriind]
-debug = true
+# Release code with debug symbols, so instruction-count profiles
+# (valgrind --tool=callgrind / cachegrind) can attribute cost to
+# functions: `cargo build --profile valgrind --benches`.
+[profile.valgrind]
 inherits = "release"
+debug = true

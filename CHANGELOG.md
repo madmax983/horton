@@ -11,6 +11,20 @@ misread (SPEC §4.5).
 
 ## [Unreleased]
 
+### Fixed
+
+- The profiling profile is `valgrind` (it was `valgriind`). The README's
+  callgrind line uses it, so the benches keep their debug symbols.
+
+## [0.18.0] - 2026-10-09
+
+### Changed
+
+- Release builds use fat LTO, `opt-level = 3` and one codegen unit. The
+  `valgrind` profile keeps release code with debug symbols for profiling.
+  Profiles do not reach dependents: the library and its on-disk format
+  are as in 0.17.0.
+
 ## [0.17.0] - 2026-10-09
 
 The first release on crates.io.
