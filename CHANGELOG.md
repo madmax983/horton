@@ -11,6 +11,10 @@ misread (SPEC §4.5).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-09
+
+The first release on crates.io.
+
 Fixes every finding of the v0.16 architecture review
 ([`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md)). Each
 confirmed defect has a regression test in `tests/review_findings.rs`; CI
@@ -166,6 +170,18 @@ misread.
   station that re-ingests the archive.
 - `FlashBlockDevice::flash` and `into_flash`: reach the chip behind the
   device.
+- `Error` implements `Display` and `core::error::Error`.
+- `Db::tables(level)`: the sealed tables of a level, for host-side
+  archive and replication loops.
+- Replica-side last-writer-wins: `TableRef` records `node_id` and
+  `seal_wall`, `Config::with_node_id`, `Db::stamp_table`, and
+  `Error::StampConflict`. Reads merge versions across nodes by
+  `(seal_wall, node_id)`; the manifest magic is now `hrtman06`.
+- The `multiwriter` ring carries range deletes and TTL puts
+  (`WriteBatch::range_delete`, `WriteBatch::put_ttl`).
+- Package metadata for crates.io (`repository`, `rust-version = "1.88"`,
+  keywords, categories), a docs.rs build with `multiwriter`, and CI jobs
+  for the MSRV and `cargo publish --dry-run`.
 
 ### Changed
 
@@ -205,6 +221,12 @@ misread.
   range-tombstone lookup.
 - `SPEC.md` is now the normative spec only (rewritten for v0.17); its
   milestone log moved to `docs/history/milestones-v0.1-v0.16.md`.
+- **Breaking:** `Error` is `#[non_exhaustive]`. A `match` on it needs a
+  `_` arm.
+- **Breaking:** the `loom` feature is gone. Loom models run with
+  `RUSTFLAGS="--cfg horton_loom"` and `--features multiwriter`, so Loom
+  is never part of a normal build.
+- **Breaking:** the unused `scratch-bump` feature is gone.
 
 ## [0.16.0] - 2026-09-23
 

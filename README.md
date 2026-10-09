@@ -4,7 +4,8 @@ A log-structured merge-tree key-value store for places where `malloc`
 doesn't exist: firmware, kernels, bootloaders.
 
 - **`#![no_std]`, no `alloc`, zero dependencies.** The `[dependencies]` table
-  is empty; the crate uses nothing but `core`.
+  is empty; the crate uses nothing but `core`. (Loom is a test-only
+  dependency behind `--cfg horton_loom`.)
 - **`#![forbid(unsafe_code)]`.** The ESP32-S3 flash driver's register logic
   is safe too. The volatile MMIO half lives in the board crate.
 - **Every byte is caller-owned and sized at compile time.** The database, a
@@ -13,6 +14,8 @@ doesn't exist: firmware, kernels, bootloaders.
   flash the board.
 - **No panics in library code.** Every failure is an [`Error`](src/error.rs)
   variant, including `BufferTooSmall { need }` instead of silent truncation.
+  The one exception is `FlashBlockDevice::new`, which rejects a wrong board
+  configuration; in a `static` that check runs at compile time.
 - **Async from the bottom.** The only I/O boundary is a poll-based
   [`BlockDevice`](src/device.rs) trait. The API is `async fn`s that allocate
   nothing, and horton ships no executor: use embassy, RTIC, or a poll loop.
@@ -38,20 +41,18 @@ doesn't exist: firmware, kernels, bootloaders.
 
 ## Quick start
 
-horton has no dependencies and is not on crates.io yet. Use a path or git
-dependency:
-
 ```toml
 [dependencies]
-horton = { git = "https://github.com/madmax983/horton" }
+horton = "0.17"
 ```
 
 Implement `BlockDevice` for your storage, choose the sizes, and drive the
 futures with your executor. Condensed from
 [`examples/quickstart.rs`](examples/quickstart.rs), which is complete and
-runs with `cargo run --example quickstart`:
+runs with `cargo run --example quickstart`. The code below runs inside an
+`async fn`:
 
-```rust
+```rust,ignore
 use horton::{BlockDevice, Config, Progress, Scan};
 
 // The sizes horton compiles in. It allocates nothing, so every buffer is

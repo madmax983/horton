@@ -61,7 +61,7 @@ impl<const BLOCK: usize> CacheEntry<BLOCK> {
     }
 }
 
-/// Test-visible cache counters. `Copy`: snapshot them any time.
+/// Cache counters. `Copy`: take a copy at any time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheStats {
     /// Block reads served from the cache.
