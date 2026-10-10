@@ -53,9 +53,9 @@ table from `level` down to the bottom once:
 - A requested job runs after the jobs that fit for full levels and region
   pressure, and before their tight jobs. A requested job that is not
   tight must leave the reserve free.
-- When a tight job for a wanted level gives up while the request has
-  work, the step returns `Done`, not `RegionFull`: the next step runs
-  the request.
+- A new request ends a running job (what it committed stays), so an
+  older job cannot skip tables for it. A requested job that fails with
+  an error is skipped too, so the request does not stop on it.
 - The state is about 20 bytes in `Db`, in memory only. `open()` clears it.
 
 The reserve stays at 2 slots.

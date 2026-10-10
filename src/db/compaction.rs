@@ -137,7 +137,9 @@ impl<
     /// that level. When a table's job gives up, or a foreign table vetoes
     /// it, the request skips that table. When no slot is free,
     /// [`compact_step`](Db::compact_step) returns [`Error::RegionFull`]. A
-    /// new request replaces an open one. The request is in memory only: [`open`](Db::open) clears it.
+    /// new request replaces an open one, and a running job ends (what it
+    /// committed stays). A requested job that fails with an error is
+    /// skipped too. The request is in memory only: [`open`](Db::open) clears it.
     /// With one level there is no compaction, and this does nothing.
     ///
     /// # Errors
@@ -152,7 +154,11 @@ impl<
         if LEVELS < 2 {
             return Ok(());
         }
-        self.manual_level = Some(u8::try_from(level).map_err(|_| Error::BadLevel { level })?);
+        let at = u8::try_from(level).map_err(|_| Error::BadLevel { level })?;
+        // A running job may serve an older request: it must not skip
+        // tables for this one. Its committed outputs stay.
+        self.abort_job();
+        self.manual_level = Some(at);
         self.manual_mark = self.manifest.next_table_id();
         self.manual_start = self.manual_mark;
         self.manual_skip = 0;
@@ -324,6 +330,11 @@ impl<
             self.compact_advance(scratch).await
         };
         if step.is_err() {
+            // A requested job that fails would fail again: the request
+            // skips its tables, so it does not stall on them.
+            if scratch.manual {
+                self.manual_skip_sources(scratch);
+            }
             self.abort_job();
             scratch.reset();
         }
@@ -427,8 +438,7 @@ impl<
         self.job_active = false;
         self.job_inputs = 0;
         c.reset();
-        // While a request has work, the next step runs it: no error yet.
-        if manual || progressed || self.manual_pending() {
+        if manual || progressed {
             Ok(Progress::Done)
         } else {
             Err(Error::RegionFull)
@@ -1134,6 +1144,20 @@ impl<
             .checked_add(done.data_blocks)
             .and_then(|n| n.checked_add(3))
             .ok_or(Error::TableTooLarge)?;
+        // The final output's pieces cover no key above the live inputs'
+        // last keys. A piece's exclusive end can be one key past them (the
+        // successor of a split output's last key, which is the next
+        // table's first key), so the bound is clipped to them.
+        let rdel_last = if hi.is_none() {
+            let cap = self.live_inputs_last(c);
+            if rdel_stats.last.as_slice() > cap.as_slice() {
+                cap
+            } else {
+                rdel_stats.last
+            }
+        } else {
+            rdel_stats.last
+        };
         let id = self.manifest.alloc_table_id::<D::Error>()?;
         Ok(Some(TableRef {
             id,
@@ -1142,13 +1166,13 @@ impl<
             // `KeyBound::min/max` let `EMPTY` lose, so a missing section
             // never corrupts the bounds. A non-final output's pieces end
             // at the successor of its last key, so its last key bounds
-            // them exactly; the final output keeps the conservative
-            // (exclusive) piece end.
+            // them exactly; the final output keeps the piece end, clipped
+            // to the inputs (`rdel_last`).
             first_key: done.first_key.min(rdel_stats.first),
             last_key: if hi.is_some() {
                 done.last_key
             } else {
-                done.last_key.max(rdel_stats.last)
+                done.last_key.max(rdel_last)
             },
             max_seq: done.max_seq.max(rdel_stats.max_seq),
             min_seq: done.min_seq,
@@ -1161,6 +1185,26 @@ impl<
             node_id: c.job_node,
             seal_wall: c.job_max_wall,
         }))
+    }
+
+    /// The largest last key of the job's live inputs: no key the job
+    /// merges lies above it.
+    fn live_inputs_last(
+        &self,
+        c: &Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> KeyBound<KEY_MAX> {
+        let mut last = KeyBound::EMPTY;
+        for i in 0..c.n_src {
+            if c.src_retired & (1u8 << i) == 0 {
+                last = last.max(c.inputs[i].tref.last_key);
+            }
+        }
+        for &id in &c.tgt[c.tgt_retired..c.n_tgt] {
+            if let Some(t) = self.manifest.find_table(id) {
+                last = last.max(t.last_key);
+            }
+        }
+        last
     }
 
     /// Commits one output (if any) in one manifest write, settling every

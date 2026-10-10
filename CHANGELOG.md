@@ -33,6 +33,9 @@ misread (SPEC §4.5).
   estimate, a *tight* job runs with one free slot and never grows the
   region. A region full of expired or deleted data now gives its space
   back; before, every write failed with `RegionFull` (issue #32).
+- The last output of a compaction job no longer claims a key range past
+  its inputs. Its range-tombstone end could be the next table's first
+  key, so two tables of one level overlapped.
 - The profiling profile is `valgrind` (it was `valgriind`). The README's
   callgrind line uses it, so the benches keep their debug symbols.
 

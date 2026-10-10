@@ -422,7 +422,7 @@ fn a_request_keeps_snapshot_views() {
 }
 
 /// Two levels: L0 and the bottom.
-type TwoLevelDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 2, 4, 1024, 8>;
+type TwoLevelDb<D = MemDevice<4096>> = horton::Db<D, 4096, 256, 1024, 64, 4096, 2, 4, 1024, 8>;
 /// One level: no compaction.
 type OneLevelDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 1, 4, 1024, 8>;
 
@@ -548,19 +548,84 @@ fn a_veto_at_a_middle_level_skips_only_the_vetoed_table() {
     assert_eq!(db.check_invariants(), Ok(()));
 }
 
-/// A tight job for a full level is in flight when a request opens. Its
-/// give-up does not fail the step: the request has work for the next one.
+/// A tight job for a full level is in flight when a request opens. The
+/// request ends that job, so its give-up cannot fail the request.
 #[test]
-fn a_request_turns_a_tight_give_up_into_progress() {
+fn a_new_request_ends_a_running_job() {
     let mut db = new_db();
     let mut c = KvCompaction::new();
     let (_, err) = fill(&mut db, &mut c, b's', 0, Stop::Full);
     assert!(matches!(err, Some(Error::RegionFull)), "{err:?}");
     // The first step starts a tight job over live data.
     assert_eq!(block_on(db.compact_step(&mut c)), Ok(Progress::More));
+    assert_eq!(db.slot_stats().reserved, 1);
     db.request_compaction(0).unwrap();
+    assert_eq!(db.slot_stats().reserved, 0);
     assert_eq!(job(&mut db, &mut c), Ok(()));
     assert!(db.compaction_pending());
+}
+
+/// Fails reads while `fail` is set.
+struct FailDevice {
+    inner: MemDevice<4096>,
+    fail: core::cell::Cell<bool>,
+}
+
+impl BlockDevice for FailDevice {
+    type Error = ();
+    const BLOCK: usize = 4096;
+
+    fn poll_read_block(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> core::task::Poll<Result<(), ()>> {
+        if self.fail.get() {
+            return core::task::Poll::Ready(Err(()));
+        }
+        self.inner.poll_read_block(cx, id, buf).map_err(|_| ())
+    }
+
+    fn poll_write_block(
+        &mut self,
+        cx: &mut core::task::Context<'_>,
+        id: u64,
+        buf: &[u8],
+    ) -> core::task::Poll<Result<(), ()>> {
+        self.inner.poll_write_block(cx, id, buf).map_err(|_| ())
+    }
+
+    fn poll_flush(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Result<(), ()>> {
+        self.inner.poll_flush(cx).map_err(|_| ())
+    }
+}
+
+/// A requested job that fails is skipped: the request does not stall on
+/// the same table at every step.
+#[test]
+fn a_request_skips_a_job_that_fails() {
+    let dev = FailDevice {
+        inner: MemDevice::new(),
+        fail: core::cell::Cell::new(false),
+    };
+    let mut db = TwoLevelDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"a", b"v")).unwrap();
+    block_on(db.flush()).unwrap();
+    let mut c = SmallComp::new();
+    db.request_compaction(0).unwrap();
+    db.device().fail.set(true);
+    assert!(matches!(
+        block_on(db.compact_step(&mut c)),
+        Err(Error::Device(()))
+    ));
+    db.device().fail.set(false);
+    assert!(!db.compaction_pending(), "the failed table is skipped");
+    assert_eq!(db.level_tables(0).unwrap().len(), 1);
+    let mut buf = [0u8; 1024];
+    assert_eq!(block_on(db.get(b"a", &mut buf)), Ok(Some(1)));
+    assert_eq!(db.slot_stats().reserved, 0);
 }
 
 /// A request does not rewrite the bottom tables that its own jobs wrote:
@@ -605,6 +670,54 @@ fn a_request_does_not_rewrite_its_own_bottom_tables() {
         .map(|t| t.id)
         .collect();
     assert_eq!(last, born, "the request rewrote its own bottom tables");
+}
+
+/// A rewrite's last output keeps its range-tombstone pieces. They must not
+/// reach into the next table: a piece of a split output ends at the
+/// successor of the output's last key, which is the next table's first
+/// key. Found by the lifecycle fuzzer (seed `0x7167a054`).
+#[test]
+fn a_rewrite_never_overlaps_the_next_table() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), tight_config());
+    block_on(db.open()).unwrap();
+    let mut c = SmallComp::new();
+    let put_all = |db: &mut TestDb<MemDevice<4096>>, c: &mut SmallComp, tag: u8| {
+        for i in 0..120u32 {
+            let k = format!("k{i:04}");
+            if block_on(db.put(k.as_bytes(), &[tag; 100])).is_err() {
+                while block_on(db.flush()) == Err(Error::NeedsCompaction) {
+                    small_drain(db, c);
+                }
+                block_on(db.put(k.as_bytes(), &[tag; 100])).unwrap();
+            }
+        }
+    };
+    // Old versions, a snapshot, then a range tombstone over all of them
+    // and new versions: the snapshot keeps the tombstone and the old
+    // versions, so bottom tables split inside the tombstone, and each
+    // piece of a split output ends at the next table's first key.
+    put_all(&mut db, &mut c, b'o');
+    let snap = db.snapshot().unwrap();
+    block_on(db.delete_range(b"k", b"l")).unwrap();
+    put_all(&mut db, &mut c, b'n');
+    while block_on(db.flush()) == Err(Error::NeedsCompaction) {
+        small_drain(&mut db, &mut c);
+    }
+    db.request_compaction(0).unwrap();
+    small_drain(&mut db, &mut c);
+    assert!(db.level_tables(SMALL_LEVELS - 1).unwrap().len() >= 2);
+    // Each full bottom table is rewritten alone, and the snapshot keeps
+    // its tombstone piece: its last output must stop at its last key.
+    db.request_compaction(SMALL_LEVELS - 1).unwrap();
+    small_drain(&mut db, &mut c);
+    assert_eq!(db.check_invariants(), Ok(()));
+    db.release_snapshot(snap);
+    let mut buf = [0u8; 1024];
+    for i in [0u32, 60, 119] {
+        let k = format!("k{i:04}");
+        let n = block_on(db.get(k.as_bytes(), &mut buf)).unwrap().unwrap();
+        assert_eq!(&buf[..n], &[b'n'; 100]);
+    }
 }
 
 /// With one level there is no compaction: a request does nothing.
