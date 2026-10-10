@@ -29,9 +29,11 @@ slot (`model_tight_job`, checked for every short sequence in
 `src/model.rs`). If the next commit would break the rule, the job drops
 that output (it releases the slot; nothing points at it) and ends. If a
 job for a wanted level committed nothing, the step returns `RegionFull`:
-the job cannot free a slot. A requested job skips its tables. A job that
-shrinks data (by a purge or by tombstones) retires inputs as it writes.
-As a result, it can run at the reserve.
+the job cannot free a slot. A requested job skips its tables. A job
+whose outputs retire inputs as it writes (data that a purge or tombstones
+remove) can run at the reserve. The rule applies after each commit, not
+only at the end: a job whose first output covers less than one input
+gives up, also when later inputs would shrink.
 
 **Requested compaction.** `Db::request_compaction(level)` compacts each
 table from `level` down to the bottom once:
@@ -42,14 +44,19 @@ table from `level` down to the bottom once:
   does not shrink costs I/O but never a slot.
 - Each level takes a mark (the next table id) when the request reaches
   it. Tables below the mark are due. The request moves on only between
-  jobs, so every output of a job is due at the next level.
+  jobs, so every output of a job is due at the next level. The bottom
+  level takes the mark from when the request opened: the request does
+  not rewrite the bottom tables its own jobs wrote there.
 - A table whose job gives up, or that a foreign table vetoes, is skipped
-  (one bit per slot). The request ends, unless no slot is free. Then
+  (one bit per slot). A veto skips only the tables of the vetoed job. The request ends, unless no slot is free. Then
   `compact_step` returns `RegionFull`.
 - A requested job runs after the jobs that fit for full levels and region
   pressure, and before their tight jobs. A requested job that is not
   tight must leave the reserve free.
-- The state is about 16 bytes in `Db`, in memory only. `open()` clears it.
+- When a tight job for a wanted level gives up while the request has
+  work, the step returns `Done`, not `RegionFull`: the next step runs
+  the request.
+- The state is about 20 bytes in `Db`, in memory only. `open()` clears it.
 
 The reserve stays at 2 slots.
 
@@ -58,7 +65,9 @@ The reserve stays at 2 slots.
 - A full region of purgeable or deleted data recovers: set
   `purge_before` (or delete), call `request_compaction(0)`, and run
   `compact_step` while `compaction_pending()` is true.
-- A request reads and writes every table it reaches once. A bottom table
+- A request reads and writes every table it reaches once. Set
+  `purge_before` before the request: bottom tables that the request's
+  own jobs wrote are not rewritten. A bottom table
   that does not shrink costs one read and one write. When its output does
   not fit one slot, the job drops the output and the table stays.
 - A tight job for a wanted level over live data drops its first output

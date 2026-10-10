@@ -257,7 +257,7 @@ an open request has work.
   compacts each table from `level` to the bottom once, below the
   triggers too. Above the bottom a table moves down a level; at the
   bottom it is rewritten in place with its small neighbours, as a tight
-  job. A requested job runs after the jobs that fit for full levels and
+  job. The bottom tables the request's own jobs wrote are not rewritten. A requested job runs after the jobs that fit for full levels and
   region pressure, and before their tight jobs. A table whose job gives
   up, or that a foreign table vetoes, is skipped. When no slot is free,
   `compact_step` returns `RegionFull`. The request is in memory only.

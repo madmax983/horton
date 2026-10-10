@@ -60,7 +60,8 @@ pub enum Error<E> {
     NeedsCompaction,
     /// The table region is full: no slot is free and compaction cannot
     /// free one (`compact_step` reports this when a level wants a job but
-    /// no job can free a slot). Nothing was written. **Remedy:** delete
+    /// no job can free a slot, or a request has work but no slot is free).
+    /// Nothing was written. **Remedy:** delete
     /// data or set [`purge_before`](crate::Compaction::purge_before), then
     /// call [`request_compaction`](crate::Db::request_compaction) and
     /// compact; archive tables; or configure a larger table region. Reads

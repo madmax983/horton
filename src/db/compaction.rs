@@ -54,7 +54,7 @@ enum Selected {
     Moved,
     /// A merge job is set up in the scratch.
     Merging,
-    /// The manual request skipped tables that no job can take.
+    /// The request skipped tables that no job can take.
     Skipped,
 }
 
@@ -63,7 +63,7 @@ enum Selected {
 struct Pick {
     /// Admit the job with one free slot, as a tight job.
     tight: bool,
-    /// Serve the manual request: only due tables are sources.
+    /// Serve the request: only due tables are sources.
     manual: bool,
 }
 
@@ -105,14 +105,14 @@ impl<
     /// Reports whether [`compact_step`](Db::compact_step) has work: a job
     /// is in flight, or it would select one right now — some level above
     /// the bottom holds `>= TABLES` tables, or the table region is down to
-    /// its compaction reserve while L0 holds two or more tables (merging
-    /// them frees slots). Unlike [`Progress::Done`], which a finished job
+    /// its compaction reserve while a level above the bottom has a table
+    /// to push down (L0: two or more tables), or an open request has
+    /// work. Unlike [`Progress::Done`], which a finished job
     /// also returns, this distinguishes "a job just finished, more may be
     /// pending" from "nothing to do" — firmware idle loops and test
     /// drivers use it to decide whether another `compact_step` is
     /// worthwhile. [`Error::NeedsCompaction`] is returned only while this
-    /// is true. An open [`request_compaction`](Db::request_compaction)
-    /// with work left also makes it true.
+    /// is true.
     #[must_use]
     pub fn compaction_pending(&self) -> bool {
         self.job_active || self.full_level().is_some() || self.manual_pending()
@@ -129,7 +129,9 @@ impl<
     /// tombstones hide and no snapshot can see, so this gives deleted and
     /// expired space back.
     /// [`compaction_pending`](Db::compaction_pending) is true until the
-    /// request is done. Flush first to include the memtable.
+    /// request is done. Flush first to include the memtable, and set
+    /// `purge_before` before the request: the request does not rewrite
+    /// the bottom tables its own jobs wrote.
     ///
     /// A level's tables are the ones it holds when the request reaches
     /// that level. When a table's job gives up, or a foreign table vetoes
@@ -152,12 +154,14 @@ impl<
         }
         self.manual_level = Some(u8::try_from(level).map_err(|_| Error::BadLevel { level })?);
         self.manual_mark = self.manifest.next_table_id();
+        self.manual_start = self.manual_mark;
         self.manual_skip = 0;
         self.manual_settle();
         Ok(())
     }
 
-    /// Whether the manual request still has table `t` to compact.
+    /// Whether the request still has table `t` to compact. Every live table
+    /// has a slot (`open()` checks it), so a skip bit can always mark it.
     fn is_due(&self, t: &TableRef<KEY_MAX>) -> bool {
         t.id < self.manual_mark
             && self
@@ -165,7 +169,7 @@ impl<
                 .is_none_or(|slot| self.manual_skip & (1u64 << slot) == 0)
     }
 
-    /// Whether level `l` holds a table the manual request must compact.
+    /// Whether level `l` holds a table the request must compact.
     fn level_has_due(&self, l: usize) -> bool {
         self.manifest
             .level(l)
@@ -177,7 +181,7 @@ impl<
         (l + 1..LEVELS).any(|m| self.manifest.level(m).is_some_and(|ts| !ts.is_empty()))
     }
 
-    /// Whether the manual request has work left.
+    /// Whether the request has work left.
     fn manual_pending(&self) -> bool {
         self.manual_level.is_some_and(|l| {
             let l = usize::from(l);
@@ -185,10 +189,12 @@ impl<
         })
     }
 
-    /// Moves the manual request to the first level with due tables, and
+    /// Moves the request to the first level with due tables, and
     /// ends it when no level has work. A level the request reaches takes
-    /// a new mark: every table it holds at that time is due. Nothing moves
-    /// while a job runs: the job can still add tables to the next level.
+    /// a new mark: every table it holds at that time is due. The bottom
+    /// level takes the start mark instead: a table the request's own jobs
+    /// wrote there was written at the bottom already. Nothing moves while
+    /// a job runs: the job can still add tables to the next level.
     fn manual_settle(&mut self) {
         if self.job_active {
             return;
@@ -204,7 +210,11 @@ impl<
             }
             // `l + 1 < LEVELS <= 64`: the cast cannot fail.
             self.manual_level = u8::try_from(l + 1).ok();
-            self.manual_mark = self.manifest.next_table_id();
+            self.manual_mark = if l + 1 == LEVELS - 1 {
+                self.manual_start
+            } else {
+                self.manifest.next_table_id()
+            };
             self.manual_skip = 0;
         }
     }
@@ -283,7 +293,8 @@ impl<
     /// # Errors
     ///
     /// [`Error::RegionFull`] when a level wants a job but no job can free
-    /// a slot (delete data or purge, archive, or grow the region);
+    /// a slot, or a request has work but no slot is free (delete data or
+    /// purge, archive, or grow the region);
     /// [`Error::TableTooLarge`] when a slot cannot hold the job's
     /// range-tombstone budget plus one key's versions; [`Error::CorruptBlock`] on a torn input table
     /// (compaction never silently drops entries); [`Error::Device`] on I/O
@@ -410,19 +421,14 @@ impl<
         }
         let progressed = c.outputs > 0;
         if c.manual {
-            for i in 0..c.n_src {
-                if c.src_retired & (1u8 << i) == 0
-                    && let Some(slot) = self.slot_of(&c.inputs[i].tref)
-                {
-                    self.manual_skip |= 1u64 << slot;
-                }
-            }
+            self.manual_skip_sources(c);
         }
         let manual = c.manual;
         self.job_active = false;
         self.job_inputs = 0;
         c.reset();
-        if manual || progressed {
+        // While a request has work, the next step runs it: no error yet.
+        if manual || progressed || self.manual_pending() {
             Ok(Progress::Done)
         } else {
             Err(Error::RegionFull)
@@ -561,7 +567,7 @@ impl<
     ///    wants (see `full_level`). A merge is admitted only when the free
     ///    slots cover its need (`job_need`); an L0 job shrinks to its
     ///    oldest tables to fit.
-    /// 2. The manual request (see [`request_compaction`](Db::request_compaction)).
+    /// 2. The request (see [`request_compaction`](Db::request_compaction)).
     /// 3. Round 1's levels again, as tight jobs: one free slot is enough,
     ///    and the job never grows the region (see `tight_commit_ok`).
     ///
@@ -615,7 +621,7 @@ impl<
         }
     }
 
-    /// Selects a job for the manual request at its current level: an
+    /// Selects a job for the request at its current level: an
     /// admitted job first, then a tight one. When no job can take the due
     /// tables (a foreign table vetoes them), they are skipped.
     ///
@@ -630,6 +636,7 @@ impl<
         let Some(l) = self.manual_level.map(usize::from) else {
             return Ok(None);
         };
+        let skipped = self.manual_skip;
         for tight in [false, true] {
             let pick = Pick {
                 tight,
@@ -642,14 +649,31 @@ impl<
         if self.slots.free_slots() == 0 {
             return Err(Error::RegionFull);
         }
-        for t in self.manifest.level(l).unwrap_or(&[]) {
-            if self.is_due(t)
-                && let Some(slot) = self.slot_of(t)
+        // With a free slot, only a veto stops a job, and it skipped the
+        // vetoed tables. If none was skipped, skip the level's due tables,
+        // so the request always moves on.
+        if self.manual_skip == skipped {
+            for t in self.manifest.level(l).unwrap_or(&[]) {
+                if self.is_due(t)
+                    && let Some(slot) = self.slot_of(t)
+                {
+                    self.manual_skip |= 1u64 << slot;
+                }
+            }
+        }
+        Ok(Some(Selected::Skipped))
+    }
+
+    /// Skips the live sources of the job in `c` for the rest of the
+    /// request.
+    fn manual_skip_sources(&mut self, c: &Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>) {
+        for i in 0..c.n_src {
+            if c.src_retired & (1u8 << i) == 0
+                && let Some(slot) = self.slot_of(&c.inputs[i].tref)
             {
                 self.manual_skip |= 1u64 << slot;
             }
         }
-        Ok(Some(Selected::Skipped))
     }
 
     /// Selects a job draining level `src` into `c`, or moves a table down
@@ -741,6 +765,9 @@ impl<
             .iter()
             .any(|t| t.node_id != node && ranges_overlap(first, last, t.first_key, t.last_key))
         {
+            if pick.manual && pick.tight {
+                self.manual_skip_sources(c);
+            }
             c.reset();
             return Ok(None);
         }

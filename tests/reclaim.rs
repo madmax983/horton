@@ -469,6 +469,144 @@ fn a_request_skips_a_table_that_a_foreign_table_vetoes() {
     assert_eq!(db.check_invariants(), Ok(()));
 }
 
+/// Three levels, 12 slots of 8 blocks: tables split often.
+type ThreeLevelDb = horton::Db<MemDevice<4096>, 4096, 256, 1024, 64, 4096, 3, 4, 1024, 8>;
+
+const fn three_config() -> horton::Config {
+    horton::Config::new(8, 136, 136, 136 + 12 * 8, 0, 4)
+}
+
+fn three_flush(db: &mut ThreeLevelDb, c: &mut SmallComp) {
+    while block_on(db.flush()) == Err(Error::NeedsCompaction) {
+        while block_on(db.compact_step(c)).unwrap() == Progress::More {}
+    }
+}
+
+fn three_drain(db: &mut ThreeLevelDb, c: &mut SmallComp) {
+    for _ in 0..MAX_STEPS {
+        if !db.compaction_pending() {
+            return;
+        }
+        block_on(db.compact_step(c)).unwrap();
+    }
+    panic!("compaction never finished");
+}
+
+/// At a middle level, a veto skips only the vetoed table: every other
+/// due table still moves down.
+#[test]
+fn a_veto_at_a_middle_level_skips_only_the_vetoed_table() {
+    let mut db = ThreeLevelDb::new(MemDevice::<4096>::new(), three_config());
+    block_on(db.open()).unwrap();
+    let mut c = SmallComp::new();
+    // A foreign table at "b" and a same-node table at "y", at the bottom.
+    for k in [b"b", b"y"] {
+        block_on(db.put(k, b"v")).unwrap();
+        three_flush(&mut db, &mut c);
+        db.request_compaction(0).unwrap();
+        three_drain(&mut db, &mut c);
+        if k == b"b" {
+            let id = db.level_tables(2).unwrap()[0].id;
+            assert!(block_on(db.stamp_table(id, 2, 100)).unwrap());
+        }
+    }
+    // Keys around both: L0 jobs leave several tables at level 1.
+    for (n, p) in b"acxz".iter().enumerate() {
+        for i in 0..150u32 {
+            let k = format!("{}{i:03}", char::from(*p));
+            let v = [u8::try_from(n).unwrap(); 100];
+            if block_on(db.put(k.as_bytes(), &v)).is_err() {
+                three_flush(&mut db, &mut c);
+                block_on(db.put(k.as_bytes(), &v)).unwrap();
+            }
+        }
+    }
+    three_flush(&mut db, &mut c);
+    three_drain(&mut db, &mut c);
+    assert!(db.level_tables(1).unwrap().len() >= 2);
+
+    db.request_compaction(1).unwrap();
+    three_drain(&mut db, &mut c);
+    // Only tables that overlap the foreign table stay at level 1.
+    let foreign: Vec<_> = db
+        .level_tables(2)
+        .unwrap()
+        .iter()
+        .filter(|t| t.node_id == 2)
+        .copied()
+        .collect();
+    for t in db.level_tables(1).unwrap() {
+        assert!(
+            foreign
+                .iter()
+                .any(|f| f.first_key.as_slice() <= t.last_key.as_slice()
+                    && t.first_key.as_slice() <= f.last_key.as_slice()),
+            "table {} stayed at level 1 without a veto",
+            t.id
+        );
+    }
+    assert_eq!(db.check_invariants(), Ok(()));
+}
+
+/// A tight job for a full level is in flight when a request opens. Its
+/// give-up does not fail the step: the request has work for the next one.
+#[test]
+fn a_request_turns_a_tight_give_up_into_progress() {
+    let mut db = new_db();
+    let mut c = KvCompaction::new();
+    let (_, err) = fill(&mut db, &mut c, b's', 0, Stop::Full);
+    assert!(matches!(err, Some(Error::RegionFull)), "{err:?}");
+    // The first step starts a tight job over live data.
+    assert_eq!(block_on(db.compact_step(&mut c)), Ok(Progress::More));
+    db.request_compaction(0).unwrap();
+    assert_eq!(job(&mut db, &mut c), Ok(()));
+    assert!(db.compaction_pending());
+}
+
+/// A request does not rewrite the bottom tables that its own jobs wrote:
+/// that costs flash wear and frees nothing.
+#[test]
+fn a_request_does_not_rewrite_its_own_bottom_tables() {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), tight_config());
+    block_on(db.open()).unwrap();
+    for i in 0..3u32 {
+        for j in 0..30u32 {
+            let k = format!("k{i}{j:03}");
+            block_on(db.put(k.as_bytes(), &[b'v'; 100])).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+    }
+    let before = (0..SMALL_LEVELS)
+        .flat_map(|l| db.level_tables(l).unwrap().iter().map(|t| t.id))
+        .max()
+        .unwrap();
+    let mut c = SmallComp::new();
+    db.request_compaction(0).unwrap();
+    let mut born = Vec::new();
+    while db.compaction_pending() {
+        block_on(db.compact_step(&mut c)).unwrap();
+        let above: usize = (0..SMALL_LEVELS - 1)
+            .map(|l| db.level_tables(l).unwrap().len())
+            .sum();
+        let bottom = db.level_tables(SMALL_LEVELS - 1).unwrap();
+        if above == 0 && born.is_empty() {
+            born = bottom
+                .iter()
+                .map(|t| t.id)
+                .filter(|&id| id > before)
+                .collect();
+        }
+    }
+    assert!(!born.is_empty());
+    let last: Vec<_> = db
+        .level_tables(SMALL_LEVELS - 1)
+        .unwrap()
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert_eq!(last, born, "the request rewrote its own bottom tables");
+}
+
 /// With one level there is no compaction: a request does nothing.
 #[test]
 fn a_request_on_one_level_does_nothing() {

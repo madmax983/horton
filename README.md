@@ -122,6 +122,9 @@ while db.compaction_pending() {
 }
 ```
 
+`RegionFull` from this loop means the rest is live data: delete, archive,
+or grow the region.
+
 ## Demo: a flight recorder that survives power cuts
 
 [`examples/flight_recorder`](examples/flight_recorder) is a sensor logger

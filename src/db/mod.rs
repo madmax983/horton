@@ -295,6 +295,10 @@ pub struct Db<
     /// Tables at `manual_level` with an id below this mark are due: the
     /// request compacts each of them once.
     manual_mark: u32,
+    /// The next table id when the request opened. At the bottom level the
+    /// mark is this: the tables the request's own jobs wrote there are
+    /// done already.
+    manual_start: u32,
     /// Slots of due tables that the request skips: their job gave up, or
     /// a foreign table vetoed it. One bit per slot.
     manual_skip: u64,
@@ -511,6 +515,7 @@ impl<
             job_inputs: 0,
             manual_level: None,
             manual_mark: 0,
+            manual_start: 0,
             manual_skip: 0,
             cfg: config,
             next_seq: 0,
