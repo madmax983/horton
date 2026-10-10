@@ -29,6 +29,12 @@
 //!    [`model_ttl_emit_tombstone`] pins compaction's purge emission:
 //!    an expired value becomes a tombstone at the same sequence number —
 //!    never a silent drop (see its docs for why the drop is unsound).
+//! 4. **Tight compaction never grows the region.** A job admitted with
+//!    fewer free slots than its estimate commits an output only when its
+//!    committed outputs do not exceed its retired inputs.
+//!    [`model_tight_commit_ok`] is the rule and [`model_tight_job`] the
+//!    slot accounting it keeps: free slots never fall below the start
+//!    value, so the next output always has a slot.
 
 /// One key-version in the model: a mutation's sequence number and whether
 /// it was a deletion.
@@ -303,6 +309,66 @@ pub fn model_visible_value(
 #[must_use]
 pub const fn model_ttl_emit_tombstone(expire_at: u64, purge_before: u64) -> bool {
     expire_at != 0 && expire_at <= purge_before
+}
+
+/// Models the commit rule of a tight compaction job (ADR-0015).
+///
+/// `outputs` and `retired` count the job's committed outputs and retired
+/// input tables, this commit included. The commit is allowed only when
+/// `outputs <= retired`: the job then uses no more slots than it frees.
+#[must_use]
+pub const fn model_tight_commit_ok(outputs: u32, retired: u32) -> bool {
+    outputs <= retired
+}
+
+/// Result of [`model_tight_job`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TightJob {
+    /// Free slots when the job stops.
+    pub free: u32,
+    /// Commits applied before the job stopped.
+    pub commits: usize,
+    /// Lowest free count seen just before an output slot is taken.
+    pub min_free_at_open: u32,
+}
+
+/// Models the slot accounting of one tight compaction job.
+///
+/// The job starts with `free` free slots. Each item of `retires` is one
+/// output: the job takes a free slot for it, then commits it, and that
+/// commit retires the given number of input tables (their slots become
+/// free). A commit that [`model_tight_commit_ok`] refuses is abandoned:
+/// its slot is given back and the job stops. The job also stops when no
+/// slot is free for the next output.
+///
+/// Property (see the tests): with `free >= 1`, no output ever finds the
+/// region without a free slot, and the job ends with at least `free` free
+/// slots.
+#[must_use]
+pub fn model_tight_job(free: u32, retires: &[u32]) -> TightJob {
+    let mut free_now = free;
+    let mut freed = 0u32;
+    let mut commits = 0usize;
+    let mut min_free_at_open = free;
+    for &r in retires {
+        min_free_at_open = min_free_at_open.min(free_now);
+        if free_now == 0 {
+            break;
+        }
+        // The output takes a slot; its commit is checked with it counted.
+        let outputs = u32::try_from(commits).map_or(u32::MAX, |n| n.saturating_add(1));
+        if !model_tight_commit_ok(outputs, freed.saturating_add(r)) {
+            break;
+        }
+        freed = freed.saturating_add(r);
+        free_now = free_now - 1 + r;
+        commits += 1;
+    }
+    TightJob {
+        free: free_now,
+        commits,
+        min_free_at_open,
+    }
 }
 
 #[cfg(test)]
@@ -598,5 +664,46 @@ mod tests {
         assert!(!model_ttl_emit_tombstone(101, 100));
         assert!(!model_ttl_emit_tombstone(0, u64::MAX));
         assert!(!model_ttl_emit_tombstone(100, 0));
+    }
+
+    #[test]
+    fn tight_commit_rule() {
+        assert!(model_tight_commit_ok(1, 1));
+        assert!(model_tight_commit_ok(0, 3));
+        assert!(!model_tight_commit_ok(2, 1));
+    }
+
+    /// Every sequence of up to 5 outputs, each retiring 0..=3 inputs, from
+    /// 1..=3 free slots: no output finds the region full, and the job
+    /// never ends with fewer free slots than it started with.
+    #[test]
+    fn tight_job_never_grows_the_region() {
+        for free in 1..=3u32 {
+            for len in 0..=5u32 {
+                for code in 0..4u32.pow(len) {
+                    let mut retires = [0u32; 5];
+                    let mut c = code;
+                    for r in retires.iter_mut().take(len as usize) {
+                        *r = c % 4;
+                        c /= 4;
+                    }
+                    let job = model_tight_job(free, &retires[..len as usize]);
+                    assert!(job.min_free_at_open >= 1, "{free} {retires:?}");
+                    assert!(job.free >= free, "{free} {retires:?}");
+                    assert!(job.commits <= len as usize);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tight_job_stops_at_the_first_refused_commit() {
+        // The second output retires nothing: 2 outputs > 1 retired.
+        let job = model_tight_job(1, &[1, 0, 5]);
+        assert_eq!(job.commits, 1);
+        assert_eq!(job.free, 1);
+        // A first output that retires nothing is refused: no change.
+        assert_eq!(model_tight_job(2, &[0]).free, 2);
+        assert_eq!(model_tight_job(2, &[0]).commits, 0);
     }
 }

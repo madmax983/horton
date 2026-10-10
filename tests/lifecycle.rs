@@ -555,6 +555,14 @@ impl Harness {
                 self.name = "reopen";
                 self.reopen();
             }
+            94..=95 => {
+                self.name = "request_compaction";
+                let level = self.rng.next_bounded(4);
+                self.db.request_compaction(level).unwrap();
+                if self.drain().is_err() {
+                    self.full = true;
+                }
+            }
             _ => {
                 self.name = "scan";
                 self.check_scans();

@@ -227,7 +227,8 @@ table per slot, wholly inside it (ADR-0009). `open()` rebuilds the slot
 map from the manifest and refuses a slot smaller than a full memtable's
 table (`BadConfig`). Flush and ingest claim a free slot after their
 manifest commit; a compaction job reserves its output slot for the job's
-life. Two slots are kept free for compaction. Every table writer is
+life. Two slots are kept free for compaction; a tight job needs only
+one (§4.7). Every table writer is
 capped at its slot (`TableTooLarge`). Allocation is next-fit, which
 spreads flash wear.
 
@@ -245,6 +246,18 @@ output's seal and commit) and returns `More` or `Done`;
   L0 job shrinks to its oldest tables. A non-small table that overlaps
   nothing below moves down with one manifest edit; small tables are
   rewritten with their small neighbours.
+- **Tight jobs** (ADR-0015): when no job fits, a wanted level gets a
+  tight job. It needs one free slot. It commits an output only when its
+  committed outputs do not exceed its retired inputs, so it never grows
+  the region. If it cannot keep that rule, it drops the output: with
+  nothing committed, the step returns `RegionFull`.
+- **Requested compaction** (ADR-0015): `request_compaction(level)`
+  compacts each table from `level` to the bottom once, below the
+  triggers too. Above the bottom a table moves down a level; at the
+  bottom it is rewritten in place with its small neighbours, as a tight
+  job. Jobs for full levels run first. A table whose job cannot free a
+  slot, or that a foreign table vetoes, is skipped. The request is in
+  memory only.
 - **Merge:** k-way over at most 8 cursors (sources, plus one
   concatenating cursor over the target level's tables), minimum key,
   highest sequence first. Per key it keeps the **keep-set**: the newest
@@ -317,6 +330,7 @@ impl Db<…> {
     pub async fn flush(&mut self) -> Result<(), …>;
     pub async fn compact_step(&mut self, scratch: &mut Compaction<…>) -> Result<Progress, …>;
     pub fn compaction_pending(&self) -> bool;
+    pub fn request_compaction(&mut self, level: usize) -> Result<(), …>;
     pub const fn snapshot(&mut self) -> Result<u64, …>;
     pub const fn release_snapshot(&mut self, snap: u64);
     pub fn archive_plan(&self, level: usize, table_id: u32) -> Option<ArchivePlan<KEY_MAX>>;
@@ -341,7 +355,7 @@ never panicked. Capacity errors name their remedy (ADR-0013):
 | `TableFull`, `ArenaFull` | memtable full | `flush()`, retry |
 | `WalFull` | WAL region exhausted | `flush()` (it wraps the WAL), retry |
 | `NeedsCompaction` | L0 full, or no slot until tables merge | `compact_step` until `Done`, retry |
-| `RegionFull` | no slot, and compaction cannot free one | delete and compact, archive, or grow the region |
+| `RegionFull` | no slot, and compaction cannot free one | delete (or set `purge_before`), `request_compaction(0)` and compact; archive; or grow the region |
 | `SnapshotLimit` | 8 snapshots live | release one |
 | `TableTooLarge` | an entry, index, or rdel section does not fit | smaller entries, bigger blocks or slots |
 | `BatchTooLarge`, `BatchFull` | batch exceeds a WAL block / `OPS` | split it |
@@ -395,6 +409,9 @@ WAL region bounds the commits between flushes.
   (multi-output jobs included), archive, and ingest is a crash point, and
   torn manifest writes are injected; the recovered state is always one of
   the committed states.
+- **Space reclaim** (`tests/reclaim.rs`): fill to `RegionFull` with TTL
+  data, pass every TTL, and show compaction frees the region; range
+  deletes; bottom-level rewrites; every crash point of a rewrite.
 - Regression tests for every architecture-review finding
   (`tests/review_findings.rs`, never `#[ignore]`d).
 - `cargo miri` over a subset; the RAM gate (`tests/profile.rs`); benches
@@ -409,6 +426,7 @@ WAL region bounds the commits between flushes.
 | v0.9–v0.12 | Crash hardening, archive, reverse scans, ingest |
 | v0.13–v0.16 | Block compression, range deletes and TTL, block cache |
 | v0.17 | Architecture review fixes: fixed table slots, split-output compaction, multi-block manifest with ring and staged edits, remedy-named errors, measured futures, range-delete space reclamation |
+| v0.19 | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015) |
 
 Details: [`CHANGELOG.md`](CHANGELOG.md) and
 [`docs/history/milestones-v0.1-v0.16.md`](docs/history/milestones-v0.1-v0.16.md).

@@ -11,8 +11,21 @@ misread (SPEC §4.5).
 
 ## [Unreleased]
 
+### Added
+
+- `Db::request_compaction(level)` compacts every table from `level` down
+  to the bottom once, also below the level triggers. Bottom tables are
+  rewritten in place, so `purge_before` and range tombstones free space
+  there (issue #32, ADR-0015).
+- `model_tight_commit_ok` and `model_tight_job` in `horton::model`.
+- The kvstore `compact` command uses `request_compaction(0)`.
+
 ### Fixed
 
+- A full table region no longer wedges. When no job fits its slot
+  estimate, a *tight* job runs with one free slot and never grows the
+  region. A region full of expired or deleted data now gives its space
+  back; before, every write failed with `RegionFull` (issue #32).
 - The profiling profile is `valgrind` (it was `valgriind`). The README's
   callgrind line uses it, so the benches keep their debug symbols.
 

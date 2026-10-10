@@ -25,6 +25,12 @@
 //! of its range, so appends consolidate into full tables rather than
 //! filling the tree with one tiny table per flush.
 //!
+//! A *tight* job runs when no job fits its slot estimate. It needs one
+//! free slot and commits an output only when it retires at least as many
+//! inputs, so it never grows the region (ADR-0015).
+//! [`Db::request_compaction`] compacts each table from a level down once,
+//! below the triggers too; at the bottom it rewrites tables in place.
+//!
 //! [`Manifest::narrow_table`]: crate::manifest::Manifest::narrow_table
 
 use super::{Db, MAX_SNAPSHOTS};
@@ -36,6 +42,8 @@ use crate::compact::{
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, ManifestEdit, TableRef};
+use crate::model::model_tight_commit_ok;
+use crate::slots::MAX_SLOTS;
 use crate::sstable::{self, RdelEntry};
 
 /// What `compact_select` decided.
@@ -46,6 +54,17 @@ enum Selected {
     Moved,
     /// A merge job is set up in the scratch.
     Merging,
+    /// The manual request skipped tables that no job can take.
+    Skipped,
+}
+
+/// How `try_select` picks and admits a job.
+#[derive(Clone, Copy)]
+struct Pick {
+    /// Admit the job with one free slot, as a tight job.
+    tight: bool,
+    /// Serve the manual request: only due tables are sources.
+    manual: bool,
 }
 
 /// Clips a merged range tombstone to an output's key range `[lo, hi)`
@@ -92,10 +111,100 @@ impl<
     /// pending" from "nothing to do" — firmware idle loops and test
     /// drivers use it to decide whether another `compact_step` is
     /// worthwhile. [`Error::NeedsCompaction`] is returned only while this
-    /// is true.
+    /// is true. An open [`request_compaction`](Db::request_compaction)
+    /// with work left also makes it true.
     #[must_use]
     pub fn compaction_pending(&self) -> bool {
-        self.job_active || self.full_level().is_some()
+        self.job_active || self.full_level().is_some() || self.manual_pending()
+    }
+
+    /// Requests a compaction of every table from `level` down to the
+    /// bottom level, also below the level triggers.
+    ///
+    /// [`compact_step`](Db::compact_step) then compacts each table of
+    /// `level` once, then each table of the next level, down to the
+    /// bottom. A table above the bottom moves down a level. A bottom table
+    /// is rewritten in place. Each job applies the scratch's
+    /// [`purge_before`](Compaction::purge_before) and drops the data that
+    /// tombstones hide, so this gives deleted and expired space back.
+    /// [`compaction_pending`](Db::compaction_pending) is true until the
+    /// request is done. Flush first to include the memtable.
+    ///
+    /// A level's tables are the ones it holds when the request reaches
+    /// that level. A job that cannot free a slot is skipped (see
+    /// [`compact_step`](Db::compact_step)). A new request replaces an open
+    /// one. The request is in memory only: [`open`](Db::open) clears it.
+    /// With one level there is no compaction, and this does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotOpen`]; [`Error::BadLevel`] when `level` is not below
+    /// `LEVELS`.
+    pub fn request_compaction(&mut self, level: usize) -> Result<(), Error<D::Error>> {
+        self.ensure_open()?;
+        if level >= LEVELS {
+            return Err(Error::BadLevel { level });
+        }
+        if LEVELS < 2 {
+            return Ok(());
+        }
+        self.manual_level = Some(u8::try_from(level).map_err(|_| Error::BadLevel { level })?);
+        self.manual_mark = self.manifest.next_table_id();
+        self.manual_skip = 0;
+        self.manual_settle();
+        Ok(())
+    }
+
+    /// Whether the manual request still has table `t` to compact.
+    fn is_due(&self, t: &TableRef<KEY_MAX>) -> bool {
+        t.id < self.manual_mark
+            && self
+                .slot_of(t)
+                .is_none_or(|slot| self.manual_skip & (1u64 << slot) == 0)
+    }
+
+    /// Whether level `l` holds a table the manual request must compact.
+    fn level_has_due(&self, l: usize) -> bool {
+        self.manifest
+            .level(l)
+            .is_some_and(|ts| ts.iter().any(|t| self.is_due(t)))
+    }
+
+    /// Whether a level below `l` holds a table.
+    fn deeper_has_tables(&self, l: usize) -> bool {
+        (l + 1..LEVELS).any(|m| self.manifest.level(m).is_some_and(|ts| !ts.is_empty()))
+    }
+
+    /// Whether the manual request has work left.
+    fn manual_pending(&self) -> bool {
+        self.manual_level.is_some_and(|l| {
+            let l = usize::from(l);
+            self.level_has_due(l) || self.deeper_has_tables(l)
+        })
+    }
+
+    /// Moves the manual request to the first level with due tables, and
+    /// ends it when no level has work. A level the request reaches takes
+    /// a new mark: every table it holds at that time is due. Nothing moves
+    /// while a job runs: the job can still add tables to the next level.
+    fn manual_settle(&mut self) {
+        if self.job_active {
+            return;
+        }
+        while let Some(l) = self.manual_level {
+            let l = usize::from(l);
+            if self.level_has_due(l) {
+                return;
+            }
+            if !self.deeper_has_tables(l) {
+                self.manual_level = None;
+                return;
+            }
+            // `l + 1 < LEVELS <= 64`: the cast cannot fail.
+            self.manual_level = u8::try_from(l + 1).ok();
+            self.manual_mark = self.manifest.next_table_id();
+            self.manual_skip = 0;
+        }
     }
 
     /// True when flush and ingest are down to the compaction reserve: the
@@ -155,6 +264,11 @@ impl<
     /// [`compaction_pending`](Db::compaction_pending) to drain every
     /// pending job.
     ///
+    /// When no job fits its slot estimate, a *tight* job runs: it needs one
+    /// free slot and never grows the region (ADR-0015). An open
+    /// [`request_compaction`](Db::request_compaction) gets its jobs after
+    /// the full levels.
+    ///
     /// The scratch is reusable across jobs and droppable mid-job: output
     /// not yet committed is invisible, and its reserved slots are released
     /// when the next `compact_step` (with any scratch) abandons the stale
@@ -164,8 +278,8 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::RegionFull`] when a level wants a job but none fits the
-    /// free slots (delete data, archive, or grow the region);
+    /// [`Error::RegionFull`] when a level wants a job but no job can free
+    /// a slot (delete data or purge, archive, or grow the region);
     /// [`Error::TableTooLarge`] when a slot cannot hold the job's
     /// range-tombstone budget plus one key's versions; [`Error::CorruptBlock`] on a torn input table
     /// (compaction never silently drops entries); [`Error::Device`] on I/O
@@ -187,7 +301,7 @@ impl<
             // is abandoned.
             self.abort_job();
             match self.compact_select(scratch).await {
-                Ok(Selected::Idle | Selected::Moved) => return Ok(Progress::Done),
+                Ok(Selected::Idle | Selected::Moved | Selected::Skipped) => Ok(Progress::Done),
                 Ok(Selected::Merging) => self.compact_advance(scratch).await,
                 Err(e) => Err(e),
             }
@@ -198,6 +312,7 @@ impl<
             self.abort_job();
             scratch.reset();
         }
+        self.manual_settle();
         step
     }
 
@@ -214,6 +329,9 @@ impl<
             MergeOutcome::More => Ok(Progress::More),
             MergeOutcome::Split => {
                 let out = self.compact_seal_output(c, false).await?;
+                if c.tight && !self.tight_commit_ok(c, out.as_ref(), false) {
+                    return self.compact_give_up(c, out.is_some());
+                }
                 self.compact_commit(c, out, false).await?;
                 if self.compact_open_output(c).is_err() {
                     // No slot for the next output: the job ends here, with
@@ -228,9 +346,82 @@ impl<
             }
             MergeOutcome::Exhausted => {
                 let out = self.compact_seal_output(c, true).await?;
+                if c.tight && !self.tight_commit_ok(c, out.as_ref(), true) {
+                    return self.compact_give_up(c, out.is_some());
+                }
                 self.compact_commit(c, out, true).await?;
                 Ok(Progress::Done)
             }
+        }
+    }
+
+    /// Whether a tight job may commit `out`: after the commit, its
+    /// committed outputs must not exceed its retired inputs. The final
+    /// commit retires every input; another commit retires each live input
+    /// whose range ends at or below `out`'s last key (see
+    /// `compact_commit`).
+    fn tight_commit_ok(
+        &self,
+        c: &Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        out: Option<&TableRef<KEY_MAX>>,
+        last_commit: bool,
+    ) -> bool {
+        let outputs = c.outputs.saturating_add(u32::from(out.is_some()));
+        let all = c.n_src + c.n_tgt;
+        let retired = if last_commit {
+            all
+        } else {
+            let k = out.map_or(KeyBound::EMPTY, |t| t.last_key);
+            let ends_by_k = |id: u32| {
+                self.manifest
+                    .find_table(id)
+                    .is_some_and(|t| t.last_key.as_slice() <= k.as_slice())
+            };
+            let src = (0..c.n_src)
+                .filter(|&i| c.src_retired & (1u8 << i) != 0 || ends_by_k(c.inputs[i].tref.id))
+                .count();
+            let tgt = c.tgt_retired
+                + c.tgt[c.tgt_retired..c.n_tgt]
+                    .iter()
+                    .filter(|&&id| ends_by_k(id))
+                    .count();
+            src + tgt
+        };
+        model_tight_commit_ok(outputs, u32::try_from(retired).unwrap_or(u32::MAX))
+    }
+
+    /// Ends a tight job whose next commit would grow the region: the
+    /// sealed output is dropped (its slot is released, nothing points at
+    /// it) and what the job committed before stays. A manual job skips
+    /// its sources, so the request moves on. Otherwise a job that
+    /// committed nothing fails with [`Error::RegionFull`]: it cannot free
+    /// a slot.
+    fn compact_give_up(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        sealed: bool,
+    ) -> Result<Progress, Error<D::Error>> {
+        if sealed {
+            self.slots.release(c.out_slot);
+        }
+        let progressed = c.outputs > 0;
+        if c.manual {
+            for i in 0..c.n_src {
+                if c.src_retired & (1u8 << i) == 0
+                    && let Some(slot) = self.slot_of(&c.inputs[i].tref)
+                {
+                    self.manual_skip |= 1u64 << slot;
+                }
+            }
+        }
+        let manual = c.manual;
+        self.job_active = false;
+        self.job_inputs = 0;
+        c.reset();
+        if manual || progressed {
+            Ok(Progress::Done)
+        } else {
+            Err(Error::RegionFull)
         }
     }
 
@@ -360,16 +551,20 @@ impl<
     /// Selects the next compaction job into `c`, or moves a table down
     /// outright. See [`compact_step`](Db::compact_step) for the policy.
     ///
-    /// Candidates are the full levels, deepest first, then the levels
-    /// region pressure wants (see `full_level`). A merge is admitted only
-    /// when the free slots cover its need (`job_need`); an L0 job shrinks
-    /// to its oldest tables to fit, and a level whose job does not fit
-    /// yields to the next candidate.
+    /// Three rounds, the first job found wins:
+    ///
+    /// 1. The full levels, deepest first; then the levels region pressure
+    ///    wants (see `full_level`). A merge is admitted only when the free
+    ///    slots cover its need (`job_need`); an L0 job shrinks to its
+    ///    oldest tables to fit.
+    /// 2. The manual request (see [`request_compaction`](Db::request_compaction)).
+    /// 3. Round 1's levels again, as tight jobs: one free slot is enough,
+    ///    and the job never grows the region (see `tight_commit_ok`).
     ///
     /// # Errors
     ///
-    /// [`Error::RegionFull`] when some level wants compaction but no job
-    /// fits the free slots.
+    /// [`Error::RegionFull`] when some level or the manual request wants
+    /// compaction but no job fits the free slots.
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -379,19 +574,33 @@ impl<
         }
         let pressure = self.under_pressure();
         let mut wanted = false;
-        // Full levels first, deepest first; then, under pressure, the
-        // levels pressure wants.
-        for pass in [false, true] {
-            if pass && !pressure {
-                break;
-            }
-            for src in (0..LEVELS - 1).rev() {
-                if !self.wants_job(src, pass) || (pass && self.wants_job(src, false)) {
-                    continue;
-                }
-                wanted = true;
-                if let Some(sel) = self.try_select(c, src).await? {
+        for tight in [false, true] {
+            if tight {
+                if let Some(sel) = self.manual_select(c).await? {
                     return Ok(sel);
+                }
+                if !wanted || self.slots.free_slots() == 0 {
+                    break;
+                }
+            }
+            let pick = Pick {
+                tight,
+                manual: false,
+            };
+            // Full levels first, deepest first; then, under pressure, the
+            // levels pressure wants.
+            for pass in [false, true] {
+                if pass && !pressure {
+                    break;
+                }
+                for src in (0..LEVELS - 1).rev() {
+                    if !self.wants_job(src, pass) || (pass && self.wants_job(src, false)) {
+                        continue;
+                    }
+                    wanted = true;
+                    if let Some(sel) = self.try_select(c, src, pick).await? {
+                        return Ok(sel);
+                    }
                 }
             }
         }
@@ -400,6 +609,43 @@ impl<
         } else {
             Ok(Selected::Idle)
         }
+    }
+
+    /// Selects a job for the manual request at its current level: an
+    /// admitted job first, then a tight one. When no job can take the due
+    /// tables (a foreign table vetoes them), they are skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RegionFull`] when no slot is free.
+    async fn manual_select(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<Option<Selected>, Error<D::Error>> {
+        self.manual_settle();
+        let Some(l) = self.manual_level.map(usize::from) else {
+            return Ok(None);
+        };
+        for tight in [false, true] {
+            let pick = Pick {
+                tight,
+                manual: true,
+            };
+            if let Some(sel) = self.try_select(c, l, pick).await? {
+                return Ok(Some(sel));
+            }
+        }
+        if self.slots.free_slots() == 0 {
+            return Err(Error::RegionFull);
+        }
+        for t in self.manifest.level(l).unwrap_or(&[]) {
+            if self.is_due(t)
+                && let Some(slot) = self.slot_of(t)
+            {
+                self.manual_skip |= 1u64 << slot;
+            }
+        }
+        Ok(Some(Selected::Skipped))
     }
 
     /// Selects a job draining level `src` into `c`, or moves a table down
@@ -417,87 +663,54 @@ impl<
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         src: usize,
+        pick: Pick,
     ) -> Result<Option<Selected>, Error<D::Error>> {
         // Distinct node_ids at the source level, oldest-first (the level
         // slice is oldest-first at L0, key-ordered below; either way the
         // order is deterministic). At most TABLES of them.
-        let mut nodes = [0u32; TABLES];
+        let mut nodes = [0u32; MAX_SLOTS];
         let mut n_nodes = 0usize;
         {
             let src_tables = self.manifest.level(src).unwrap_or(&[]);
             for t in src_tables {
-                if !nodes[..n_nodes].contains(&t.node_id) {
+                if (!pick.manual || self.is_due(t)) && !nodes[..n_nodes].contains(&t.node_id) {
                     nodes[n_nodes] = t.node_id;
                     n_nodes += 1;
                 }
             }
         }
         for node in nodes.iter().take(n_nodes).copied() {
-            if let Some(sel) = self.try_select_group(c, src, node).await? {
+            if let Some(sel) = self.try_select_group(c, src, node, pick).await? {
                 return Ok(Some(sel));
             }
         }
         Ok(None)
     }
 
-    /// Selects a job for one node group at level `src`: L0's oldest
-    /// tables of that node (all of them when the slots allow), or the one
-    /// table of a deeper level whose range overlaps the fewest target
-    /// tables. `None` when the group has no job: nothing fits, or a
-    /// foreign target table overlaps the range (veto).
+    /// Selects a job for one node group at level `src` (sources from
+    /// `pick_sources`), or moves its table down outright. `None` when the
+    /// group has no job: no source, nothing fits, or a foreign target
+    /// table overlaps the range (veto).
     async fn try_select_group(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         src: usize,
         node: u32,
+        pick: Pick,
     ) -> Result<Option<Selected>, Error<D::Error>> {
-        let tgt = src + 1;
+        let rewrite = src == LEVELS - 1;
+        let tgt = if rewrite { src } else { src + 1 };
+        let tight = pick.tight || rewrite;
         let free = u64::from(self.slots.free_slots());
-        let (src_tables, tgt_tables) = (
-            self.manifest.level(src).unwrap_or(&[]),
-            self.manifest.level(tgt).unwrap_or(&[]),
-        );
-        let data = |t: &TableRef<KEY_MAX>| u64::from(t.block_count).saturating_sub(3);
-        // Sources: L0's oldest tables of this node — all of them when the
-        // slots allow — or the one table of a deeper level whose range
-        // overlaps the fewest target tables (ties to the lowest key), the
-        // cheapest to push down.
-        c.reset();
-        let mut src_data = 0u64;
-        if src == 0 {
-            for t in src_tables {
-                if t.node_id != node {
-                    continue;
-                }
-                let d = src_data + data(t);
-                if c.n_src > 0 && self.job_need(d) > free {
-                    break;
-                }
-                c.inputs[c.n_src] = Input { level: 0, tref: *t };
-                c.n_src += 1;
-                src_data = d;
-            }
-        } else {
-            let pick = src_tables
-                .iter()
-                .filter(|t| t.node_id == node)
-                .min_by_key(|t| {
-                    let (a, b) = Self::overlap_run(tgt_tables, t.first_key, t.last_key);
-                    b - a
-                })
-                .copied()
-                .ok_or(Error::CorruptManifest)?;
-            c.inputs[0] = Input {
-                level: src,
-                tref: pick,
-            };
-            c.n_src = 1;
-            src_data = data(&pick);
-        }
-        if c.n_src == 0 {
+        let Some(src_data) = self.pick_sources(c, src, node, pick, free) else {
             c.reset();
             return Ok(None);
-        }
+        };
+        let tgt_tables = if rewrite {
+            &[]
+        } else {
+            self.manifest.level(tgt).unwrap_or(&[])
+        };
         let mut first = c.inputs[0].tref.first_key;
         let mut last = c.inputs[0].tref.last_key;
         for input in &c.inputs[1..c.n_src] {
@@ -517,28 +730,24 @@ impl<
             c.reset();
             return Ok(None);
         }
-        if src > 0 && a == b && !self.is_small(&c.inputs[0].tref) {
+        if src > 0 && !rewrite && a == b && !self.is_small(&c.inputs[0].tref) {
             // Nothing below overlaps and the table is worth keeping whole:
             // re-parent it with one manifest edit, no data rewritten.
             let tref = c.inputs[0].tref;
             c.reset();
-            let mut edit = ManifestEdit::new();
-            self.manifest
-                .stage_remove::<D::Error>(&mut edit, src, tref.id)?;
-            edit.add::<D::Error>(tgt, tref)?;
-            edit.raise_seq_high(self.next_seq);
-            let layout = self.manifest_layout();
-            self.manifest
-                .commit_edit(
-                    &edit,
-                    self.wal.device_mut(),
-                    self.get_scratch.get_mut(),
-                    layout,
-                )
-                .await?;
+            self.move_down(src, tref).await?;
             return Ok(Some(Selected::Moved));
         }
-        if self.job_need(src_data) > free {
+        // Admission: the free slots must cover the estimate, or, for a
+        // tight job, hold its one output. A manual job is optional work:
+        // unless it is tight, it leaves the reserve to the jobs flush
+        // waits for.
+        let keep = if pick.manual {
+            u64::from(Self::COMPACTION_RESERVE)
+        } else {
+            0
+        };
+        if (tight && free == 0) || (!tight && self.job_need(src_data) + keep > free) {
             c.reset();
             return Ok(None);
         }
@@ -559,8 +768,102 @@ impl<
             last = last.max(t.last_key);
         }
         c.n_tgt = b - a;
+        c.tight = tight;
+        c.manual = pick.manual;
         self.compact_start(c, tgt, first, last).await?;
         Ok(Some(Selected::Merging))
+    }
+
+    /// Puts the sources of a job for one node group at level `src` into
+    /// `c` and returns their data blocks; `None` when there is no source.
+    ///
+    /// - L0: its oldest tables of the node. All of them when the free
+    ///   slots allow; only the oldest for a tight job.
+    /// - The bottom level (a manual rewrite): the first due table in key
+    ///   order, plus the small same-node tables on both sides of it.
+    ///   Earlier rewrites shrank them, and merging them frees slots.
+    /// - Another level: the one table whose range overlaps the fewest
+    ///   target tables (ties to the lowest key), the cheapest to push
+    ///   down.
+    ///
+    /// A manual pick takes only due tables.
+    fn pick_sources(
+        &self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        src: usize,
+        node: u32,
+        pick: Pick,
+        free: u64,
+    ) -> Option<u64> {
+        let src_tables = self.manifest.level(src).unwrap_or(&[]);
+        let eligible =
+            |t: &TableRef<KEY_MAX>| t.node_id == node && (!pick.manual || self.is_due(t));
+        let data = |t: &TableRef<KEY_MAX>| u64::from(t.block_count).saturating_sub(3);
+        let push = |c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>, t| {
+            c.inputs[c.n_src] = Input {
+                level: src,
+                tref: t,
+            };
+            c.n_src += 1;
+        };
+        c.reset();
+        let mut src_data = 0u64;
+        if src == 0 {
+            for t in src_tables.iter().filter(|t| eligible(t)) {
+                let d = src_data + data(t);
+                if c.n_src > 0 && (pick.tight || self.job_need(d) > free) {
+                    break;
+                }
+                push(c, *t);
+                src_data = d;
+            }
+        } else if src == LEVELS - 1 {
+            let due = src_tables.iter().position(eligible)?;
+            let joins = |t: &TableRef<KEY_MAX>| t.node_id == node && self.is_small(t);
+            let (mut lo, mut hi) = (due, due + 1);
+            while lo > 0 && hi - lo + 1 < COMPACTION_KMAX && joins(&src_tables[lo - 1]) {
+                lo -= 1;
+            }
+            while hi < src_tables.len() && hi - lo + 1 < COMPACTION_KMAX && joins(&src_tables[hi]) {
+                hi += 1;
+            }
+            for t in &src_tables[lo..hi] {
+                push(c, *t);
+                src_data += data(t);
+            }
+        } else {
+            let tgt_tables = self.manifest.level(src + 1).unwrap_or(&[]);
+            let t = src_tables.iter().filter(|t| eligible(t)).min_by_key(|t| {
+                let (a, b) = Self::overlap_run(tgt_tables, t.first_key, t.last_key);
+                b - a
+            })?;
+            push(c, *t);
+            src_data = data(t);
+        }
+        (c.n_src > 0).then_some(src_data)
+    }
+
+    /// Moves table `tref` from level `src` to the level below with one
+    /// manifest edit. No data is rewritten.
+    async fn move_down(
+        &mut self,
+        src: usize,
+        tref: TableRef<KEY_MAX>,
+    ) -> Result<(), Error<D::Error>> {
+        let mut edit = ManifestEdit::new();
+        self.manifest
+            .stage_remove::<D::Error>(&mut edit, src, tref.id)?;
+        edit.add::<D::Error>(src + 1, tref)?;
+        edit.raise_seq_high(self.next_seq);
+        let layout = self.manifest_layout();
+        self.manifest
+            .commit_edit(
+                &edit,
+                self.wal.device_mut(),
+                self.get_scratch.get_mut(),
+                layout,
+            )
+            .await
     }
 
     /// Sets up the merge for the inputs `compact_select` chose: the
@@ -911,6 +1214,7 @@ impl<
         // repeat, so stale entries could never be read).
         if out.is_some() {
             self.slots.commit(c.out_slot);
+            c.outputs = c.outputs.saturating_add(1);
         }
         for slot in 0..64u32 {
             if freed & (1u64 << slot) != 0 {
