@@ -476,7 +476,7 @@ LIFECYCLE_SEEDS=300 cargo test --release --test lifecycle   # wider fuzz sweep
 cargo test --release              # same suite, optimized
 cargo run --example quickstart
 cargo +nightly miri test --test <name>          # UB check (the crate has no unsafe)
-cargo build --release --benches                 # callgrind instruction-count harnesses
+cargo build --profile valgrind --benches        # callgrind instruction-count harnesses
 ./xtensa-check.sh                               # ESP32-S3 build gate (needs the esp toolchain)
 examples/ground_station/build.sh && node examples/ground_station/test.mjs target/flight_recorder/flash.img
 node examples/ground_station/live-test.mjs 300                # live logger: 300 power cuts
