@@ -980,11 +980,10 @@ fn mut_manifest_encode_rejects_oversized() {
     );
 }
 
-/// A seeded run that fills the 8-block-slot region with puts, TTL puts,
-/// deletes and range deletes until no flush fits, then compacts with a
-/// purge (and, for some seeds, a request from level 0). Returns the used
-/// slots at the start, the most during the compaction, and at the end.
-fn reserve_drain(seed: u64) -> (u32, u32, u32) {
+/// A seeded fill of the 8-block-slot region with puts, TTL puts, deletes
+/// and range deletes, until no flush fits. Returns the database, its
+/// compaction scratch, the clock, and the generator.
+fn reserve_fill(seed: u64) -> (TestDb<MemDevice<4096>>, TestCompaction, u64, common::Lcg) {
     let mut rng = common::Lcg::new(seed);
     let mut db = TestDb::new(MemDevice::<4096>::new(), common::tight_config());
     open(&mut db);
@@ -1025,6 +1024,14 @@ fn reserve_drain(seed: u64) -> (u32, u32, u32) {
             break;
         }
     }
+    (db, c, now, rng)
+}
+
+/// `reserve_fill`, then compaction with a purge (and, for some seeds, a
+/// request from level 0). Returns the used slots at the start, the most
+/// during the compaction, and at the end.
+fn reserve_drain(seed: u64) -> (u32, u32, u32) {
+    let (mut db, mut c, now, mut rng) = reserve_fill(seed);
     let start = db.slot_stats().used;
     c.purge_before = now / 2 + rng.next() % (now / 2 + 1);
     if rng.next_bounded(2) == 0 {
@@ -1039,6 +1046,32 @@ fn reserve_drain(seed: u64) -> (u32, u32, u32) {
         assert_eq!(db.check_invariants(), Ok(()), "seed {seed}");
     }
     (start, most, db.slot_stats().used)
+}
+
+/// Kills: a tight job that gives up after it committed outputs and
+/// returns `RegionFull`. It freed slots, so the step is progress: seed
+/// 448's fill makes room through such jobs and fills all 28 slots.
+#[test]
+fn mut_tight_give_up_after_progress_is_done() {
+    let (db, ..) = reserve_fill(448);
+    assert_eq!(db.slot_stats().used, 28);
+}
+
+/// Kills: a request that skips its level when no slot is free. With no
+/// free slot nothing can run, so the step fails with `RegionFull` and
+/// the request stays open.
+#[test]
+fn mut_request_with_no_free_slot_fails() {
+    let (mut db, mut c, ..) = reserve_fill(448);
+    let full = db.slot_stats();
+    assert_eq!(full.free, 0);
+    db.request_compaction(0).unwrap();
+    assert!(matches!(
+        block_on(db.compact_step(&mut c)),
+        Err(Error::RegionFull)
+    ));
+    assert!(db.compaction_pending());
+    assert_eq!(db.slot_stats(), full);
 }
 
 /// Kills: a tight job that does not count its committed outputs (it then
