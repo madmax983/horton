@@ -176,6 +176,16 @@ pub struct Compaction<
     /// drop unsoundly (a drop under the overestimate implies the drop
     /// under the true wall).
     pub(crate) job_max_wall: u64,
+    /// The job is *tight*: it did not get its estimate (plus the reserve,
+    /// for a request), or it rewrites tables in place. It commits an output only when its
+    /// committed outputs do not exceed its retired inputs
+    /// ([`model_tight_commit_ok`](crate::model::model_tight_commit_ok)),
+    /// so it needs one free slot and never grows the region.
+    pub(crate) tight: bool,
+    /// The job serves [`Db::request_compaction`](crate::db::Db::request_compaction).
+    pub(crate) manual: bool,
+    /// Outputs this job committed.
+    pub(crate) outputs: u32,
     /// TTL purge cutoff for this job: an emitted value with
     /// `expire_at != 0 && expire_at <= purge_before` is converted to a
     /// point tombstone at the same sequence — never silently dropped
@@ -400,6 +410,9 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             outside_foreign_min: (u64::MAX, u32::MAX),
             job_node: 0,
             job_max_wall: 0,
+            tight: false,
+            manual: false,
+            outputs: 0,
             purge_before: 0,
             rdel_budget: 0,
             data_budget: 0,
@@ -454,6 +467,9 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         self.outside_foreign_min = (u64::MAX, u32::MAX);
         self.job_node = 0;
         self.job_max_wall = 0;
+        self.tight = false;
+        self.manual = false;
+        self.outputs = 0;
     }
 
     /// Starts the coverage stream over every input's range-tombstone

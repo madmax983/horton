@@ -102,7 +102,7 @@ Capacity errors name their remedy:
 | `TableFull`, `ArenaFull` | the memtable is full | `flush()`, retry |
 | `WalFull` | the WAL region is exhausted | `flush()` (it wraps the WAL), retry |
 | `NeedsCompaction` | level 0 is full, or no slot is free until tables merge | `compact_step` until `Done`, retry |
-| `RegionFull` | no slot is free and compaction cannot free one | delete and compact, archive, or grow the region |
+| `RegionFull` | no slot is free and compaction cannot free one | delete (or set `purge_before`), `request_compaction(0)` and compact; archive; or grow the region |
 | `SnapshotLimit` | eight snapshots are live | release one |
 | `TableTooLarge` | an entry, index, or range-tombstone section does not fit | smaller entries, bigger blocks or slots |
 | `BatchTooLarge` | a batch does not fit one WAL block | split it |
@@ -111,6 +111,19 @@ Capacity errors name their remedy:
 
 `NeedsCompaction` is only returned while `compaction_pending()` is true, so
 a compact-then-retry loop always makes progress.
+
+To give deleted and expired space back, also below the level triggers:
+
+```rust,ignore
+scratch.purge_before = now; // expired values become tombstones
+db.request_compaction(0)?; // every table, from level 0 down, once
+while db.compaction_pending() {
+    db.compact_step(&mut scratch).await?;
+}
+```
+
+`RegionFull` from this loop means the rest is live data: delete, archive,
+or grow the region.
 
 ## Demo: a flight recorder that survives power cuts
 
@@ -324,7 +337,12 @@ version of each key plus the newest version visible to each live snapshot.
 Outputs split at slot size and commit one at a time: inputs the output has
 passed retire, the one it is inside is narrowed past it. Tombstones — point
 and range — are dropped once no reader can see what they hide
-([ADR-0010](docs/adr/0010-split-output-compaction.md)).
+([ADR-0010](docs/adr/0010-split-output-compaction.md)). When no job fits
+its slot estimate, a *tight* job runs with one free slot and never grows
+the region, so a full region of deleted or expired data gives its space
+back. `request_compaction(level)` compacts each table from `level` down
+once, below the triggers too; at the bottom it rewrites tables in place
+([ADR-0015](docs/adr/0015-tight-jobs-and-requested-compaction.md)).
 
 **Crash model.** The manifest is stored as whole copies (a pair, or a ring
 of `n`), each spanning as many blocks as the worst case needs; every block
@@ -400,9 +418,9 @@ start's sizes that is about 25 KiB for `Db`, 11 KiB for a `Scan` and
 
 `horton::profile` has a measured ESP32-S3 instantiation (4 KiB blocks,
 32-byte keys, 64-byte values, 16-entry memtable, 4 × 4 levels, 2-slot
-cache): `Db` 25,264 + `Scan` 10,568 + `Compaction` 59,472 = 95,304 bytes
+cache): `Db` 25,408 + `Scan` 10,824 + `Compaction` 59,568 = 95,800 bytes
 of structs, plus at most 17.6 KiB of live futures (`archive_commit()`),
-for a measured peak of 112,928 bytes under a 112 KiB budget asserted by
+for a measured peak of 113,432 bytes under a 112 KiB budget asserted by
 `tests/profile.rs`. See [`BUDGET.md`](BUDGET.md).
 
 ### Mapping it onto your device

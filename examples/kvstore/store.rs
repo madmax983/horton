@@ -415,8 +415,9 @@ impl Handle {
         self.call(Request::Flush)
     }
 
-    /// Flushes, then runs compaction until nothing is pending, like
-    /// `LevelDB`'s `CompactRange(nullptr, nullptr)`.
+    /// Flushes, then compacts every table once, down to the bottom level,
+    /// like `LevelDB`'s `CompactRange(nullptr, nullptr)`. This frees the
+    /// space of deleted data.
     pub fn compact(&self) -> Result<(), StoreError> {
         self.call(Request::CompactAll)
     }
@@ -642,6 +643,7 @@ impl Engine {
             }
             Request::CompactAll(reply) => {
                 let r = self.room.flush(&mut self.db).and_then(|()| {
+                    self.db.request_compaction(0)?;
                     while self.db.compaction_pending() {
                         self.room.job(&mut self.db)?;
                     }
@@ -1097,5 +1099,23 @@ mod tests {
             store.range(b"", None, false).expect("range").count(),
             (threads - 1) * per / 2 + 8
         );
+    }
+
+    #[test]
+    fn compact_gives_deleted_space_back() {
+        let store = TempStore::new("reclaim");
+        for i in 0..300 {
+            store.put(&key(i), b"value").expect("put");
+        }
+        store.flush().expect("flush");
+        assert_eq!(store.stats().expect("stats").slots.used, 1);
+        store
+            .delete_range(&key(0), &key(300))
+            .expect("delete_range");
+        store.compact().expect("compact");
+        // The range tombstone and the data it hid are both gone.
+        let stats = store.stats().expect("stats");
+        assert_eq!(stats.slots.used, 0, "{:?}", stats.slots);
+        assert_eq!(store.range(b"", None, false).expect("range").count(), 0);
     }
 }
