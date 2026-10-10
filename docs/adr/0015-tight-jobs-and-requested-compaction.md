@@ -48,8 +48,9 @@ table from `level` down to the bottom once:
   level takes the mark from when the request opened: the request does
   not rewrite the bottom tables its own jobs wrote there.
 - A table whose job gives up, or that a foreign table vetoes, is skipped
-  (one bit per slot). A veto skips only the tables of the vetoed job. The request ends, unless no slot is free. Then
-  `compact_step` returns `RegionFull`.
+  (one bit per slot). A veto skips only the tables of the vetoed job. The
+  request ends, unless no slot is free. Then `compact_step` returns
+  `RegionFull`.
 - A requested job runs after the jobs that fit for full levels and region
   pressure, and before their tight jobs. A requested job that is not
   tight must leave the reserve free.
@@ -67,9 +68,9 @@ The reserve stays at 2 slots.
   `compact_step` while `compaction_pending()` is true.
 - A request reads and writes every table it reaches once. Set
   `purge_before` before the request: bottom tables that the request's
-  own jobs wrote are not rewritten. A bottom table
-  that does not shrink costs one read and one write. When its output does
-  not fit one slot, the job drops the output and the table stays.
+  own jobs wrote are not rewritten. A bottom table that does not shrink
+  costs one read and one write. When its output does not fit one slot,
+  the job drops the output and the table stays.
 - A tight job for a wanted level over live data drops its first output
   and returns `RegionFull` each time it runs. The region is full: delete,
   archive, or grow it.
