@@ -26,8 +26,8 @@
 //! filling the tree with one tiny table per flush.
 //!
 //! A *tight* job runs when no job fits its slot estimate. It needs one
-//! free slot and commits an output only when it retires at least as many
-//! inputs, so it never grows the region (ADR-0015).
+//! free slot and commits an output only when its committed outputs do not
+//! exceed its retired inputs, so it never grows the region (ADR-0015).
 //! [`Db::request_compaction`] compacts each table from a level down once,
 //! below the triggers too; at the bottom it rewrites tables in place.
 //!
@@ -126,14 +126,16 @@ impl<
     /// bottom. A table above the bottom moves down a level. A bottom table
     /// is rewritten in place. Each job applies the scratch's
     /// [`purge_before`](Compaction::purge_before) and drops the data that
-    /// tombstones hide, so this gives deleted and expired space back.
+    /// tombstones hide and no snapshot can see, so this gives deleted and
+    /// expired space back.
     /// [`compaction_pending`](Db::compaction_pending) is true until the
     /// request is done. Flush first to include the memtable.
     ///
     /// A level's tables are the ones it holds when the request reaches
-    /// that level. A job that cannot free a slot is skipped (see
-    /// [`compact_step`](Db::compact_step)). A new request replaces an open
-    /// one. The request is in memory only: [`open`](Db::open) clears it.
+    /// that level. When a table's job gives up, or a foreign table vetoes
+    /// it, the request skips that table. When no slot is free,
+    /// [`compact_step`](Db::compact_step) returns [`Error::RegionFull`]. A
+    /// new request replaces an open one. The request is in memory only: [`open`](Db::open) clears it.
     /// With one level there is no compaction, and this does nothing.
     ///
     /// # Errors
@@ -257,17 +259,19 @@ impl<
     /// ends at a key boundary and the next one begins in a fresh slot,
     /// with progress committed whenever the outputs so far cover a whole
     /// target table. The call that exhausts the merge commits the rest
-    /// atomically and returns [`Progress::Done`]. With no full level this
-    /// is a no-op returning [`Progress::Done`]. Note `Done` is returned in
+    /// atomically and returns [`Progress::Done`]. With no full level, no
+    /// region pressure and no open request, this does nothing and returns
+    /// [`Progress::Done`]. Note `Done` is returned in
     /// every case, so `while db.compact_step(&mut scratch).await? ==
     /// Progress::More {}` drives exactly one job; loop on
     /// [`compaction_pending`](Db::compaction_pending) to drain every
     /// pending job.
     ///
     /// When no job fits its slot estimate, a *tight* job runs: it needs one
-    /// free slot and never grows the region (ADR-0015). An open
-    /// [`request_compaction`](Db::request_compaction) gets its jobs after
-    /// the full levels.
+    /// free slot and never grows the region (ADR-0015). A job for an open
+    /// [`request_compaction`](Db::request_compaction) runs after the jobs
+    /// that fit for full levels and region pressure, and before their
+    /// tight jobs.
     ///
     /// The scratch is reusable across jobs and droppable mid-job: output
     /// not yet committed is invisible, and its reserved slots are released
@@ -563,8 +567,8 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`Error::RegionFull`] when some level or the manual request wants
-    /// compaction but no job fits the free slots.
+    /// [`Error::RegionFull`] when some level or the request wants a job
+    /// but no job can start.
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -658,7 +662,8 @@ impl<
     /// a deeper level tries its cheapest table's node. A foreign target
     /// table overlapping the job's range vetoes the job (`Ok(None)`): the
     /// foreign side drains down through its own selectable jobs, so the
-    /// veto always clears — or the sweeper carries the cold range off.
+    /// veto always clears — or the sweeper carries the cold range off. A
+    /// request skips the vetoed tables.
     async fn try_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
@@ -667,7 +672,7 @@ impl<
     ) -> Result<Option<Selected>, Error<D::Error>> {
         // Distinct node_ids at the source level, oldest-first (the level
         // slice is oldest-first at L0, key-ordered below; either way the
-        // order is deterministic). At most TABLES of them.
+        // order is deterministic). At most `MAX_SLOTS` of them.
         let mut nodes = [0u32; MAX_SLOTS];
         let mut n_nodes = 0usize;
         {
@@ -702,7 +707,15 @@ impl<
         let tgt = if rewrite { src } else { src + 1 };
         let tight = pick.tight || rewrite;
         let free = u64::from(self.slots.free_slots());
-        let Some(src_data) = self.pick_sources(c, src, node, pick, free) else {
+        // A requested job is optional work: unless it is tight, it leaves
+        // the reserve to the jobs flush waits for.
+        let keep = if pick.manual {
+            u64::from(Self::COMPACTION_RESERVE)
+        } else {
+            0
+        };
+        let budget = free.saturating_sub(keep);
+        let Some(src_data) = self.pick_sources(c, src, node, pick, budget) else {
             c.reset();
             return Ok(None);
         };
@@ -722,7 +735,8 @@ impl<
         // the two nodes' ranges still interleave at the target level —
         // merging now would conflate origins. The foreign side drains
         // down through its own selectable jobs, so the veto always
-        // clears; this group is retried on a later pass.
+        // clears; this group is retried on a later pass. A request skips
+        // the vetoed tables.
         if tgt_tables
             .iter()
             .any(|t| t.node_id != node && ranges_overlap(first, last, t.first_key, t.last_key))
@@ -738,16 +752,9 @@ impl<
             self.move_down(src, tref).await?;
             return Ok(Some(Selected::Moved));
         }
-        // Admission: the free slots must cover the estimate, or, for a
-        // tight job, hold its one output. A manual job is optional work:
-        // unless it is tight, it leaves the reserve to the jobs flush
-        // waits for.
-        let keep = if pick.manual {
-            u64::from(Self::COMPACTION_RESERVE)
-        } else {
-            0
-        };
-        if (tight && free == 0) || (!tight && self.job_need(src_data) + keep > free) {
+        // Admission: the budget must cover the estimate, or, for a tight
+        // job, the free slots must hold its one output.
+        if (tight && free == 0) || (!tight && self.job_need(src_data) > budget) {
             c.reset();
             return Ok(None);
         }
@@ -777,11 +784,10 @@ impl<
     /// Puts the sources of a job for one node group at level `src` into
     /// `c` and returns their data blocks; `None` when there is no source.
     ///
-    /// - L0: its oldest tables of the node. All of them when the free
-    ///   slots allow; only the oldest for a tight job.
+    /// - L0: its oldest tables of the node, as many as `budget` free slots
+    ///   allow; only the oldest for a tight job.
     /// - The bottom level (a manual rewrite): the first due table in key
     ///   order, plus the small same-node tables on both sides of it.
-    ///   Earlier rewrites shrank them, and merging them frees slots.
     /// - Another level: the one table whose range overlaps the fewest
     ///   target tables (ties to the lowest key), the cheapest to push
     ///   down.
@@ -793,7 +799,7 @@ impl<
         src: usize,
         node: u32,
         pick: Pick,
-        free: u64,
+        budget: u64,
     ) -> Option<u64> {
         let src_tables = self.manifest.level(src).unwrap_or(&[]);
         let eligible =
@@ -811,7 +817,7 @@ impl<
         if src == 0 {
             for t in src_tables.iter().filter(|t| eligible(t)) {
                 let d = src_data + data(t);
-                if c.n_src > 0 && (pick.tight || self.job_need(d) > free) {
+                if c.n_src > 0 && (pick.tight || self.job_need(d) > budget) {
                     break;
                 }
                 push(c, *t);

@@ -33,8 +33,9 @@
 //!    fewer free slots than its estimate commits an output only when its
 //!    committed outputs do not exceed its retired inputs.
 //!    [`model_tight_commit_ok`] is the rule and [`model_tight_job`] the
-//!    slot accounting it keeps: free slots never fall below the start
-//!    value, so the next output always has a slot.
+//!    slot accounting it keeps: after each commit, the free slots are at
+//!    least their start value. As a result, the next output always has a
+//!    slot.
 
 /// One key-version in the model: a mutation's sequence number and whether
 /// it was a deletion.

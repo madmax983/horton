@@ -176,8 +176,8 @@ pub struct Compaction<
     /// drop unsoundly (a drop under the overestimate implies the drop
     /// under the true wall).
     pub(crate) job_max_wall: u64,
-    /// The job is *tight*: it got fewer free slots than its estimate, or
-    /// it rewrites tables in place. It commits an output only when its
+    /// The job is *tight*: it did not get its estimate (plus the reserve,
+    /// for a request), or it rewrites tables in place. It commits an output only when its
     /// committed outputs do not exceed its retired inputs
     /// ([`model_tight_commit_ok`](crate::model::model_tight_commit_ok)),
     /// so it needs one free slot and never grows the region.

@@ -238,7 +238,8 @@ spreads flash wear.
 caller-owned `Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>` scratch
 (ADR-0004). Each call does bounded work (at most one output block, or one
 output's seal and commit) and returns `More` or `Done`;
-`compaction_pending()` says whether a job is in flight or selectable.
+`compaction_pending()` says whether a job is in flight or selectable, or
+an open request has work.
 
 - **Selection** (ADR-0010): full levels first, deepest first; then, when
   flush is down to the compaction reserve, pressure pushes intermediate
@@ -249,15 +250,17 @@ output's seal and commit) and returns `More` or `Done`;
 - **Tight jobs** (ADR-0015): when no job fits, a wanted level gets a
   tight job. It needs one free slot. It commits an output only when its
   committed outputs do not exceed its retired inputs, so it never grows
-  the region. If it cannot keep that rule, it drops the output: with
-  nothing committed, the step returns `RegionFull`.
+  the region. If it cannot keep that rule, it drops the output. If a job
+  for a wanted level committed nothing, the step returns `RegionFull`; a
+  requested job skips its tables.
 - **Requested compaction** (ADR-0015): `request_compaction(level)`
   compacts each table from `level` to the bottom once, below the
   triggers too. Above the bottom a table moves down a level; at the
   bottom it is rewritten in place with its small neighbours, as a tight
-  job. Jobs for full levels run first. A table whose job cannot free a
-  slot, or that a foreign table vetoes, is skipped. The request is in
-  memory only.
+  job. A requested job runs after the jobs that fit for full levels and
+  region pressure, and before their tight jobs. A table whose job gives
+  up, or that a foreign table vetoes, is skipped. When no slot is free,
+  `compact_step` returns `RegionFull`. The request is in memory only.
 - **Merge:** k-way over at most 8 cursors (sources, plus one
   concatenating cursor over the target level's tables), minimum key,
   highest sequence first. Per key it keeps the **keep-set**: the newest
@@ -410,7 +413,8 @@ WAL region bounds the commits between flushes.
   torn manifest writes are injected; the recovered state is always one of
   the committed states.
 - **Space reclaim** (`tests/reclaim.rs`): fill to `RegionFull` with TTL
-  data, pass every TTL, and show compaction frees the region; range
+  data, move the clock past every TTL, and show that compaction frees the
+  region; range
   deletes; bottom-level rewrites; every crash point of a rewrite.
 - Regression tests for every architecture-review finding
   (`tests/review_findings.rs`, never `#[ignore]`d).
@@ -426,7 +430,7 @@ WAL region bounds the commits between flushes.
 | v0.9–v0.12 | Crash hardening, archive, reverse scans, ingest |
 | v0.13–v0.16 | Block compression, range deletes and TTL, block cache |
 | v0.17 | Architecture review fixes: fixed table slots, split-output compaction, multi-block manifest with ring and staged edits, remedy-named errors, measured futures, range-delete space reclamation |
-| v0.19 | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015) |
+| Unreleased | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015) |
 
 Details: [`CHANGELOG.md`](CHANGELOG.md) and
 [`docs/history/milestones-v0.1-v0.16.md`](docs/history/milestones-v0.1-v0.16.md).

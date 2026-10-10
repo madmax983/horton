@@ -289,14 +289,14 @@ pub struct Db<
     /// Slots of the active job's input tables, one bit per slot. Archiving
     /// one of them aborts the job (its merge still reads the table).
     job_inputs: u64,
-    /// The level a [`request_compaction`](Db::request_compaction) cascade
+    /// The level that an open [`request_compaction`](Db::request_compaction)
     /// is at, or `None` when no request is open. In memory only.
     manual_level: Option<u8>,
     /// Tables at `manual_level` with an id below this mark are due: the
     /// request compacts each of them once.
     manual_mark: u32,
-    /// Slots of due tables that the request skips: their job could not
-    /// free a slot. One bit per slot.
+    /// Slots of due tables that the request skips: their job gave up, or
+    /// a foreign table vetoed it. One bit per slot.
     manual_skip: u64,
     cfg: Config,
     next_seq: u64,

@@ -416,8 +416,8 @@ impl Handle {
     }
 
     /// Flushes, then compacts every table once, down to the bottom level,
-    /// like `LevelDB`'s `CompactRange(nullptr, nullptr)`. Deleted data
-    /// gives its space back.
+    /// like `LevelDB`'s `CompactRange(nullptr, nullptr)`. This frees the
+    /// space of deleted data.
     pub fn compact(&self) -> Result<(), StoreError> {
         self.call(Request::CompactAll)
     }

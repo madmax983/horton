@@ -3,7 +3,8 @@
 //!
 //! A seeded PRNG drives a long stream of mixed operations — `put`,
 //! `delete`, `put_with_ttl`, `delete_range`, `WriteBatch`, `flush`,
-//! `compact_step` (with TTL purge cutoffs), `request_compaction`, snapshot acquire/release,
+//! `compact_step` (with TTL purge cutoffs), `request_compaction`,
+//! snapshot acquire/release,
 //! logical-time advancement, and `into_device` + `open` reopens — against
 //! a `TestDb`. An in-test oracle records every accepted mutation (point
 //! version chains plus range tombstones); after every meaningful step each
