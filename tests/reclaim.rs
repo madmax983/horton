@@ -296,8 +296,10 @@ fn a_bottom_level_rewrite_purges_expired_data() {
     // Only the bottom level holds data. Rewrite it with the purge on.
     c.purge_before = LATER;
     requested_compaction(&mut db, &mut c, LEVELS - 1);
+    // Half the data expired: rewrites merge with their small neighbours,
+    // so half the tables are left.
     let after = db.slot_stats().used;
-    assert!(after < bottom, "{bottom} -> {after}");
+    assert!(after * 2 <= bottom, "{bottom} -> {after}");
     for i in 0..1_200u64 {
         let want = (i % 2 == 0).then(|| val(i).to_vec());
         assert_eq!(get(&db, &key(b's', i), LATER), want, "key {i}");
@@ -374,19 +376,28 @@ fn live_data_is_never_made_larger_by_a_tight_job() {
     assert!(matches!(r, Err(Error::RegionFull)), "{r:?}");
     assert_eq!(db.slot_stats(), before);
 
+    // The request skips every table whose job gives up, so it ends. Then
+    // nothing is pending, or only full levels whose tight jobs fail.
     db.request_compaction(0).unwrap();
     let mut steps = 0;
     while db.compaction_pending() {
-        // A step may fail with `RegionFull`; it must not grow the region.
-        let _ = block_on(db.compact_step(&mut c));
+        match block_on(db.compact_step(&mut c)) {
+            Ok(_) => {}
+            Err(Error::RegionFull) => break,
+            Err(e) => panic!("{e:?}"),
+        }
         assert!(db.slot_stats().used <= before.used);
         steps += 1;
-        assert!(steps < MAX_STEPS, "never finished");
-        if steps > 10_000 {
-            break;
+        assert!(steps < 1_000, "the request never ended");
+    }
+    if db.compaction_pending() {
+        for _ in 0..3 {
+            let r = block_on(db.compact_step(&mut c));
+            assert!(matches!(r, Err(Error::RegionFull)), "{r:?}");
         }
     }
-    for i in [0, n / 3, n - 1] {
+    assert!(db.slot_stats().used <= before.used);
+    for i in (0..n).step_by(7) {
         assert_eq!(get(&db, &key(b's', i), 0), Some(val(i).to_vec()), "key {i}");
     }
     assert_eq!(db.check_invariants(), Ok(()));
@@ -718,6 +729,23 @@ fn a_rewrite_never_overlaps_the_next_table() {
         let n = block_on(db.get(k.as_bytes(), &mut buf)).unwrap().unwrap();
         assert_eq!(&buf[..n], &[b'n'; 100]);
     }
+}
+
+/// A reopen clears an open request.
+#[test]
+fn a_reopen_clears_an_open_request() {
+    let mut db = new_db();
+    let mut c = KvCompaction::new();
+    write_all(&mut db, &mut c, (0..400u64).map(|i| (key(b's', i), i, 0)));
+    flush(&mut db, &mut c).unwrap();
+    drain(&mut db, &mut c);
+    db.request_compaction(0).unwrap();
+    assert!(db.compaction_pending());
+    block_on(db.compact_step(&mut c)).unwrap();
+    assert!(db.compaction_pending());
+    // `open` again on the same handle recovers from the device.
+    block_on(db.open()).unwrap();
+    assert!(!db.compaction_pending());
 }
 
 /// With one level there is no compaction: a request does nothing.

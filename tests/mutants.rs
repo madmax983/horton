@@ -979,3 +979,86 @@ fn mut_manifest_encode_rejects_oversized() {
         "oversized manifest must be ManifestFull, never a panic"
     );
 }
+
+/// A seeded run that fills the 8-block-slot region with puts, TTL puts,
+/// deletes and range deletes until no flush fits, then compacts with a
+/// purge (and, for some seeds, a request from level 0). Returns the used
+/// slots at the start, the most during the compaction, and at the end.
+fn reserve_drain(seed: u64) -> (u32, u32, u32) {
+    let mut rng = common::Lcg::new(seed);
+    let mut db = TestDb::new(MemDevice::<4096>::new(), common::tight_config());
+    open(&mut db);
+    let mut c = TestCompaction::new();
+    let keys = 200 + rng.next() % 800;
+    let mut now = 0u64;
+    let flush = |db: &mut TestDb<MemDevice<4096>>, c: &mut TestCompaction| {
+        for _ in 0..100 {
+            match block_on(db.flush()) {
+                Err(Error::NeedsCompaction) => {
+                    while block_on(db.compact_step(c))? == Progress::More {}
+                }
+                r => return r,
+            }
+        }
+        Err(Error::RegionFull)
+    };
+    for _ in 0..20_000 {
+        let k = format!("k{:05}", rng.next() % keys);
+        let r = match rng.next_bounded(10) {
+            0 => {
+                let a = rng.next() % keys;
+                let b = a + rng.next() % 50;
+                block_on(
+                    db.delete_range(format!("k{a:05}").as_bytes(), format!("k{b:05}").as_bytes()),
+                )
+            }
+            1 | 2 => block_on(db.put_with_ttl(
+                k.as_bytes(),
+                &vec![b'v'; 10 + rng.next_bounded(300)],
+                now + 1 + rng.next() % 50,
+            )),
+            3 => block_on(db.delete(k.as_bytes())),
+            _ => block_on(db.put(k.as_bytes(), &vec![b'v'; 10 + rng.next_bounded(300)])),
+        };
+        now += 1;
+        if r.is_err() && flush(&mut db, &mut c).is_err() {
+            break;
+        }
+    }
+    let start = db.slot_stats().used;
+    c.purge_before = now / 2 + rng.next() % (now / 2 + 1);
+    if rng.next_bounded(2) == 0 {
+        db.request_compaction(0).unwrap();
+    }
+    let mut most = start;
+    for _ in 0..3_000 {
+        if !db.compaction_pending() || block_on(db.compact_step(&mut c)).is_err() {
+            break;
+        }
+        most = most.max(db.slot_stats().used);
+        assert_eq!(db.check_invariants(), Ok(()), "seed {seed}");
+    }
+    (start, most, db.slot_stats().used)
+}
+
+/// Kills: a tight job that does not count its committed outputs (it then
+/// commits outputs that retire nothing). Seed 248 runs a tight job whose
+/// second output retires no input: counted, the job gives up there and
+/// the region never grows past its start.
+#[test]
+fn mut_tight_job_counts_its_outputs() {
+    let (start, most, end) = reserve_drain(248);
+    assert!(most <= start, "{start} -> {most}");
+    assert!(end < start, "{start} -> {end}");
+}
+
+/// Kills: a requested L0 job that picks its sources against all free
+/// slots instead of the free slots less the reserve. It then picks more
+/// tables than it can admit and falls back to one table at a time. Seed
+/// 50 frees 13 of 27 slots with the budget and only 9 without it.
+#[test]
+fn mut_request_sizes_l0_jobs_to_their_budget() {
+    let (start, _, end) = reserve_drain(50);
+    assert_eq!(start, 27);
+    assert!(end <= 14, "27 -> {end}");
+}
