@@ -122,7 +122,7 @@ commands:
   delrange START END            delete every key in [START, END)
   scan [START [END]] [--reverse] [--limit N]
                                 print the keys in [START, END)
-  compact                       flush and compact until nothing is pending
+  compact                       flush, then compact every table once
   stats                         the layout, the levels and the counters
   bench [--num N] [--value-size N] [--threads N] [--batch N]
         [--benchmarks a,b,...]  db_bench's workloads on a fresh store

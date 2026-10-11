@@ -3,7 +3,8 @@
 //!
 //! A seeded PRNG drives a long stream of mixed operations — `put`,
 //! `delete`, `put_with_ttl`, `delete_range`, `WriteBatch`, `flush`,
-//! `compact_step` (with TTL purge cutoffs), snapshot acquire/release,
+//! `compact_step` (with TTL purge cutoffs), `request_compaction`,
+//! snapshot acquire/release,
 //! logical-time advancement, and `into_device` + `open` reopens — against
 //! a `TestDb`. An in-test oracle records every accepted mutation (point
 //! version chains plus range tombstones); after every meaningful step each
@@ -186,6 +187,20 @@ fn drive_compaction(db: &mut TestDb<TestDev>, purge_before: u64) {
     let mut c = TestCompaction::new();
     c.purge_before = purge_before;
     while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+}
+
+/// Runs `compact_step` until nothing is pending, a requested
+/// compaction included.
+fn drive_request(db: &mut TestDb<TestDev>, purge_before: u64) {
+    let mut c = TestCompaction::new();
+    c.purge_before = purge_before;
+    for _ in 0..100_000 {
+        if !db.compaction_pending() {
+            return;
+        }
+        block_on(db.compact_step(&mut c)).unwrap();
+    }
+    panic!("a requested compaction never finished");
 }
 
 /// Runs one mutating db op, flushing and retrying once on
@@ -457,13 +472,19 @@ fn run_stream(seed: u64, iters: usize, heavy_compact: bool) {
                 oracle.check_all(&db, &ctx, &extra_keys);
             }
             63..=67 => {
-                // compact to quiescence, sometimes with a TTL purge
+                // compact to quiescence, sometimes with a TTL purge, and
+                // sometimes on request from a random level down
                 let purge = if rng.next().is_multiple_of(2) {
                     oracle.now
                 } else {
                     0
                 };
-                drive_compaction(&mut db, purge);
+                if rng.next().is_multiple_of(3) {
+                    db.request_compaction(rng.next_bounded(7)).unwrap();
+                    drive_request(&mut db, purge);
+                } else {
+                    drive_compaction(&mut db, purge);
+                }
                 oracle.apply_purge(purge);
                 oracle.check_all(&db, &ctx, &extra_keys);
             }

@@ -555,6 +555,14 @@ impl Harness {
                 self.name = "reopen";
                 self.reopen();
             }
+            94..=95 => {
+                self.name = "request_compaction";
+                let level = self.rng.next_bounded(4);
+                self.db.request_compaction(level).unwrap();
+                if self.drain().is_err() {
+                    self.full = true;
+                }
+            }
             _ => {
                 self.name = "scan";
                 self.check_scans();
@@ -667,4 +675,18 @@ fn lifecycle_fuzz_tight_slots() {
             "seed {seed}: appends full after {done} ops"
         );
     }
+}
+
+/// Seeds that once found a bug, at full depth. Release builds only (CI's
+/// release test job): the debug build takes minutes, and
+/// `tests/reclaim.rs` holds a direct test for each bug.
+/// `0x7167a054`: a bottom-level rewrite's last output overlapped the next
+/// table (its range-tombstone end was the next table's first key).
+#[test]
+fn lifecycle_regression_seeds() {
+    if cfg!(debug_assertions) || cfg!(miri) {
+        return;
+    }
+    let done = run(0x7167_a054, Keys::Append, 1200, tight_cfg());
+    assert!(done >= 250, "appends full after {done} ops");
 }

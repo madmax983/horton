@@ -11,8 +11,31 @@ misread (SPEC §4.5).
 
 ## [Unreleased]
 
+### Added
+
+- `Db::request_compaction(level)` compacts every table from `level` down
+  to the bottom once, also below the level triggers. Bottom tables are
+  rewritten in place, so `purge_before` and range tombstones free space
+  there (issue #32, ADR-0015).
+- `model_tight_commit_ok`, `model_tight_job` and `TightJob` in
+  `horton::model`.
+- The kvstore `compact` command uses `request_compaction(0)`.
+
+### Changed
+
+- `compaction_pending()` is also true while a request has work.
+- `compact_step` can return `RegionFull` from a tight job that cannot
+  free a slot. It changes nothing then.
+
 ### Fixed
 
+- A full table region no longer stops all writes. When no job fits its slot
+  estimate, a *tight* job runs with one free slot and never grows the
+  region. A region full of expired or deleted data now gives its space
+  back; before, every write failed with `RegionFull` (issue #32).
+- The last output of a compaction job no longer claims a key range past
+  its inputs. Its range-tombstone end could be the next table's first
+  key, so two tables of one level overlapped.
 - The profiling profile is `valgrind` (it was `valgriind`). The README's
   callgrind line uses it, so the benches keep their debug symbols.
 

@@ -289,6 +289,19 @@ pub struct Db<
     /// Slots of the active job's input tables, one bit per slot. Archiving
     /// one of them aborts the job (its merge still reads the table).
     job_inputs: u64,
+    /// The level that an open [`request_compaction`](Db::request_compaction)
+    /// is at, or `None` when no request is open. In memory only.
+    manual_level: Option<u8>,
+    /// Tables at `manual_level` with an id below this mark are due: the
+    /// request compacts each of them once.
+    manual_mark: u32,
+    /// The next table id when the request opened. At the bottom level the
+    /// mark is this: the tables the request's own jobs wrote there are
+    /// done already.
+    manual_start: u32,
+    /// Slots of due tables that the request skips: their job gave up, or
+    /// a foreign table vetoed it. One bit per slot.
+    manual_skip: u64,
     cfg: Config,
     next_seq: u64,
     /// Live snapshot watermarks (sequence numbers). A snapshot pins reads
@@ -500,6 +513,10 @@ impl<
             job_gen: 0,
             job_active: false,
             job_inputs: 0,
+            manual_level: None,
+            manual_mark: 0,
+            manual_start: 0,
+            manual_skip: 0,
             cfg: config,
             next_seq: 0,
             snapshots: [0u64; MAX_SNAPSHOTS],
@@ -781,6 +798,7 @@ impl<
         self.job_active = false;
         self.job_inputs = 0;
         self.job_gen = self.job_gen.wrapping_add(1);
+        self.manual_level = None;
         self.check_regions()?;
         let mut slots = SlotMap::layout(
             self.cfg.tbl_start,
