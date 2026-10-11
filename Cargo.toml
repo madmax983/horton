@@ -1,6 +1,6 @@
 [package]
 name = "horton"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Zero-dependency, zero-allocation LSM-tree KV store (no_std, no_alloc)"
