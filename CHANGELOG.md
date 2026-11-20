@@ -18,8 +18,9 @@ v0.19, are rejected, not misread.
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
 key-value store against RocksDB on db_bench's workloads, before and
-after. Point reads are 9 to 20 times faster than 0.19, scans 2 to 3
-times, and unsynced writes about twice.
+after. Against 0.19, point reads are 5 to 7 times faster (8 to 16 for
+absent keys), scans 2 to 5 times, and unsynced writes 1.5 to 3 times;
+synced writes are unchanged.
 
 ### Added
 
@@ -67,7 +68,8 @@ times, and unsynced writes about twice.
 - **The bloom filter is bucketed** (ADR-0017): a key's probes all fall
   in one 64-byte bucket, and a point read fetches that bucket and the
   footer's 45 bytes from the cache instead of two whole blocks. A probe
-  of a table that does not hold the key costs about 0.2 µs once cached.
+  of a table that does not hold the key costs well under a microsecond
+  once cached.
   False positives rise slightly (0.84% to 0.98% at 10 bits per key).
 - **A block cache above 8 slots is hashed**: a block's slot is one of 8
   chosen from its key, so lookups and inserts no longer scan every

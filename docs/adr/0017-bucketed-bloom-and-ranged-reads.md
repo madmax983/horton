@@ -41,10 +41,11 @@ its first read.
 
 ## Consequences
 
-- **A probe that the filter rejects costs about 0.2 µs** once the two
-  blocks are cached: two tag lookups and two chunk sums. In the host
-  store a read of an absent key went from 26 µs to under 10 µs with
-  this change and the engine lock (see `docs/THROUGHPUT.md`).
+- **A probe that the filter rejects costs well under a microsecond**
+  once the two blocks are cached: two tag lookups and two chunk sums.
+  In the host store a read of an absent key went from 26 µs to 18 µs
+  on this change alone, most of the rest being thread hand-off (see
+  `docs/THROUGHPUT.md`).
 - **Slightly more false positives.** Keys are not spread evenly over
   buckets, and a fuller bucket filters worse. At 10 bits per key the
   rate goes from 0.84% to 0.98%, at 16 from 0.05% to 0.09% (Poisson
