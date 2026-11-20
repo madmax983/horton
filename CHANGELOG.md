@@ -19,6 +19,12 @@ misread (SPEC §4.5).
   give equal fingerprints whatever the write history, flushes or
   compactions; per-range fingerprints merge, for bucketed anti-entropy
   between a device and its replica.
+- `horton::diff`: `Diff` merge-joins two positioned ascending sources
+  and yields a `Delta` (`OnlyLeft`, `OnlyRight`, `Differs`) for every key
+  whose visible value differs, in one pass over four caller-owned
+  buffers. `SortedEntries` is the source trait; `Scan` implements it.
+  After `fingerprint_buckets` finds the bucket that disagrees, a diff of
+  that bucket is the exact repair list.
 - `Db::request_compaction(level)` compacts every table from `level` down
   to the bottom once, also below the level triggers. Bottom tables are
   rewritten in place, so `purge_before` and range tombstones free space
