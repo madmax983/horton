@@ -2679,7 +2679,8 @@ mod tests {
 
     /// Key `n` as three bytes, order-preserving.
     fn k(n: usize) -> [u8; 3] {
-        [b'k', (n / 256) as u8, (n % 256) as u8]
+        let [hi, lo] = u16::try_from(n).unwrap().to_be_bytes();
+        [b'k', hi, lo]
     }
 
     /// Every index size around the stride boundaries, with and without

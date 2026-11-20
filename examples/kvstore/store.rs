@@ -386,10 +386,10 @@ impl Shared {
                 core::hint::spin_loop();
             }
             if started.elapsed() >= SPIN {
-                break match self.engine.lock() {
-                    Ok(guard) => self.opened(guard),
-                    Err(_) => Err(StoreError::Closed),
-                };
+                break self
+                    .engine
+                    .lock()
+                    .map_or_else(|_| Err(StoreError::Closed), |guard| self.opened(guard));
             }
             std::thread::yield_now();
         };
@@ -401,9 +401,9 @@ impl Shared {
     /// [`Locked::finish`]).
     fn with<T>(&self, op: impl FnOnce(&mut Engine) -> Result<T, DbError>) -> Result<T, StoreError> {
         let mut engine = self.engine()?;
-        let r = op(&mut engine);
+        let r = op(&mut engine).map_err(StoreError::Db);
         engine.finish();
-        r.map_err(StoreError::Db)
+        r
     }
 
     /// Queues `work` and returns its result once some thread has served
@@ -442,7 +442,7 @@ impl Shared {
                         Instant::now()
                     });
                     polls += 1;
-                    if polls % POLLS_PER_YIELD != 0 {
+                    if !polls.is_multiple_of(POLLS_PER_YIELD) {
                         core::hint::spin_loop();
                     } else if since.elapsed() < SPIN {
                         std::thread::yield_now();
@@ -479,14 +479,16 @@ impl Shared {
     /// waiting for the lock.
     fn background(&self) {
         loop {
+            let mut asleep = lock(&self.wake.0);
+            while !self.background_due.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire)
             {
-                let mut g = lock(&self.wake.0);
-                while !self.background_due.load(Ordering::Acquire)
-                    && !self.stop.load(Ordering::Acquire)
-                {
-                    g = self.wake.1.wait(g).unwrap_or_else(PoisonError::into_inner);
-                }
+                asleep = self
+                    .wake
+                    .1
+                    .wait(asleep)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
+            drop(asleep);
             loop {
                 if self.stop.load(Ordering::Acquire) {
                     return;
@@ -943,6 +945,7 @@ impl Engine {
                 self.group.extend(queue.pop_front());
             }
         }
+        drop(queue);
         Some(head)
     }
 

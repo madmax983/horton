@@ -1,4 +1,4 @@
-# Horton ESP32-S3 RAM budget (v0.17)
+# Horton ESP32-S3 RAM budget (v0.20)
 
 All numbers are **measured** with `core::mem::size_of` /
 `core::mem::size_of_val` on the host (`tests/profile.rs` prints and
@@ -26,10 +26,10 @@ not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 25,408 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache, the region layout, the requested-compaction state |
+| `Db` | 25,672 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
 | `Scan` | 10,824 | logical block buffer, physical read buffer, cursors |
 | `Compaction` | 59,568 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,728 bytes: F16, F22) |
-| **Structs** | **95,800** | |
+| **Structs** | **96,064** | |
 
 ## Measured futures
 
@@ -39,15 +39,15 @@ future, and the executor stores the future: in a static task arena
 
 | Future | Bytes | Notes |
 |---|---|---|
-| `archive_commit()` | 17,632 | the resurrection review's entry stream over the candidate |
+| `archive_commit()` | 17,680 | the resurrection review's entry stream over the candidate |
 | `flush()` | 17,608 | table writer (data + index blocks) and trial-compression scratch |
 | `open()` | 7,008 | WAL recovery |
-| `compact_step()` | 2,856 | merge state lives in the caller's `Compaction` |
-| `get()` | 1,104 | blocks are read through the `Db`'s shared buffers |
+| `compact_step()` | 2,864 | merge state lives in the caller's `Compaction` |
+| `get()` | 1,184 | blocks are read through the `Db`'s shared buffers |
 | `ingest_table()` | 592 | copies through the `Db`'s block scratch |
 | `put()`, `delete()`, `write()`, … | ≤ 488 | |
-| `Scan::next()`, `RevScan::prev()` | ≤ 1,216 | |
-| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,192 | |
+| `Scan::next()`, `RevScan::prev()` | ≤ 1,264 | |
+| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,240 | |
 
 At most one `&mut self` call runs at a time, and it excludes scans
 (a `Scan` borrows the `Db`). A `get` can run alongside a scan step. The
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 95,800 + max(17,632, 1,104 + 1,216) = 113,432 bytes
+= 96,064 + max(17,680, 1,184 + 1,264) = 113,744 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
@@ -68,6 +68,9 @@ History:
 - 64 KiB until v0.13.
 - 96 KiB from v0.13: block compression costs about 20 KiB of
   caller-owned scratch.
+- Still 112 KiB at v0.20, with 944 bytes to spare: the block cache
+  keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
+  and the read futures carry a bloom probe and a byte range.
 - 112 KiB from v0.17: the futures are counted (architecture review F8).
   Before the fix the `flush()` future alone was 29.8 KiB. It now borrows
   the `Db`'s block scratch, stages the range-tombstone section in its

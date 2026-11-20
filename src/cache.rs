@@ -422,7 +422,7 @@ impl<const BLOCK: usize, const SLOTS: usize> BlockCache<BLOCK, SLOTS> {
 
     /// Ends a lookup that found slot `i`: a hit when the sums matched,
     /// otherwise the slot is dropped and the lookup is a (rejected) miss.
-    fn settle(&mut self, i: usize, sums_matched: bool) -> bool {
+    const fn settle(&mut self, i: usize, sums_matched: bool) -> bool {
         if sums_matched {
             self.tags[i].refbit = true;
             self.hits = self.hits.saturating_add(1);

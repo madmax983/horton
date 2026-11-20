@@ -90,8 +90,8 @@ What it guarantees, for two images of equal length:
   of a good block. `tests/cache.rs` and `tests/fuzz.rs` are rewritten
   to that rule.
 - **RAM.** A slot carries 16 sums: 144 bytes of tag and sums against 16
-  bytes before. The ESP32-S3 profile's two slots add 256 bytes to
-  `Db`; the budget holds (BUDGET.md).
+  bytes before. The ESP32-S3 profile's two slots add 264 bytes to
+  `Db`; the 112 KiB budget holds with 944 bytes to spare (BUDGET.md).
 - **`BlockCache::put` trusts its caller.** The cache hands back exactly
   what it was given. Code outside horton that inserts unverified bytes
   gets them back unverified.
