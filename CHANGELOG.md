@@ -13,6 +13,12 @@ misread (SPEC §4.5).
 
 ### Added
 
+- `horton::fingerprint`: `Fingerprint` (a count and a mergeable
+  multiset hash of key-value pairs), `fingerprint` and
+  `fingerprint_buckets` over a positioned `Scan`. Equal visible contents
+  give equal fingerprints whatever the write history, flushes or
+  compactions; per-range fingerprints merge, for bucketed anti-entropy
+  between a device and its replica.
 - `Db::request_compaction(level)` compacts every table from `level` down
   to the bottom once, also below the level triggers. Bottom tables are
   rewritten in place, so `purge_before` and range tombstones free space
