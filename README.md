@@ -218,16 +218,18 @@ cargo run --release --example kvstore -- crash 25          # kill -9 the writer 
 ```
 
 horton's `Db` is one value with `&mut self` writes and no locks, which
-suits firmware. The example puts it on a **store thread** and gives other
-threads a `Handle` that sends requests over a channel:
+suits firmware. The example puts it behind one lock and gives every
+thread a `Handle`. A thread that wants a point read or a write queues
+it; whichever thread holds the lock serves the queue in order, its own
+request and everyone else's:
 
 | LevelDB | here |
 |---|---|
 | `DB::Open` on a directory | `Store::open` on one file, created sparse at `--size-mb` (256 MiB); a `BlockDevice` over `pread`/`pwrite` and `fdatasync` ([`device.rs`](examples/kvstore/device.rs)) |
 | `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
-| writer queue, group commit | the store thread commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
-| background compaction | one bounded `compact_step` between requests, back to back when idle; full memtables, WALs and level 0s are handled on the store thread, so callers never see those errors |
+| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them. Point reads go through the same queue, so the database stays in one CPU's cache |
+| background compaction | one bounded `compact_step` at the end of each operation, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator` | `range(start, end, reverse)`: pins a snapshot, pages through horton's `Scan` or `RevScan` |
 | `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
@@ -359,10 +361,10 @@ rebuilds the slot map from the manifest.
 ```text
 block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
              └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
-               blocks, magic "hrtman05"
+               blocks, magic "hrtman07"
 
 SSTable:    [data]* [rdel]* [bloom] [index] [footer]
-             │       │        │       │       └ magic "hrtsst02", ids, entry count, k, rdel count, min seq
+             │       │        │       │       └ magic "hrtsst03", ids, entry count, k, rdel count, min seq
              │       │        │       └ per data block: first key, block id, max seq
              │       │        └ BLOOM_BYTES bit array
              │       └ range tombstones sorted by start
@@ -546,7 +548,7 @@ What the suite covers:
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
 | `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
-| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the store thread with group commit and background compaction (`store.rs`), db_bench's workloads (`bench.rs`), and the kill -9 crash test (`crash.rs`) |
+| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its request queue, group commit and background compaction (`store.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
 | `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |

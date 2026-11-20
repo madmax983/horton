@@ -17,15 +17,18 @@
 //!   key | val`, then restart offsets (`u16` each, one every 16 entries),
 //!   then the restart count (`u16`). Restart offsets make a block
 //!   binary-searchable without a full scan.
-//! - Bloom block: a `BLOOM_BYTES * 8`-bit array. `k` (stored in the footer) probes
-//!   come from double hashing of a hand-rolled splitmix64-over-Fx-fold hash.
+//! - Bloom block: a `BLOOM_BYTES * 8`-bit array in 64-byte buckets. A key
+//!   hashes (hand-rolled splitmix64 over an Fx fold) to one bucket, and
+//!   its `k` probes (stored in the footer) are double-hashed inside those
+//!   512 bits, so a lookup reads 64 bytes of the block. A filter under
+//!   64 bytes is one bucket.
 //! - Index block: one entry per data block,
 //!   `first_key_len u16 | first_key | block_id u64 | max_seq u64`.
 //! - Rdel block: range tombstones `start_len u16 | end_len u16 | seq u64 |
 //!   start | end`, sorted by `start` ascending (ties in any sequence
 //!   order: compaction clips pieces to its outputs' ranges), then
 //!   `count u16`.
-//! - Footer block: `magic u64 = "hrtsst02" | index_block u64 |
+//! - Footer block: `magic u64 = "hrtsst03" | index_block u64 |
 //!   bloom_block u64 | entry_count u64 | k u8 | rdel_blocks u32 |
 //!   min_seq u64`. The rdel section is `[bloom_block - rdel_blocks,
 //!   bloom_block)`.
@@ -50,14 +53,19 @@ use crate::error::Error;
 use crate::manifest::KeyBound;
 use crate::wal::Op;
 
-/// Footer magic: ASCII "hrtsst02" as stored on device.
+/// Footer magic: ASCII "hrtsst03" as stored on device.
 ///
 /// Pre-1.0 format policy: the magic changes whenever the table layout
 /// does. "lsmtable" was the v0.2–v0.16 layout (rdel section first, no
 /// `min_seq`); "hrtsst02" is v0.17 (rdel section after the data, footer
-/// `min_seq`). A foreign magic is [`Error::CorruptBlock`], never a
+/// `min_seq`); "hrtsst03" is v0.20 (the bloom filter is bucketed: an
+/// older table's filter read by the new rule would answer "absent" for
+/// keys it holds). A foreign magic is [`Error::CorruptBlock`], never a
 /// misparse.
-pub const SSTABLE_MAGIC: u64 = u64::from_le_bytes(*b"hrtsst02");
+pub const SSTABLE_MAGIC: u64 = u64::from_le_bytes(*b"hrtsst03");
+
+/// Bytes of a footer block that carry fields; the rest is zero padding.
+const FOOTER_LEN: usize = 45;
 
 /// One sorted-run entry: exactly one per key (the memtable already keeps
 /// only the newest version of each key).
@@ -279,50 +287,114 @@ const fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Bloom bit positions for `key`: double hashing over the two mixed hashes.
-fn probe_positions(key: &[u8], k: u8, bits: u64) -> impl Iterator<Item = u64> {
-    let h1 = splitmix64(fx_fold(key));
-    let h2 = splitmix64(h1 ^ 0x9e37_79b9_7f4a_7c15);
-    (0..k).map(move |i| h1.wrapping_add(u64::from(i).wrapping_mul(h2)) % bits)
+/// Bytes in a bloom bucket: one cache line, 512 bits.
+pub const BLOOM_BUCKET_BYTES: usize = 64;
+
+/// Where one key's bloom probes fall: every probe lies inside one bucket
+/// of the filter, so a reader needs only that bucket's bytes.
+///
+/// The bucket comes from one hash and the probe sequence from another,
+/// so keys sharing a bucket still spread over its bits.
+#[derive(Debug, Clone, Copy)]
+pub struct BloomProbe {
+    /// First byte of the bucket within the filter.
+    start: usize,
+    /// Bytes in the bucket: [`BLOOM_BUCKET_BYTES`], or the whole filter
+    /// when it is smaller than one bucket. Zero for an empty filter.
+    len: usize,
+    /// First probe and the (odd) stride of the double hashing.
+    first: u64,
+    stride: u64,
+}
+
+impl BloomProbe {
+    /// The probe for `key` in a filter of `bloom_len` bytes.
+    #[must_use]
+    pub fn new(bloom_len: usize, key: &[u8]) -> Self {
+        let h1 = splitmix64(fx_fold(key));
+        let h2 = splitmix64(h1 ^ 0x9e37_79b9_7f4a_7c15);
+        let buckets = bloom_len / BLOOM_BUCKET_BYTES;
+        let (start, len) = if buckets == 0 {
+            (0, bloom_len)
+        } else {
+            // Multiply-shift maps the high half of `h1` evenly onto
+            // `0..buckets` (the product is below `buckets << 32`).
+            let pick = (h1 >> 32).wrapping_mul(buckets as u64) >> 32;
+            let bucket = usize::try_from(pick).map_or(0, |b| b.min(buckets - 1));
+            (bucket * BLOOM_BUCKET_BYTES, BLOOM_BUCKET_BYTES)
+        };
+        Self {
+            start,
+            len,
+            first: h2 & 0xFFFF_FFFF,
+            // Odd, so in a 512-bit bucket the probes never repeat.
+            stride: (h2 >> 32) | 1,
+        }
+    }
+
+    /// The bucket's bytes within the filter (and within the bloom block,
+    /// which the filter starts).
+    #[must_use]
+    pub const fn range(&self) -> core::ops::Range<usize> {
+        self.start..self.start + self.len
+    }
+
+    /// Bit positions inside the bucket.
+    fn bits(&self, k: u8) -> impl Iterator<Item = usize> {
+        let (first, stride) = (self.first, self.stride);
+        // `len` is at most 64, so the bit count and every position fit.
+        let bits = (self.len * 8) as u64;
+        (0..u64::from(k)).filter_map(move |i| {
+            let p = first
+                .wrapping_add(i.wrapping_mul(stride))
+                .checked_rem(bits)?;
+            usize::try_from(p).ok()
+        })
+    }
+
+    /// Sets the key's `k` probe bits in `bucket`, the filter's bytes at
+    /// [`range`](Self::range).
+    fn add_to(&self, bucket: &mut [u8], k: u8) {
+        for p in self.bits(k) {
+            if let Some(byte) = bucket.get_mut(p / 8) {
+                *byte |= 1u8 << (p % 8);
+            }
+        }
+    }
+
+    /// Reports whether the key may be present, given `bucket`, the
+    /// filter's bytes at [`range`](Self::range): all `k` probe bits set.
+    /// An empty or short bucket answers "maybe", never a false negative.
+    #[must_use]
+    pub fn matches(&self, bucket: &[u8], k: u8) -> bool {
+        self.bits(k).all(|p| {
+            bucket
+                .get(p / 8)
+                .is_none_or(|byte| byte >> (p % 8) & 1 == 1)
+        })
+    }
 }
 
 /// Sets the `k` probe bits for `key`. A zero-length filter degrades to "no
 /// information" (all lookups proceed); it never panics.
 fn bloom_add(bloom: &mut [u8], key: &[u8], k: u8) {
-    let Ok(bits) = u64::try_from(bloom.len() * 8) else {
-        return;
-    };
-    if bits == 0 {
-        return;
-    }
-    for p in probe_positions(key, k, bits) {
-        // `p < bits <= bloom.len() * 8`: the position always addresses the
-        // filter on 64-bit targets; the fallback only exists for 32-bit.
-        let Ok(p) = usize::try_from(p) else { continue };
-        bloom[p / 8] |= 1u8 << (p % 8);
+    let probe = BloomProbe::new(bloom.len(), key);
+    if let Some(bucket) = bloom.get_mut(probe.range()) {
+        probe.add_to(bucket, k);
     }
 }
 
 /// Reports whether `key` may be in the filter: all `k` probe bits set.
 ///
 /// Never a false negative; false positives possible. `bloom` must be the
-/// exact filter bytes (any length); `k` comes from [`bloom_k`].
+/// exact filter bytes (any length); `k` comes from [`bloom_k`]. A reader
+/// holding only part of the filter uses [`BloomProbe`] instead.
 #[must_use]
 pub fn bloom_maybe_contains(bloom: &[u8], key: &[u8], k: u8) -> bool {
-    let Ok(bits) = u64::try_from(bloom.len() * 8) else {
-        return true;
-    };
-    if bits == 0 {
-        return true;
-    }
-    probe_positions(key, k, bits).all(|p| {
-        // Unaddressable on 32-bit only; answering "maybe" keeps the
-        // no-false-negative guarantee.
-        let Ok(p) = usize::try_from(p) else {
-            return true;
-        };
-        bloom[p / 8] >> (p % 8) & 1 == 1
-    })
+    let probe = BloomProbe::new(bloom.len(), key);
+    bloom
+        .get(probe.range())
+        .is_none_or(|bucket| probe.matches(bucket, k))
 }
 
 /// Computes the table shape (pass 1, no I/O). Entries must arrive in
@@ -847,8 +919,8 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data[24..32].copy_from_slice(&self.entry_count.to_le_bytes());
         self.data[32] = self.k;
         self.data[33..37].copy_from_slice(&rdel_blocks.to_le_bytes());
-        self.data[37..45].copy_from_slice(&min_seq.to_le_bytes());
-        seal_block(device, footer_id, &mut self.data, 45, None, None).await?;
+        self.data[37..FOOTER_LEN].copy_from_slice(&min_seq.to_le_bytes());
+        seal_block(device, footer_id, &mut self.data, FOOTER_LEN, None, None).await?;
 
         // Table blocks are durable before the manifest commit makes them
         // visible.
@@ -1214,6 +1286,15 @@ pub(crate) fn rdel_block_count<E, const BLOCK: usize>(
     id: u64,
 ) -> Result<usize, Error<E>> {
     check_block_crc::<E, BLOCK>(block, id)?;
+    rdel_count_verified::<E, BLOCK>(block, id)
+}
+
+/// The entry count of an rdel block whose CRC the caller has already
+/// verified (it came through [`read_block_verified`]).
+fn rdel_count_verified<E, const BLOCK: usize>(
+    block: &[u8; BLOCK],
+    id: u64,
+) -> Result<usize, Error<E>> {
     let raw = u16::from_le_bytes(
         block[BLOCK - CRC_LEN - 2..BLOCK - CRC_LEN]
             .try_into()
@@ -1598,62 +1679,96 @@ fn index_entry_parse(payload: &[u8], off: usize) -> Result<(&[u8], u64, usize), 
     Ok((key, block_id, next))
 }
 
-/// Binary-searches the index for the first data block that may hold `key`.
-/// Parses the index entry at position `i` by re-parsing from the start
-/// (O(n) per call, no allocation). Shared by the index searches below.
-fn index_entry_at(payload: &[u8], i: usize) -> Result<(&[u8], u64, usize), ()> {
-    let mut off = 0usize;
-    for _ in 0..i {
-        let (_, _, next) = index_entry_parse(payload, off)?;
-        off = next;
-    }
-    index_entry_parse(payload, off)
+/// Index entries between two key comparisons of [`index_partition`]'s
+/// forward pass.
+const INDEX_STRIDE: usize = 16;
+
+/// What one pass over an index block found, for a predicate that holds
+/// for a (possibly empty) prefix of the entries and for none after it.
+struct IndexSplit {
+    /// Entries the predicate holds for.
+    matching: usize,
+    /// Data block of the last of them.
+    last_matching: Option<u64>,
+    /// Data block of the first entry.
+    first: Option<u64>,
+    /// Entries in the index.
+    count: usize,
 }
 
-/// Counts index entries, then binary-searches for the first entry whose
-/// `first_key` sorts after `key`. Returns `(lo, count)` with `lo >= 1`, or
-/// `None` when `key` sorts before every block. Shared by [`index_lookup`]
-/// and [`index_last_le_block`].
-fn index_upper_bound<E>(
+/// Walks the index once and splits it at the first entry whose
+/// `first_key` fails `holds`. Entries are sorted by `first_key`, and
+/// `holds` must be monotone over them (true, then false).
+///
+/// Entries are variable-length with no offset table, so position `i` is
+/// only reachable by parsing the `i` entries before it. Rather than
+/// binary-search by re-parsing from the start for every probe, the pass
+/// parses each entry once (it must anyway, to count and validate them),
+/// compares only every [`INDEX_STRIDE`]th key, and finishes with a
+/// linear scan of the one stride the boundary falls in.
+///
+/// The block's CRC already passed, so a parse failure is either genuine
+/// zero padding (all zeros to the end of the block body: the end of the
+/// index) or structural corruption; the two are told apart explicitly.
+fn index_partition<E>(
     payload: &[u8],
-    key: &[u8],
     index_id: u64,
-) -> Result<Option<(usize, usize)>, Error<E>> {
+    holds: impl Fn(&[u8]) -> bool,
+) -> Result<IndexSplit, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: index_id };
-    // Count entries with one linear pass; the binary search below then
-    // re-parses on demand (O(n log n) byte scans, no allocation). The
-    // block's CRC already passed, so a parse failure is either genuine zero
-    // padding (all zeros to the end of the block body: the end of the index)
-    // or structural corruption — the two are distinguished explicitly.
-    let mut count = 0usize;
+    let mut split = IndexSplit {
+        matching: 0,
+        last_matching: None,
+        first: None,
+        count: 0,
+    };
+    // The last sampled entry that matched: `(position, offset)`. The
+    // boundary is searched for from here once a later sample fails.
+    let mut anchor: Option<(usize, usize)> = None;
+    // Where the boundary's stride ends, once a sample has failed.
+    let mut stride_end: Option<usize> = None;
     let mut off = 0usize;
     while off < payload.len() {
-        if let Ok((_, _, next)) = index_entry_parse(payload, off) {
-            off = next;
-            count += 1;
-        } else if all_zero(&payload[off..]) {
-            break;
-        } else {
+        let Ok((fkey, block_id, next)) = index_entry_parse(payload, off) else {
+            if all_zero(&payload[off..]) {
+                break;
+            }
             return Err(corrupt());
+        };
+        if split.count == 0 {
+            split.first = Some(block_id);
+        }
+        if stride_end.is_none() && split.count.is_multiple_of(INDEX_STRIDE) {
+            if holds(fkey) {
+                anchor = Some((split.count, off));
+                split.matching = split.count + 1;
+                split.last_matching = Some(block_id);
+            } else {
+                stride_end = Some(split.count);
+            }
+        }
+        off = next;
+        split.count += 1;
+    }
+    // The entries after the anchor, up to the failed sample (or the end),
+    // were not compared: the boundary is among them.
+    if let Some((at, anchor_off)) = anchor {
+        let end = stride_end.unwrap_or(split.count);
+        let (_, _, mut off) = index_entry_parse(payload, anchor_off).map_err(|()| corrupt())?;
+        for pos in at + 1..end {
+            let (fkey, block_id, next) = index_entry_parse(payload, off).map_err(|()| corrupt())?;
+            if !holds(fkey) {
+                break;
+            }
+            split.matching = pos + 1;
+            split.last_matching = Some(block_id);
+            off = next;
         }
     }
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let (fkey, _, _) = index_entry_at(payload, mid).map_err(|()| corrupt())?;
-        if fkey <= key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    if lo == 0 {
-        return Ok(None);
-    }
-    Ok(Some((lo, count)))
+    Ok(split)
 }
-/// Binary-searches the index for the first data block that may hold `key`.
+
+/// Finds the first data block that may hold `key`.
 /// Returns the block id and the maximum number of data blocks a point
 /// lookup may walk forward from it (the index entry count minus the
 /// resolved position: the walk stays inside the table), or `None` when
@@ -1665,36 +1780,33 @@ fn index_upper_bound<E>(
 /// touches carries the key as its restart (first) key, and worse, a block
 /// can seal *inside* the run — so the block before the first duplicate
 /// restart can hold the run's newest versions. The search therefore lands
-/// on the last restart with `first_key <= key` and then walks back over
-/// every duplicate of `key`, ending at the last restart strictly below
-/// `key` (entry 0 stays put): the first block whose key range can contain
-/// `key`. Starting any later would miss the run's newest versions.
+/// on the last restart strictly below `key` (entry 0 when there is
+/// none): the first block whose key range can contain `key`. Starting
+/// any later would miss the run's newest versions.
 pub(crate) fn index_lookup<E>(
     payload: &[u8],
     key: &[u8],
     index_id: u64,
 ) -> Result<Option<(u64, usize)>, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: index_id };
-    let Some((lo, count)) = index_upper_bound(payload, key, index_id)? else {
-        return Ok(None);
-    };
-    // `lo - 1`: last restart with `first_key <= key`. Walk back over
-    // duplicates of `key` — the run's newest versions live in the first
-    // block it touches, which can be the block *before* the first
-    // duplicate restart when a block seals mid-run.
-    let mut pos = lo - 1;
-    while pos > 0 {
-        let (fkey, _, _) = index_entry_at(payload, pos).map_err(|()| corrupt())?;
-        if fkey != key {
-            break;
+    // Entries strictly below `key`: the last of them is the block to
+    // start in, whether or not restarts equal to `key` follow it.
+    let below = index_partition(payload, index_id, |fkey| fkey < key)?;
+    if below.matching == 0 {
+        // No restart below `key`. The table can hold it only if its
+        // first restart is `key` itself; the search starts there.
+        let first_is_key = index_entry_parse(payload, 0).is_ok_and(|(fkey, _, _)| fkey == key);
+        if !first_is_key {
+            return Ok(None);
         }
-        pos -= 1;
+        let block_id = below.first.ok_or_else(corrupt)?;
+        return Ok(Some((block_id, below.count)));
     }
-    let (_, block_id, _) = index_entry_at(payload, pos).map_err(|()| corrupt())?;
-    // The walk may visit every data block from `pos` onward — never past
+    let block_id = below.last_matching.ok_or_else(corrupt)?;
+    // The walk may visit every data block from there onward — never past
     // the table's last data block (whose readers must not stray into the
     // bloom/index/footer blocks).
-    Ok(Some((block_id, count - pos)))
+    Ok(Some((block_id, below.count - (below.matching - 1))))
 }
 
 /// Returns the last data block whose `first_key` sorts at or before `key`,
@@ -1709,13 +1821,7 @@ pub(crate) fn index_last_le_block<E>(
     key: &[u8],
     index_id: u64,
 ) -> Result<Option<u64>, Error<E>> {
-    let corrupt = || Error::CorruptBlock { id: index_id };
-    let Some((lo, _)) = index_upper_bound(payload, key, index_id)? else {
-        return Ok(None);
-    };
-    // `lo - 1`: last restart with `first_key <= key`.
-    let (_, block_id, _) = index_entry_at(payload, lo - 1).map_err(|()| corrupt())?;
-    Ok(Some(block_id))
+    Ok(index_partition(payload, index_id, |fkey| fkey <= key)?.last_matching)
 }
 
 /// Reads and verifies a table footer, returning its index block id.
@@ -1733,8 +1839,16 @@ pub(crate) async fn footer_index_block<D: BlockDevice, const BLOCK: usize>(
     scratch: &mut [u8; BLOCK],
     footer_block: u64,
 ) -> Result<u64, Error<D::Error>> {
-    read_block_cached(device, cache, table_id, footer_block, scratch, true).await?;
-    check_block_crc::<D::Error, BLOCK>(scratch, footer_block)?;
+    read_range_verified(
+        device,
+        cache,
+        table_id,
+        footer_block,
+        scratch,
+        0..FOOTER_LEN,
+        true,
+    )
+    .await?;
     let magic = u64::from_le_bytes(
         scratch[0..8]
             .try_into()
@@ -2008,8 +2122,8 @@ pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
             .ok_or(Error::CorruptBlock { id: rdel_first })?;
         // Hot: covering probes run per key per table, so these blocks
         // are re-read constantly — the cache's biggest win.
-        read_block_cached(device, cache, table_id, id, scratch, true).await?;
-        let count = rdel_block_count::<D::Error, BLOCK>(scratch, id)?;
+        read_block_verified(device, cache, table_id, id, scratch, true).await?;
+        let count = rdel_count_verified::<D::Error, BLOCK>(scratch, id)?;
         let mut off = 0usize;
         for _ in 0..count {
             let (e, next) =
@@ -2023,18 +2137,27 @@ pub(crate) async fn covering_rdel_seq_in<D: BlockDevice, const BLOCK: usize>(
     Ok(best)
 }
 
-/// Reads one `SSTable` block through the block cache when one is supplied.
+/// Reads one `SSTable` block and verifies it: the funnel for every block
+/// a reader parses whole. On `Ok`, `scratch` holds an image whose trailing
+/// CRC-32 matched.
 ///
-/// On a hit the cached image is copied into `scratch` and no device I/O
-/// happens; on a miss the block is read from the device and then
-/// inserted (with `hot` setting the CLOCK reference bit — see
-/// [`crate::cache`]). The cached bytes are the physical image exactly as
-/// the device returned them, so every check the caller runs afterwards
-/// (CRC, magic, bloom, decompression) behaves byte-identically to a
-/// re-read, including corruption semantics. `table_id` is the owning
-/// table's manifest id: ids are monotone and never reused, so the key
-/// `(table_id, block_id)` names the image immutably.
-pub(crate) async fn read_block_cached<D: BlockDevice, const BLOCK: usize>(
+/// With a cache: a hit copies the cached image into `scratch` and does no
+/// device I/O and no CRC. The cache holds only images this module has
+/// CRC-checked, and re-checks each hit against a RAM checksum of those
+/// bytes (see [`crate::cache`], ADR-0016), so a hit is exactly the
+/// verified image or it is a miss. On a miss the block is read from the
+/// device, its CRC is checked, and only then is it inserted (`hot` sets
+/// the CLOCK reference bit). A block that fails its CRC is never cached:
+/// each read of it reaches the device and reports the corruption again.
+/// `table_id` is the owning table's manifest id: ids are monotone and
+/// never reused, so the key `(table_id, block_id)` names the image
+/// immutably.
+///
+/// # Errors
+///
+/// [`Error::CorruptBlock`] when the CRC does not match, or
+/// [`Error::Device`] on I/O failure.
+pub(crate) async fn read_block_verified<D: BlockDevice, const BLOCK: usize>(
     device: &D,
     cache: Option<&dyn CachePort<BLOCK>>,
     table_id: u32,
@@ -2047,9 +2170,58 @@ pub(crate) async fn read_block_cached<D: BlockDevice, const BLOCK: usize>(
     {
         return Ok(());
     }
+    fetch_block(device, cache, table_id, block_id, scratch, hot).await
+}
+
+/// Like [`read_block_verified`], for a reader that needs only `range` of
+/// the block (a footer's fields, one bloom bucket). On `Ok`,
+/// `scratch[range]` holds verified bytes of the block; the rest of
+/// `scratch` is unspecified and must not be read.
+///
+/// A cache hit copies and checks just the range (see
+/// [`BlockCache::get_range_into`](crate::cache::BlockCache::get_range_into)),
+/// which is what makes probing a table that does not hold the key cheap.
+/// A miss reads and CRC-checks the whole block, as it must, and caches it.
+///
+/// # Errors
+///
+/// [`Error::CorruptBlock`] when the CRC does not match or `range` is not
+/// inside a block, or [`Error::Device`] on I/O failure.
+pub(crate) async fn read_range_verified<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    scratch: &mut [u8; BLOCK],
+    range: core::ops::Range<usize>,
+    hot: bool,
+) -> Result<(), Error<D::Error>> {
+    let start = range.start;
+    let out = scratch
+        .get_mut(range)
+        .ok_or(Error::CorruptBlock { id: block_id })?;
+    if let Some(c) = cache
+        && c.get_range_into(table_id, block_id, start, out)
+    {
+        return Ok(());
+    }
+    fetch_block(device, cache, table_id, block_id, scratch, hot).await
+}
+
+/// The miss path of the two funnels above: device read, CRC check, and
+/// only then the cache insert.
+async fn fetch_block<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    scratch: &mut [u8; BLOCK],
+    hot: bool,
+) -> Result<(), Error<D::Error>> {
     poll_fn(|cx| device.poll_read_block(cx, block_id, scratch))
         .await
         .map_err(Error::Device)?;
+    check_block_crc::<D::Error, BLOCK>(scratch, block_id)?;
     if let Some(c) = cache {
         c.put(table_id, block_id, scratch, hot);
     }
@@ -2082,8 +2254,7 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
     logical: &mut [u8; BLOCK],
     hot: bool,
 ) -> Result<bool, Error<D::Error>> {
-    read_block_cached(device, cache, table_id, block_id, raw, hot).await?;
-    check_block_crc::<D::Error, BLOCK>(raw, block_id)?;
+    read_block_verified(device, cache, table_id, block_id, raw, hot).await?;
     inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)
 }
 
@@ -2146,8 +2317,19 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         scratch: &mut [u8; BLOCK],
         footer_block: u64,
     ) -> Result<Self, Error<D::Error>> {
-        read_block_cached(device, cache, table_id, footer_block, scratch, true).await?;
-        check_block_crc::<D::Error, BLOCK>(scratch, footer_block)?;
+        // Only the footer's fields are read (and, on a cache hit, only
+        // they are fetched): everything parsed below lies inside
+        // `FOOTER_LEN`.
+        read_range_verified(
+            device,
+            cache,
+            table_id,
+            footer_block,
+            scratch,
+            0..FOOTER_LEN,
+            true,
+        )
+        .await?;
         let magic = u64::from_le_bytes(
             scratch[0..8]
                 .try_into()
@@ -2359,25 +2541,35 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         max_seq: u64,
     ) -> Result<Lookup, Error<D::Error>> {
         let device = self.device;
-        // Bloom gate (advisory: corruption just disables the optimization,
-        // never the lookup). The cached image is byte-identical to a
-        // re-read, so the advisory-CRC rule below behaves the same.
-        read_block_cached(
+        // Bloom gate (advisory: a corrupt bloom block just disables the
+        // optimization, never the lookup; a device error is still an
+        // error). The key's probes all fall in one bucket of the filter,
+        // which starts the bloom block, so only that bucket is read.
+        let probe = BloomProbe::new(BLOOM_BYTES, key);
+        match read_range_verified(
             device,
             self.cache,
             self.table_id,
             self.bloom_block,
             scratch,
+            probe.range(),
             true,
         )
-        .await?;
-        if check_block_crc::<D::Error, BLOCK>(scratch, self.bloom_block).is_ok()
-            && !bloom_maybe_contains(&scratch[..BLOOM_BYTES], key, self.k)
+        .await
         {
-            return Ok(Lookup::Missing);
+            Ok(()) => {
+                if scratch
+                    .get(probe.range())
+                    .is_some_and(|bucket| !probe.matches(bucket, self.k))
+                {
+                    return Ok(Lookup::Missing);
+                }
+            }
+            Err(Error::CorruptBlock { .. }) => {}
+            Err(e) => return Err(e),
         }
         // Index: structural; corruption is an error, never a silent miss.
-        read_block_cached(
+        read_block_verified(
             device,
             self.cache,
             self.table_id,
@@ -2386,7 +2578,6 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             true,
         )
         .await?;
-        check_block_crc::<D::Error, BLOCK>(scratch, self.index_block)?;
         let payload_end = BLOCK - CRC_LEN;
         let Some((mut block_id, mut remaining)) =
             index_lookup::<D::Error>(&scratch[..payload_end], key, self.index_block)?
@@ -2442,6 +2633,126 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
                         .ok_or(Error::CorruptBlock { id: block_id })?;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{CRC_LEN, INDEX_STRIDE, append_index, index_last_le_block, index_lookup};
+    use std::vec::Vec;
+
+    const BLOCK: usize = 4096;
+
+    /// An index block body over `keys` (sorted, duplicates allowed);
+    /// entry `i` names data block `100 + i`.
+    fn index_of(keys: &[[u8; 3]]) -> [u8; BLOCK] {
+        let mut block = [0u8; BLOCK];
+        let mut len = 0usize;
+        for (i, k) in keys.iter().enumerate() {
+            append_index::<(), BLOCK>(&mut block, &mut len, Some(k), 100 + i as u64, 0).unwrap();
+        }
+        block
+    }
+
+    /// The rule the search implements, spelled out over a slice.
+    fn model_lookup(keys: &[[u8; 3]], key: &[u8]) -> Option<(u64, usize)> {
+        // Last restart at or below the key, then back over duplicates of
+        // the key to the restart before the first of them.
+        let le = keys.iter().filter(|k| k.as_slice() <= key).count();
+        if le == 0 {
+            return None;
+        }
+        let mut pos = le - 1;
+        while pos > 0 && keys[pos].as_slice() == key {
+            pos -= 1;
+        }
+        Some((100 + pos as u64, keys.len() - pos))
+    }
+
+    fn model_last_le(keys: &[[u8; 3]], key: &[u8]) -> Option<u64> {
+        let le = keys.iter().filter(|k| k.as_slice() <= key).count();
+        le.checked_sub(1).map(|pos| 100 + pos as u64)
+    }
+
+    /// Key `n` as three bytes, order-preserving.
+    fn k(n: usize) -> [u8; 3] {
+        [b'k', (n / 256) as u8, (n % 256) as u8]
+    }
+
+    /// Every index size around the stride boundaries, with and without
+    /// runs of duplicate restarts, probed with every key in and between
+    /// the entries: the one-pass search agrees with the model.
+    #[test]
+    fn index_search_matches_the_model() {
+        let sizes = [
+            0,
+            1,
+            2,
+            INDEX_STRIDE - 1,
+            INDEX_STRIDE,
+            INDEX_STRIDE + 1,
+            2 * INDEX_STRIDE,
+            3 * INDEX_STRIDE + 5,
+            100,
+        ];
+        // `dup_every`: 0 = all keys distinct; otherwise every such entry
+        // starts a run of `dup_len` equal restarts.
+        for (dup_every, dup_len) in [
+            (0usize, 0usize),
+            (5, 2),
+            (7, 4),
+            (1, 3),
+            (INDEX_STRIDE, INDEX_STRIDE + 2),
+        ] {
+            for &n in &sizes {
+                // Even numbers only, so odd probes fall between entries.
+                let mut keys = Vec::with_capacity(n);
+                let mut next = 2usize;
+                while keys.len() < n {
+                    let run = if dup_every != 0 && keys.len() % dup_every == 0 {
+                        dup_len
+                    } else {
+                        1
+                    };
+                    for _ in 0..run.min(n - keys.len()) {
+                        keys.push(k(next));
+                    }
+                    next += 2;
+                }
+                let block = index_of(&keys);
+                let payload = &block[..BLOCK - CRC_LEN];
+                for probe in 0..next + 2 {
+                    let key = k(probe);
+                    assert_eq!(
+                        index_lookup::<()>(payload, &key, 9).unwrap(),
+                        model_lookup(&keys, &key),
+                        "lookup: {n} entries, dups ({dup_every}, {dup_len}), probe {probe}"
+                    );
+                    assert_eq!(
+                        index_last_le_block::<()>(payload, &key, 9).unwrap(),
+                        model_last_le(&keys, &key),
+                        "last_le: {n} entries, dups ({dup_every}, {dup_len}), probe {probe}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bytes that are neither an entry nor zero padding are corruption,
+    /// wherever they sit relative to the key searched for.
+    #[test]
+    fn index_search_rejects_garbage_after_the_entries() {
+        let keys: Vec<[u8; 3]> = (1..=40).map(|i| k(2 * i)).collect();
+        let mut block = index_of(&keys);
+        // One stray byte in the padding, far past the last entry.
+        block[BLOCK - CRC_LEN - 1] = 1;
+        let payload = &block[..BLOCK - CRC_LEN];
+        for probe in [0usize, 3, 40, 81, 500] {
+            assert!(index_lookup::<()>(payload, &k(probe), 9).is_err());
+            assert!(index_last_le_block::<()>(payload, &k(probe), 9).is_err());
         }
     }
 }

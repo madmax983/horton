@@ -171,6 +171,7 @@ fn zero_slots_disables_the_cache() {
         CacheStats {
             hits: 0,
             misses: 1,
+            rejected: 0,
             len: 0,
             capacity: 0,
         }
@@ -550,6 +551,93 @@ fn corrupt_bloom_is_advisory_through_the_cache() {
     assert_eq!(get(&db, b"missing"), None);
 }
 
+/// ADR-0016: only blocks whose CRC matched enter the cache. A damaged
+/// block is read from the device, and reported, on every lookup that
+/// needs it; nothing of it is kept, so the moment the device returns
+/// good bytes again the read succeeds. (Before v0.20 the damaged image
+/// was cached, and every hit on it re-ran a CRC over the whole block to
+/// find that out again.)
+#[test]
+fn a_block_that_fails_its_crc_is_never_cached() {
+    let mut db = TestDb::new(CountingDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    put_keys(&mut db, &[(b"k", b"v")]);
+    let data_id = db.archive_plan(0, 0).unwrap().table.first_block;
+    let data_idx = usize::try_from(data_id).unwrap();
+
+    // Damage the table's data block on the device, CRC and all.
+    let mut dev = db.into_device();
+    let good = dev.inner.blocks_mut()[data_idx];
+    dev.inner.blocks_mut()[data_idx][10] ^= 0x01;
+    let mut db = TestDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+
+    let mut buf = [0u8; 1024];
+    let mut device_reads = db.device().reads();
+    for attempt in 0..3 {
+        let err = block_on(db.get(b"k", &mut buf)).unwrap_err();
+        assert!(
+            matches!(err, horton::Error::CorruptBlock { id } if id == data_id),
+            "attempt {attempt}: {err:?}"
+        );
+        // The damaged block came from the device again, not the cache.
+        let now = db.device().reads();
+        assert!(now > device_reads, "attempt {attempt}: served from cache");
+        device_reads = now;
+    }
+    // The footer, bloom and index of the table are cached; the damaged
+    // data block is not.
+    assert_eq!(db.cache_stats().len, 3);
+    assert_eq!(db.cache_stats().rejected, 0, "no RAM damage happened");
+
+    // The device recovers (a transient read fault): the very next read
+    // succeeds, with nothing stale in the way.
+    let mut dev = db.into_device();
+    dev.inner.blocks_mut()[data_idx] = good;
+    let mut db = TestDb::new(dev, test_config());
+    block_on(db.open()).unwrap();
+    assert_eq!(get(&db, b"k"), Some(b"v".to_vec()));
+    assert_eq!(db.cache_stats().len, 4);
+}
+
+/// A point read of a table that does not hold the key consults its
+/// footer and one bloom bucket. Once those blocks are cached the read
+/// costs no device I/O at all, and a key the filter rejects never
+/// reaches the index or a data block.
+#[test]
+fn a_bloom_rejected_read_touches_only_the_footer_and_bloom_blocks() {
+    let mut db = TestDb::new(CountingDevice::new(), test_config());
+    block_on(db.open()).unwrap();
+    put_keys(&mut db, &[(b"a", b"1"), (b"m", b"2"), (b"z", b"3")]);
+
+    // Cold: the footer and bloom blocks are read whole and cached.
+    let absent: Vec<Vec<u8>> = (0..50u32)
+        .map(|i| format!("b{i:03}").into_bytes())
+        .collect();
+    assert_eq!(get(&db, &absent[0]), None);
+    let cold_reads = db.device().reads();
+    assert_eq!(cold_reads, 2, "footer + bloom, never the index or data");
+    assert_eq!(db.cache_stats().len, 2);
+
+    // Warm: every further absent key is answered from the cache.
+    let hits = db.cache_stats().hits;
+    for key in &absent[1..] {
+        assert_eq!(get(&db, key), None);
+    }
+    assert_eq!(
+        db.device().reads(),
+        cold_reads,
+        "warm misses did device I/O"
+    );
+    assert_eq!(db.cache_stats().hits, hits + 2 * 49);
+    assert_eq!(db.cache_stats().len, 2, "no index or data block was read");
+
+    // A present key goes on to the index and its data block.
+    assert_eq!(get(&db, b"m"), Some(b"2".to_vec()));
+    assert_eq!(db.device().reads(), cold_reads + 2);
+    assert_eq!(db.cache_stats().len, 4);
+}
+
 #[test]
 fn reopen_starts_with_a_cold_volatile_cache() {
     let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
@@ -571,6 +659,7 @@ fn reopen_starts_with_a_cold_volatile_cache() {
         CacheStats {
             hits: 0,
             misses: 0,
+            rejected: 0,
             len: 0,
             capacity: 8,
         }
@@ -676,6 +765,7 @@ fn crash_during_compaction_reopens_with_cold_cache() {
             CacheStats {
                 hits: 0,
                 misses: 0,
+                rejected: 0,
                 len: 0,
                 capacity: 8,
             },

@@ -11,7 +11,28 @@ misread (SPEC §4.5).
 
 ## [Unreleased]
 
+The next release is 0.20.0. **The on-disk format changes** (manifest
+`hrtman07`, SSTable `hrtsst03`): v0.19 images, and archives exported by
+v0.19, are rejected, not misread.
+
+Read throughput is the subject:
+[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
+key-value store against RocksDB on db_bench's workloads, before and
+after. Point reads are 9 to 20 times faster than 0.19, scans 2 to 3
+times, and unsynced writes about twice.
+
 ### Added
+
+- `BlockCache::get_range_into` (and `CachePort::get_range_into`): copy a
+  byte range of a cached block, checking only the chunks of the image
+  the range touches. `cache::image_sum` is the RAM checksum behind it;
+  `CacheStats::rejected` counts hits whose image had changed in RAM
+  (ADR-0016).
+- `sstable::BloomProbe` and `BLOOM_BUCKET_BYTES`: the 64-byte bucket of
+  a bloom filter that one key's probes fall in, for a reader that holds
+  only part of the filter (ADR-0017).
+- `examples/kvstore/vs-rocksdb.sh` runs db_bench's workloads on RocksDB
+  and on the kvstore and prints the rates side by side.
 
 - `horton::fingerprint`: `Fingerprint` (a count and a mergeable
   multiset hash of key-value pairs), `fingerprint` and
@@ -35,6 +56,36 @@ misread (SPEC §4.5).
 
 ### Changed
 
+- **Block-cache hits no longer re-run CRC-32** (ADR-0016, superseding
+  ADR-0014). Only blocks whose CRC matched are cached, and a hit is
+  checked against a RAM checksum of the cached image instead: about 6
+  times cheaper on a 64-bit host, with no lookup tables. A bit that
+  flips in a cached image is still never served; it now costs one
+  re-read from the device where it used to return `CorruptBlock` on
+  every hit. A block that fails its CRC is never cached, so each read
+  of it reaches the device and reports it.
+- **The bloom filter is bucketed** (ADR-0017): a key's probes all fall
+  in one 64-byte bucket, and a point read fetches that bucket and the
+  footer's 45 bytes from the cache instead of two whole blocks. A probe
+  of a table that does not hold the key costs about 0.2 µs once cached.
+  False positives rise slightly (0.84% to 0.98% at 10 bits per key).
+- **A block cache above 8 slots is hashed**: a block's slot is one of 8
+  chosen from its key, so lookups and inserts no longer scan every
+  slot. Caches of up to 8 slots (every firmware profile) keep one CLOCK
+  hand over all slots, as before.
+- An index-block search parses the index once. It used to re-parse it
+  from the start for every step of a binary search, about 2,000 entry
+  parses for a full 16 KiB index.
+- `CachePort` has a new required method, `get_range_into`, and
+  `CacheStats` a new field, `rejected`.
+- The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk
+  sums); the RAM budget is unchanged.
+- **kvstore** runs horton under one lock instead of on a store thread.
+  Point reads and writes are queued and served in order by whichever
+  thread holds the lock (flat combining; group commit is the write half
+  of it), waiters spin for 100 µs before they park, and the cache is
+  8 MiB (512 blocks). Dropping the `Store` closes it: surviving handles
+  return `Closed`.
 - `compaction_pending()` is also true while a request has work.
 - `compact_step` can return `RegionFull` from a tight job that cannot
   free a slot. It changes nothing then.

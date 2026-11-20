@@ -16,7 +16,8 @@
 //! then on. `store.rs` turns horton's single-owner `Db` into a shared
 //! handle with group commit and background compaction; `device.rs` is the
 //! file-backed block device; `bench.rs` and `crash.rs` are the benchmark
-//! and the crash test.
+//! and the crash test. `vs-rocksdb.sh` runs the benchmark against
+//! `RocksDB`'s `db_bench`; `docs/THROUGHPUT.md` reads the result.
 
 mod bench;
 mod crash;
@@ -49,8 +50,9 @@ pub const LEVELS: usize = 4;
 // tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
 // file gives each table an 8 MiB slot). The memtable (4096 writes, 1 MiB)
 // is what one flush turns into a table; the bloom filter takes a whole
-// block; the cache keeps 64 blocks (1 MiB) of recently read tables. A
-// point read probes up to 7 tables in level 0 and one per level below.
+// block; the cache keeps 512 blocks (8 MiB, LevelDB's default) of
+// recently read tables. A point read probes up to 7 tables in level 0
+// and one per level below.
 horton::db_types! {
     block: BLOCK,
     key_max: KEY_MAX,
@@ -60,7 +62,7 @@ horton::db_types! {
     levels: LEVELS,
     tables_per_level: 7,
     bloom_bytes: BLOCK - 4,
-    cache_blocks: 64;
+    cache_blocks: 512;
 
     /// The store's database, over any device.
     pub type Db = KvDb;
@@ -267,7 +269,7 @@ pub const fn float(n: u64) -> f64 {
 ///
 /// # Errors
 ///
-/// The store thread has stopped.
+/// The store is closed.
 pub fn print_stats(store: &Handle) -> Result<(), String> {
     let s = store.stats().map_err(|e| e.to_string())?;
     let mib = |blocks: u64| float(blocks * BLOCK as u64) / float(1 << 20);
