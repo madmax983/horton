@@ -68,15 +68,15 @@ History:
 - 64 KiB until v0.13.
 - 96 KiB from v0.13: block compression costs about 20 KiB of
   caller-owned scratch.
-- Still 112 KiB at v0.20, with 944 bytes to spare: the block cache
-  keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
-  and the read futures carry a bloom probe and a byte range.
 - 112 KiB from v0.17: the futures are counted (architecture review F8).
   Before the fix the `flush()` future alone was 29.8 KiB. It now borrows
   the `Db`'s block scratch, stages the range-tombstone section in its
   table writer's idle data block, and commits the manifest as a small
   `ManifestEdit` instead of a full copy. `get()` returns `Error::Busy`
   instead of carrying two fallback block buffers in every future.
+- Still 112 KiB at v0.20, with 944 bytes to spare: the block cache
+  keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
+  and the read futures carry a bloom probe and a byte range.
 
 ## Context
 
