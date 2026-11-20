@@ -19,6 +19,11 @@ misread (SPEC §4.5).
   give equal fingerprints whatever the write history, flushes or
   compactions; per-range fingerprints merge, for bucketed anti-entropy
   between a device and its replica.
+- `horton::diff`: `Diff` merge-joins two positioned `Scan`s and yields
+  each differing key as a `Change` (`Added`, `Removed`, `Changed`) with
+  both sides' values. Scan one database at a snapshot and at the head
+  for a change feed, or a database and its replica over a mismatched
+  fingerprint bucket for the exact keys to repair. Inline memory only.
 - `Db::request_compaction(level)` compacts every table from `level` down
   to the bottom once, also below the level triggers. Bottom tables are
   rewritten in place, so `purge_before` and range tombstones free space

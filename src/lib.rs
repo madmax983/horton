@@ -54,6 +54,7 @@ pub mod crc;
 pub mod db;
 pub mod defaults;
 pub mod device;
+pub mod diff;
 #[cfg(feature = "multiwriter")]
 pub mod drainer;
 pub mod error;
@@ -84,6 +85,7 @@ pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
 pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable, SlotStats};
 pub use device::BlockDevice;
+pub use diff::{Change, Diff};
 pub use error::Error;
 pub use fingerprint::Fingerprint;
 pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestEdit, ManifestLayout, TableRef};
