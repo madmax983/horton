@@ -163,16 +163,21 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   inflate transparently.
 - **Rdel block:** range tombstones `start_len u16 | end_len u16 | seq u64
   | start | end`, sorted by start, then a `u16` count. Never compressed.
-- **Bloom block:** `BLOOM_BYTES × 8` bits; `k` probes by double hashing.
-  Advisory: a bad CRC disables the filter.
+- **Bloom block:** `BLOOM_BYTES × 8` bits in 64-byte buckets. A key
+  hashes to one bucket and its `k` probes are double-hashed inside that
+  bucket's 512 bits, so a reader needs 64 bytes of the block (ADR-0017).
+  A filter under 64 bytes is one bucket. Advisory: a bad CRC disables
+  the filter.
 - **Index block:** per data block `first_key_len u16 | first_key |
   block_id u64 | max_seq u64`.
-- **Footer:** `magic u64 = "hrtsst02" | index_block u64 | bloom_block u64
+- **Footer:** `magic u64 = "hrtsst03" | index_block u64 | bloom_block u64
   | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64`.
 
 A CRC failure on a footer, index, data, or rdel block is `CorruptBlock`
-everywhere, never "absent" (which would let an older version win). All
-data-block reads go through `sstable::read_data_block`.
+everywhere, never "absent" (which would let an older version win). Every
+block a reader parses comes through `sstable::read_block_verified` or
+`read_range_verified`, which check the CRC of whatever the device
+returns; data blocks then go through `sstable::read_data_block`.
 
 A table's `TableRef` carries `first_key` (its **live lower bound**),
 `last_key` (covering both sections, the greatest rdel end inclusively),
@@ -189,13 +194,13 @@ shared by the levels. L0 holds at most `TABLES` refs, oldest first;
 deeper levels hold disjoint runs sorted by first key, in any share of
 the pool.
 
-Storage (format `hrtman05`, ADR-0011): two or more **copies**
+Storage (format `hrtman07`, ADR-0011): two or more **copies**
 (`ManifestLayout::pair` or `ManifestLayout::ring`), each
 `Manifest::max_blocks::<BLOCK>()` blocks long, the compile-time worst
 case. Block layout:
 
 ```
-magic: u64 = "hrtman05" | seq: u64 | index: u16 | count: u16 | len: u32
+magic: u64 = "hrtman07" | seq: u64 | index: u16 | count: u16 | len: u32
 | body chunk[len] | crc32: u32
 ```
 
@@ -293,7 +298,14 @@ an open request has work.
   cursor per table in caller-owned state, same winner rule, skipping
   hidden keys; `BufferTooSmall` never consumes an entry.
 - **Block cache:** `CACHE` slots of CLOCK-evicted physical block images
-  keyed by `(table id, block id)`; scans insert cold (ADR-0007).
+  keyed by `(table id, block id)`; scans insert cold (ADR-0007). Only
+  blocks whose CRC matched are inserted. A hit is not CRC-checked
+  again: each slot keeps a RAM checksum of its image in 16 chunks, and
+  a hit must match it or it is dropped and read from the device again
+  (ADR-0016). A point read asks for byte ranges of the footer and bloom
+  blocks and pays for the chunks they touch. Above 8 slots a block's
+  slot is one of 8 chosen by hashing its key, so lookups do not grow
+  with the cache.
 
 ### 4.9 Archive and ingest
 

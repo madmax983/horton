@@ -1,6 +1,6 @@
 # ADR-0014: Block-cache hits re-verify the CRC
 
-Status: Accepted (v0.17, 2026-09-29)
+Status: Superseded by [ADR-0016](0016-cache-hits-reverify-with-a-ram-checksum.md) (accepted v0.17, 2026-09-29)
 
 ## Context
 

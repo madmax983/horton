@@ -209,6 +209,28 @@ fn old_magic_is_rejected_not_misparsed() {
 }
 
 #[test]
+fn a_v019_manifest_is_rejected_not_misparsed() {
+    // v0.20 keeps the manifest layout of "hrtman06" but changes what its
+    // tables hold (the bucketed bloom filter, `hrtsst03`), so the magic
+    // moved to "hrtman07": a v0.19 image is refused when it is opened,
+    // before any of its tables is read by the new rule.
+    let mut m = TestManifest::new();
+    m.add_table_to_level::<DevError>(0, tref(0, 100)).unwrap();
+    let mut buf = [0u8; BLOCK];
+    m.encode::<DevError, BLOCK>(&mut buf).unwrap();
+    assert_eq!(&buf[0..8], b"hrtman07");
+    buf[0..8].copy_from_slice(b"hrtman06");
+    // A real v0.19 block carries a CRC over its own magic.
+    let crc = horton::crc32(&buf[..BLOCK - 4]);
+    buf[BLOCK - 4..].copy_from_slice(&crc.to_le_bytes());
+    let res = TestManifest::decode::<DevError, BLOCK>(&buf);
+    assert!(
+        matches!(res, Err(Error::CorruptManifest)),
+        "a v0.19 manifest must be rejected, got {res:?}"
+    );
+}
+
+#[test]
 fn encode_crc_tail_is_bounds_checked() {
     // Regression: the trailing CRC write was not bounds-checked. A payload
     // leaving fewer than 4 bytes for the CRC panicked instead of failing

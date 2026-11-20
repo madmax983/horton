@@ -218,16 +218,18 @@ cargo run --release --example kvstore -- crash 25          # kill -9 the writer 
 ```
 
 horton's `Db` is one value with `&mut self` writes and no locks, which
-suits firmware. The example puts it on a **store thread** and gives other
-threads a `Handle` that sends requests over a channel:
+suits firmware. The example puts it behind one lock and gives every
+thread a `Handle`. A thread that wants a point read or a write queues
+it; whichever thread holds the lock serves the queue in order, its own
+request and everyone else's:
 
 | LevelDB | here |
 |---|---|
 | `DB::Open` on a directory | `Store::open` on one file, created sparse at `--size-mb` (256 MiB); a `BlockDevice` over `pread`/`pwrite` and `fdatasync` ([`device.rs`](examples/kvstore/device.rs)) |
 | `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
-| writer queue, group commit | the store thread commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
-| background compaction | one bounded `compact_step` between requests, back to back when idle; full memtables, WALs and level 0s are handled on the store thread, so callers never see those errors |
+| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them. Point reads go through the same queue, so the database stays in one CPU's cache |
+| background compaction | one bounded `compact_step` at the end of each operation, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator` | `range(start, end, reverse)`: pins a snapshot, pages through horton's `Scan` or `RevScan` |
 | `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
@@ -255,26 +257,36 @@ and the store could not flush again. It is fixed; the crash test now
 prints the tombstone blocks as they come and go.
 
 `bench` runs db_bench's workloads (16-byte keys, 100-byte values that
-compress by half, four client threads). On a CI-class Linux container:
+compress by half, four client threads), and
+[`vs-rocksdb.sh`](examples/kvstore/vs-rocksdb.sh) runs them on RocksDB's
+`db_bench` too. On a 4-vCPU Linux VM, in ops/s:
 
-| | fdatasync on | `--no-sync` |
-|---|---|---|
-| `fillrandom` | 10.6 K ops/s (2.4 writes per commit) | 55.6 K ops/s |
-| `readrandom` | 10.8 K ops/s | 10.7 K ops/s |
-| `readseq` | 478 K entries/s | 342 K entries/s |
-| `fillrandom`, 1 M entries | | 42.5 K ops/s, 15 of 28 tables used |
+| | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
+|---|---:|---:|---:|
+| `fillseq`, no fsync | 289 K | 264 K | 274 K |
+| `fillrandom`, no fsync | 174 K | 73 K | 195 K |
+| `fillrandom`, fdatasync on | 15.6 K (2.5 writes per commit) | | 16.2 K (100 K keys) |
+| `readrandom` | 73 K | 35 K | 324 K |
+| `readmissing` | 191 K | 64 K | 3,932 K |
+| `readseq` | 1,695 K | 464 K | 19,764 K |
+
+[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, where
+the time goes, and what v0.20 changed: point reads were 100 to 140 µs
+in 0.19 and are 14 to 29 µs now.
 
 ### Where horton stops at host scale
 
 The example is also a measurement of how far a firmware store stretches.
 These are the limits it meets, and each is a property of the library:
 
-- **Point reads are slow: about 100 µs.** Each table a read probes costs a
-  full-block CRC of its footer and its bloom filter, and a hit costs the
-  index and the data block too, even when they come from the block cache
-  (the cache stores raw images, and every read re-verifies them). With
-  16 KiB blocks and up to 10 tables to probe, that is most of the time.
-  8 KiB blocks halve it, at a quarter of the capacity.
+- **A point read costs 14 to 29 µs, and readers do not run in
+  parallel.** Ruling out a table that does not hold the key is cheap (a
+  footer's fields and one bloom bucket from the cache). The table that
+  may hold it costs an index block and a data block, each checked whole,
+  and the data block inflated, on every read: the cache keeps the
+  compressed image. A block that is not cached costs a 16 KiB CRC in
+  software on top (8 µs). And one thread at a time runs the engine, so
+  four readers get one core's worth of reads.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
@@ -282,13 +294,16 @@ These are the limits it meets, and each is a property of the library:
   `RegionFull`: the flight recorder's answer is to archive cold tables.
 - **A bloom filter is one block** (16 K bytes, about 13 K keys at 1%
   false positives), so large tables filter poorly.
-- **One thread does all the work.** Reads queue behind writes and
-  compaction steps on the store thread; there are no concurrent readers.
+- **One thread at a time does the work.** Reads, writes and compaction
+  steps take turns under the engine lock, so random writes at scale are
+  bound by flush and compaction (73 K ops/s at 1 M keys, where RocksDB's
+  background threads keep it at 195 K).
+- **Scans reload blocks.** A `Scan` keeps one block in memory for all
+  its table cursors, so a merge over overlapping tables re-reads a block
+  each time it changes table, and a seek positions every table in range.
 - **Batches are one WAL block**, keys and values have compile-time
   maximums (128 B and 4 KiB here), and at most eight snapshots (so eight
   iterators) are live at once.
-- **`compact` finishes pending work**; horton has no call that forces
-  every level down to the bottom, like LevelDB's `CompactRange`.
 
 ## Architecture
 
@@ -359,10 +374,10 @@ rebuilds the slot map from the manifest.
 ```text
 block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
              └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
-               blocks, magic "hrtman05"
+               blocks, magic "hrtman07"
 
 SSTable:    [data]* [rdel]* [bloom] [index] [footer]
-             │       │        │       │       └ magic "hrtsst02", ids, entry count, k, rdel count, min seq
+             │       │        │       │       └ magic "hrtsst03", ids, entry count, k, rdel count, min seq
              │       │        │       └ per data block: first key, block id, max seq
              │       │        └ BLOOM_BYTES bit array
              │       └ range tombstones sorted by start
@@ -546,7 +561,7 @@ What the suite covers:
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
 | `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
-| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the store thread with group commit and background compaction (`store.rs`), db_bench's workloads (`bench.rs`), and the kill -9 crash test (`crash.rs`) |
+| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its request queue, group commit and background compaction (`store.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
 | `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |

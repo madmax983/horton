@@ -444,3 +444,133 @@ fn version_run_crossing_blocks() {
     );
     assert_eq!(get_at(&dev, footer, b"m", u64::MAX).unwrap(), None);
 }
+
+// ---------------------------------------------------------------------------
+// v0.20: the bucketed bloom filter (`hrtsst03`).
+// ---------------------------------------------------------------------------
+
+/// Every probe of a key lies in one 64-byte bucket of the filter, and a
+/// reader holding only that bucket decides exactly as one holding the
+/// whole filter. This is what lets a point read fetch 64 bytes of the
+/// bloom block instead of all of it.
+#[test]
+fn a_bloom_bucket_alone_answers_like_the_whole_filter() {
+    use horton::sstable::{BLOOM_BUCKET_BYTES, BloomProbe, bloom_maybe_contains};
+
+    let n = 600u32;
+    let keys: Vec<Vec<u8>> = (0..n)
+        .map(|i| format!("bucket-{:05}", i * 2).into_bytes())
+        .collect();
+    let items: Vec<SstEntry<'_>> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| entry(k, b"v", i as u64 + 1))
+        .collect();
+    let mut dev = MemDevice::<BLOCK>::new();
+    let (_, data_blocks) = write(&items, &mut dev);
+    let blk = read_block(&dev, BASE + data_blocks);
+    let filter = &blk[..BLOOM_BYTES];
+    let k = bloom_k(BLOOM_BYTES * 8, u64::from(n));
+
+    let mut used = std::collections::BTreeSet::new();
+    for i in 0..n * 2 {
+        let key = format!("bucket-{i:05}").into_bytes();
+        let probe = BloomProbe::new(BLOOM_BYTES, &key);
+        let r = probe.range();
+        assert_eq!(r.len(), BLOOM_BUCKET_BYTES);
+        assert_eq!(r.start % BLOOM_BUCKET_BYTES, 0, "buckets do not overlap");
+        assert!(r.end <= BLOOM_BYTES);
+        used.insert(r.start);
+        let whole = bloom_maybe_contains(filter, &key, k);
+        assert_eq!(probe.matches(&filter[r], k), whole, "key {i}");
+        if i % 2 == 0 {
+            assert!(whole, "false negative for inserted key {i}");
+        }
+    }
+    // The keys spread over every bucket of the filter.
+    assert_eq!(used.len(), BLOOM_BYTES / BLOOM_BUCKET_BYTES);
+}
+
+/// Filters smaller than a bucket, and sizes that are not a multiple of
+/// one, keep the two bloom guarantees: probes stay inside the filter and
+/// an inserted key is never reported absent. (The ESP32-S3 profile's
+/// 64-byte filter is exactly one bucket.)
+#[test]
+fn odd_bloom_sizes_have_no_false_negatives() {
+    use horton::sstable::{BloomProbe, bloom_maybe_contains};
+
+    fn check<const BLOOM: usize>() {
+        let keys: Vec<Vec<u8>> = (0..40u32)
+            .map(|i| format!("odd-{i:03}").into_bytes())
+            .collect();
+        let items: Vec<SstEntry<'_>> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| entry(k, b"v", i as u64 + 1))
+            .collect();
+        let mut dev = MemDevice::<BLOCK>::new();
+        let plan =
+            plan_table::<core::convert::Infallible, BLOCK, KEY_MAX>(items.iter().copied()).unwrap();
+        let k = bloom_k(BLOOM * 8, plan.entry_count);
+        let n = block_on(write_table::<MemDevice<BLOCK>, BLOCK, BLOOM, KEY_MAX>(
+            &mut dev,
+            BASE,
+            k,
+            items.iter().copied(),
+            None,
+        ))
+        .unwrap();
+        let blk = read_block(&dev, BASE + plan.data_blocks);
+        for key in &keys {
+            let probe = BloomProbe::new(BLOOM, key);
+            assert!(probe.range().end <= BLOOM, "{BLOOM}-byte filter");
+            assert!(probe.matches(&blk[probe.range()], k), "{BLOOM}-byte filter");
+            assert!(bloom_maybe_contains(&blk[..BLOOM], key, k));
+        }
+        // And through a reader built for this filter size.
+        let mut scratch = [0u8; BLOCK];
+        let mut decomp = [0u8; BLOCK];
+        let mut buf = [0u8; 64];
+        let reader = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, BLOOM>::open(
+            &dev,
+            &mut scratch,
+            BASE + n - 1,
+        ))
+        .unwrap();
+        for key in &keys {
+            let got = block_on(reader.get(&mut scratch, &mut decomp, key, &mut buf)).unwrap();
+            assert_eq!(got, Some(1), "{BLOOM}-byte filter lost {key:?}");
+        }
+    }
+    check::<1>();
+    check::<7>();
+    check::<63>();
+    check::<64>();
+    check::<65>();
+    check::<100>();
+    check::<{ BLOCK - 4 }>();
+}
+
+/// A table written before v0.20 carries the unbucketed filter under the
+/// magic "hrtsst02". Read by today's rule it would report keys it holds
+/// as absent, so its footer is refused outright.
+#[test]
+fn a_table_with_the_old_magic_is_rejected() {
+    let mut dev = MemDevice::<BLOCK>::new();
+    let items = [entry(b"k", b"v", 1)];
+    let (n, _) = write(&items, &mut dev);
+    let footer = BASE + n - 1;
+    assert_eq!(get(&dev, footer, b"k").unwrap(), Some(b"v".to_vec()));
+    for old in [b"hrtsst02", b"lsmtable"] {
+        let mut blk = read_block(&dev, footer);
+        blk[..8].copy_from_slice(old);
+        reseal(&mut blk);
+        write_block(&mut dev, footer, &blk);
+        let err = get(&dev, footer, b"k").unwrap_err();
+        assert!(
+            matches!(err, Error::CorruptBlock { id } if id == footer),
+            "{:?}: {err:?}",
+            core::str::from_utf8(old)
+        );
+    }
+}
