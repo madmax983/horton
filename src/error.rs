@@ -148,6 +148,14 @@ pub enum Error<E> {
     /// of the `drainer::payload::encode_*` constructors. The drainer is
     /// poisoned and nothing was written.
     BadPayload,
+    /// A received [`frame`](crate::frame) failed its check: it is
+    /// truncated, of another format version, fails its CRC, or its body
+    /// does not decode into strictly ascending entries. Nothing from the
+    /// damaged part was yielded. **Remedy:** ask the sender again.
+    CorruptFrame {
+        /// Byte offset in the frame where the damage was found.
+        offset: usize,
+    },
     /// The underlying block device reported an error.
     Device(E),
 }
@@ -188,6 +196,7 @@ impl Error<core::convert::Infallible> {
             Self::NotOpen => Error::NotOpen,
             Self::RingFull => Error::RingFull,
             Self::BadPayload => Error::BadPayload,
+            Self::CorruptFrame { offset } => Error::CorruptFrame { offset },
             Self::Device(e) => match e {},
         }
     }
@@ -236,6 +245,7 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
             Self::NotOpen => f.write_str("database is not open"),
             Self::RingFull => f.write_str("admission ring is full: let the drainer sweep"),
             Self::BadPayload => f.write_str("ring payload did not decode"),
+            Self::CorruptFrame { offset } => write!(f, "frame is corrupt at byte {offset}"),
             Self::Device(e) => write!(f, "device error: {e}"),
         }
     }

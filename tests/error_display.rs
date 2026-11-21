@@ -26,7 +26,7 @@ fn display_names_the_reason_and_the_remedy() {
 
 #[test]
 fn every_variant_has_a_message() {
-    let all: [Error<Dev>; 30] = [
+    let all: [Error<Dev>; 31] = [
         Error::KeyTooLarge { len: 1, max: 0 },
         Error::ValueTooLarge { len: 1, max: 0 },
         Error::EmptyKey,
@@ -55,6 +55,7 @@ fn every_variant_has_a_message() {
         Error::NotOpen,
         Error::RingFull,
         Error::BadPayload,
+        Error::CorruptFrame { offset: 3 },
         Error::Device(Dev),
         Error::EmptyKey,
     ];

@@ -47,6 +47,13 @@ synced writes are unchanged.
   buffers. `SortedEntries` is the source trait; `Scan` implements it.
   After `fingerprint_buckets` finds the bucket that disagrees, a diff of
   that bucket is the exact repair list.
+- `horton::frame`: `FrameWriter` packs strictly ascending entries
+  (front-coded keys, LEB128 lengths, a CRC-32 seal) into a caller-owned
+  buffer, and `fill` pages a `Scan` into MTU-sized frames;
+  `FrameReader` checks a received frame and is a `SortedEntries` source,
+  so a `Diff` joins a local `Scan` against a replica's bytes directly.
+  New `Error::CorruptFrame { offset }` for a frame that is truncated,
+  fails its CRC, or does not decode into ascending entries.
 - `Db::request_compaction(level)` compacts every table from `level` down
   to the bottom once, also below the level triggers. Bottom tables are
   rewritten in place, so `purge_before` and range tombstones free space
