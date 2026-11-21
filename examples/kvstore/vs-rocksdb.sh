@@ -8,7 +8,8 @@
 #   rocksdb          db_bench as it ships: 64 MiB memtable, 32 MiB block
 #                    cache, 4 KiB blocks, background flush and compaction
 #   rocksdb (small)  db_bench given the kvstore's memory: 1 MiB memtable,
-#                    8 MiB block cache, 16 KiB blocks
+#                    16 MiB block cache (the kvstore has 8 MiB for point
+#                    reads and 8 MiB for scans), 16 KiB blocks
 #   horton           this repository's kvstore example
 #
 # and prints operations per second side by side. NUM is the number of
@@ -86,7 +87,7 @@ horton() { # column-file, kvstore binary
 echo "RocksDB, as shipped ..." >&2
 rocksdb "$work/col.1"
 echo "RocksDB, small ..." >&2
-rocksdb "$work/col.2" --write_buffer_size=1048576 --cache_size=8388608 --block_size=16384
+rocksdb "$work/col.2" --write_buffer_size=1048576 --cache_size=16777216 --block_size=16384
 columns=("rocksdb" "rocksdb (small)")
 files=("$work/col.1" "$work/col.2")
 if [ -n "${KVSTORE_BASELINE:-}" ]; then

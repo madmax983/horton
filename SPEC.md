@@ -294,6 +294,17 @@ an open request has work.
   wins; a strictly newer covering range tombstone hides it; an expired
   winner reads as missing. Blocks are read through the `Db`'s shared
   buffers, so a second concurrent `get` on one handle is `Busy`.
+- **Detached point reads** (ADR-0018): the two phases of a point read
+  are also separate calls. `Db::probe_memtable` returns a `MemProbe`
+  (plain data: the key, the snapshot, what the memtable held), and
+  `TableView::resolve` finishes it over a copy of `Db::manifest`, any
+  handle to the device and a caller-owned `ReadScratch`, without the
+  `Db`. The answer is the store as of the probe. The caller must not
+  run `flush`, `compact_step`, `ingest_table` or `archive_commit`
+  between the probe and the end of `resolve`: they are what could
+  rewrite a table under the reader. Writes that reach only the WAL and
+  the memtable may run meanwhile. `Db::get` is the same two phases over
+  the `Db`'s own manifest, device, buffers and cache.
 - **Scans** (`Scan`, `RevScan`): a merge over the memtable and one
   cursor per table in caller-owned state, same winner rule, skipping
   hidden keys; `BufferTooSmall` never consumes an entry.

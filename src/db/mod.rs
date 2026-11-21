@@ -35,6 +35,7 @@ mod invariants;
 mod read;
 
 pub use archive::{ArchivePlan, SealedTable};
+pub use read::{MemProbe, ReadScratch, TableView};
 
 /// Where the database lives on the device, in block ids.
 ///

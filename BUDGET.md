@@ -43,7 +43,7 @@ future, and the executor stores the future: in a static task arena
 | `flush()` | 17,608 | table writer (data + index blocks) and trial-compression scratch |
 | `open()` | 7,008 | WAL recovery |
 | `compact_step()` | 2,864 | merge state lives in the caller's `Compaction` |
-| `get()` | 1,184 | blocks are read through the `Db`'s shared buffers |
+| `get()` | 1,336 | blocks are read through the `Db`'s shared buffers |
 | `ingest_table()` | 592 | copies through the `Db`'s block scratch |
 | `put()`, `delete()`, `write()`, … | ≤ 488 | |
 | `Scan::next()`, `RevScan::prev()` | ≤ 1,264 | |
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 96,064 + max(17,680, 1,184 + 1,264) = 113,744 bytes
+= 96,064 + max(17,680, 1,336 + 1,264) = 113,744 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
@@ -76,7 +76,9 @@ History:
   instead of carrying two fallback block buffers in every future.
 - Still 112 KiB at v0.20, with 944 bytes to spare: the block cache
   keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
-  and the read futures carry a bloom probe and a byte range.
+  and the read futures carry a bloom probe and a byte range. `get()`
+  grew by another 152 bytes when its table phase became shared with
+  detached reads (ADR-0018); it is not the peak.
 
 ## Context
 

@@ -228,8 +228,9 @@ request and everyone else's:
 | `DB::Open` on a directory | `Store::open` on one file, created sparse at `--size-mb` (256 MiB); a `BlockDevice` over `pread`/`pwrite` and `fdatasync` ([`device.rs`](examples/kvstore/device.rs)) |
 | `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
-| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them. Point reads go through the same queue, so the database stays in one CPU's cache |
+| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
 | background compaction | one bounded `compact_step` at the end of each operation, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
+| `Get` from many threads at once | a read's memtable probe goes through the queue; the caller then reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers. Flush and compaction wait for readers to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator` | `range(start, end, reverse)`: pins a snapshot, pages through horton's `Scan` or `RevScan` |
 | `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
@@ -279,14 +280,14 @@ in 0.19 and are 14 to 29 µs now.
 The example is also a measurement of how far a firmware store stretches.
 These are the limits it meets, and each is a property of the library:
 
-- **A point read costs 14 to 29 µs, and readers do not run in
-  parallel.** Ruling out a table that does not hold the key is cheap (a
-  footer's fields and one bloom bucket from the cache). The table that
-  may hold it costs an index block and a data block, each checked whole,
-  and the data block inflated, on every read: the cache keeps the
-  compressed image. A block that is not cached costs a 16 KiB CRC in
-  software on top (8 µs). And one thread at a time runs the engine, so
-  four readers get one core's worth of reads.
+- **A point read costs 14 to 29 µs of one core.** Ruling out a table
+  that does not hold the key is cheap (a footer's fields and one bloom
+  bucket from the cache). The table that may hold it costs an index
+  block and a data block, each checked whole, and the data block
+  inflated, on every read: the cache keeps the compressed image. A
+  block that is not cached costs a 16 KiB CRC in software on top
+  (8 µs). Readers do run in parallel, so four threads get close to four
+  cores' worth; a single read is no faster for it.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
@@ -294,8 +295,9 @@ These are the limits it meets, and each is a property of the library:
   `RegionFull`: the flight recorder's answer is to archive cold tables.
 - **A bloom filter is one block** (16 K bytes, about 13 K keys at 1%
   false positives), so large tables filter poorly.
-- **One thread at a time does the work.** Reads, writes and compaction
-  steps take turns under the engine lock, so random writes at scale are
+- **One thread at a time writes.** Writes, scans, flushes and
+  compaction steps take turns under the engine lock (only the table
+  phase of a point read runs outside it), so random writes at scale are
   bound by flush and compaction (73 K ops/s at 1 M keys, where RocksDB's
   background threads keep it at 195 K).
 - **Scans reload blocks.** A `Scan` keeps one block in memory for all

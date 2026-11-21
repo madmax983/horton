@@ -45,14 +45,20 @@ pub const KEY_MAX: usize = 128;
 pub const VAL_MAX: usize = 4096;
 /// Levels of tables.
 pub const LEVELS: usize = 4;
+/// Tables per level.
+pub const TABLES_PER_LEVEL: usize = 7;
 
 // The shape of the store: 4 levels of up to 7 tables, so at most 28
 // tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
 // file gives each table an 8 MiB slot). The memtable (4096 writes, 1 MiB)
 // is what one flush turns into a table; the bloom filter takes a whole
-// block; the cache keeps 512 blocks (8 MiB, LevelDB's default) of
-// recently read tables. A point read probes up to 7 tables in level 0
-// and one per level below.
+// block. A point read probes up to 7 tables in level 0 and one per level
+// below.
+//
+// There are two block caches of 8 MiB each (LevelDB's default is 8,
+// RocksDB's 32). This one, inside the `Db`, serves scans, which run
+// under the engine lock. The store's shared cache
+// (`store::SharedCache`) serves point reads, from every thread at once.
 horton::db_types! {
     block: BLOCK,
     key_max: KEY_MAX,
@@ -60,7 +66,7 @@ horton::db_types! {
     memtable_entries: 4096,
     memtable_arena: 1 << 20,
     levels: LEVELS,
-    tables_per_level: 7,
+    tables_per_level: TABLES_PER_LEVEL,
     bloom_bytes: BLOCK - 4,
     cache_blocks: 512;
 
@@ -69,7 +75,16 @@ horton::db_types! {
     pub type Scan = KvScan;
     pub type RevScan = KvRevScan;
     pub type Compaction = KvCompaction;
+    /// The tables of the store, read without the `Db` (a detached read).
+    pub type TableView = KvTables;
+    /// A point read between its memtable probe and its table phase.
+    pub type MemProbe = KvProbe;
+    /// A reader thread's block buffers.
+    pub type ReadScratch = KvReadScratch;
 }
+
+/// The manifest: which tables exist, level by level.
+pub type KvManifest = horton::Manifest<LEVELS, TABLES_PER_LEVEL, KEY_MAX>;
 
 /// horton ships no executor. The file device completes every call before
 /// returning, so every future is ready the first time it is polled.

@@ -30,6 +30,7 @@ history keeps it); its §9 milestone log now lives in
 
 | [0016](0016-cache-hits-reverify-with-a-ram-checksum.md) | Only CRC-verified blocks are cached; hits re-verify against a per-chunk RAM checksum, not CRC-32 |
 | [0017](0017-bucketed-bloom-and-ranged-reads.md) | Bloom probes stay in one 64-byte bucket; point reads fetch ranges of the footer and bloom blocks (`hrtsst03`) |
+| [0018](0018-detached-point-reads.md) | A point read is a memtable probe plus a table phase that runs without the `Db`; the caller keeps table writes away from detached readers |
 
 ## Adding a record
 

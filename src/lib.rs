@@ -83,7 +83,9 @@ pub use batch::WriteBatch;
 pub use cache::{BlockCache, CachePort, CacheStats};
 pub use compact::{COMPACTION_KMAX, Compaction, Progress};
 pub use crc::crc32;
-pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable, SlotStats};
+pub use db::{
+    ArchivePlan, Config, Db, MemProbe, OpenReport, ReadScratch, SealedTable, SlotStats, TableView,
+};
 pub use device::BlockDevice;
 pub use diff::{Delta, Diff, SortedEntries};
 pub use error::Error;

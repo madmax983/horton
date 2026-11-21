@@ -10,8 +10,16 @@
 //!
 //! Every call completes before it returns, so the futures horton builds
 //! on top of it are ready the first time they are polled.
+//!
+//! [`FileDevice`] is the database's device: one owner, reads and writes.
+//! [`ReadDevice`] is a second, read-only handle to the same file that any
+//! number of threads share for the table phase of point reads (horton's
+//! detached reads, ADR-0018). Both go through the operating system's
+//! page cache, so a block the database has written is what a reader
+//! gets, synced or not.
 
 use core::cell::Cell;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::task::{Context, Poll};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -116,6 +124,78 @@ impl FileDevice {
                 kind: io::ErrorKind::InvalidInput,
             })
         }
+    }
+}
+
+/// A read-only handle to a store's file, shared by reader threads.
+///
+/// It opens the file again and does not duplicate the database's
+/// handle: on Windows a duplicated handle shares one file object, and
+/// reads through it would take turns.
+pub struct ReadDevice {
+    file: File,
+    blocks: u64,
+    reads: AtomicU64,
+}
+
+impl ReadDevice {
+    /// Opens the store at `path`, which [`FileDevice::open`] has created.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let blocks = file.metadata()?.len() / BLOCK as u64;
+        Ok(Self {
+            file,
+            blocks,
+            reads: AtomicU64::new(0),
+        })
+    }
+
+    /// Blocks read through this handle.
+    pub fn reads(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl BlockDevice for ReadDevice {
+    type Error = IoError;
+    const BLOCK: usize = BLOCK;
+
+    fn poll_read_block(
+        &self,
+        _cx: &mut Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<(), IoError>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let read = if id < self.blocks {
+            read_at(&self.file, buf, id * BLOCK as u64).map_err(|e| e.kind())
+        } else {
+            Err(io::ErrorKind::InvalidInput)
+        };
+        Poll::Ready(read.map_err(|kind| IoError {
+            op: "read",
+            block: id,
+            kind,
+        }))
+    }
+
+    /// Refused: the handle is read-only, and horton's read path never
+    /// writes.
+    fn poll_write_block(
+        &mut self,
+        _cx: &mut Context<'_>,
+        id: u64,
+        _buf: &[u8],
+    ) -> Poll<Result<(), IoError>> {
+        Poll::Ready(Err(IoError {
+            op: "write",
+            block: id,
+            kind: io::ErrorKind::PermissionDenied,
+        }))
+    }
+
+    fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), IoError>> {
+        Poll::Ready(Ok(()))
     }
 }
 

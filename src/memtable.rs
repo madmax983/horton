@@ -133,6 +133,9 @@ pub struct MemTable<
     arena: [u8; ARENA],
     arena_len: usize,
     max_seq: u64,
+    /// Range tombstones among the slots. Most memtables hold none, and
+    /// then a point read's covering-tombstone search has nothing to do.
+    range_dels: usize,
 }
 
 /// Insertion plan computed by [`MemTable::plan`].
@@ -196,6 +199,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             arena: [0u8; ARENA],
             arena_len: 0,
             max_seq: 0,
+            range_dels: 0,
         }
     }
 
@@ -239,6 +243,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         self.len = 0;
         self.arena_len = 0;
         self.max_seq = 0;
+        self.range_dels = 0;
     }
 
     fn slot_key(&self, slot: &Slot) -> &[u8] {
@@ -391,6 +396,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             expire_at: a.expire_at,
         };
         self.len += 1;
+        self.range_dels += usize::from(a.range_del);
         if a.seq > self.max_seq {
             self.max_seq = a.seq;
         }
@@ -554,6 +560,11 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     /// rare, and point lookups already paid the binary search.
     #[must_use]
     pub fn max_covering_rdel(&self, key: &[u8], max_seq: u64) -> Option<u64> {
+        // Every point read asks this. Without the count it walks every
+        // slot to learn that none is a range tombstone.
+        if self.range_dels == 0 {
+            return None;
+        }
         let mut best: Option<u64> = None;
         for slot in &self.slots[..self.len] {
             if !slot.range_del || slot.seq > max_seq {

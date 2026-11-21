@@ -208,4 +208,20 @@ macro_rules! __db_type_alias {
         $(#[$meta])*
         $vis type $name = $crate::Compaction<{ $b }, { $k }, { $v }, { $bl }>;
     };
+    (TableView [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name<'a, R> =
+            $crate::TableView<'a, R, { $b }, { $k }, { $v }, { $l }, { $t }, { $bl }>;
+    };
+    (MemProbe [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name = $crate::MemProbe<{ $k }, { $v }>;
+    };
+    (ReadScratch [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name = $crate::ReadScratch<{ $b }>;
+    };
 }

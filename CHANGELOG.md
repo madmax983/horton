@@ -20,9 +20,21 @@ Read throughput is the subject:
 key-value store against RocksDB on db_bench's workloads, before and
 after. Against 0.19, point reads are 5 to 7 times faster (8 to 16 for
 absent keys), scans 2 to 5 times, and unsynced writes 1.5 to 3 times;
-synced writes are unchanged.
+synced writes are unchanged. With detached reads the host store's point
+reads then scale with reader threads: @@CHANGELOG_SCALE@@
 
 ### Added
+
+- **Detached point reads** (ADR-0018). `Db::probe_memtable` runs the
+  memtable half of a point read and returns a `MemProbe`;
+  `TableView::resolve` finishes it over a copy of `Db::manifest`, any
+  handle to the device and a caller-owned `ReadScratch`, without the
+  `Db`. A host can run the table half of many reads at once on other
+  threads while one thread owns the `Db`; an async firmware can wait
+  for flash without holding a borrow of the `Db`. The caller must keep
+  `flush`, `compact_step`, `ingest_table` and `archive_commit` from
+  running while a detached read is in its tables. `db_types!` takes
+  `TableView`, `MemProbe` and `ReadScratch` aliases.
 
 - `BlockCache::get_range_into` (and `CachePort::get_range_into`): copy a
   byte range of a cached block, checking only the chunks of the image
@@ -82,6 +94,17 @@ synced writes are unchanged.
   `CacheStats` a new field, `rejected`.
 - The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk
   sums); the RAM budget is unchanged.
+- `Db::get` and its variants run the same table phase as a detached
+  read; the `get()` future is 152 bytes larger (the ESP32-S3 peak is
+  unchanged).
+- A memtable counts its range tombstones, so a point read no longer
+  walks every slot to learn that none covers the key.
+- **kvstore point reads run in parallel.** The memtable probe is served
+  through the request queue; the caller then reads the tables on its
+  own thread, through a read-only handle to the file and an 8 MiB cache
+  shared by all readers (horton's `BlockCache` in eight locked shards).
+  Flush and compaction wait for readers in their table phase to leave.
+  The `Db`'s own 8 MiB cache now serves scans only.
 - **kvstore** runs horton under one lock instead of on a store thread.
   Point reads and writes are queued and served in order by whichever
   thread holds the lock (flat combining; group commit is the write half
