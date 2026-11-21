@@ -26,10 +26,10 @@ not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 25,672 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
-| `Scan` | 10,824 | logical block buffer, physical read buffer, cursors |
+| `Db` | 25,680 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
+| `Scan` | 10,904 | one decoded block, the physical read buffer, cursors; block buffers lent with `use_block_pool` are the caller's and not counted (the profile lends none) |
 | `Compaction` | 59,568 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,728 bytes: F16, F22) |
-| **Structs** | **96,064** | |
+| **Structs** | **96,152** | |
 
 ## Measured futures
 
@@ -46,8 +46,8 @@ future, and the executor stores the future: in a static task arena
 | `get()` | 1,336 | blocks are read through the `Db`'s shared buffers |
 | `ingest_table()` | 592 | copies through the `Db`'s block scratch |
 | `put()`, `delete()`, `write()`, … | ≤ 488 | |
-| `Scan::next()`, `RevScan::prev()` | ≤ 1,264 | |
-| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,240 | |
+| `Scan::next()`, `RevScan::prev()` | ≤ 1,280 | |
+| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,288 | |
 
 At most one `&mut self` call runs at a time, and it excludes scans
 (a `Scan` borrows the `Db`). A `get` can run alongside a scan step. The
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 96,064 + max(17,680, 1,336 + 1,264) = 113,744 bytes
+= 96,152 + max(17,680, 1,336 + 1,288) = 113,832 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
@@ -74,11 +74,14 @@ History:
   table writer's idle data block, and commits the manifest as a small
   `ManifestEdit` instead of a full copy. `get()` returns `Error::Busy`
   instead of carrying two fallback block buffers in every future.
-- Still 112 KiB at v0.20, with 944 bytes to spare: the block cache
+- Still 112 KiB at v0.20, with 856 bytes to spare: the block cache
   keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
   and the read futures carry a bloom probe and a byte range. `get()`
   grew by another 152 bytes when its table phase became shared with
-  detached reads (ADR-0018); it is not the peak.
+  detached reads (ADR-0018); it is not the peak. A `Scan` grew by 80
+  bytes (the bookkeeping for lent block buffers and for tables it has
+  not reached yet: ADR-0019) and the memtable by 8 (a count of its
+  range tombstones).
 
 ## Context
 

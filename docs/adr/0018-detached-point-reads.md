@@ -88,9 +88,9 @@ exist. Everything that only reaches the WAL and the memtable (`put`,
 ## Consequences
 
 - **Point reads scale with threads on a host.** In the kvstore, at 1 M
-  keys on four cores, `readrandom` went from @@RR_BEFORE@@ to
-  @@RR_AFTER@@ ops/s and `readmissing` from @@RM_BEFORE@@ to
-  @@RM_AFTER@@ (`docs/THROUGHPUT.md`). Writes proceed while table
+  keys on four cores, `readrandom` went from 36 K to
+  117 K ops/s and `readmissing` from 74 K to 202 K
+  (`docs/THROUGHPUT.md`). Writes proceed while table
   phases run; only flush and compaction wait, for tens of microseconds.
 - **Firmware pays 152 bytes** in the `get()` future (the read's
   accumulator is now handed to the shared table phase) and nothing

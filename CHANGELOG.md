@@ -21,7 +21,7 @@ key-value store against RocksDB on db_bench's workloads, before and
 after. Against 0.19, point reads are 5 to 7 times faster (8 to 16 for
 absent keys), scans 2 to 5 times, and unsynced writes 1.5 to 3 times;
 synced writes are unchanged. With detached reads the host store's point
-reads then scale with reader threads: @@CHANGELOG_SCALE@@
+reads, scans and seeks then run on every reader thread at once.
 
 ### Added
 

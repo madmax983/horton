@@ -53,7 +53,8 @@ scan.
 [ScanBlock])` gives a scan caller-owned buffers beside its own. A
 block then stays decoded while the merge is at another table, up to
 the pool's size, least recently used first. A scan with no pool
-behaves as it always did, and costs 56 bytes more.
+behaves as it always did, and is 80 bytes larger (10,904 on the
+ESP32-S3 profile; the RAM budget holds, with 856 bytes to spare).
 
 **A forward seek reads the tables that hold its key.** A table whose
 first key is past `start` cannot supply the scan's first entry. Its
