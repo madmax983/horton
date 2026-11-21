@@ -6,8 +6,8 @@ Status: Accepted (unreleased, 2026-11-21)
 
 After ADR-0018 the host store's point reads ran in parallel, and its
 scans were where it stood furthest from RocksDB: at 1 M keys a full
-scan ran at 0.75 M entries/s and a seek took 127 µs, against 20 M
-entries/s and 2.8 µs. `docs/THROUGHPUT.md` put the cost in three
+scan ran at 0.6 M entries/s and a seek took 126 µs, against 20 M
+entries/s and 3.2 µs. `docs/THROUGHPUT.md` put the cost in three
 places, and only one of them is about threads:
 
 1. **A scan borrows the `Db`.** So a host scan holds the engine lock
@@ -64,10 +64,32 @@ positioned for real only when it reaches the front. Nothing already
 compared is disturbed, because the table's first entry sorts at or
 after its bound.
 
+One page of a host scan, as the kvstore runs it:
+
+```mermaid
+flowchart TD
+    A["queue a page: from key, range end, 1,024 keys"] --> B
+    subgraph lock["under the engine lock, about 30 µs"]
+        B["copy_memtable_range into a page buffer<br/>returns the horizon"] --> C["manifest copy, pin (readers + 1)"]
+    end
+    C --> D
+    subgraph own["on the caller's thread, no lock"]
+        D["Scan::detached over the copy,<br/>lent a 32-block pool"] --> E["seek: position tables that hold the key;<br/>the rest wait at their lower bound"]
+        E --> F["next until the horizon, the end, or a full page"]
+    end
+    F --> G["drop the pin; next page starts at the horizon<br/>or after the last key yielded"]
+```
+
 ## Consequences
 
-- **Host scans and seeks run in parallel, and each is faster.**
-  `docs/THROUGHPUT.md` has the kvstore's measurements.
+- **Host scans and seeks run in parallel, and each is faster.** In the
+  kvstore at 1 M keys, one thread's forward scan went from 0.50 to
+  1.80 M entries/s, its reverse scan from 0.42 to 1.06 M, and its seek
+  from 144 to 67 µs. Four threads scale each by four: 7.6 M entries/s
+  forwards, 4.1 M backwards, 60 K seeks/s where there were 8 K.
+  Against RocksDB with the same memory that is 0.38× for `readseq`
+  (from 0.03×), 0.26× for `readreverse` and 0.20× for `seekrandom`
+  (from 0.03×). `docs/THROUGHPUT.md` has the tables.
 - **An error in a table the scan has not reached is reported when it
   gets there**, by `next`, not by `seek`. It is still reported before
   anything from that table is yielded, and before the scan passes it:

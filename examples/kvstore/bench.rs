@@ -342,7 +342,8 @@ fn read_seq(store: &Store, p: &Params, reverse: bool) -> Result<Done, String> {
 }
 
 fn seek_random(store: &Store, p: &Params) -> Result<Done, String> {
-    // A seek re-reads every table's index, so do a tenth as many.
+    // A seek reads an index and a data block of every table that could
+    // hold its key, so do a tenth as many.
     let p = Params {
         num: (p.num / 10).max(1),
         benchmarks: Vec::new(),

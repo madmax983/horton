@@ -85,13 +85,32 @@ exist. Everything that only reaches the WAL and the memtable (`put`,
   the queue and never waits for the pins to drain: it would wait for
   itself.
 
+```mermaid
+sequenceDiagram
+    participant R as reader thread
+    participant E as engine lock (Db)
+    participant T as tables (read-only handle, shared cache)
+    participant W as flush / compaction step
+    R->>E: probe_memtable(key, snapshot)
+    E-->>R: MemProbe, Arc of the manifest, pin (count + 1)
+    par table phase, no lock held
+        R->>T: TableView resolve, reading footers, bloom buckets, index, data
+        T-->>R: value or None
+    and
+        W->>E: take the lock, wait for the pin count to reach 0
+    end
+    R->>E: drop the pin (count - 1)
+    E-->>W: no readers in the tables: run the step
+```
+
 ## Consequences
 
 - **Point reads scale with threads on a host.** In the kvstore, at 1 M
-  keys on four cores, `readrandom` went from 36 K to
-  117 K ops/s and `readmissing` from 74 K to 202 K
-  (`docs/THROUGHPUT.md`). Writes proceed while table
-  phases run; only flush and compaction wait, for tens of microseconds.
+  keys on four cores, `readrandom` went from 38 K to 116 K ops/s and
+  `readmissing` from 81 K to 194 K; four threads do 3.0 times one
+  thread's reads, where they did 0.9 times before
+  (`docs/THROUGHPUT.md`). Writes proceed while table phases run; only
+  flush and compaction wait, for tens of microseconds.
 - **Firmware pays 152 bytes** in the `get()` future (the read's
   accumulator is now handed to the shared table phase) and nothing
   else: the peak in BUDGET.md is unchanged. An async firmware can use

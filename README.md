@@ -219,9 +219,11 @@ cargo run --release --example kvstore -- crash 25          # kill -9 the writer 
 
 horton's `Db` is one value with `&mut self` writes and no locks, which
 suits firmware. The example puts it behind one lock and gives every
-thread a `Handle`. A thread that wants a point read or a write queues
-it; whichever thread holds the lock serves the queue in order, its own
-request and everyone else's:
+thread a `Handle`. A thread that wants a write, a read or a page of a
+scan queues it; whichever thread holds the lock serves the queue in
+order, its own request and everyone else's. Reads and scans take only
+their memtable part from the lock and read the tables on their own
+thread:
 
 | LevelDB | here |
 |---|---|
@@ -232,7 +234,7 @@ request and everyone else's:
 | background compaction | one bounded `compact_step` at the end of each operation, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
 | `Get` from many threads at once | a read's memtable probe goes through the queue; the caller then reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers. Flush and compaction wait for readers to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
-| `NewIterator` | `range(start, end, reverse)`: pins a snapshot, pages through horton's `Scan` or `RevScan` |
+| `NewIterator`, `Seek` from many threads at once | `range(start, end, reverse)`: pins a snapshot and pages through horton's `Scan` or `RevScan`. Each page copies its memtable keys under the lock, then merges them with the tables on the caller's thread (a detached scan, ADR-0019), with 32 decoded blocks of its own |
 | `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
 
 `crash` runs a writer process with several threads (puts, deletes,
@@ -264,30 +266,34 @@ compress by half, four client threads), and
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 289 K | 264 K | 274 K |
-| `fillrandom`, no fsync | 174 K | 73 K | 195 K |
-| `fillrandom`, fdatasync on | 15.6 K (2.5 writes per commit) | | 16.2 K (100 K keys) |
-| `readrandom` | 73 K | 35 K | 324 K |
-| `readmissing` | 191 K | 64 K | 3,932 K |
-| `readseq` | 1,695 K | 464 K | 19,764 K |
+| `fillseq`, no fsync | 226 K | 218 K | 256 K |
+| `fillrandom`, no fsync | 141 K | 66 K | 193 K |
+| `fillrandom`, fdatasync on | 16.1 K (2.6 writes per commit) | | 15.7 K (100 K keys) |
+| `readrandom` | 176 K | 116 K | 344 K |
+| `readmissing` | 269 K | 194 K | 4,059 K |
+| `seekrandom` | 56 K | 64 K | 316 K |
+| `readseq`, entries/s over four scanning threads | 10,805 K | 7,599 K | 19,878 K |
+| `readreverse`, the same | 6,073 K | 4,140 K | 16,218 K |
 
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, where
-the time goes, and what v0.20 changed: point reads were 100 to 140 µs
-in 0.19 and are 14 to 29 µs now.
+the time goes, and what v0.20 changed. Against 0.19, at 1 M keys on
+four threads, point reads are 16 times faster, seeks 33 times and
+scans 36 times; four reader threads do 3 to 4 times the work of one.
 
 ### Where horton stops at host scale
 
 The example is also a measurement of how far a firmware store stretches.
 These are the limits it meets, and each is a property of the library:
 
-- **A point read costs 14 to 29 µs of one core.** Ruling out a table
+- **A point read costs 22 µs of one core at 1 M keys**, 12 µs when the
+  key is absent. Ruling out a table
   that does not hold the key is cheap (a footer's fields and one bloom
   bucket from the cache). The table that may hold it costs an index
   block and a data block, each checked whole, and the data block
   inflated, on every read: the cache keeps the compressed image. A
   block that is not cached costs a 16 KiB CRC in software on top
-  (8 µs). Readers do run in parallel, so four threads get close to four
-  cores' worth; a single read is no faster for it.
+  (8 µs). Readers do run in parallel, so four threads get three cores'
+  worth; a single read is no faster for it.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
@@ -295,14 +301,17 @@ These are the limits it meets, and each is a property of the library:
   `RegionFull`: the flight recorder's answer is to archive cold tables.
 - **A bloom filter is one block** (16 K bytes, about 13 K keys at 1%
   false positives), so large tables filter poorly.
-- **One thread at a time writes.** Writes, scans, flushes and
-  compaction steps take turns under the engine lock (only the table
-  phase of a point read runs outside it), so random writes at scale are
-  bound by flush and compaction (73 K ops/s at 1 M keys, where RocksDB's
-  background threads keep it at 195 K).
-- **Scans reload blocks.** A `Scan` keeps one block in memory for all
-  its table cursors, so a merge over overlapping tables re-reads a block
-  each time it changes table, and a seek positions every table in range.
+- **One thread at a time writes.** Writes, flushes and compaction
+  steps take turns under the engine lock (the table work of reads,
+  scans and seeks runs outside it), so random writes at scale are
+  bound by flush and compaction (66 K ops/s at 1 M keys, where RocksDB's
+  background threads keep it at 193 K).
+- **A scan pays for its memory.** With one block for all its table
+  cursors, which is what firmware gives it, a merge over overlapping
+  tables decodes a block again each time it changes table: 0.5 M
+  entries/s here. Lent 32 blocks it does 1.8 M on one thread. Each
+  `next` still compares the head of every table in range, and a
+  reverse seek still positions all of them.
 - **Batches are one WAL block**, keys and values have compile-time
   maximums (128 B and 4 KiB here), and at most eight snapshots (so eight
   iterators) are live at once.

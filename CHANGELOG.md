@@ -18,10 +18,12 @@ v0.19, are rejected, not misread.
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
 key-value store against RocksDB on db_bench's workloads, before and
-after. Against 0.19, point reads are 5 to 7 times faster (8 to 16 for
-absent keys), scans 2 to 5 times, and unsynced writes 1.5 to 3 times;
-synced writes are unchanged. With detached reads the host store's point
-reads, scans and seeks then run on every reader thread at once.
+after. Against 0.19, one point read is 5 times cheaper (10 for an
+absent key), one thread's scan 9 times and its seek 7 times, and
+unsynced writes 1.4 to 2.4 times; synced writes are unchanged. With
+detached reads the host store's point reads, scans and seeks also run
+on every reader thread at once: at 1 M keys on four threads, point
+reads are 16 times 0.19's rate, seeks 33 times and scans 36 times.
 
 ### Added
 
