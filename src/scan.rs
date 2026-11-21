@@ -16,12 +16,314 @@
 //! reported *before* any cursor advances, so retrying with a larger buffer
 //! yields the same entry — never silent truncation, never a skipped entry.
 
+use crate::cache::CachePort;
 use crate::db::Db;
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::TableRef;
+use crate::manifest::{Manifest, TableRef};
+use crate::memtable::MemTable;
 use crate::sstable;
 use crate::version::{Version, version_gt};
+
+/// What a scan reads: a memtable, the tables a manifest names, a device
+/// to read their blocks from and a cache for them. A scan over a `Db`
+/// ([`Scan::new`]) takes all four from the `Db`. A detached scan
+/// ([`Scan::detached`]) is handed them one by one, and none of them need
+/// be the `Db`'s own.
+struct Source<
+    'd,
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> {
+    memtable: &'d MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+    manifest: &'d Manifest<LEVELS, TABLES, KEY_MAX>,
+    device: &'d D,
+    cache: Option<&'d dyn CachePort<BLOCK>>,
+    /// The node the memtable's versions carry in the replica merge.
+    node_id: u32,
+    /// False for a `Db` that has not been opened: its memtable and
+    /// manifest are not the database's yet.
+    open: bool,
+}
+
+// Hand-written: a derive would demand `D: Copy`, and the device is only
+// ever held by reference.
+impl<
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> Clone for Source<'_, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> Copy for Source<'_, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>
+{
+}
+
+impl<
+    'd,
+    D: BlockDevice,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>
+{
+    /// Everything a scan reads, taken from `db`.
+    const fn of_db<const BLOOM_BYTES: usize, const CACHE: usize>(
+        db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
+    ) -> Self {
+        Self {
+            memtable: db.memtable(),
+            manifest: db.manifest_ref(),
+            device: db.device(),
+            cache: Some(db.cache_port()),
+            node_id: db.node_id(),
+            open: db.is_open(),
+        }
+    }
+
+    const fn ensure_open(&self) -> Result<(), Error<D::Error>> {
+        if self.open {
+            Ok(())
+        } else {
+            Err(Error::NotOpen)
+        }
+    }
+
+    /// Whether a range tombstone at/below `max_seq` and newer than `above`
+    /// covers `key`, across the memtable and every table with a
+    /// range-tombstone section — the scans' "is the winning version hidden?"
+    /// test. `above` is the winner's version; "newer" is the merge rule
+    /// (see [`crate::version`]). Tables that cannot hold such a tombstone
+    /// are skipped without I/O: no rdel section, no version above the
+    /// winner's (exact: every version in the table is at or below its
+    /// `(node, wall, max_seq)` bound), or bounds that cannot contain `key`
+    /// (`last_key` carries the greatest exclusive rdel end inclusively, so
+    /// that prune is a conservative superset).
+    /// The search stops at the first hit. `scratch` is the scan's
+    /// physical-read buffer, dead between block reads, so the scan
+    /// futures hold no block buffer for it.
+    async fn rdel_hides(
+        &self,
+        key: &[u8],
+        max_seq: u64,
+        above: Version,
+        scratch: &mut [u8; BLOCK],
+    ) -> Result<bool, Error<D::Error>> {
+        if self
+            .memtable
+            .max_covering_rdel(key, max_seq)
+            .is_some_and(|q| version_gt(Version::memtable(self.node_id, q), above))
+        {
+            return Ok(true);
+        }
+        for li in 0..LEVELS {
+            let tables = self.manifest.level(li).unwrap_or(&[]);
+            for tref in tables {
+                // The table's best possible version: nothing in it can
+                // beat `above` when even this bound does not.
+                let bound = Version::table(tref.node_id, tref.seal_wall, tref.max_seq);
+                if tref.rdel_blocks == 0
+                    || !version_gt(bound, above)
+                    || tref.first_key.as_slice() > key
+                    || tref.last_key.as_slice() < key
+                {
+                    continue;
+                }
+                if sstable::covering_rdel_seq_in(
+                    self.device,
+                    self.cache,
+                    tref.id,
+                    scratch,
+                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
+                    tref.rdel_blocks,
+                    key,
+                    max_seq,
+                )
+                .await?
+                .is_some_and(|q| version_gt(Version::table(tref.node_id, tref.seal_wall, q), above))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// A block buffer lent to a scan: see [`Scan::use_block_pool`]. `BLOCK`
+/// bytes and a tag.
+pub struct ScanBlock<const BLOCK: usize> {
+    /// The device block decoded here, if any.
+    id: Option<u64>,
+    /// When it was last used, on the scan's own counter.
+    used: u64,
+    data: [u8; BLOCK],
+}
+
+impl<const BLOCK: usize> ScanBlock<BLOCK> {
+    /// An empty buffer. `const`, so a pool can sit in a `static` or be
+    /// built in place.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            id: None,
+            used: 0,
+            data: [0u8; BLOCK],
+        }
+    }
+}
+
+impl<const BLOCK: usize> Default for ScanBlock<BLOCK> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A scan's block buffers. A scan keeps one cursor per table but, by
+/// default, one decoded block for all of them: whenever the merge turns
+/// to another table's cursor, that table's block is fetched and inflated
+/// again. That keeps a scan small (ADR-0002's point), and it is most of
+/// a scan's time when tables overlap. A caller with memory to spare
+/// lends the scan more buffers, and each cursor's block then stays
+/// decoded while the merge is elsewhere.
+struct Blocks<'d, const BLOCK: usize> {
+    /// A block as stored, before it is inflated into a buffer; also the
+    /// scratch for range-tombstone probes. Dead between block reads.
+    raw: [u8; BLOCK],
+    /// The scan's own buffer.
+    own: ScanBlock<BLOCK>,
+    /// Buffers the caller lent.
+    pool: &'d mut [ScanBlock<BLOCK>],
+    /// The buffer the parsers read: 0 is `own`, `i + 1` is `pool[i]`.
+    cur: usize,
+    tick: u64,
+}
+
+impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
+    const fn new() -> Self {
+        Self {
+            raw: [0u8; BLOCK],
+            own: ScanBlock::new(),
+            pool: &mut [],
+            cur: 0,
+            tick: 0,
+        }
+    }
+
+    /// The decoded block the last [`find`](Self::find) or
+    /// [`loaded`](Self::loaded) settled on.
+    fn current(&self) -> &[u8; BLOCK] {
+        self.cur
+            .checked_sub(1)
+            .and_then(|i| self.pool.get(i))
+            .map_or(&self.own.data, |lent| &lent.data)
+    }
+
+    fn slot_mut(&mut self, at: usize) -> &mut ScanBlock<BLOCK> {
+        match at.checked_sub(1).and_then(|i| self.pool.get_mut(i)) {
+            Some(lent) => lent,
+            None => &mut self.own,
+        }
+    }
+
+    /// Makes the buffer holding block `id` current, if one does.
+    fn find(&mut self, id: u64) -> bool {
+        let held = if self.own.id == Some(id) {
+            Some(0)
+        } else {
+            self.pool
+                .iter()
+                .position(|b| b.id == Some(id))
+                .map(|i| i + 1)
+        };
+        let Some(at) = held else {
+            return false;
+        };
+        self.tick += 1;
+        let tick = self.tick;
+        self.slot_mut(at).used = tick;
+        self.cur = at;
+        true
+    }
+
+    /// Picks the buffer the next block is decoded into (an empty one,
+    /// else the least recently used), makes it current and empties it.
+    /// Returns the read buffer and that buffer. Call
+    /// [`loaded`](Self::loaded) once the block is in it.
+    fn victim(&mut self) -> (&mut [u8; BLOCK], &mut [u8; BLOCK]) {
+        let age = |b: &ScanBlock<BLOCK>| b.id.map_or(0, |_| b.used + 1);
+        let mut at = 0;
+        let mut oldest = age(&self.own);
+        for (i, lent) in self.pool.iter().enumerate() {
+            if age(lent) < oldest {
+                oldest = age(lent);
+                at = i + 1;
+            }
+        }
+        self.cur = at;
+        let block = match at.checked_sub(1).and_then(|i| self.pool.get_mut(i)) {
+            Some(lent) => lent,
+            None => &mut self.own,
+        };
+        // Until `loaded`, the buffer holds no block: a failed read must
+        // not leave the old tag on new bytes.
+        block.id = None;
+        (&mut self.raw, &mut block.data)
+    }
+
+    /// Records that the current buffer now holds block `id`.
+    fn loaded(&mut self, id: u64) {
+        self.tick += 1;
+        let tick = self.tick;
+        let block = self.slot_mut(self.cur);
+        block.id = Some(id);
+        block.used = tick;
+    }
+
+    /// Forgets every decoded block (a re-seek starts from scratch).
+    fn forget(&mut self) {
+        self.own.id = None;
+        for lent in self.pool.iter_mut() {
+            lent.id = None;
+        }
+    }
+
+    /// Takes `pool` as extra buffers, in place of any lent before.
+    fn lend(&mut self, pool: &'d mut [ScanBlock<BLOCK>]) {
+        self.own.id = None;
+        self.cur = 0;
+        self.pool = pool;
+        self.forget();
+    }
+}
 
 /// One table's position in a scan. The head entry is cached so the merge
 /// compares keys without reloading blocks; values are re-parsed from the
@@ -45,6 +347,12 @@ struct ScanCursor<const KEY_MAX: usize> {
     /// Entries end in the current block (start of the restart trailer).
     end: usize,
     live: bool,
+    /// Not positioned yet: the table starts after the scan's start key,
+    /// so nothing of it has been read. `key` is then the table's lower
+    /// bound, not an entry: no entry of the table sorts below it, which
+    /// is all the merge needs until the scan gets there. The cursor is
+    /// positioned for real (and this cleared) before its head can win.
+    pending: bool,
     key: [u8; KEY_MAX],
     key_len: usize,
     seq: u64,
@@ -70,6 +378,7 @@ impl<const KEY_MAX: usize> ScanCursor<KEY_MAX> {
             next: 0,
             end: 0,
             live: false,
+            pending: false,
             key: [0u8; KEY_MAX],
             key_len: 0,
             seq: 0,
@@ -103,7 +412,7 @@ pub struct Scan<
     const BLOOM_BYTES: usize,
     const CACHE: usize,
 > {
-    db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
+    src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
     start: [u8; KEY_MAX],
     start_len: usize,
     end: [u8; KEY_MAX],
@@ -113,15 +422,11 @@ pub struct Scan<
     /// Caller-supplied clock for TTL reads: values with nonzero
     /// `expire_at <= now` are suppressed.
     now: u64,
-    /// Physical block as last read (CRC-verified); `block` below is the
-    /// logical block inflated from it. Shared block buffer; `block_id`
-    /// says what it currently holds.
-    raw: [u8; BLOCK],
-    /// Logical block: `raw` copied here when uncompressed, decompressed
-    /// here when the compression flag is set. Every parser reads from
-    /// here, so decompression is transparent to the scan.
-    block: [u8; BLOCK],
-    block_id: Option<u64>,
+    /// The scan's block buffers: one of its own, any the caller lent it
+    /// ([`use_block_pool`](Self::use_block_pool)), and the buffer a
+    /// block is read into before it is inflated. Every parser reads the
+    /// current one.
+    blocks: Blocks<'d, BLOCK>,
     /// Memtable head: slot index plus cached entry bytes.
     mem_idx: usize,
     mem_key: [u8; KEY_MAX],
@@ -166,8 +471,13 @@ impl<
     pub const fn new(
         db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     ) -> Self {
+        Self::over(Source::of_db(db))
+    }
+
+    /// An unpositioned scan over `src`.
+    const fn over(src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>) -> Self {
         Self {
-            db,
+            src,
             start: [0u8; KEY_MAX],
             start_len: 0,
             end: [0u8; KEY_MAX],
@@ -175,9 +485,7 @@ impl<
             has_end: false,
             max_seq: u64::MAX,
             now: 0,
-            raw: [0u8; BLOCK],
-            block: [0u8; BLOCK],
-            block_id: None,
+            blocks: Blocks::new(),
             mem_idx: 0,
             mem_key: [0u8; KEY_MAX],
             mem_key_len: 0,
@@ -193,6 +501,59 @@ impl<
         }
     }
 
+    /// Creates an unpositioned scan that does not borrow a `Db`: a
+    /// *detached* scan (ADR-0019), the scan counterpart of a detached
+    /// point read ([`TableView`](crate::TableView)). It merges
+    /// `memtable` with the tables `manifest` names, read from `device`
+    /// through `cache` (`None`: every block comes from the device).
+    /// `node_id` is the `Db`'s [`node_id`](Db::node_id).
+    ///
+    /// `memtable` is usually a copy of part of the `Db`'s memtable, made
+    /// by [`Db::copy_memtable_range`], and `manifest` a copy of
+    /// [`Db::manifest`] taken at the same moment; the scan then yields
+    /// what a scan over the `Db` would have yielded at that moment, up
+    /// to the copy's horizon. Nothing here borrows the `Db`, so its
+    /// owner can go on writing, and any number of detached scans can run
+    /// at once, on other threads or tasks.
+    ///
+    /// The caller keeps the same rule as for a detached point read:
+    /// while the scan is alive, do not run `flush`, `compact_step`,
+    /// `ingest_table` or `archive_commit` on the `Db`. They can rewrite
+    /// a table the scan is in the middle of.
+    #[must_use]
+    pub const fn detached(
+        memtable: &'d MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        manifest: &'d Manifest<LEVELS, TABLES, KEY_MAX>,
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        node_id: u32,
+    ) -> Self {
+        Self::over(Source {
+            memtable,
+            manifest,
+            device,
+            cache,
+            node_id,
+            open: true,
+        })
+    }
+
+    /// Lends the scan extra block buffers, for as long as it lives.
+    ///
+    /// A scan has one cursor per table and, of its own, one decoded
+    /// block: each time the merge moves to another table's cursor, that
+    /// table's block is read and inflated again. With a pool, each
+    /// cursor's block stays decoded while the merge is elsewhere, up to
+    /// the pool's size (least recently used goes first). One buffer per
+    /// table that overlaps the range is the most that helps; firmware
+    /// that scans little passes none and keeps the scan small.
+    ///
+    /// Call it before [`seek`](Self::seek); it forgets what the scan had
+    /// decoded. The scan's results do not depend on the pool.
+    pub fn use_block_pool(&mut self, pool: &'d mut [ScanBlock<BLOCK>]) {
+        self.blocks.lend(pool);
+    }
+
     /// Positions the scan at the first entry `>= start` and below `end`
     /// (exclusive; `None` scans to the last key), showing only mutations
     /// with `seq <= max_seq`. Pass a [`Db::snapshot`] watermark for a
@@ -202,6 +563,13 @@ impl<
     /// An empty `start` scans from the first key. A `start` at or above
     /// `end` simply yields nothing. Re-seeking a scan is allowed and
     /// repositions every cursor from scratch.
+    ///
+    /// The seek reads the tables whose key range holds `start`. A table
+    /// that starts after `start` is read when the scan reaches it, by
+    /// [`next`](Scan::next), so a seek followed by a few entries costs
+    /// the tables around `start` and not every table of the range. An
+    /// error in such a table is reported by the `next` that gets there,
+    /// before that `next` yields anything.
     ///
     /// # Errors
     ///
@@ -233,7 +601,7 @@ impl<
         max_seq: u64,
         now: u64,
     ) -> Result<(), Error<D::Error>> {
-        self.db.ensure_open()?;
+        self.src.ensure_open()?;
         if start.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
                 len: start.len(),
@@ -262,13 +630,13 @@ impl<
         self.start_len = start.len();
         self.max_seq = max_seq;
         self.now = now;
-        self.block_id = None;
+        self.blocks.forget();
 
         // Copy the shared ref: everything derived from it lives
         // independently of this `&mut self` borrow.
-        let db = self.db;
+        let db = self.src;
         // Memtable cursor: first slot at/after `start`.
-        self.mem_idx = db.memtable().lower_bound(start);
+        self.mem_idx = db.memtable.lower_bound(start);
         self.advance_mem();
 
         // One cursor per table overlapping [start, end). The merge resolves
@@ -277,7 +645,7 @@ impl<
         let mut base = 0;
         for li in 0..LEVELS {
             self.level_base[li] = base;
-            let tables = db.manifest_ref().level(li).unwrap_or(&[]);
+            let tables = db.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
                 // Key-range prune: no I/O for tables outside the scan.
                 if tref.last_key.as_slice() < start {
@@ -290,7 +658,17 @@ impl<
                 // compaction already merged them into a newer table): the
                 // cursor starts at the bound at the earliest.
                 let from = start.max(tref.first_key.as_slice());
-                self.add_cursor(tref, li, from).await?;
+                if tref.first_key.as_slice() > start {
+                    // The table starts after `start`: nothing of it can
+                    // be the scan's first entry. Its cursor waits at the
+                    // table's lower bound and is positioned, with I/O,
+                    // only if the scan gets that far. A seek that reads
+                    // a few entries then touches the tables around
+                    // `start`, not every table to the end of the range.
+                    self.add_pending(tref, li)?;
+                } else {
+                    self.add_cursor(tref, li, from).await?;
+                }
             }
             base += self.cursor_counts[li];
         }
@@ -326,7 +704,10 @@ impl<
     /// # Errors
     ///
     /// [`Error::BufferTooSmall`] with the required length, [`Error::CorruptBlock`]
-    /// on a torn data block, or [`Error::Device`] on I/O failure.
+    /// on a torn data block (or a torn index block or bad footer of a
+    /// table the scan reaches for the first time),
+    /// [`Error::CorruptManifest`] on a malformed table range, or
+    /// [`Error::Device`] on I/O failure.
     pub async fn next(
         &mut self,
         key_buf: &mut [u8],
@@ -343,6 +724,18 @@ impl<
             // The end bound is exclusive: a head at/above it ends the scan.
             if self.has_end && min_key >= &self.end[..self.end_len] {
                 return Ok(None);
+            }
+            // A cursor still waiting at its table's lower bound has
+            // reached the front: position it for real, then look again.
+            // Its first entry sorts at or after the bound, so nothing
+            // already compared is disturbed.
+            if let Some(src) = (1..=total).find(|&src| {
+                let (li, ti) = self.cursor_pos(src);
+                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+                c.live && c.pending && &c.key[..c.key_len] == min_key
+            }) {
+                self.position_pending(src).await?;
+                continue;
             }
             // Pass 2: among heads on the minimum key, the highest version
             // wins (see [`crate::version`]). `min_key` is invariant for
@@ -403,8 +796,8 @@ impl<
             // winning value with `expire_at <= now`, hides the key. An
             // expired winner never falls through to an older version.
             let covered = self
-                .db
-                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.raw)
+                .src
+                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.blocks.raw)
                 .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
@@ -438,7 +831,7 @@ impl<
             } else {
                 self.ensure_block(winner_table, winner_bid).await?;
                 let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
-                    &self.block,
+                    self.blocks.current(),
                     winner_off,
                     winner_end,
                     winner_bid,
@@ -493,23 +886,16 @@ impl<
     /// it when the compression flag is set. Afterwards `self.block` holds
     /// the logical block; every parser reads from there. For data blocks.
     async fn read_verify(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.db;
+        let db = self.src;
+        let (raw, block) = self.blocks.victim();
         // Cold insert: a scan streams each data block once with no reuse,
         // so scan blocks must not displace the point-read hot set.
-        let inflated = sstable::read_data_block(
-            db.device(),
-            Some(db.cache_port()),
-            table_id,
-            id,
-            &mut self.raw,
-            &mut self.block,
-            false,
-        )
-        .await?;
+        let inflated =
+            sstable::read_data_block(db.device, db.cache, table_id, id, raw, block, false).await?;
         if !inflated {
-            self.block.copy_from_slice(&self.raw);
+            block.copy_from_slice(raw);
         }
-        self.block_id = Some(id);
+        self.blocks.loaded(id);
         Ok(())
     }
 
@@ -518,23 +904,16 @@ impl<
     /// tail bytes are index payload, not a restart count — running them
     /// through the flag check would misread a coincidental bit).
     async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.db;
-        sstable::read_block_verified(
-            db.device(),
-            Some(db.cache_port()),
-            table_id,
-            id,
-            &mut self.block,
-            true,
-        )
-        .await?;
-        self.block_id = Some(id);
+        let db = self.src;
+        let (_, block) = self.blocks.victim();
+        sstable::read_block_verified(db.device, db.cache, table_id, id, block, true).await?;
+        self.blocks.loaded(id);
         Ok(())
     }
 
     /// Ensures the shared buffer holds block `id` (verified on load).
     async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        if self.block_id == Some(id) {
+        if self.blocks.find(id) {
             return Ok(());
         }
         self.read_verify(table_id, id).await
@@ -549,34 +928,106 @@ impl<
         li: usize,
         start: &[u8],
     ) -> Result<(), Error<D::Error>> {
-        // The data section leads the table; the scan cursor walks data
-        // blocks only.
-        let data_first = tref.data_first();
-        let data_blocks = tref.data_blocks().ok_or(Error::CorruptBlock {
-            id: tref.first_block,
-        })?;
-        if data_blocks == 0 {
+        if Self::data_blocks_of(tref)? == 0 {
             // Range-only table (flush or compaction carrying nothing but
             // range tombstones): no point cursor to add. Its rdel section
             // still shadows keys via the separate covering probes, which
             // walk the manifest, not the cursors.
             return Ok(());
         }
+        let ti = self.cursor_counts[li];
+        self.cursor_counts[li] += 1;
+        self.position_cursor(tref, li, ti, start).await
+    }
+
+    /// Adds a cursor over `tref` that is not positioned yet: it waits at
+    /// the table's lower bound and reads nothing (see
+    /// [`ScanCursor::pending`]).
+    fn add_pending(&mut self, tref: &TableRef<KEY_MAX>, li: usize) -> Result<(), Error<D::Error>> {
+        let data_blocks = Self::data_blocks_of(tref)?;
+        if data_blocks == 0 {
+            return Ok(());
+        }
+        let ti = self.cursor_counts[li];
+        let bound = tref.first_key.as_slice();
+        // The manifest holds at most the pool's worth of tables, so this
+        // never fails; if it did, the manifest is what is wrong.
+        let slot = self
+            .cursors
+            .as_flattened_mut()
+            .get_mut(self.level_base[li] + ti)
+            .ok_or(Error::CorruptManifest)?;
+        *slot = ScanCursor::empty();
+        slot.table_id = tref.id;
+        slot.live = true;
+        slot.pending = true;
+        slot.key
+            .get_mut(..bound.len())
+            .ok_or(Error::CorruptManifest)?
+            .copy_from_slice(bound);
+        slot.key_len = bound.len();
+        self.cursor_counts[li] += 1;
+        Ok(())
+    }
+
+    /// Positions the pending cursor at source `src` for real: at its
+    /// table's first entry at or after the scan's start.
+    async fn position_pending(&mut self, src: usize) -> Result<(), Error<D::Error>> {
+        let (li, ti) = self.cursor_pos(src);
+        let table_id = self.cursors.as_flattened()[self.level_base[li] + ti].table_id;
+        // The scan's source does not change under it, so the table is
+        // still in the manifest it was added from.
+        let tref = *self
+            .src
+            .manifest
+            .find_table(table_id)
+            .ok_or(Error::CorruptManifest)?;
+        // Entries below the table's live lower bound are dead; the
+        // bound is above `start`, or the cursor would not be pending.
+        let from = tref.first_key;
+        self.position_cursor(&tref, li, ti, from.as_slice()).await
+    }
+
+    /// A table's data-block count, checked.
+    fn data_blocks_of(tref: &TableRef<KEY_MAX>) -> Result<u64, Error<D::Error>> {
+        tref.data_blocks().ok_or(Error::CorruptBlock {
+            id: tref.first_block,
+        })
+    }
+
+    /// Reads cursor `(li, ti)` into place over `tref`: resolves the
+    /// table's block index to the data block that can hold `start`, and
+    /// parks at the first entry `>= start` with `seq <= max_seq`.
+    async fn position_cursor(
+        &mut self,
+        tref: &TableRef<KEY_MAX>,
+        li: usize,
+        ti: usize,
+        start: &[u8],
+    ) -> Result<(), Error<D::Error>> {
+        // The data section leads the table; the scan cursor walks data
+        // blocks only.
+        let data_first = tref.data_first();
+        let data_blocks = Self::data_blocks_of(tref)?;
         let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-        let db = self.db;
+        let db = self.src;
         let index_id = sstable::footer_index_block(
-            db.device(),
-            Some(db.cache_port()),
+            db.device,
+            db.cache,
             tref.id,
-            &mut self.block,
+            // Only the footer's fields are fetched: the read buffer will
+            // do, and no block buffer is disturbed.
+            &mut self.blocks.raw,
             footer,
         )
         .await?;
-        self.block_id = Some(footer);
         self.read_verify_index(tref.id, index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
-        let data_id =
-            sstable::index_lookup::<D::Error>(&self.block[..payload_end], start, index_id)?;
+        let data_id = sstable::index_lookup::<D::Error>(
+            &self.blocks.current()[..payload_end],
+            start,
+            index_id,
+        )?;
         // `None`: `start` sorts before every block — begin at block 0.
         // (The walk budget in the tuple's second half is for point
         // lookups; the scan cursor walks blocks on its own.)
@@ -597,12 +1048,11 @@ impl<
                 id: tref.first_block,
             })?;
         self.read_verify(tref.id, bid).await?;
-        let end = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, bid)?;
+        let end = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), bid)?;
         if end == 0 {
             // A data block always carries at least one entry.
             return Err(Error::CorruptBlock { id: bid });
         }
-        let ti = self.cursor_counts[li];
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
         let slot = self
@@ -623,13 +1073,13 @@ impl<
             next: 0,
             end,
             live: true,
+            pending: false,
             key: [0u8; KEY_MAX],
             key_len: 0,
             seq: 0,
             tombstone: false,
             val_len: 0,
         };
-        self.cursor_counts[li] += 1;
         self.park_cursor(li, ti, Some(start)).await
     }
 
@@ -665,12 +1115,15 @@ impl<
             let mut off = off;
             // Scan this block's entries for the next visible one.
             let parked = loop {
-                let Ok(entry) =
-                    sstable::parse_data_entry::<D::Error, BLOCK>(&self.block, off, end, bid)
-                else {
+                let Ok(entry) = sstable::parse_data_entry::<D::Error, BLOCK>(
+                    self.blocks.current(),
+                    off,
+                    end,
+                    bid,
+                ) else {
                     // Genuine zero padding marks end-of-entries; any
                     // other unparseable structure is corruption.
-                    if sstable::all_zero(&self.block[off..end]) {
+                    if sstable::all_zero(&self.blocks.current()[off..end]) {
                         break None;
                     }
                     return Err(Error::CorruptBlock { id: bid });
@@ -717,7 +1170,7 @@ impl<
                 .checked_add(idx + 1)
                 .ok_or(Error::CorruptBlock { id: first })?;
             self.read_verify(tid, nid).await?;
-            let nend = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, nid)?;
+            let nend = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), nid)?;
             if nend == 0 {
                 return Err(Error::CorruptBlock { id: nid });
             }
@@ -734,12 +1187,12 @@ impl<
     /// `put`/`flush` can shift slots under this index walk.
     fn advance_mem(&mut self) {
         let max_seq = self.max_seq;
-        let db = self.db;
+        let db = self.src;
         self.mem_live = false;
-        while self.mem_idx < db.memtable().slot_len() {
+        while self.mem_idx < db.memtable.slot_len() {
             // Range-tombstone slots sort by their start key but are not
             // point versions: the merge never yields them as entries.
-            if let Some(v) = db.memtable().slot_view(self.mem_idx)
+            if let Some(v) = db.memtable.slot_view(self.mem_idx)
                 && v.seq <= max_seq
                 && !v.range_del
             {
@@ -833,7 +1286,7 @@ impl<
     /// their table's origin.
     fn head_version(&self, src: usize) -> Version {
         if src == 0 {
-            Version::memtable(self.db.node_id(), self.mem_seq)
+            Version::memtable(self.src.node_id, self.mem_seq)
         } else {
             let (li, ti) = self.cursor_pos(src);
             let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
@@ -967,7 +1420,7 @@ pub struct RevScan<
     const BLOOM_BYTES: usize,
     const CACHE: usize,
 > {
-    db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
+    src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
     /// Inclusive ceiling: entries qualify when `key <= ceil`. Set when
     /// `seek_prev`'s `from` is non-empty; an empty `from` means no
     /// ceiling — the scan starts at the last key.
@@ -981,15 +1434,11 @@ pub struct RevScan<
     /// Caller-supplied clock for TTL reads: values with nonzero
     /// `expire_at <= now` are suppressed.
     now: u64,
-    /// Physical block as last read (CRC-verified); `block` below is the
-    /// logical block inflated from it. Shared block buffer; `block_id`
-    /// says what it currently holds.
-    raw: [u8; BLOCK],
-    /// Logical block: `raw` copied here when uncompressed, decompressed
-    /// here when the compression flag is set. Every parser reads from
-    /// here, so decompression is transparent to the scan.
-    block: [u8; BLOCK],
-    block_id: Option<u64>,
+    /// The scan's block buffers: one of its own, any the caller lent it
+    /// ([`use_block_pool`](Self::use_block_pool)), and the buffer a
+    /// block is read into before it is inflated. Every parser reads the
+    /// current one.
+    blocks: Blocks<'d, BLOCK>,
     /// Memtable head: slot index plus cached entry bytes. The walk moves
     /// downward from the last slot at/below the ceiling.
     mem_idx: usize,
@@ -1029,14 +1478,40 @@ impl<
     const CACHE: usize,
 > RevScan<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
+    /// Creates an unpositioned reverse scan that does not borrow a `Db`:
+    /// the reverse of [`Scan::detached`], over a memtable copy made by
+    /// [`Db::copy_memtable_range_rev`]. The same rule applies.
+    #[must_use]
+    pub const fn detached(
+        memtable: &'d MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        manifest: &'d Manifest<LEVELS, TABLES, KEY_MAX>,
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        node_id: u32,
+    ) -> Self {
+        Self::over(Source {
+            memtable,
+            manifest,
+            device,
+            cache,
+            node_id,
+            open: true,
+        })
+    }
+
     /// Creates an unpositioned reverse scan over `db`. Call
     /// [`seek_prev`](RevScan::seek_prev) before [`prev`](RevScan::prev).
     #[must_use]
     pub const fn new(
         db: &'d Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     ) -> Self {
+        Self::over(Source::of_db(db))
+    }
+
+    /// An unpositioned scan over `src`.
+    const fn over(src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>) -> Self {
         Self {
-            db,
+            src,
             ceil: [0u8; KEY_MAX],
             ceil_len: 0,
             lower: [0u8; KEY_MAX],
@@ -1044,9 +1519,7 @@ impl<
             has_lower: false,
             max_seq: u64::MAX,
             now: 0,
-            raw: [0u8; BLOCK],
-            block: [0u8; BLOCK],
-            block_id: None,
+            blocks: Blocks::new(),
             mem_idx: 0,
             mem_key: [0u8; KEY_MAX],
             mem_key_len: 0,
@@ -1060,6 +1533,13 @@ impl<
             cursor_counts: [0; LEVELS],
             level_base: [0; LEVELS],
         }
+    }
+
+    /// Lends the scan extra block buffers, for as long as it lives; see
+    /// [`Scan::use_block_pool`]. Call it before
+    /// [`seek_prev`](Self::seek_prev).
+    pub fn use_block_pool(&mut self, pool: &'d mut [ScanBlock<BLOCK>]) {
+        self.blocks.lend(pool);
     }
 
     /// Positions the scan at the greatest entry `<= from` and above
@@ -1101,7 +1581,7 @@ impl<
         max_seq: u64,
         now: u64,
     ) -> Result<(), Error<D::Error>> {
-        self.db.ensure_open()?;
+        self.src.ensure_open()?;
         if from.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
                 len: from.len(),
@@ -1132,20 +1612,20 @@ impl<
         }
         self.max_seq = max_seq;
         self.now = now;
-        let db = self.db;
+        let db = self.src;
         // Memtable cursor: the last slot at/below `from` (or the last slot
         // when `from` is empty). When `from` is present that is the *end*
         // of its version run: `advance_mem_rev` resolves the whole run, so
         // starting at the run start would skip `from`'s older versions when
         // the newest one sits above `max_seq`.
-        let n = db.memtable().slot_len();
+        let n = db.memtable.slot_len();
         self.mem_idx = if n == 0 {
             0
         } else if from.is_empty() {
             n - 1
         } else {
-            let mut ub = db.memtable().lower_bound(from);
-            while ub < n && db.memtable().slot_view(ub).is_some_and(|v| v.key == from) {
+            let mut ub = db.memtable.lower_bound(from);
+            while ub < n && db.memtable.slot_view(ub).is_some_and(|v| v.key == from) {
                 ub += 1;
             }
             if ub > 0 {
@@ -1163,7 +1643,7 @@ impl<
         let mut base = 0;
         for li in 0..LEVELS {
             self.level_base[li] = base;
-            let tables = db.manifest_ref().level(li).unwrap_or(&[]);
+            let tables = db.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
                 // Key-range prune: no I/O for tables outside the scan.
                 if !from.is_empty() && tref.first_key.as_slice() > &self.ceil[..self.ceil_len] {
@@ -1269,8 +1749,8 @@ impl<
             // winning value with `expire_at <= now`, hides the key. An
             // expired winner never falls through to an older version.
             let covered = self
-                .db
-                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.raw)
+                .src
+                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.blocks.raw)
                 .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
@@ -1304,7 +1784,7 @@ impl<
             } else {
                 self.ensure_block(winner_table, winner_bid).await?;
                 let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
-                    &self.block,
+                    self.blocks.current(),
                     winner_off,
                     winner_end,
                     winner_bid,
@@ -1388,23 +1868,16 @@ impl<
     /// it when the compression flag is set. Afterwards `self.block` holds
     /// the logical block; every parser reads from there. For data blocks.
     async fn read_verify(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.db;
+        let db = self.src;
+        let (raw, block) = self.blocks.victim();
         // Cold insert: a scan streams each data block once with no reuse,
         // so scan blocks must not displace the point-read hot set.
-        let inflated = sstable::read_data_block(
-            db.device(),
-            Some(db.cache_port()),
-            table_id,
-            id,
-            &mut self.raw,
-            &mut self.block,
-            false,
-        )
-        .await?;
+        let inflated =
+            sstable::read_data_block(db.device, db.cache, table_id, id, raw, block, false).await?;
         if !inflated {
-            self.block.copy_from_slice(&self.raw);
+            block.copy_from_slice(raw);
         }
-        self.block_id = Some(id);
+        self.blocks.loaded(id);
         Ok(())
     }
 
@@ -1413,23 +1886,16 @@ impl<
     /// tail bytes are index payload, not a restart count — running them
     /// through the flag check would misread a coincidental bit).
     async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.db;
-        sstable::read_block_verified(
-            db.device(),
-            Some(db.cache_port()),
-            table_id,
-            id,
-            &mut self.block,
-            true,
-        )
-        .await?;
-        self.block_id = Some(id);
+        let db = self.src;
+        let (_, block) = self.blocks.victim();
+        sstable::read_block_verified(db.device, db.cache, table_id, id, block, true).await?;
+        self.blocks.loaded(id);
         Ok(())
     }
 
     /// Ensures the shared buffer holds block `id` (verified on load).
     async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        if self.block_id == Some(id) {
+        if self.blocks.find(id) {
             return Ok(());
         }
         self.read_verify(table_id, id).await
@@ -1460,16 +1926,17 @@ impl<
             return Ok(());
         }
         let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-        let db = self.db;
+        let db = self.src;
         let index_id = sstable::footer_index_block(
-            db.device(),
-            Some(db.cache_port()),
+            db.device,
+            db.cache,
             tref.id,
-            &mut self.block,
+            // Only the footer's fields are fetched: the read buffer will
+            // do, and no block buffer is disturbed.
+            &mut self.blocks.raw,
             footer,
         )
         .await?;
-        self.block_id = Some(footer);
         self.read_verify_index(tref.id, index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
         // Last data block whose first key sorts at/before `from`; empty
@@ -1478,7 +1945,7 @@ impl<
             data_blocks - 1
         } else {
             match sstable::index_last_le_block::<D::Error>(
-                &self.block[..payload_end],
+                &self.blocks.current()[..payload_end],
                 from,
                 index_id,
             )? {
@@ -1499,7 +1966,7 @@ impl<
                 id: tref.first_block,
             })?;
         self.read_verify(tref.id, bid).await?;
-        let end = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, bid)?;
+        let end = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), bid)?;
         if end == 0 {
             // A data block always carries at least one entry.
             return Err(Error::CorruptBlock { id: bid });
@@ -1594,9 +2061,9 @@ impl<
                 // Below the table's live lower bound every entry is dead (a
                 // compaction already merged them into a newer table), and
                 // a backward walk only goes lower: the cursor is done.
-                let db = self.db;
+                let db = self.src;
                 if db
-                    .manifest_ref()
+                    .manifest
                     .find_table(tid)
                     .is_some_and(|t| key[..klen] < *t.first_key.as_slice())
                 {
@@ -1636,7 +2103,7 @@ impl<
                 .checked_add(idx - 1)
                 .ok_or(Error::CorruptBlock { id: first })?;
             self.read_verify(tid, nid).await?;
-            let nend = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, nid)?;
+            let nend = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), nid)?;
             if nend == 0 {
                 return Err(Error::CorruptBlock { id: nid });
             }
@@ -1677,7 +2144,7 @@ impl<
                 .checked_add(pidx)
                 .ok_or(Error::CorruptBlock { id: first })?;
             self.read_verify(table_id, pbid).await?;
-            let pend = sstable::data_entries_end::<D::Error, BLOCK>(&self.block, pbid)?;
+            let pend = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), pbid)?;
             if pend == 0 {
                 return Err(Error::CorruptBlock { id: pbid });
             }
@@ -1731,7 +2198,7 @@ impl<
     ) -> Result<Option<RevHead<KEY_MAX>>, Error<D::Error>> {
         let body_end = BLOCK - sstable::CRC_LEN;
         let rcount = usize::from(u16::from_le_bytes(
-            self.block[body_end - 2..body_end]
+            self.blocks.current()[body_end - 2..body_end]
                 .try_into()
                 .map_err(|_| Error::CorruptBlock { id: bid })?,
         ));
@@ -1828,14 +2295,17 @@ impl<
             let mut rbest: Option<RevHead<KEY_MAX>> = None;
             let mut off = rs;
             while off < limit {
-                let Ok(entry) =
-                    sstable::parse_data_entry::<D::Error, BLOCK>(&self.block, off, end, bid)
-                else {
+                let Ok(entry) = sstable::parse_data_entry::<D::Error, BLOCK>(
+                    self.blocks.current(),
+                    off,
+                    end,
+                    bid,
+                ) else {
                     // Genuine zero padding marks end-of-entries, but
                     // only in the top region (padding lives after the
                     // last entry); anywhere else an unparseable entry
                     // is corruption.
-                    if j == rstart && sstable::all_zero(&self.block[off..end]) {
+                    if j == rstart && sstable::all_zero(&self.blocks.current()[off..end]) {
                         break;
                     }
                     return Err(Error::CorruptBlock { id: bid });
@@ -1901,13 +2371,17 @@ impl<
         if off.checked_add(2)? > BLOCK - sstable::CRC_LEN {
             return None;
         }
-        let roff = usize::from(u16::from_le_bytes([self.block[off], self.block[off + 1]]));
+        let roff = usize::from(u16::from_le_bytes([
+            self.blocks.current()[off],
+            self.blocks.current()[off + 1],
+        ]));
         (roff < end).then_some(roff)
     }
 
     /// Entry key at `off` in the loaded block.
     fn entry_key_at(&self, off: usize, end: usize, bid: u64) -> Result<&[u8], Error<D::Error>> {
-        sstable::parse_data_entry::<D::Error, BLOCK>(&self.block, off, end, bid).map(|e| e.key)
+        sstable::parse_data_entry::<D::Error, BLOCK>(self.blocks.current(), off, end, bid)
+            .map(|e| e.key)
     }
 
     /// Parks the memtable head on the greatest key at/below `mem_idx` that
@@ -1925,8 +2399,8 @@ impl<
     /// can shift slots under this index walk.
     fn advance_mem_rev(&mut self) {
         let max_seq = self.max_seq;
-        let db = self.db;
-        let mem = db.memtable();
+        let db = self.src;
+        let mem = db.memtable;
         self.mem_live = false;
         while self.mem_idx < mem.slot_len() {
             let Some(landing) = mem.slot_view(self.mem_idx) else {
@@ -2046,7 +2520,7 @@ impl<
     /// their table's origin.
     fn head_version(&self, src: usize) -> Version {
         if src == 0 {
-            Version::memtable(self.db.node_id(), self.mem_seq)
+            Version::memtable(self.src.node_id, self.mem_seq)
         } else {
             let (li, ti) = self.cursor_pos(src);
             let c = &self.cursors.as_flattened()[self.level_base[li] + ti];

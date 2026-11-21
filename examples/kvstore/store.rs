@@ -52,6 +52,13 @@
 //!   with its own buffers, through a read-only handle to the file and a
 //!   cache shared by all readers ([`SharedCache`]). Any number of threads
 //!   do that at once, and writes go on meanwhile.
+//! - **So do scans** (ADR-0019). A scan runs a page at a time. For each
+//!   page the queue hands the caller a copy of the slice of the memtable
+//!   the page can reach, the current manifest and a pin; the caller then
+//!   merges that copy with the tables on its own thread, with a pool of
+//!   block buffers so that each table's block stays decoded while the
+//!   merge is at another table. The copy says where it stops knowing
+//!   (its horizon), and the page stops there.
 //! - **Flush and compaction wait for readers.** They are the only calls
 //!   that write tables, and a reader must not have a table rewritten
 //!   under it. A read in its table phase holds a [`Pin`]; flush and
@@ -77,13 +84,14 @@ use std::time::{Duration, Instant};
 
 use horton::wal::WAL_RECORD_OVERHEAD;
 use horton::{
-    BlockCache, CachePort, CacheStats, Error, OpenReport, Progress, SlotStats, WriteBatch,
+    BlockCache, CachePort, CacheStats, Error, OpenReport, Progress, ScanBlock, SlotStats,
+    WriteBatch,
 };
 
 use crate::device::{FileDevice, IoError, IoStats, ReadDevice};
 use crate::{
-    BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvProbe, KvReadScratch, KvRevScan, KvScan,
-    KvTables, LEVELS, VAL_MAX, block_on,
+    BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
+    KvScan, KvTables, LEVELS, VAL_MAX, block_on,
 };
 
 /// horton's error, with this store's device error.
@@ -123,9 +131,18 @@ const SERVE_MAX: usize = 64;
 const PARK: Duration = Duration::from_millis(2);
 
 /// Shards of the readers' block cache, each behind its own lock, and the
-/// blocks in each: 8 x 64 x 16 KiB = 8 MiB.
+/// blocks in each: 8 x 128 x 16 KiB = 16 MiB.
 const CACHE_SHARDS: usize = 8;
-const SHARD_BLOCKS: usize = 64;
+const SHARD_BLOCKS: usize = 128;
+
+/// Block buffers a scanning thread lends each scan: one for every table
+/// the store can hold, and a few for index blocks. 512 KiB a thread.
+const SCAN_BLOCKS: usize = 32;
+
+/// Memtable-page buffers shared by all scanning threads (1.2 MiB each).
+/// A page of a scan holds one while it runs; more scanners than this
+/// wait their turn.
+const SCAN_PAGES: usize = 8;
 
 /// How long the compaction thread stands back when clients are waiting
 /// for the lock (they run the compaction steps themselves meanwhile).
@@ -279,14 +296,77 @@ pub struct Stats {
 /// Key-value pairs, in scan order.
 pub type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// One page of a scan: the entries, and whether the range is exhausted.
-type Page = (Entries, bool);
-
 /// What a queued request asks for.
 enum Work {
     Write(Batch),
     /// A point read of a key as of a sequence number.
     Get(Vec<u8>, u64),
+    /// The memtable's share of one page of a scan.
+    Page {
+        /// Descending.
+        reverse: bool,
+        /// Where the page begins: the first key of a forward page, the
+        /// greatest of a reverse one (empty: the last key).
+        from: Vec<u8>,
+        /// A forward page's exclusive end.
+        end: Option<Vec<u8>>,
+        /// Most memtable keys to copy.
+        max_keys: usize,
+        /// The buffer to copy them into, taken by whoever serves this.
+        into: Mutex<Option<PageLease>>,
+    },
+}
+
+impl Work {
+    /// A read: its caller has a table phase of its own to run once the
+    /// memtable part is served.
+    const fn is_read(&self) -> bool {
+        matches!(self, Self::Get(..) | Self::Page { .. })
+    }
+}
+
+/// A memtable-page buffer on loan from the store's pool; it goes back
+/// when dropped, whichever thread drops it.
+struct PageLease {
+    page: Option<Box<KvMemPage>>,
+    home: Arc<Mutex<Vec<Box<KvMemPage>>>>,
+}
+
+impl PageLease {
+    /// Takes a buffer from `pool`, waiting while every one is lent out.
+    fn take(pool: &Arc<Mutex<Vec<Box<KvMemPage>>>>) -> Self {
+        loop {
+            let page = lock(pool).pop();
+            if page.is_some() {
+                return Self {
+                    page,
+                    home: Arc::clone(pool),
+                };
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// The store's memtable-page buffers. Each is over a megabyte and is
+/// built on the stack before it is boxed: call this on a thread with
+/// room.
+#[allow(
+    clippy::large_stack_frames,
+    reason = "a page is built on the stack before it is boxed; the opening thread has 64 MiB"
+)]
+fn new_scan_pages() -> Vec<Box<KvMemPage>> {
+    (0..SCAN_PAGES)
+        .map(|_| Box::new(KvMemPage::new()))
+        .collect()
+}
+
+impl Drop for PageLease {
+    fn drop(&mut self) {
+        if let Some(page) = self.page.take() {
+            lock(&self.home).push(page);
+        }
+    }
 }
 
 /// A reader in the table phase of a point read. While any is alive,
@@ -321,6 +401,17 @@ enum Reply {
     Tables {
         probe: Box<KvProbe>,
         tables: Arc<KvManifest>,
+        _pin: Pin,
+    },
+    /// A scan page's share of the memtable: the caller merges it with
+    /// the tables. `horizon` is the nearest key the copy does not hold
+    /// (the page must stop there), or `None` when it holds the rest of
+    /// the range. `tables` and the pin are as for a point read.
+    Page {
+        memtable: PageLease,
+        horizon: Option<Vec<u8>>,
+        tables: Arc<KvManifest>,
+        node: u32,
         _pin: Pin,
     },
 }
@@ -443,6 +534,20 @@ thread_local! {
         scratch: KvReadScratch::new(),
         val: [0u8; VAL_MAX],
     }));
+
+    /// Every thread that scans keeps its own block buffers to lend its
+    /// scans (see [`SCAN_BLOCKS`]), built the first time it scans.
+    static SCAN_POOL: RefCell<Vec<ScanBlock<BLOCK>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Where a scan goes on from, between pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cursor {
+    key: Vec<u8>,
+    /// True when `key` was the last entry yielded (the next page starts
+    /// past it); false when the last page stopped short of `key`, at its
+    /// memtable copy's horizon (the next page starts on it).
+    yielded: bool,
 }
 
 /// What every [`Handle`] shares.
@@ -466,6 +571,8 @@ struct Shared {
     read_device: ReadDevice,
     /// Their block cache.
     cache: SharedCache,
+    /// Memtable-page buffers for scans; see [`PageLease`].
+    pages: Arc<Mutex<Vec<Box<KvMemPage>>>>,
     /// Test hook: the next read to reach its table phase reports in on
     /// the sender and stays there, pinned, until the receiver yields.
     #[cfg(test)]
@@ -652,15 +759,11 @@ impl Shared {
         let served = self.submit(Work::Get(key.to_vec(), seq))?;
         match served.reply()? {
             Reply::Done(value) => Ok(value.clone()),
+            // A point read is never answered with a scan page.
+            Reply::Page { .. } => Err(StoreError::Closed),
             Reply::Tables { probe, tables, .. } => READER.with(|reader| {
                 #[cfg(test)]
-                {
-                    let hold = lock(&self.hold_next_reader).take();
-                    if let Some((entered, release)) = hold {
-                        let _ = entered.send(());
-                        let _ = release.recv();
-                    }
-                }
+                self.hold_if_asked();
                 let mut reader = reader.borrow_mut();
                 let Reader { scratch, val } = &mut **reader;
                 let view = KvTables::new(&self.read_device, tables, Some(&self.cache));
@@ -669,6 +772,201 @@ impl Shared {
             }),
         }
         // `served` is dropped here, and the reader's pin with it.
+    }
+
+    /// Test hook: holds the calling reader here, in its table phase and
+    /// pinned, if a test asked for the next reader to be held.
+    #[cfg(test)]
+    fn hold_if_asked(&self) {
+        let hold = lock(&self.hold_next_reader).take();
+        if let Some((entered, release)) = hold {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+
+    /// One page of a scan of `[start, end)`, ascending or descending, as
+    /// of sequence `seq`: up to `limit` entries from `cursor` on (`None`:
+    /// from the range's own bound), and where the next page goes on
+    /// (`None`: the range is exhausted).
+    ///
+    /// The memtable's share is copied under the engine lock, through the
+    /// queue; the merge with the tables runs here, on the calling
+    /// thread, alongside every other reader's. A page can come back
+    /// short of `limit` with more to follow: it stops at the horizon of
+    /// its memtable copy.
+    fn page(
+        &self,
+        (start, end): (&[u8], Option<&[u8]>),
+        reverse: bool,
+        cursor: Option<&Cursor>,
+        limit: usize,
+        seq: u64,
+    ) -> Result<(Entries, Option<Cursor>), StoreError> {
+        // horton reads an empty reverse `from` as "from the last key"; an
+        // empty exclusive end is an empty range, refused in both
+        // directions as the forward scan refuses it.
+        if end == Some(&[]) {
+            return Err(StoreError::Db(Error::EmptyKey));
+        }
+        // Where this page begins, and the key to pass over if it comes
+        // first: the one the last page ended on, or a reverse range's
+        // exclusive end.
+        let (from, skip) = match (cursor, reverse) {
+            (Some(c), _) => (c.key.as_slice(), c.yielded.then_some(c.key.as_slice())),
+            (None, false) => (start, None),
+            (None, true) => (end.unwrap_or(&[]), end),
+        };
+        let served = self.submit(Work::Page {
+            reverse,
+            from: from.to_vec(),
+            end: end.filter(|_| !reverse).map(<[u8]>::to_vec),
+            // One more than the page yields: the key passed over.
+            max_keys: limit.saturating_add(1),
+            into: Mutex::new(Some(PageLease::take(&self.pages))),
+        })?;
+        let Reply::Page {
+            memtable,
+            horizon,
+            tables,
+            node,
+            ..
+        } = served.reply()?
+        else {
+            return Err(StoreError::Closed);
+        };
+        let Some(memtable) = memtable.page.as_deref() else {
+            return Err(StoreError::Closed);
+        };
+        #[cfg(test)]
+        self.hold_if_asked();
+        let horizon = horizon.as_deref();
+        let parts = (memtable, &**tables, *node);
+        let mut out = Vec::new();
+        let more = SCAN_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            // Built one buffer at a time: 16 KiB each on the way through
+            // the stack, not half a megabyte at once.
+            while pool.len() < SCAN_BLOCKS {
+                pool.push(ScanBlock::new());
+            }
+            if reverse {
+                self.merge_rev(
+                    parts,
+                    &mut pool,
+                    (from, horizon, start),
+                    skip,
+                    limit,
+                    seq,
+                    &mut out,
+                )
+            } else {
+                self.merge_fwd(
+                    parts,
+                    &mut pool,
+                    (from, horizon.or(end)),
+                    skip,
+                    limit,
+                    seq,
+                    &mut out,
+                )
+            }
+        })?;
+        let next = match (more, out.last(), horizon) {
+            // Cut at `limit`: go on past the last key yielded.
+            (true, Some((last, _)), _) => Some(Cursor {
+                key: last.clone(),
+                yielded: true,
+            }),
+            // Ran to the horizon: go on from it, unless a reverse scan
+            // has already left its range.
+            (false, _, Some(h)) if !reverse || h >= start => Some(Cursor {
+                key: h.to_vec(),
+                yielded: false,
+            }),
+            _ => None,
+        };
+        Ok((out, next))
+        // `served` is dropped here: the pin and the page buffer with it.
+    }
+
+    /// The table phase of a forward page: merges `memtable` with the
+    /// tables over `[from, stop)`, passing over `skip` if it comes
+    /// first. Returns true when it stopped at `limit` with the range not
+    /// known to be exhausted.
+    #[allow(clippy::too_many_arguments)] // a page's inputs; `page` is the only caller.
+    fn merge_fwd(
+        &self,
+        (memtable, tables, node): (&KvMemPage, &KvManifest, u32),
+        pool: &mut [ScanBlock<BLOCK>],
+        (from, stop): (&[u8], Option<&[u8]>),
+        skip: Option<&[u8]>,
+        limit: usize,
+        seq: u64,
+        out: &mut Entries,
+    ) -> Result<bool, StoreError> {
+        let mut scan = Box::new(KvScan::detached(
+            memtable,
+            tables,
+            &self.read_device,
+            Some(&self.cache),
+            node,
+        ));
+        scan.use_block_pool(pool);
+        block_on(scan.seek(from, stop, seq))?;
+        let mut key = [0u8; KEY_MAX];
+        READER.with(|reader| {
+            let val = &mut reader.borrow_mut().val;
+            while out.len() < limit {
+                match block_on(scan.next(&mut key, &mut val[..]))? {
+                    Some((kl, _)) if out.is_empty() && Some(&key[..kl]) == skip => {}
+                    Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
+                    None => return Ok(false),
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    /// The table phase of a reverse page: descends from `from` to above
+    /// `lower` (the memtable copy's horizon, exclusive), passing over
+    /// `skip` if it comes first and ending the scan below `start`.
+    /// horton's reverse scan starts at the greatest key `<= from` and
+    /// stops above an exclusive lower bound, so the range's inclusive
+    /// `start` is checked here.
+    #[allow(clippy::too_many_arguments)] // a page's inputs; `page` is the only caller.
+    fn merge_rev(
+        &self,
+        (memtable, tables, node): (&KvMemPage, &KvManifest, u32),
+        pool: &mut [ScanBlock<BLOCK>],
+        (from, lower, start): (&[u8], Option<&[u8]>, &[u8]),
+        skip: Option<&[u8]>,
+        limit: usize,
+        seq: u64,
+        out: &mut Entries,
+    ) -> Result<bool, StoreError> {
+        let mut scan = Box::new(KvRevScan::detached(
+            memtable,
+            tables,
+            &self.read_device,
+            Some(&self.cache),
+            node,
+        ));
+        scan.use_block_pool(pool);
+        block_on(scan.seek_prev(from, lower, seq))?;
+        let mut key = [0u8; KEY_MAX];
+        READER.with(|reader| {
+            let val = &mut reader.borrow_mut().val;
+            while out.len() < limit {
+                match block_on(scan.prev(&mut key, &mut val[..]))? {
+                    Some((kl, _)) if out.is_empty() && Some(&key[..kl]) == skip => {}
+                    Some((kl, _)) if &key[..kl] < start => return Ok(false),
+                    Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
+                    None => return Ok(false),
+                }
+            }
+            Ok(true)
+        })
     }
 
     /// Wakes the thread whose request heads the queue, if it has parked:
@@ -787,12 +1085,16 @@ impl Store {
             .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
         let readers = Arc::new(AtomicUsize::new(0));
         let engine_readers = Arc::clone(&readers);
-        let (engine, cache) = std::thread::Builder::new()
+        let (engine, cache, pages): (_, _, Vec<_>) = std::thread::Builder::new()
             .name("horton-open".into())
             .stack_size(OPEN_STACK)
             .spawn(move || {
-                Engine::open(device, options.sync, engine_readers)
-                    .map(|engine| (engine, SharedCache::new()))
+                Engine::open(device, options.sync, engine_readers).map(|engine| {
+                    // Megabyte-sized values, built on the stack before
+                    // they are boxed: this thread has the room.
+                    let pages = new_scan_pages();
+                    (engine, SharedCache::new(), pages)
+                })
             })
             .map_err(|e| StoreError::Open(e.to_string()))?
             .join()
@@ -808,6 +1110,7 @@ impl Store {
             readers,
             read_device,
             cache,
+            pages: Arc::new(Mutex::new(pages)),
             #[cfg(test)]
             hold_next_reader: Mutex::new(None),
             wake: (Mutex::new(()), Condvar::new()),
@@ -885,24 +1188,6 @@ impl Handle {
         })
     }
 
-    /// One page of `[start, end)` as of sequence `seq`.
-    fn page(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        reverse: bool,
-        limit: usize,
-        seq: u64,
-    ) -> Result<Page, StoreError> {
-        self.shared.with(|e| {
-            if reverse {
-                e.scan_rev(start, end, limit, seq)
-            } else {
-                e.scan_fwd(start, end, limit, seq)
-            }
-        })
-    }
-
     /// Up to `limit` entries of `[start, end)` (an empty `start` is the
     /// first key, `end = None` the last), ascending or, with `reverse`,
     /// descending, as of `snapshot` (or now).
@@ -915,7 +1200,21 @@ impl Handle {
         snapshot: Option<&Snapshot>,
     ) -> Result<Entries, StoreError> {
         let seq = snapshot.map_or(u64::MAX, |s| s.seq);
-        Ok(self.page(start, end, reverse, limit, seq)?.0)
+        let mut out = Entries::new();
+        let mut cursor = None;
+        // A page can stop short of `limit` at its memtable copy's
+        // horizon: go on until the limit or the end of the range.
+        loop {
+            let want = limit - out.len();
+            let (mut entries, next) =
+                self.shared
+                    .page((start, end), reverse, cursor.as_ref(), want.min(PAGE), seq)?;
+            out.append(&mut entries);
+            if next.is_none() || out.len() >= limit {
+                return Ok(out);
+            }
+            cursor = next;
+        }
     }
 
     /// Iterates `[start, end)` in order (or in reverse) over a snapshot
@@ -932,7 +1231,7 @@ impl Handle {
             start: start.to_vec(),
             end: end.map(<[u8]>::to_vec),
             reverse,
-            resume: None,
+            cursor: None,
             page: Vec::new().into_iter(),
             done: false,
         })
@@ -1003,8 +1302,8 @@ pub struct Iter {
     start: Vec<u8>,
     end: Option<Vec<u8>>,
     reverse: bool,
-    /// The last key yielded: the next page starts there, exclusive.
-    resume: Option<Vec<u8>>,
+    /// Where the next page goes on from.
+    cursor: Option<Cursor>,
     page: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
     done: bool,
 }
@@ -1015,31 +1314,22 @@ impl Iterator for Iter {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(kv) = self.page.next() {
-                self.resume = Some(kv.0.clone());
                 return Some(Ok(kv));
             }
             if self.done {
                 return None;
             }
-            // The next page resumes at the last key yielded and skips it,
-            // so a key of `KEY_MAX` bytes needs no successor computed.
-            let (start, end) = match (&self.resume, self.reverse) {
-                (Some(k), false) => (k.clone(), self.end.clone()),
-                (Some(k), true) => (self.start.clone(), Some(k.clone())),
-                (None, _) => (self.start.clone(), self.end.clone()),
-            };
-            let resumed = self.resume.is_some();
-            let seq = self.snapshot.seq;
-            let reverse = self.reverse;
-            let page = self.handle.page(&start, end.as_deref(), reverse, PAGE, seq);
+            let page = self.handle.shared.page(
+                (&self.start, self.end.as_deref()),
+                self.reverse,
+                self.cursor.as_ref(),
+                PAGE,
+                self.snapshot.seq,
+            );
             match page {
-                Ok((mut entries, done)) => {
-                    // Forward pages restart at the resume key, inclusive.
-                    if resumed && !reverse && entries.first().map(|e| &e.0) == self.resume.as_ref()
-                    {
-                        entries.remove(0);
-                    }
-                    self.done = done;
+                Ok((entries, next)) => {
+                    self.done = next.is_none();
+                    self.cursor = next;
                     self.page = entries.into_iter();
                 }
                 Err(e) => {
@@ -1162,6 +1452,41 @@ impl Engine {
         })
     }
 
+    /// The memtable's share of one page of a scan: copies into `lease`
+    /// the at most `max_keys` keys of the memtable the page reaches
+    /// first, and hands it back with the copy's horizon, the manifest of
+    /// this moment and a pin, for the caller to merge with the tables on
+    /// its own thread.
+    fn begin_page(
+        &mut self,
+        reverse: bool,
+        from: &[u8],
+        end: Option<&[u8]>,
+        max_keys: usize,
+        mut lease: PageLease,
+    ) -> Result<Reply, DbError> {
+        let Some(page) = lease.page.as_deref_mut() else {
+            return Err(Error::Busy);
+        };
+        let horizon = if reverse {
+            self.db
+                .copy_memtable_range_rev(from, None, max_keys, page)?
+        } else {
+            self.db.copy_memtable_range(from, end, max_keys, page)?
+        };
+        if self.tables.seq() != self.db.manifest().seq() {
+            self.tables = Arc::new(*self.db.manifest());
+        }
+        // Pinned under the engine lock, as for a point read.
+        Ok(Reply::Page {
+            memtable: lease,
+            horizon: horizon.map(|h| h.as_slice().to_vec()),
+            tables: Arc::clone(&self.tables),
+            node: self.db.node_id(),
+            _pin: Pin::new(&self.readers),
+        })
+    }
+
     /// Serves the queue from its head, in order: each point read's
     /// memtable probe, and each run of writes as a group. Stops when the
     /// queue is empty or after [`SERVE_MAX`] turns.
@@ -1183,7 +1508,7 @@ impl Engine {
     fn serve(&mut self, queue: &Mutex<VecDeque<Arc<Pending>>>, me: &Pending) {
         for _ in 0..SERVE_MAX {
             let served = me.done.get().is_some();
-            if served && matches!(me.work, Work::Get(..)) {
+            if served && me.work.is_read() {
                 return;
             }
             let Some(next) = self.take_group(queue, self.sync && served) else {
@@ -1192,6 +1517,20 @@ impl Engine {
             match &next.work {
                 Work::Get(key, seq) => {
                     let r = self.begin_read(key, *seq).map_err(StoreError::Db);
+                    next.finish(r);
+                }
+                Work::Page {
+                    reverse,
+                    from,
+                    end,
+                    max_keys,
+                    into,
+                } => {
+                    let lease = lock(into).take();
+                    let r = lease.ok_or(StoreError::Closed).and_then(|lease| {
+                        self.begin_page(*reverse, from, end.as_deref(), *max_keys, lease)
+                            .map_err(StoreError::Db)
+                    });
                     next.finish(r);
                 }
                 Work::Write(_) => self.commit_group(),
@@ -1239,7 +1578,7 @@ impl Engine {
         let mut result = Ok(());
         let writes = self.group.iter().filter_map(|p| match &p.work {
             Work::Write(b) => Some(b),
-            Work::Get(..) => None,
+            Work::Get(..) | Work::Page { .. } => None,
         });
         for op in writes.flat_map(|b| &b.ops) {
             let r = match op {
@@ -1266,60 +1605,6 @@ impl Engine {
         for p in self.group.drain(..) {
             p.finish(result.clone().map(|()| Reply::Done(None)));
         }
-    }
-
-    fn scan_fwd(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        limit: usize,
-        seq: u64,
-    ) -> Result<Page, DbError> {
-        let mut scan = Box::new(KvScan::new(&self.db));
-        block_on(scan.seek(start, end, seq))?;
-        let mut key = [0u8; KEY_MAX];
-        let mut val = vec![0u8; VAL_MAX];
-        let mut out = Vec::new();
-        while out.len() < limit {
-            match block_on(scan.next(&mut key, &mut val))? {
-                Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
-                None => return Ok((out, true)),
-            }
-        }
-        Ok((out, false))
-    }
-
-    /// Descending over `[start, end)`. horton's reverse scan starts at
-    /// the greatest key `<= from` and stops above an exclusive lower
-    /// bound, so the exclusive `end` is skipped here and the inclusive
-    /// `start` is checked here.
-    fn scan_rev(
-        &self,
-        start: &[u8],
-        end: Option<&[u8]>,
-        limit: usize,
-        seq: u64,
-    ) -> Result<Page, DbError> {
-        // horton reads an empty `from` as "from the last key"; an empty
-        // exclusive end is an empty range, refused as the forward scan
-        // refuses it.
-        if end == Some(&[]) {
-            return Err(Error::EmptyKey);
-        }
-        let mut scan = Box::new(KvRevScan::new(&self.db));
-        block_on(scan.seek_prev(end.unwrap_or(&[]), None, seq))?;
-        let mut key = [0u8; KEY_MAX];
-        let mut val = vec![0u8; VAL_MAX];
-        let mut out = Vec::new();
-        while out.len() < limit {
-            match block_on(scan.prev(&mut key, &mut val))? {
-                Some((kl, _)) if Some(&key[..kl]) == end => {}
-                Some((kl, _)) if &key[..kl] < start => return Ok((out, true)),
-                Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
-                None => return Ok((out, true)),
-            }
-        }
-        Ok((out, false))
     }
 
     fn stats(&self) -> Stats {
@@ -2076,5 +2361,196 @@ mod tests {
         let cache = store.handle.shared.cache.stats();
         assert!(cache.hits > 0 && cache.len > 0, "{cache:?}");
         assert!(store.handle.shared.read_device.reads() > 0);
+    }
+
+    /// The gate holds for scans as for point reads: a scan page held in
+    /// its table phase keeps flush and compaction from finishing, writes
+    /// go on meanwhile, and the page yields the store as of its start.
+    #[test]
+    fn flush_and_compaction_wait_for_a_scan_in_its_table_phase() {
+        within_a_minute(|| {
+            let store = TempStore::new("scan-gate");
+            for k in 0..60 {
+                store.put(&key(k), &stamped(k, 1)).expect("put");
+            }
+            store.flush().expect("flush");
+
+            let (entered_tx, entered) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            *lock(&store.handle.shared.hold_next_reader) = Some((entered_tx, release_rx));
+            let compacted = Arc::new(AtomicBool::new(false));
+            std::thread::scope(|s| {
+                let h = store.handle();
+                let scanner = s.spawn(move || h.scan(&key(10), Some(&key(20)), false, 100, None));
+                entered.recv().expect("the scan reached its table phase");
+                assert_eq!(store.handle.shared.readers.load(Ordering::SeqCst), 1);
+                for k in 0..60 {
+                    store.put(&key(k), &stamped(k, 2)).expect("put");
+                }
+                let (h, done) = (store.handle(), Arc::clone(&compacted));
+                let mutator = s.spawn(move || {
+                    h.compact().expect("compact");
+                    done.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(
+                    !compacted.load(Ordering::SeqCst),
+                    "tables were rewritten while a scan was inside them"
+                );
+                release.send(()).expect("release");
+                let page = scanner.join().expect("scanner").expect("scan");
+                let got: Vec<_> = page.iter().map(|(_, v)| unstamp(v)).collect();
+                let want: Vec<_> = (10..20).map(|k| (k, 1)).collect();
+                assert_eq!(got, want, "the page is the store as of its start");
+                mutator.join().expect("mutator");
+            });
+            let shared = &store.handle.shared;
+            assert_eq!(shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                lock(&shared.pages).len(),
+                SCAN_PAGES,
+                "a page buffer was lost"
+            );
+        });
+    }
+
+    /// A scan takes the memtable a page at a time, and a page stops
+    /// where its copy of the memtable stops. With more keys in the
+    /// memtable than a page copies, over tables holding other keys and
+    /// older versions, scans in both directions, bounded and unbounded,
+    /// and `scan` with limits on either side of a page, all yield
+    /// exactly the model.
+    #[test]
+    fn scans_page_across_the_memtable_and_the_tables() {
+        let store = TempStore::new("horizon");
+        let mut model = std::collections::BTreeMap::new();
+        // Tables: every third key, and old versions of the rest.
+        for k in 0..3000usize {
+            store.put(&key(k), b"old").expect("put");
+            model.insert(key(k), b"old".to_vec());
+        }
+        store.flush().expect("flush");
+        // Memtable: more keys than one page (1024), some deleted.
+        for k in (0..3000usize).filter(|k| k % 3 != 0) {
+            if k % 7 == 0 {
+                store.delete(&key(k)).expect("delete");
+                model.remove(&key(k));
+            } else {
+                store.put(&key(k), b"new").expect("put");
+                model.insert(key(k), b"new".to_vec());
+            }
+        }
+        let all: Entries = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let collect = |start: &[u8], end: Option<&[u8]>, reverse: bool| -> Entries {
+            store
+                .range(start, end, reverse)
+                .expect("range")
+                .map(|kv| kv.expect("page"))
+                .collect()
+        };
+        assert_eq!(collect(b"", None, false), all);
+        let mut rev = all.clone();
+        rev.reverse();
+        assert_eq!(collect(b"", None, true), rev);
+
+        let (lo, hi) = (key(500), key(2600));
+        let slice: Entries = all
+            .iter()
+            .filter(|(k, _)| *k >= lo && *k < hi)
+            .cloned()
+            .collect();
+        assert_eq!(collect(&lo, Some(&hi), false), slice);
+        let mut slice_rev = slice.clone();
+        slice_rev.reverse();
+        assert_eq!(collect(&lo, Some(&hi), true), slice_rev);
+
+        // `scan` returns up to its limit even when that takes pages.
+        for limit in [1usize, 7, 1024, 1025, 2500, 10_000] {
+            let got = store
+                .scan(&lo, Some(&hi), false, limit, None)
+                .expect("scan");
+            assert_eq!(
+                got,
+                slice[..limit.min(slice.len())],
+                "forward, limit {limit}"
+            );
+            let got = store.scan(&lo, Some(&hi), true, limit, None).expect("scan");
+            assert_eq!(
+                got,
+                slice_rev[..limit.min(slice.len())],
+                "reverse, limit {limit}"
+            );
+        }
+        assert_eq!(lock(&store.handle.shared.pages).len(), SCAN_PAGES);
+    }
+
+    /// Scanners on three threads, forward and in reverse, against two
+    /// writers that keep the store flushing and compacting. Every scan
+    /// sees every key exactly once, in order, with a whole value that is
+    /// never older than that scanner has seen for the key.
+    #[test]
+    fn scanners_and_writers_run_together_under_compaction() {
+        within_a_minute(|| {
+            const KEYS: usize = 96;
+            let store = TempStore::new("scan-parallel");
+            for k in 0..KEYS {
+                store.put(&key(k), &stamped(k, 0)).expect("put");
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let scans = Arc::new(AtomicUsize::new(0));
+            std::thread::scope(|s| {
+                let scanners: Vec<_> = (0..3usize)
+                    .map(|t| {
+                        let (h, stop, scans) =
+                            (store.handle(), Arc::clone(&stop), Arc::clone(&scans));
+                        s.spawn(move || {
+                            let mut seen = [0u64; KEYS];
+                            while !stop.load(Ordering::Relaxed) {
+                                let reverse = t == 2;
+                                let got: Vec<_> = h
+                                    .range(b"", None, reverse)
+                                    .expect("range")
+                                    .map(|kv| unstamp(&kv.expect("page").1))
+                                    .collect();
+                                let mut keys: Vec<_> = got.iter().map(|&(k, _)| k).collect();
+                                if reverse {
+                                    keys.reverse();
+                                }
+                                assert_eq!(keys, (0..KEYS).collect::<Vec<_>>(), "thread {t}");
+                                for (k, version) in got {
+                                    assert!(version >= seen[k], "key {k} went back in time");
+                                    seen[k] = version;
+                                }
+                                scans.fetch_add(1, Ordering::Relaxed);
+                            }
+                        })
+                    })
+                    .collect();
+                let writers: Vec<_> = (0..2usize)
+                    .map(|w| {
+                        let h = store.handle();
+                        s.spawn(move || {
+                            for version in 1..=40u64 {
+                                for k in (w..KEYS).step_by(2) {
+                                    h.put(&key(k), &stamped(k, version)).expect("put");
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                for w in writers {
+                    w.join().expect("writer");
+                }
+                store.compact().expect("compact");
+                stop.store(true, Ordering::Relaxed);
+                for sc in scanners {
+                    sc.join().expect("scanner");
+                }
+            });
+            assert!(scans.load(Ordering::Relaxed) > 20);
+            let shared = &store.handle.shared;
+            assert_eq!(shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(lock(&shared.pages).len(), SCAN_PAGES);
+        });
     }
 }

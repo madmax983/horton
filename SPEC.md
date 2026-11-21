@@ -307,7 +307,20 @@ an open request has work.
   the `Db`'s own manifest, device, buffers and cache.
 - **Scans** (`Scan`, `RevScan`): a merge over the memtable and one
   cursor per table in caller-owned state, same winner rule, skipping
-  hidden keys; `BufferTooSmall` never consumes an entry.
+  hidden keys; `BufferTooSmall` never consumes an entry. A scan holds
+  one decoded block of its own; `use_block_pool` lends it more, so a
+  table's block stays decoded while the merge is at another table. A
+  forward seek reads the tables whose range holds `start`; a table that
+  starts later is read when the scan reaches it, and an error in it is
+  reported by that `next` (ADR-0019).
+- **Detached scans** (ADR-0019): `Scan::detached` and
+  `RevScan::detached` merge a caller-owned `MemTable` with the tables
+  of a manifest copy, read through any device handle, without the
+  `Db`. `Db::copy_memtable_range` (and `_rev`) fills that `MemTable`
+  with the memtable's next `max_keys` keys and returns the horizon,
+  the first key it did not copy: a page scans up to the horizon and
+  the next page starts there. The caller's rule is the detached point
+  read's.
 - **Block cache:** `CACHE` slots of CLOCK-evicted physical block images
   keyed by `(table id, block id)`; scans insert cold (ADR-0007). Only
   blocks whose CRC matched are inserted. A hit is not CRC-checked

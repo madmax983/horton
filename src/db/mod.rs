@@ -740,7 +740,7 @@ impl<
 
     /// The block cache, for the scan iterators' block reads. Scans borrow
     /// it through the same [`CachePort`] view the point-read path uses.
-    pub(crate) fn cache_port(&self) -> &dyn CachePort<BLOCK> {
+    pub(crate) const fn cache_port(&self) -> &dyn CachePort<BLOCK> {
         &self.cache
     }
 

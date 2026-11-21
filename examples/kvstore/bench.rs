@@ -7,9 +7,10 @@
 //! - **Every write is synced by default.** `db_bench`'s `fillseq` and
 //!   `fillrandom` do not sync (its `fillsync` does). Pass `--no-sync` for
 //!   the like-for-like run.
-//! - **Writers are threads, not one loop.** `--threads N` (default 4)
-//!   clients share the store, so group commit has something to group;
-//!   `--batch N` puts N writes in each client batch, like `fillbatch`.
+//! - **Clients are threads, not one loop.** `--threads N` (default 4)
+//!   clients share the store, so group commit has something to group
+//!   and reads, seeks and scans run side by side; `--batch N` puts N
+//!   writes in each client batch, like `fillbatch`.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -176,8 +177,8 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
             "fillrandom" | "overwrite" => fill(&store, &p, true),
             "readrandom" => read_random(&store, &p, false),
             "readmissing" => read_random(&store, &p, true),
-            "readseq" => read_seq(&store, false),
-            "readreverse" => read_seq(&store, true),
+            "readseq" => read_seq(&store, &p, false),
+            "readreverse" => read_seq(&store, &p, true),
             "seekrandom" => seek_random(&store, &p),
             "deleterandom" => delete_random(&store, &p),
             "compact" => store
@@ -317,22 +318,27 @@ fn read_random(store: &Store, p: &Params, missing: bool) -> Result<Done, String>
     Ok(done)
 }
 
-fn read_seq(store: &Store, reverse: bool) -> Result<Done, String> {
-    let mut d = Done::default();
-    let mut last: Option<Vec<u8>> = None;
-    for kv in store.range(b"", None, reverse).map_err(|e| e.to_string())? {
-        let (k, v) = kv.map_err(|e| e.to_string())?;
-        if let Some(prev) = &last {
-            let ordered = if reverse { *prev > k } else { *prev < k };
-            if !ordered {
-                return Err("keys out of order".into());
+/// Every client thread scans the whole store, as `db_bench`'s `readseq`
+/// does with `--threads`: the rate is entries per second over all of
+/// them.
+fn read_seq(store: &Store, p: &Params, reverse: bool) -> Result<Done, String> {
+    clients(store, p, |h, _, _| {
+        let mut d = Done::default();
+        let mut last: Option<Vec<u8>> = None;
+        for kv in h.range(b"", None, reverse).map_err(|e| e.to_string())? {
+            let (k, v) = kv.map_err(|e| e.to_string())?;
+            if let Some(prev) = &last {
+                let ordered = if reverse { *prev > k } else { *prev < k };
+                if !ordered {
+                    return Err("keys out of order".into());
+                }
             }
+            d.ops += 1;
+            d.bytes += (k.len() + v.len()) as u64;
+            last = Some(k);
         }
-        d.ops += 1;
-        d.bytes += (k.len() + v.len()) as u64;
-        last = Some(k);
-    }
-    Ok(d)
+        Ok(d)
+    })
 }
 
 fn seek_random(store: &Store, p: &Params) -> Result<Done, String> {

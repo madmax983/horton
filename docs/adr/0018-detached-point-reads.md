@@ -76,7 +76,8 @@ exist. Everything that only reaches the WAL and the memtable (`put`,
 - The caller runs the table phase on its own thread, with thread-local
   buffers, through a second, read-only handle to the file and a block
   cache shared by all readers (the library's `BlockCache` in eight
-  shards, each behind a lock). The pin drops when the read is done.
+  shards, each behind a lock; 16 MiB). The pin drops when the read is
+  done.
 - Flush and compaction steps, which run under the engine lock, first
   wait for the pin count to reach zero. No new pin can appear while
   they wait or run, because pins are only made under that lock.
@@ -103,12 +104,13 @@ exist. Everything that only reaches the WAL and the memtable (`put`,
   and nothing on the device would catch it. The kvstore's tests hold a
   reader inside its table phase and assert that compaction cannot
   finish; a caller writing its own protocol needs the same test.
-- **Scans stay attached.** A scan merges the memtable continuously, so
-  it needs the `Db` for as long as it runs. In the kvstore scans still
-  take the engine lock for each page.
+- **Scans need more than a probe.** A scan merges the memtable all the
+  way through, so it cannot take one probe and leave.
+  [ADR-0019](0019-detached-scans-block-pool-lazy-seek.md) detaches
+  scans by copying the memtable a page at a time.
 - **The `Db`'s cache is not shared with detached readers** (it is in a
-  `RefCell`). A host runs a second cache for them. The kvstore has 8
-  MiB for each.
+  `RefCell`). A host runs its own cache for them, and with every read
+  detached it needs no other: the kvstore's `Db` has none.
 - **Not done:** a way for the library to detect a broken protocol (a
   table generation stamped in every block would do it, at a format
   change and four bytes a block), and parallel table phases inside one

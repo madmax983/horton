@@ -324,10 +324,10 @@ impl<
     }
 
     /// This handle's node identity (see
-    /// [`Config::with_node_id`]): the node its memtable versions carry in
+    /// [`Config::with_node_id`](crate::Config::with_node_id)): the node its memtable versions carry in
     /// the replica LWW merge. `0` = legacy single-node.
     #[must_use]
-    pub(crate) const fn node_id(&self) -> u32 {
+    pub const fn node_id(&self) -> u32 {
         self.cfg.node_id
     }
 

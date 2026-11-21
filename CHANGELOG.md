@@ -35,6 +35,17 @@ reads then scale with reader threads: @@CHANGELOG_SCALE@@
   `flush`, `compact_step`, `ingest_table` and `archive_commit` from
   running while a detached read is in its tables. `db_types!` takes
   `TableView`, `MemProbe` and `ReadScratch` aliases.
+- **Detached scans** (ADR-0019). `Scan::detached` and
+  `RevScan::detached` scan without the `Db`, over a copy of part of the
+  memtable made by `Db::copy_memtable_range` / `copy_memtable_range_rev`
+  (`MemTable::copy_range` / `copy_range_rev`), which return the horizon
+  a page must stop at.
+- **A block pool for scans** (ADR-0019). `Scan::use_block_pool` and
+  `RevScan::use_block_pool` lend a scan caller-owned `ScanBlock`
+  buffers, so a table's block stays decoded while the merge is at
+  another table. Without a pool a scan reloads a block each time it
+  comes back to a table, which was most of a scan's time over
+  overlapping tables.
 
 - `BlockCache::get_range_into` (and `CachePort::get_range_into`): copy a
   byte range of a cached block, checking only the chunks of the image
@@ -94,17 +105,28 @@ reads then scale with reader threads: @@CHANGELOG_SCALE@@
   `CacheStats` a new field, `rejected`.
 - The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk
   sums); the RAM budget is unchanged.
+- **A forward seek reads the tables that hold its key** (ADR-0019). A
+  table that starts after the seek key is read when the scan reaches
+  it. A seek followed by a few entries no longer reads a footer, an
+  index and a data block of every table in range. An error in a table
+  the scan has not reached is now reported by the `next` that gets
+  there, not by `seek`; it is still reported before anything of that
+  table is yielded.
+- `Db::node_id` is public.
 - `Db::get` and its variants run the same table phase as a detached
   read; the `get()` future is 152 bytes larger (the ESP32-S3 peak is
   unchanged).
 - A memtable counts its range tombstones, so a point read no longer
   walks every slot to learn that none covers the key.
-- **kvstore point reads run in parallel.** The memtable probe is served
-  through the request queue; the caller then reads the tables on its
-  own thread, through a read-only handle to the file and an 8 MiB cache
-  shared by all readers (horton's `BlockCache` in eight locked shards).
-  Flush and compaction wait for readers in their table phase to leave.
-  The `Db`'s own 8 MiB cache now serves scans only.
+- **kvstore point reads, scans and seeks run in parallel.** The
+  memtable's part (a probe, or a page's slice) is served through the
+  request queue; the caller then reads the tables on its own thread,
+  through a read-only handle to the file and a 16 MiB cache shared by
+  all readers (horton's `BlockCache` in eight locked shards). Scans
+  lend each page 32 block buffers. Flush and compaction wait for
+  readers in their table phase to leave. The `Db`'s own cache is off:
+  no read goes through the `Db` any more. `bench`'s `readseq` and
+  `readreverse` run one scan per client thread.
 - **kvstore** runs horton under one lock instead of on a store thread.
   Point reads and writes are queued and served in order by whichever
   thread holds the lock (flat combining; group commit is the write half

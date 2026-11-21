@@ -47,6 +47,10 @@ pub const VAL_MAX: usize = 4096;
 pub const LEVELS: usize = 4;
 /// Tables per level.
 pub const TABLES_PER_LEVEL: usize = 7;
+/// Writes the memtable holds before it is flushed to a table.
+pub const MEMTABLE_ENTRIES: usize = 4096;
+/// Bytes of keys and values the memtable holds.
+pub const MEMTABLE_ARENA: usize = 1 << 20;
 
 // The shape of the store: 4 levels of up to 7 tables, so at most 28
 // tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
@@ -55,20 +59,21 @@ pub const TABLES_PER_LEVEL: usize = 7;
 // block. A point read probes up to 7 tables in level 0 and one per level
 // below.
 //
-// There are two block caches of 8 MiB each (LevelDB's default is 8,
-// RocksDB's 32). This one, inside the `Db`, serves scans, which run
-// under the engine lock. The store's shared cache
-// (`store::SharedCache`) serves point reads, from every thread at once.
+// The block cache is the store's own (`store::SharedCache`, 16 MiB;
+// LevelDB's default is 8, RocksDB's 32): point reads and scans both run
+// outside the `Db`, on their callers' threads, and share it. The cache
+// inside the `Db` would serve only reads made through the `Db` itself,
+// and the store makes none, so it is switched off.
 horton::db_types! {
     block: BLOCK,
     key_max: KEY_MAX,
     val_max: VAL_MAX,
-    memtable_entries: 4096,
-    memtable_arena: 1 << 20,
+    memtable_entries: MEMTABLE_ENTRIES,
+    memtable_arena: MEMTABLE_ARENA,
     levels: LEVELS,
     tables_per_level: TABLES_PER_LEVEL,
     bloom_bytes: BLOCK - 4,
-    cache_blocks: 512;
+    cache_blocks: 0;
 
     /// The store's database, over any device.
     pub type Db = KvDb;
@@ -82,6 +87,10 @@ horton::db_types! {
     /// A reader thread's block buffers.
     pub type ReadScratch = KvReadScratch;
 }
+
+/// A copy of part of the memtable, for one page of a detached scan: a
+/// memtable of the database's own shape, so any slice of it fits.
+pub type KvMemPage = horton::MemTable<MEMTABLE_ENTRIES, MEMTABLE_ARENA, KEY_MAX, VAL_MAX>;
 
 /// The manifest: which tables exist, level by level.
 pub type KvManifest = horton::Manifest<LEVELS, TABLES_PER_LEVEL, KEY_MAX>;

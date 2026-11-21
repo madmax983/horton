@@ -541,6 +541,50 @@ impl<
         &self.manifest
     }
 
+    /// The memtable's share of a forward scan page, for a detached scan
+    /// ([`Scan::detached`](crate::Scan::detached)): copies into `page`
+    /// at most `max_keys` keys of the memtable in `[start, end)`, in
+    /// order from `start`, and returns the horizon, the first key not
+    /// copied. See [`MemTable::copy_range`](crate::MemTable::copy_range).
+    /// No I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotOpen`] before [`open`](Db::open), or
+    /// [`Error::TableFull`] / [`Error::ArenaFull`] when `page` cannot
+    /// hold even one key.
+    pub fn copy_memtable_range<const C2: usize, const A2: usize>(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        max_keys: usize,
+        page: &mut crate::MemTable<C2, A2, KEY_MAX, VAL_MAX>,
+    ) -> Result<Option<crate::KeyBound<KEY_MAX>>, Error<D::Error>> {
+        self.ensure_open()?;
+        self.table.copy_range(start, end, max_keys, page)
+    }
+
+    /// The memtable's share of a reverse scan page: the at most
+    /// `max_keys` greatest keys at or below `from` and above `lower`.
+    /// See [`MemTable::copy_range_rev`](crate::MemTable::copy_range_rev).
+    /// No I/O.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotOpen`] before [`open`](Db::open), or
+    /// [`Error::TableFull`] / [`Error::ArenaFull`] when `page` cannot
+    /// hold `max_keys` keys.
+    pub fn copy_memtable_range_rev<const C2: usize, const A2: usize>(
+        &self,
+        from: &[u8],
+        lower: Option<&[u8]>,
+        max_keys: usize,
+        page: &mut crate::MemTable<C2, A2, KEY_MAX, VAL_MAX>,
+    ) -> Result<Option<crate::KeyBound<KEY_MAX>>, Error<D::Error>> {
+        self.ensure_open()?;
+        self.table.copy_range_rev(from, lower, max_keys, page)
+    }
+
     /// What the memtable holds for `key` at `max_seq`: the newest visible
     /// version, staged, and the newest covering range tombstone.
     fn memtable_acc(&self, key: &[u8], max_seq: u64) -> ReadAcc<VAL_MAX> {
@@ -620,65 +664,5 @@ impl<
             exclude,
         )
         .await
-    }
-
-    /// Whether a range tombstone at/below `max_seq` and newer than `above`
-    /// covers `key`, across the memtable and every table with a
-    /// range-tombstone section — the scans' "is the winning version hidden?"
-    /// test. `above` is the winner's version; "newer" is the merge rule
-    /// (see [`crate::version`]). Tables that cannot hold such a tombstone
-    /// are skipped without I/O: no rdel section, no version above the
-    /// winner's (exact: every version in the table is at or below its
-    /// `(node, wall, max_seq)` bound), or bounds that cannot contain `key`
-    /// (`last_key` carries the greatest exclusive rdel end inclusively, so
-    /// that prune is a conservative superset).
-    /// The search stops at the first hit. `scratch` is the scan's
-    /// physical-read buffer, dead between block reads, so the scan
-    /// futures hold no block buffer for it.
-    pub(crate) async fn rdel_hides(
-        &self,
-        key: &[u8],
-        max_seq: u64,
-        above: Version,
-        scratch: &mut [u8; BLOCK],
-    ) -> Result<bool, Error<D::Error>> {
-        if self
-            .table
-            .max_covering_rdel(key, max_seq)
-            .is_some_and(|q| version_gt(Version::memtable(self.node_id(), q), above))
-        {
-            return Ok(true);
-        }
-        for li in 0..LEVELS {
-            let tables = self.manifest.level(li).unwrap_or(&[]);
-            for tref in tables {
-                // The table's best possible version: nothing in it can
-                // beat `above` when even this bound does not.
-                let bound = Version::table(tref.node_id, tref.seal_wall, tref.max_seq);
-                if tref.rdel_blocks == 0
-                    || !version_gt(bound, above)
-                    || tref.first_key.as_slice() > key
-                    || tref.last_key.as_slice() < key
-                {
-                    continue;
-                }
-                if sstable::covering_rdel_seq_in(
-                    self.device(),
-                    Some(self.cache_port()),
-                    tref.id,
-                    scratch,
-                    tref.rdel_first().ok_or(Error::CorruptManifest)?,
-                    tref.rdel_blocks,
-                    key,
-                    max_seq,
-                )
-                .await?
-                .is_some_and(|q| version_gt(Version::table(tref.node_id, tref.seal_wall, q), above))
-                {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
     }
 }
