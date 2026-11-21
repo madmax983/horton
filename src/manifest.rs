@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman07" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman08" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -30,6 +30,7 @@
 //!           | fk_len: u16 | fk_bytes[fk_len]
 //!           | lk_len: u16 | lk_bytes[lk_len]
 //!           | max_seq: u64 | min_seq: u64 | entry_count: u32 | rdel_blocks: u32
+//!           | bloom_blocks: u32 | node_id: u32 | seal_wall: u64
 //! ```
 
 use core::future::{Future, poll_fn};
@@ -38,7 +39,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman07".
+/// Manifest block magic: ASCII "hrtman08".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -47,13 +48,15 @@ use crate::error::Error;
 /// with the per-table `rdel_blocks` count; "hrtman04" added the persisted
 /// sequence floors `flushed_seq` and `seq_high`; "hrtman05" (v0.17) spreads
 /// a copy over as many blocks as it needs; "hrtman06" adds the per-table
-/// replica-merge origin (`node_id`, `seal_wall`); "hrtman07" (v0.20) has
-/// the same layout and names tables in the `hrtsst03` format, so an
-/// image whose tables carry the older bloom filter is rejected when it
-/// is opened, not at its first read. A foreign magic decodes
+/// replica-merge origin (`node_id`, `seal_wall`); "hrtman07" was an
+/// unreleased v0.20 layout naming tables in the `hrtsst03` format;
+/// "hrtman08" (v0.20) adds the per-table `bloom_blocks` count and names
+/// tables in the `hrtsst04` format, so an image whose tables carry an
+/// older bloom filter is rejected when it is opened, not at its first
+/// read. A foreign magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman07");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman08");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.
@@ -269,6 +272,10 @@ pub struct TableRef<const KEY_MAX: usize> {
     /// Range-tombstone blocks, stored after the data blocks (see
     /// [`rdel_first`](Self::rdel_first)).
     pub rdel_blocks: u32,
+    /// Bloom-filter blocks, stored after the range-tombstone blocks: at
+    /// least 1 in a table horton wrote (see
+    /// [`BloomShape`](crate::sstable::BloomShape)).
+    pub bloom_blocks: u32,
     /// Origin node of the table's versions: the primary that sealed it
     /// (`0` = unstamped — a legacy table, or one the host has not stamped
     /// yet). Replicas order same-key versions across primaries by
@@ -296,20 +303,18 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
         min_seq: 0,
         entry_count: 0,
         rdel_blocks: 0,
+        bloom_blocks: 0,
         node_id: 0,
         seal_wall: 0,
     };
 
-    /// Data blocks: `block_count - rdel_blocks - 3` (bloom, index,
-    /// footer), or `None` for a malformed ref.
+    /// Data blocks: `block_count - rdel_blocks - bloom_blocks - 2` (index
+    /// and footer), or `None` for a malformed ref.
     #[must_use]
     pub const fn data_blocks(&self) -> Option<u64> {
         let total = self.block_count as u64;
-        let rdel = self.rdel_blocks as u64;
-        match total.checked_sub(rdel) {
-            Some(n) => n.checked_sub(3),
-            None => None,
-        }
+        let tail = self.rdel_blocks as u64 + self.bloom_blocks as u64 + 2;
+        total.checked_sub(tail)
     }
 
     /// First data block: the table starts with its data section.
@@ -698,7 +703,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
 
     /// The largest body any manifest of this shape can encode to: every
     /// pool entry in use, every key bound at `KEY_MAX` bytes.
-    const MAX_BODY: usize = 8 + 4 + 8 + 8 + 4 + 4 * LEVELS + Self::CAPACITY * (56 + 2 * KEY_MAX);
+    const MAX_BODY: usize = 8 + 4 + 8 + 8 + 4 + 4 * LEVELS + Self::CAPACITY * (60 + 2 * KEY_MAX);
 
     /// Blocks one copy of this manifest shape can need, at most: the size
     /// of every copy in a [`ManifestLayout`]. A compile-time function of
@@ -731,7 +736,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let mut refs = 0;
         for li in 0..LEVELS {
             self.view_level(edit, li, |t| {
-                refs += 56 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
+                refs += 60 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
             });
         }
         8 + 4 + 8 + 8 + 4 + 4 * LEVELS + refs
@@ -818,6 +823,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 w.u64(tref.min_seq);
                 w.u32(tref.entry_count);
                 w.u32(tref.rdel_blocks);
+                w.u32(tref.bloom_blocks);
                 w.u32(tref.node_id);
                 w.u64(tref.seal_wall);
             });
@@ -971,6 +977,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             min_seq: src.u64().await?,
             entry_count: src.u32().await?,
             rdel_blocks: src.u32().await?,
+            bloom_blocks: src.u32().await?,
             node_id: src.u32().await?,
             seal_wall: src.u64().await?,
         })

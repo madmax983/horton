@@ -12,8 +12,9 @@ misread (SPEC §4.5).
 ## [Unreleased]
 
 The next release is 0.20.0. **The on-disk format changes** (manifest
-`hrtman07`, SSTable `hrtsst03`): v0.19 images, and archives exported by
-v0.19, are rejected, not misread.
+`hrtman08`, SSTable `hrtsst04`): v0.19 images, and archives exported by
+v0.19, are rejected, not misread. So are images written by a build of
+`main` from before this release (`hrtman07`, `hrtsst03`).
 
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
@@ -22,11 +23,25 @@ after. Against 0.19, one point read is 5 times cheaper (10 for an
 absent key), one thread's scan 9 times and its seek 7 times, and
 unsynced writes 1.4 to 2.4 times; synced writes are unchanged. With
 detached reads the host store's point reads, scans and seeks also run
-on every reader thread at once: at 1 M keys on four threads, point
-reads are 16 times 0.19's rate, seeks 33 times and scans 36 times.
+on every reader thread at once, and with bloom filters sized to their
+tables a read of an absent key stops at the filter: at 1 M keys on
+four threads, point reads are 19 times 0.19's rate, reads of absent
+keys 48 times, seeks 26 times and scans 34 times.
 
 ### Added
 
+- **Bloom filters that span blocks** (ADR-0020). `bloom_bytes` may now
+  exceed a block. It is the most filter a table can have: the table
+  writer builds the filter at that length and, when the table ends,
+  folds it down to the fewest blocks that give each entry 10 bits
+  (`BLOOM_BITS_PER_KEY`), so a small table still writes one bloom block
+  and a large one is no longer starved. `BloomShape` is the size rule;
+  `TableWriter::probes_for` picks the probe count for an expected entry
+  count; `TableWriter::restart` and `set_block_limit` start a writer
+  over in place. A configuration that fits one block behaves exactly as
+  before.
+- `TableRef::bloom_blocks`, `FinishedTable::bloom_blocks`,
+  `TableReader::bloom_blocks` and `bloom_len`.
 - **Detached point reads** (ADR-0018). `Db::probe_memtable` runs the
   memtable half of a point read and returns a `MemProbe`;
   `TableView::resolve` finishes it over a copy of `Db::manifest`, any
@@ -107,6 +122,21 @@ reads are 16 times 0.19's rate, seeks 33 times and scans 36 times.
   `CacheStats` a new field, `rejected`.
 - The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk
   sums); the RAM budget is unchanged.
+- **The table footer records the filter's length** (`bloom_len`), and
+  the manifest each table's bloom-block count. A reader takes the
+  filter's size from the table, not from its own `BLOOM_BYTES`, and
+  refuses a footer whose length and block ids disagree.
+  `TableRef::data_blocks` is `block_count - rdel_blocks - bloom_blocks
+  - 2`. A table reference is 4 bytes longer on the device and 8 in RAM.
+- `BLOOM_BYTES` is no longer limited to `BLOCK - 4`.
+- A bloom probe's bit positions in a whole bucket are reduced with a
+  mask where they took a 64-bit division each. The positions are the
+  same.
+- The kvstore's `stats` prints the bloom blocks its tables hold.
+- A compaction job reuses its table writer in place for each output.
+- **kvstore tables carry up to sixteen bloom blocks** (`bloom_bytes` is
+  255 KiB), and the store boxes its flush future, which holds the
+  writer and so the filter.
 - **A forward seek reads the tables that hold its key** (ADR-0019). A
   table that starts after the seek key is read when the scan reaches
   it. A seek followed by a few entries no longer reads a footer, an

@@ -98,5 +98,7 @@ pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
 // Low-level table construction, for tests and tooling: `Db` builds its
 // tables itself.
 #[doc(hidden)]
-pub use sstable::{SstEntry, TablePlan, bloom_k, bloom_maybe_contains, plan_table, write_table};
+pub use sstable::{
+    BloomShape, SstEntry, TablePlan, bloom_k, bloom_maybe_contains, plan_table, write_table,
+};
 pub use wal::{BatchRecord, BatchReport, Op, RecoverState, WalWriter};

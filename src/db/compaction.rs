@@ -841,7 +841,10 @@ impl<
         let src_tables = self.manifest.level(src).unwrap_or(&[]);
         let eligible =
             |t: &TableRef<KEY_MAX>| t.node_id == node && (!pick.manual || self.is_due(t));
-        let data = |t: &TableRef<KEY_MAX>| u64::from(t.block_count).saturating_sub(3);
+        // Everything but the fixed tail: data and range-tombstone blocks.
+        let data = |t: &TableRef<KEY_MAX>| {
+            u64::from(t.block_count).saturating_sub(u64::from(t.bloom_blocks) + 2)
+        };
         let push = |c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>, t| {
             c.inputs[c.n_src] = Input {
                 level: src,
@@ -982,11 +985,15 @@ impl<
         // The data section gets the rest of the slot. It must hold at
         // least one key's worst case or no output could end.
         let margin = Compaction::<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>::key_run_blocks(n);
+        // An output's entry count is not known until it ends, so its
+        // bloom filter is budgeted at full length.
+        let bloom_budget = u64::from(sstable::BloomShape::full(BLOOM_BYTES, BLOCK).blocks);
         let data_budget = self
             .slots
             .slot_blocks()
             .checked_sub(rdel_budget)
-            .and_then(|d| d.checked_sub(3))
+            .and_then(|d| d.checked_sub(bloom_budget))
+            .and_then(|d| d.checked_sub(2))
             .filter(|&d| d >= margin)
             .ok_or(Error::TableTooLarge)?;
         c.split_margin = margin;
@@ -1006,7 +1013,9 @@ impl<
             data = data.saturating_add(t.data_blocks().unwrap_or(0));
         }
         let per_output = entries.saturating_mul(data_budget) / data.max(1) + 1;
-        c.bloom_k = sstable::bloom_k(BLOOM_BYTES * 8, per_output.min(entries.max(1)));
+        c.bloom_k = sstable::TableWriter::<BLOCK, BLOOM_BYTES, KEY_MAX>::probes_for(
+            per_output.min(entries.max(1)),
+        );
         // The job is live from here: its first output slot is reserved,
         // and archiving any of its inputs aborts it.
         self.job_active = true;
@@ -1054,7 +1063,9 @@ impl<
         // The writer's block limit is the data budget: a merge that would
         // need more blocks fails with `TableTooLarge` instead of writing past
         // the slot.
-        c.writer = sstable::TableWriter::new(c.out_base, c.bloom_k).with_block_limit(c.data_budget);
+        // In place: the writer carries the whole bloom filter.
+        c.writer.restart(c.out_base, c.bloom_k);
+        c.writer.set_block_limit(c.data_budget);
         Ok(())
     }
 
@@ -1142,7 +1153,8 @@ impl<
             .await?;
         let total = u64::from(rdel_blocks)
             .checked_add(done.data_blocks)
-            .and_then(|n| n.checked_add(3))
+            .and_then(|n| n.checked_add(u64::from(done.bloom_blocks)))
+            .and_then(|n| n.checked_add(2))
             .ok_or(Error::TableTooLarge)?;
         // The final output's pieces cover no key above the live inputs'
         // last keys. A piece's exclusive end can be one key past them (the
@@ -1178,6 +1190,7 @@ impl<
             min_seq: done.min_seq,
             entry_count: u32::try_from(done.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks,
+            bloom_blocks: done.bloom_blocks,
             // The job is pure-node and `job_max_wall` is the maximum
             // `seal_wall` over every table whose versions reach this
             // output (inputs and overlapping targets): grouping-

@@ -38,7 +38,8 @@ pub struct SealedTable<const KEY_MAX: usize> {
     /// The table's original id; ingest preserves it so the table is
     /// idempotent across retries and database copies.
     pub id: u32,
-    /// Total blocks: data blocks + rdel blocks + bloom + index + footer.
+    /// Total blocks: data blocks + rdel blocks + bloom blocks + index +
+    /// footer.
     pub block_count: u32,
     /// Smallest key in the table.
     pub first_key: KeyBound<KEY_MAX>,
@@ -231,6 +232,12 @@ impl<
         {
             return Err(Error::CorruptBlock { id: footer });
         }
+        // The descriptor does not say how many blocks the filter takes:
+        // the table does, in the footer just verified, and
+        // `relocate_table` has checked that count against the table's
+        // length.
+        let bloom_blocks =
+            u32::try_from(reader.bloom_blocks()).map_err(|_| Error::CorruptBlock { id: footer })?;
         // The ingested table may hold versions older than tombstones an
         // in-flight compaction job is about to drop (the job's drop floor
         // predates it), so the job restarts from scratch.
@@ -256,6 +263,7 @@ impl<
                 min_seq: sealed.min_seq,
                 entry_count: sealed.entry_count,
                 rdel_blocks: sealed.rdel_blocks,
+                bloom_blocks,
                 node_id: sealed.node_id,
                 seal_wall: sealed.seal_wall,
             },

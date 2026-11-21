@@ -47,6 +47,10 @@ pub const VAL_MAX: usize = 4096;
 pub const LEVELS: usize = 4;
 /// Tables per level.
 pub const TABLES_PER_LEVEL: usize = 7;
+/// The most bloom filter a table carries: sixteen blocks of 64-byte
+/// buckets, about 2 million bits. A table gets as many of those blocks
+/// as its entry count calls for (`horton::BloomShape`).
+pub const BLOOM_BYTES: usize = 16 * ((BLOCK - 4) / 64) * 64;
 /// Writes the memtable holds before it is flushed to a table.
 pub const MEMTABLE_ENTRIES: usize = 4096;
 /// Bytes of keys and values the memtable holds.
@@ -55,9 +59,14 @@ pub const MEMTABLE_ARENA: usize = 1 << 20;
 // The shape of the store: 4 levels of up to 7 tables, so at most 28
 // tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
 // file gives each table an 8 MiB slot). The memtable (4096 writes, 1 MiB)
-// is what one flush turns into a table; the bloom filter takes a whole
-// block. A point read probes up to 7 tables in level 0 and one per level
-// below.
+// is what one flush turns into a table. A point read probes up to 7
+// tables in level 0 and one per level below.
+//
+// A table's bloom filter is sized to it, 10 bits a key: one 16 KiB block
+// for the 4096 entries of a flush, up to sixteen for the 100,000 and
+// more of a full table at the bottom. The writer keeps the largest
+// filter in RAM while it writes (`BLOOM_BYTES`, 255 KiB), which is what
+// lets a filter span blocks at all.
 //
 // The block cache is the store's own (`store::SharedCache`, 16 MiB;
 // LevelDB's default is 8, RocksDB's 32): point reads and scans both run
@@ -72,7 +81,7 @@ horton::db_types! {
     memtable_arena: MEMTABLE_ARENA,
     levels: LEVELS,
     tables_per_level: TABLES_PER_LEVEL,
-    bloom_bytes: BLOCK - 4,
+    bloom_bytes: BLOOM_BYTES,
     cache_blocks: 0;
 
     /// The store's database, over any device.
@@ -307,8 +316,9 @@ pub fn print_stats(store: &Handle) -> Result<(), String> {
         mib(s.slots.slot_blocks)
     );
     println!(
-        "tables    {} used, {} free; per level {:?}; {} blocks of range tombstones",
-        s.slots.used, s.slots.free, s.level_tables, s.rdel_blocks
+        "tables    {} used, {} free; per level {:?}; {} blocks of bloom filter, {} of range \
+         tombstones",
+        s.slots.used, s.slots.free, s.level_tables, s.bloom_blocks, s.rdel_blocks
     );
     println!(
         "writes    {} client writes in {} commits since open ({:.1} per commit)",

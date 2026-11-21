@@ -282,6 +282,9 @@ pub struct Stats {
     pub level_tables: [usize; LEVELS],
     /// Blocks of range tombstones across every table.
     pub rdel_blocks: u64,
+    /// Blocks of bloom filter across every table: one for a small
+    /// table, up to sixteen for a full one.
+    pub bloom_blocks: u64,
     pub io: IoStats,
     pub cache_hits: u64,
     pub cache_misses: u64,
@@ -1609,11 +1612,15 @@ impl Engine {
 
     fn stats(&self) -> Stats {
         let mut level_tables = [0; LEVELS];
-        let mut rdel_blocks = 0;
+        let (mut rdel_blocks, mut bloom_blocks) = (0, 0);
         for (l, n) in level_tables.iter_mut().enumerate() {
             let tables = self.db.level_tables(l).unwrap_or(&[]);
             *n = tables.len();
             rdel_blocks += tables.iter().map(|t| u64::from(t.rdel_blocks)).sum::<u64>();
+            bloom_blocks += tables
+                .iter()
+                .map(|t| u64::from(t.bloom_blocks))
+                .sum::<u64>();
         }
         let cache = self.db.cache_stats();
         Stats {
@@ -1622,6 +1629,7 @@ impl Engine {
             slots: self.db.slot_stats(),
             level_tables,
             rdel_blocks,
+            bloom_blocks,
             io: self.db.device().stats(),
             cache_hits: cache.hits,
             cache_misses: cache.misses,
@@ -1693,18 +1701,23 @@ impl Room {
     }
 
     /// Flushes the memtable, compacting first if level 0 is full.
+    ///
+    /// A flush holds a table writer, and a writer holds the largest
+    /// bloom filter a table can have (`BLOOM_BYTES`, 255 KiB), so the
+    /// flush future goes on the heap: this runs on whichever client
+    /// thread holds the engine, with whatever stack that thread has.
     fn flush(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
         self.quiesce();
-        for _ in 0..ROOM_TRIES {
-            match block_on(db.flush()) {
-                Err(Error::NeedsCompaction) => self.job(db)?,
+        for attempt in 0..=ROOM_TRIES {
+            match block_on(Box::pin(db.flush())) {
+                Err(Error::NeedsCompaction) if attempt < ROOM_TRIES => self.job(db)?,
                 r => {
                     self.flushes += u64::from(r.is_ok());
                     return r;
                 }
             }
         }
-        block_on(db.flush())
+        Err(Error::NeedsCompaction)
     }
 
     /// Runs one compaction job (or finishes the one in flight).

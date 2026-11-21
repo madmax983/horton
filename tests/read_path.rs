@@ -68,6 +68,7 @@ fn write_single(
         min_seq: 0,
         entry_count: u32::try_from(plan.entry_count).expect("entry count fits"),
         rdel_blocks: 0,
+        bloom_blocks: 1,
         node_id: 0,
         seal_wall: 0,
     }

@@ -266,41 +266,49 @@ compress by half, four client threads), and
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 226 K | 218 K | 256 K |
-| `fillrandom`, no fsync | 141 K | 66 K | 193 K |
-| `fillrandom`, fdatasync on | 16.1 K (2.6 writes per commit) | | 15.7 K (100 K keys) |
-| `readrandom` | 176 K | 116 K | 344 K |
-| `readmissing` | 269 K | 194 K | 4,059 K |
-| `seekrandom` | 56 K | 64 K | 316 K |
-| `readseq`, entries/s over four scanning threads | 10,805 K | 7,599 K | 19,878 K |
-| `readreverse`, the same | 6,073 K | 4,140 K | 16,218 K |
+| `fillseq`, no fsync | 263 K | 224 K | 247 K |
+| `fillrandom`, no fsync | 157 K | 66 K | 193 K |
+| `fillrandom`, fdatasync on | 14.4 K (2.6 writes per commit) | | 15.8 K (100 K keys) |
+| `readrandom` | 269 K | 135 K | 386 K |
+| `readmissing` | 626 K | 385 K | 4,289 K |
+| `seekrandom` | 170 K | 52 K | 357 K |
+| `readseq`, entries/s over four scanning threads | 15,444 K | 7,205 K | 20,499 K |
+| `readreverse`, the same | 8,348 K | 4,178 K | 16,838 K |
 
-[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, where
-the time goes, and what v0.20 changed. Against 0.19, at 1 M keys on
-four threads, point reads are 16 times faster, seeks 33 times and
-scans 36 times; four reader threads do 3 to 4 times the work of one.
+These are single runs, and the read rows move by a third from one run
+to the next with the number of level-0 tables the fills leave.
+[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
+spread, where the time goes, and what v0.20 changed. Against 0.19, at
+1 M keys on four threads, point reads are 19 times faster, reads of
+absent keys 48 times, seeks 26 times and scans 34 times.
 
 ### Where horton stops at host scale
 
 The example is also a measurement of how far a firmware store stretches.
 These are the limits it meets, and each is a property of the library:
 
-- **A point read costs 22 µs of one core at 1 M keys**, 12 µs when the
+- **A point read costs 21 µs of one core at 1 M keys**, 2.3 µs when the
   key is absent. Ruling out a table
   that does not hold the key is cheap (a footer's fields and one bloom
   bucket from the cache). The table that may hold it costs an index
   block and a data block, each checked whole, and the data block
   inflated, on every read: the cache keeps the compressed image. A
   block that is not cached costs a 16 KiB CRC in software on top
-  (8 µs). Readers do run in parallel, so four threads get three cores'
-  worth; a single read is no faster for it.
+  (8 µs). Readers do run in parallel, so four threads get about three
+  and a half cores' worth of such reads. Reads of absent keys, which
+  are only the cheap part, do not scale past one thread's rate: each
+  still queues for its memtable probe and takes locks on the shared
+  cache.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
   200 MiB compressed; 1 M db_bench entries take 15. A fuller store gets
   `RegionFull`: the flight recorder's answer is to archive cold tables.
-- **A bloom filter is one block** (16 K bytes, about 13 K keys at 1%
-  false positives), so large tables filter poorly.
+- **A table's bloom filter is sized to it, up to sixteen blocks**
+  (ten bits a key up to 209,000 keys), and the table writer holds the
+  largest one, 255 KiB, in RAM while it writes. With one block per
+  table, which is what firmware uses, a 100,000-entry table had 1.3
+  bits a key and filtered almost nothing (ADR-0020).
 - **One thread at a time writes.** Writes, flushes and compaction
   steps take turns under the engine lock (the table work of reads,
   scans and seeks runs outside it), so random writes at scale are
@@ -385,12 +393,12 @@ rebuilds the slot map from the manifest.
 ```text
 block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
              └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
-               blocks, magic "hrtman07"
+               blocks, magic "hrtman08"
 
-SSTable:    [data]* [rdel]* [bloom] [index] [footer]
-             │       │        │       │       └ magic "hrtsst03", ids, entry count, k, rdel count, min seq
-             │       │        │       └ per data block: first key, block id, max seq
-             │       │        └ BLOOM_BYTES bit array
+SSTable:    [data]* [rdel]* [bloom]+ [index] [footer]
+             │       │        │        │       └ magic "hrtsst04", ids, entry count, k, rdel count, min seq, filter length
+             │       │        │        └ per data block: first key, block id, max seq
+             │       │        └ bit array in 64-byte buckets, up to BLOOM_BYTES, sized to the table's entry count
              │       └ range tombstones sorted by start
              └ entries + restart points; optionally LZ77-compressed (flag bit in trailer)
 every block ends in a CRC32 of its payload
@@ -427,7 +435,7 @@ tables exist and where.
 | `memtable_arena` | RAM bytes for those writes' keys and values | About `memtable_entries` × your typical key + value size. When full, writes fail with `ArenaFull`: call `flush()` | 128 per entry, at least `key_max + val_max` |
 | `levels` | Levels of tables on the device | 4 suits most uses | 4 |
 | `tables_per_level` | Tables each level holds | Below 8. `levels × tables_per_level` (at most 64) is how many tables exist. More tables mean more data between compactions, but more tables to check per read and smaller table slots | 4 |
-| `bloom_bytes` | Per-table filter that lets a read skip tables that cannot hold the key | About 1.25 bytes per key in a table gives about 1% wasted reads | 256 |
+| `bloom_bytes` | The most filter a table carries: what lets a read skip tables that cannot hold the key | About 1.25 bytes per key in the largest table gives about 1% wasted reads. Past `block - 4` the filter spans blocks, and each table stores what its entry count calls for (ADR-0020) | 256 |
 | `cache_blocks` | Recently read blocks kept in RAM, `block` bytes each | 0 turns it off. A few blocks speed up repeated reads | 0 |
 
 Give the parameters in this order and leave out any tuning knob to keep

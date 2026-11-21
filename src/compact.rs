@@ -2051,6 +2051,7 @@ mod tests {
         let mut t = TableRef::<256>::EMPTY;
         t.first_block = base;
         t.rdel_blocks = rdel_blocks;
+        t.bloom_blocks = 1;
         t.block_count = rdel_blocks + 3;
         t
     }

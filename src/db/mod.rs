@@ -229,7 +229,7 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 /// | `ARENA` | memtable key/value bytes | at least `KEY_MAX + VAL_MAX` |
 /// | `LEVELS` | LSM levels. `1` disables compaction: level 0 fills, then flush reports [`Error::RegionFull`] | `LEVELS * TABLES` within `1..=64` |
 /// | `TABLES` | tables per level (L0's limit; deeper levels share the pool) | below [`COMPACTION_KMAX`] |
-/// | `BLOOM_BYTES` | bloom filter bytes per table | `1..=BLOCK-4` |
+/// | `BLOOM_BYTES` | most bloom filter bytes per table; over `BLOCK-4` it spans blocks | `>= 1` |
 /// | `CACHE` | block-cache slots; `0` disables the cache | |
 ///
 /// The region layout in [`Config`] is checked by [`open`](Db::open)
@@ -402,8 +402,9 @@ impl<
         "BLOCK must fit the largest WAL record"
     );
     const ASSERT_BLOOM: () = assert!(
-        BLOOM_BYTES >= 1 && BLOOM_BYTES + 4 <= BLOCK,
-        "BLOOM_BYTES must be within 1..=BLOCK-4"
+        BLOOM_BYTES >= 1 && (BLOOM_BYTES + 4 <= BLOCK || BLOCK >= 68),
+        "BLOOM_BYTES must be at least 1, and a block must hold a filter under 64 bytes \
+         whole or at least one 64-byte bucket of a longer one"
     );
     const ASSERT_SLOTS: () = assert!(
         LEVELS >= 1 && TABLES >= 1 && LEVELS * TABLES <= MAX_SLOTS,
@@ -432,7 +433,8 @@ impl<
 
     /// Smallest usable slot: a full memtable's table must fit one, or the
     /// write path could wedge on a flush that never fits.
-    const MIN_SLOT_BLOCKS: u64 = sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX);
+    const MIN_SLOT_BLOCKS: u64 =
+        sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX, BLOOM_BYTES);
 
     /// The smallest device, in blocks, that [`Config::whole_device`]
     /// accepts for this shape with the default manifest pair. A manifest

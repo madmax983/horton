@@ -27,7 +27,8 @@ impl<
     ///   in flight (the output it is writing).
     /// - Levels 1 and deeper hold pairwise disjoint key ranges.
     /// - Each table is well-formed (room for bloom, index, and footer after
-    ///   its sections; `min_seq <= max_seq`), and the sequence counter
+    ///   its sections; no more bloom blocks than `BLOOM_BYTES` fills;
+    ///   `min_seq <= max_seq`), and the sequence counter
     ///   dominates every stored sequence and both persisted floors.
     /// - The manifest fits its copies (`Manifest::max_blocks` blocks).
     ///
@@ -56,6 +57,10 @@ impl<
                 }
                 if t.data_blocks().is_none() {
                     return Err("a table has no room for bloom, index, and footer");
+                }
+                let bloom = crate::sstable::BloomShape::full(BLOOM_BYTES, BLOCK).blocks;
+                if t.bloom_blocks == 0 || t.bloom_blocks > bloom {
+                    return Err("a table's bloom blocks are not within 1..=the configured filter");
                 }
                 if t.entry_count > 0 && t.min_seq > t.max_seq {
                     return Err("a table's min_seq exceeds its max_seq");

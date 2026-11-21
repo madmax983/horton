@@ -151,7 +151,7 @@ All I/O is whole blocks (`buf.len() == BLOCK`, else `BadBufferLen`). The
 ### 4.4 SSTable — immutable sorted run
 
 ```
-[data block]* [rdel block]* [bloom block] [index block] [footer block]
+[data block]* [rdel block]* [bloom block]+ [index block] [footer block]
 ```
 
 Every block is `BLOCK` bytes ending in a CRC32 of its payload.
@@ -163,15 +163,23 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   inflate transparently.
 - **Rdel block:** range tombstones `start_len u16 | end_len u16 | seq u64
   | start | end`, sorted by start, then a `u16` count. Never compressed.
-- **Bloom block:** `BLOOM_BYTES × 8` bits in 64-byte buckets. A key
-  hashes to one bucket and its `k` probes are double-hashed inside that
-  bucket's 512 bits, so a reader needs 64 bytes of the block (ADR-0017).
-  A filter under 64 bytes is one bucket. Advisory: a bad CRC disables
-  the filter.
+- **Bloom blocks:** a bit array in 64-byte buckets. A key hashes to one
+  bucket (`(h × buckets) >> 32`) and its `k` probes are double-hashed
+  inside that bucket's 512 bits, so a reader needs 64 bytes of one
+  block (ADR-0017). A filter under 64 bytes is one bucket. `BLOOM_BYTES`
+  is the most filter a table can have. One that fits a block is stored
+  whole. A longer one fills consecutive blocks, `(BLOCK - 4) / 64`
+  buckets each, and is stored at the size the table's entry count
+  calls for: the writer builds it at full length and folds it (ORs
+  runs of neighbouring buckets) to the fewest blocks that give each
+  entry 10 bits (ADR-0020). Advisory: a bad CRC disables the filter
+  for the keys whose bucket is in that block.
 - **Index block:** per data block `first_key_len u16 | first_key |
   block_id u64 | max_seq u64`.
-- **Footer:** `magic u64 = "hrtsst03" | index_block u64 | bloom_block u64
-  | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64`.
+- **Footer:** `magic u64 = "hrtsst04" | index_block u64 | bloom_block u64
+  | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64 |
+  bloom_len u32`. The bloom section is `[bloom_block, index_block)`,
+  and must be exactly the blocks `bloom_len` bytes of filter fill.
 
 A CRC failure on a footer, index, data, or rdel block is `CorruptBlock`
 everywhere, never "absent" (which would let an older version win). Every
@@ -181,7 +189,9 @@ returns; data blocks then go through `sstable::read_data_block`.
 
 A table's `TableRef` carries `first_key` (its **live lower bound**),
 `last_key` (covering both sections, the greatest rdel end inclusively),
-`max_seq`/`min_seq` over both sections, `entry_count`, and `rdel_blocks`.
+`max_seq`/`min_seq` over both sections, `entry_count`, `rdel_blocks` and
+`bloom_blocks` (so a table's data blocks number `block_count -
+rdel_blocks - bloom_blocks - 2`).
 Entries and range-tombstone pieces below `first_key` are dead to every
 reader (a compaction narrowed the table past them).
 
@@ -194,13 +204,13 @@ shared by the levels. L0 holds at most `TABLES` refs, oldest first;
 deeper levels hold disjoint runs sorted by first key, in any share of
 the pool.
 
-Storage (format `hrtman07`, ADR-0011): two or more **copies**
+Storage (format `hrtman08`, ADR-0011): two or more **copies**
 (`ManifestLayout::pair` or `ManifestLayout::ring`), each
 `Manifest::max_blocks::<BLOCK>()` blocks long, the compile-time worst
 case. Block layout:
 
 ```
-magic: u64 = "hrtman07" | seq: u64 | index: u16 | count: u16 | len: u32
+magic: u64 = "hrtman08" | seq: u64 | index: u16 | count: u16 | len: u32
 | body chunk[len] | crc32: u32
 ```
 
