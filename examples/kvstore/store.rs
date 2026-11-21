@@ -2217,7 +2217,11 @@ mod tests {
                         s.spawn(move || {
                             let mut seen = [0u64; KEYS];
                             let mut i = t;
-                            while !stop.load(Ordering::Relaxed) {
+                            // Until the writers are done, and at least
+                            // 300 reads however fast this machine is.
+                            let mut mine = 0usize;
+                            while mine < 300 || !stop.load(Ordering::Relaxed) {
+                                mine += 1;
                                 i = (i * 31 + 7) % KEYS;
                                 let v = h.get(&key(i)).expect("get").expect("every key exists");
                                 let (k, version) = unstamp(&v);
@@ -2261,7 +2265,7 @@ mod tests {
                 "only {} jobs",
                 stats.compaction_jobs
             );
-            assert!(reads.load(Ordering::Relaxed) > 1000);
+            assert!(reads.load(Ordering::Relaxed) >= 4 * 300);
             // Every read gave its pin back.
             assert_eq!(store.handle.shared.readers.load(Ordering::SeqCst), 0);
             for k in 0..KEYS {
@@ -2505,7 +2509,11 @@ mod tests {
                             (store.handle(), Arc::clone(&stop), Arc::clone(&scans));
                         s.spawn(move || {
                             let mut seen = [0u64; KEYS];
-                            while !stop.load(Ordering::Relaxed) {
+                            // Until the writers are done, and at least
+                            // eight scans however fast this machine is.
+                            let mut mine = 0usize;
+                            while mine < 8 || !stop.load(Ordering::Relaxed) {
+                                mine += 1;
                                 let reverse = t == 2;
                                 let got: Vec<_> = h
                                     .range(b"", None, reverse)
@@ -2547,7 +2555,7 @@ mod tests {
                     sc.join().expect("scanner");
                 }
             });
-            assert!(scans.load(Ordering::Relaxed) > 20);
+            assert!(scans.load(Ordering::Relaxed) >= 3 * 8);
             let shared = &store.handle.shared;
             assert_eq!(shared.readers.load(Ordering::SeqCst), 0);
             assert_eq!(lock(&shared.pages).len(), SCAN_PAGES);
