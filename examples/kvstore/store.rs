@@ -4,40 +4,60 @@
 //! writes and no locks, the right shape for firmware. A host program
 //! wants what `LevelDB` gives it instead: a handle any thread can clone,
 //! writes from many threads at once, and compaction that happens by
-//! itself. This module provides that with one **store thread** that owns
-//! the `Db`:
+//! itself. This module provides that by putting the `Db` behind one lock,
+//! the **engine lock**, which `LevelDB` calls its mutex:
 //!
 //! ```text
-//!  client threads ──Request──▶ channel ──▶ store thread ──▶ Db ──▶ FileDevice
-//!        ▲                                     │
-//!        └──────────── reply ◀─────────────────┘
+//!  client threads ──▶ engine lock ──▶ Db ──▶ FileDevice
+//!  compaction thread ──┘   (one holder at a time; each runs horton itself)
 //! ```
 //!
-//! - **Group commit.** The store thread takes a write off the channel,
-//!   then every write queued behind it that still fits one WAL block, and
-//!   commits them all as one [`WriteBatch`]: one block write and one
-//!   `fdatasync` for the whole group. This is `LevelDB`'s writer queue.
-//!   Each client's batch stays atomic (the group is all or nothing).
+//! - **Callers run horton themselves.** Nothing is handed to a store
+//!   thread: the thread holding the lock does the work and returns.
+//!   (Until v0.20 a store thread did everything and every call paid two
+//!   thread switches, a quarter of a read's time and half of a write's.)
+//! - **The lock holder serves everyone waiting.** A point read or a
+//!   write is queued first; then its thread goes for the lock. Whoever
+//!   gets it serves the queue in order, its own request and the others',
+//!   and marks each done. The threads it served see their result and
+//!   never take the lock. This is flat combining, and it matters because
+//!   the database is megabytes of state that would otherwise move
+//!   between CPU caches on every call: four threads taking turns at the
+//!   lock read slower than one thread alone.
+//! - **Group commit** falls out of it: consecutive writes in the queue
+//!   that fit one WAL block are committed as one [`WriteBatch`], one
+//!   block write and one `fdatasync` for all of them. This is `LevelDB`'s
+//!   writer queue. Each client's batch stays atomic (the group is all or
+//!   nothing).
+//! - **Waiters spin before they sleep.** An operation takes microseconds,
+//!   so a waiting thread polls for its result and for the lock for up to
+//!   [`SPIN`] before parking, as `RocksDB`'s write thread does. Parking
+//!   costs more than the wait it would save. A parked thread is woken by
+//!   the thread that serves its request, or, if it is at the head of the
+//!   queue, by whoever releases the lock.
 //! - **Capacity errors are handled here.** horton reports a full memtable,
-//!   WAL or level 0 as an error naming its remedy; the store thread
-//!   applies the remedy (`flush`, `compact_step`) and retries, so callers
-//!   never see them.
-//! - **Background compaction.** While a job is pending, the store thread
-//!   runs one bounded `compact_step` between requests, and runs them back
-//!   to back when the channel is idle. Writers are never stalled for a
-//!   whole compaction, which is what `LevelDB`'s L0 slowdown trigger
-//!   approximates with sleeps.
+//!   WAL or level 0 as an error naming its remedy; the caller holding the
+//!   lock applies the remedy (`flush`, `compact_step`) and retries, so
+//!   clients never see them.
+//! - **Background compaction.** While a job is pending, every operation
+//!   ends with one bounded `compact_step` before it gives the lock up,
+//!   and a compaction thread runs them back to back whenever no client
+//!   is waiting. Writers are never stalled for a whole compaction, which
+//!   is what `LevelDB`'s L0 slowdown trigger approximates with sleeps.
 //! - **Snapshots and iterators.** A [`Snapshot`] is horton's sequence
 //!   watermark, released when dropped. An [`Iter`] pins one for its
 //!   lifetime, like a `LevelDB` iterator, and pages through the range.
 //!
-//! Every reply is sent after the operation completes, so a write that
+//! Every call returns after the operation completes, so a write that
 //! returned `Ok` is on the disk (or, without `sync`, in the operating
 //! system's hands).
 
+use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use horton::wal::WAL_RECORD_OVERHEAD;
 use horton::{Error, OpenReport, Progress, SlotStats, WriteBatch};
@@ -63,6 +83,28 @@ const ROOM_TRIES: usize = 16;
 /// Entries per page when an [`Iter`] refills.
 const PAGE: usize = 1024;
 
+/// How long a thread polls for the engine lock before it parks. Longer
+/// than any read or unsynced commit, far shorter than an `fdatasync` or a
+/// flush; `RocksDB` uses the same figure for its write thread.
+const SPIN: Duration = Duration::from_micros(100);
+
+/// Lock polls between two `yield`s while spinning.
+const POLLS_PER_YIELD: usize = 64;
+
+/// Most queued requests one lock holder serves before it gives the lock
+/// up (a write group counts as one). Bounds how long a thread works for
+/// others after its own request is done.
+const SERVE_MAX: usize = 64;
+
+/// The longest a queued thread stays parked before it looks again. It is
+/// woken sooner whenever there is something for it to do; this bounds the
+/// cost of a wake-up that was missed.
+const PARK: Duration = Duration::from_millis(2);
+
+/// How long the compaction thread stands back when clients are waiting
+/// for the lock (they run the compaction steps themselves meanwhile).
+const BACKGROUND_PAUSE: Duration = Duration::from_micros(200);
+
 /// Why a store call failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
@@ -70,8 +112,8 @@ pub enum StoreError {
     Db(DbError),
     /// The store could not be opened.
     Open(String),
-    /// The store thread has stopped (it hit an error it cannot recover
-    /// from, or the store was closed).
+    /// The store was closed (its [`Store`] was dropped), or a thread
+    /// panicked while it held the engine.
     Closed,
 }
 
@@ -80,7 +122,7 @@ impl core::fmt::Display for StoreError {
         match self {
             Self::Db(e) => write!(f, "{e:?}"),
             Self::Open(e) => write!(f, "open: {e}"),
-            Self::Closed => write!(f, "the store thread has stopped"),
+            Self::Closed => write!(f, "the store is closed"),
         }
     }
 }
@@ -188,7 +230,7 @@ const fn check_key(key: &[u8]) -> Result<(), DbError> {
     }
 }
 
-/// What the store thread has done, and the state of the database.
+/// What the store has done, and the state of the database.
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
     pub open: OpenReport,
@@ -208,42 +250,283 @@ pub struct Stats {
     pub compaction_steps: u64,
 }
 
-type Reply<T> = SyncSender<Result<T, StoreError>>;
-
 /// Key-value pairs, in scan order.
 pub type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// One page of a scan: the entries, and whether the range is exhausted.
 type Page = (Entries, bool);
 
-enum Request {
-    Write(Batch, Reply<u64>),
-    DeleteRange(Vec<u8>, Vec<u8>, Reply<u64>),
-    Get(Vec<u8>, u64, Reply<Option<Vec<u8>>>),
-    Scan {
-        start: Vec<u8>,
-        end: Option<Vec<u8>>,
-        reverse: bool,
-        limit: usize,
-        seq: u64,
-        reply: Reply<Page>,
-    },
-    Snapshot(Reply<u64>),
-    Release(u64),
-    Flush(Reply<()>),
-    CompactAll(Reply<()>),
-    Stats(Reply<Stats>),
+/// What a queued request asks for.
+enum Work {
+    Write(Batch),
+    /// A point read of a key as of a sequence number.
+    Get(Vec<u8>, u64),
+}
+
+/// A request in the queue. The thread that serves it sets `done` (a
+/// write's value is `None`); its caller returns as soon as it sees that.
+struct Pending {
+    work: Work,
+    done: OnceLock<Result<Option<Vec<u8>>, StoreError>>,
+    /// The thread that queued it, to wake when it is done.
+    waiter: std::thread::Thread,
+}
+
+impl Pending {
+    fn finish(&self, result: Result<Option<Vec<u8>>, StoreError>) {
+        let _ = self.done.set(result);
+        // Free unless the thread has parked.
+        self.waiter.unpark();
+    }
+}
+
+/// What every [`Handle`] shares.
+struct Shared {
+    /// The database. `None` once the store is closed.
+    engine: Mutex<Option<Engine>>,
+    /// Point reads and writes waiting to be served, oldest first. Taken
+    /// after the engine lock by the thread serving and alone by a thread
+    /// queueing, never the other way round.
+    queue: Mutex<VecDeque<Arc<Pending>>>,
+    /// Client threads polling or parked for the engine lock. The
+    /// compaction thread stands back while this is nonzero.
+    waiting: AtomicUsize,
+    /// The compaction thread has work (or must look for some).
+    background_due: AtomicBool,
+    /// The store is closing: the compaction thread exits.
+    stop: AtomicBool,
+    /// Where the compaction thread sleeps until `background_due` or
+    /// `stop`.
+    wake: (Mutex<()>, Condvar),
+}
+
+/// The lock guard of plain data that a panic cannot leave half changed.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The engine, locked: derefs to the [`Engine`]. A client ends its turn
+/// with [`finish`](Locked::finish), which keeps compaction moving and
+/// wakes whoever is next.
+struct Locked<'a> {
+    shared: &'a Shared,
+    guard: MutexGuard<'a, Option<Engine>>,
+}
+
+impl core::ops::Deref for Locked<'_> {
+    type Target = Engine;
+    fn deref(&self) -> &Engine {
+        // `Shared::opened` builds a `Locked` only over `Some`, and nothing
+        // takes the engine out while the guard is held.
+        self.guard.as_ref().unwrap_or_else(|| unreachable!())
+    }
+}
+
+impl core::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut Engine {
+        self.guard.as_mut().unwrap_or_else(|| unreachable!())
+    }
+}
+
+impl Locked<'_> {
+    /// Ends a client operation: one bounded compaction step if a job is
+    /// pending, so the job keeps moving however busy the clients are,
+    /// then the lock is released.
+    fn finish(mut self) {
+        if self.background_pending() {
+            self.background_step();
+        }
+        let pending = self.background_pending();
+        let shared = self.shared;
+        drop(self);
+        shared.wake_queue();
+        if pending {
+            shared.wake_background();
+        }
+    }
+}
+
+impl Shared {
+    /// The locked engine, or [`StoreError::Closed`] once it is gone.
+    fn opened<'a>(
+        &'a self,
+        guard: MutexGuard<'a, Option<Engine>>,
+    ) -> Result<Locked<'a>, StoreError> {
+        if guard.is_some() {
+            Ok(Locked {
+                shared: self,
+                guard,
+            })
+        } else {
+            Err(StoreError::Closed)
+        }
+    }
+
+    /// One poll of the engine lock: `None` while another thread holds it.
+    fn poll_engine(&self) -> Option<Result<Locked<'_>, StoreError>> {
+        match self.engine.try_lock() {
+            Ok(guard) => Some(self.opened(guard)),
+            Err(TryLockError::Poisoned(_)) => Some(Err(StoreError::Closed)),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Takes the engine lock for a client: poll for [`SPIN`], then block.
+    fn engine(&self) -> Result<Locked<'_>, StoreError> {
+        if let Some(r) = self.poll_engine() {
+            return r;
+        }
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let got = 'spin: loop {
+            for _ in 0..POLLS_PER_YIELD {
+                if let Some(r) = self.poll_engine() {
+                    break 'spin r;
+                }
+                core::hint::spin_loop();
+            }
+            if started.elapsed() >= SPIN {
+                break self
+                    .engine
+                    .lock()
+                    .map_or_else(|_| Err(StoreError::Closed), |guard| self.opened(guard));
+            }
+            std::thread::yield_now();
+        };
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        got
+    }
+
+    /// Runs `op` on the engine and ends the operation (see
+    /// [`Locked::finish`]).
+    fn with<T>(&self, op: impl FnOnce(&mut Engine) -> Result<T, DbError>) -> Result<T, StoreError> {
+        let mut engine = self.engine()?;
+        let r = op(&mut engine).map_err(StoreError::Db);
+        engine.finish();
+        r
+    }
+
+    /// Queues `work` and returns its result once some thread has served
+    /// it: this one, if it gets the engine lock first, in which case it
+    /// serves the rest of the queue too.
+    fn submit(&self, work: Work) -> Result<Option<Vec<u8>>, StoreError> {
+        let me = Arc::new(Pending {
+            work,
+            done: OnceLock::new(),
+            waiter: std::thread::current(),
+        });
+        lock(&self.queue).push_back(Arc::clone(&me));
+        let mut waiting_since: Option<Instant> = None;
+        let mut polls = 0usize;
+        let result = loop {
+            if let Some(r) = me.done.get() {
+                break r.clone();
+            }
+            match self.poll_engine() {
+                Some(Ok(mut engine)) => {
+                    // The queue is served from its head, which may not
+                    // reach this request in one turn; then go again.
+                    engine.serve(&self.queue, &me);
+                    engine.finish();
+                }
+                Some(Err(e)) => {
+                    // Closed: nobody will serve this request.
+                    lock(&self.queue).retain(|p| !Arc::ptr_eq(p, &me));
+                    break me.done.get().cloned().unwrap_or(Err(e));
+                }
+                None => {
+                    // Another thread holds the engine, and may be serving
+                    // this very request. Poll, then yield, then park.
+                    let since = *waiting_since.get_or_insert_with(|| {
+                        self.waiting.fetch_add(1, Ordering::Relaxed);
+                        Instant::now()
+                    });
+                    polls += 1;
+                    if !polls.is_multiple_of(POLLS_PER_YIELD) {
+                        core::hint::spin_loop();
+                    } else if since.elapsed() < SPIN {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::park_timeout(PARK);
+                    }
+                }
+            }
+        };
+        if waiting_since.is_some() {
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Wakes the thread whose request heads the queue, if it has parked:
+    /// the engine is free and its request is next. Called by whoever
+    /// releases the engine lock.
+    fn wake_queue(&self) {
+        if let Some(head) = lock(&self.queue).front() {
+            head.waiter.unpark();
+        }
+    }
+
+    fn wake_background(&self) {
+        if !self.background_due.swap(true, Ordering::AcqRel) {
+            let _g = lock(&self.wake.0);
+            self.wake.1.notify_one();
+        }
+    }
+
+    /// The compaction thread: sleeps until a job is pending, then runs
+    /// bounded steps back to back, standing back whenever a client is
+    /// waiting for the lock.
+    fn background(&self) {
+        loop {
+            let mut asleep = lock(&self.wake.0);
+            while !self.background_due.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire)
+            {
+                asleep = self
+                    .wake
+                    .1
+                    .wait(asleep)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(asleep);
+            loop {
+                if self.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if self.waiting.load(Ordering::Relaxed) > 0 {
+                    std::thread::sleep(BACKGROUND_PAUSE);
+                    continue;
+                }
+                let Ok(mut guard) = self.engine.lock() else {
+                    return;
+                };
+                let Some(engine) = guard.as_mut() else {
+                    return;
+                };
+                if !engine.background_pending() {
+                    // Cleared under the engine lock: a client that leaves
+                    // a job pending after this sets it again.
+                    self.background_due.store(false, Ordering::Release);
+                    break;
+                }
+                engine.background_step();
+                drop(guard);
+                self.wake_queue();
+            }
+        }
+    }
 }
 
 /// A cloneable, `Send` handle to an open store. Every call blocks the
-/// calling thread until the store thread has done it.
+/// calling thread until the operation is done.
 #[derive(Clone)]
 pub struct Handle {
-    tx: Sender<Request>,
+    shared: Arc<Shared>,
 }
 
-/// An open store: a [`Handle`] plus the store thread, stopped and joined
-/// on drop (after every clone of the handle is gone).
+/// An open store: a [`Handle`] plus the compaction thread. Dropping it
+/// closes the store: the database and its file are released, and calls
+/// through handles still alive return [`StoreError::Closed`].
 pub struct Store {
     handle: Handle,
     thread: Option<JoinHandle<()>>,
@@ -258,13 +541,18 @@ impl core::ops::Deref for Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
-        // Swap in a dead sender so ours drops: once the last clone is
-        // gone the store thread's `recv` fails and it exits.
-        let (dead, _) = mpsc::channel();
-        drop(core::mem::replace(&mut self.handle.tx, dead));
+        let shared = &self.handle.shared;
+        shared.stop.store(true, Ordering::Release);
+        {
+            let _g = lock(&shared.wake.0);
+            shared.wake.1.notify_one();
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        // Close: drop the database (and its file) now, whoever still
+        // holds a handle.
+        drop(lock(&shared.engine).take());
     }
 }
 
@@ -274,31 +562,33 @@ impl Store {
     pub fn open(path: &Path, options: Options) -> Result<(Self, OpenReport), StoreError> {
         let device = FileDevice::open(path, options.create_blocks, options.sync)
             .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
-        let (tx, rx) = mpsc::channel();
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        // The database is built on the stack before it is boxed, and it
+        // is megabytes: build it on a thread with room.
+        let engine = std::thread::Builder::new()
+            .name("horton-open".into())
+            .stack_size(OPEN_STACK)
+            .spawn(move || Engine::open(device, options.sync))
+            .map_err(|e| StoreError::Open(e.to_string()))?
+            .join()
+            .map_err(|_| StoreError::Open("the opening thread panicked".into()))??;
+        let report = engine.open;
+        let shared = Arc::new(Shared {
+            engine: Mutex::new(Some(engine)),
+            queue: Mutex::new(VecDeque::new()),
+            waiting: AtomicUsize::new(0),
+            // Look once: recovery may have left a job pending.
+            background_due: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            wake: (Mutex::new(()), Condvar::new()),
+        });
+        let background = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
-            .name("horton-store".into())
-            // The database and the futures that drive it live on this
-            // thread's stack while they are built: give it room.
-            .stack_size(64 << 20)
-            .spawn(move || {
-                let mut engine = match Engine::open(device) {
-                    Ok((engine, report)) => {
-                        let _ = ready_tx.send(Ok(report));
-                        engine
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                engine.run(&rx);
-            })
+            .name("horton-compact".into())
+            .spawn(move || background.background())
             .map_err(|e| StoreError::Open(e.to_string()))?;
-        let report = ready_rx.recv().map_err(|_| StoreError::Closed)??;
         Ok((
             Self {
-                handle: Handle { tx },
+                handle: Handle { shared },
                 thread: Some(thread),
             },
             report,
@@ -312,12 +602,6 @@ impl Store {
 }
 
 impl Handle {
-    fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, StoreError> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        self.tx.send(make(tx)).map_err(|_| StoreError::Closed)?;
-        rx.recv().map_err(|_| StoreError::Closed)?
-    }
-
     /// Stores `key → val`. Returns once it is durable.
     pub fn put(&self, key: &[u8], val: &[u8]) -> Result<(), StoreError> {
         let mut b = Batch::new();
@@ -335,7 +619,7 @@ impl Handle {
     /// Applies `batch` atomically. Returns once it is durable.
     pub fn write(&self, batch: Batch) -> Result<(), StoreError> {
         batch.check()?;
-        self.call(|r| Request::Write(batch, r)).map(drop)
+        self.shared.submit(Work::Write(batch)).map(drop)
     }
 
     /// Deletes every key in `[start, end)` with one range tombstone, like
@@ -343,27 +627,48 @@ impl Handle {
     pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), StoreError> {
         check_key(start)?;
         check_key(end)?;
-        self.call(|r| Request::DeleteRange(start.to_vec(), end.to_vec(), r))
-            .map(drop)
+        self.shared.with(|e| {
+            e.room
+                .with_room(&mut e.db, |db| block_on(db.delete_range(start, end)))
+                .map(drop)
+        })
     }
 
     /// The value of `key`, or `None`.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
-        self.call(|r| Request::Get(key.to_vec(), u64::MAX, r))
+        self.shared.submit(Work::Get(key.to_vec(), u64::MAX))
     }
 
     /// The value of `key` as of `snapshot`.
     pub fn get_at(&self, key: &[u8], snapshot: &Snapshot) -> Result<Option<Vec<u8>>, StoreError> {
-        self.call(|r| Request::Get(key.to_vec(), snapshot.seq, r))
+        self.shared.submit(Work::Get(key.to_vec(), snapshot.seq))
     }
 
     /// A consistent view of the store as it is now; released on drop.
     /// horton keeps at most eight live at once (`SnapshotLimit`).
     pub fn snapshot(&self) -> Result<Snapshot, StoreError> {
-        let seq = self.call(Request::Snapshot)?;
+        let seq = self.shared.with(|e| e.db.snapshot())?;
         Ok(Snapshot {
             seq,
-            tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    /// One page of `[start, end)` as of sequence `seq`.
+    fn page(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        reverse: bool,
+        limit: usize,
+        seq: u64,
+    ) -> Result<Page, StoreError> {
+        self.shared.with(|e| {
+            if reverse {
+                e.scan_rev(start, end, limit, seq)
+            } else {
+                e.scan_fwd(start, end, limit, seq)
+            }
         })
     }
 
@@ -378,15 +683,8 @@ impl Handle {
         limit: usize,
         snapshot: Option<&Snapshot>,
     ) -> Result<Entries, StoreError> {
-        let (page, _) = self.call(|reply| Request::Scan {
-            start: start.to_vec(),
-            end: end.map(<[u8]>::to_vec),
-            reverse,
-            limit,
-            seq: snapshot.map_or(u64::MAX, |s| s.seq),
-            reply,
-        })?;
-        Ok(page)
+        let seq = snapshot.map_or(u64::MAX, |s| s.seq);
+        Ok(self.page(start, end, reverse, limit, seq)?.0)
     }
 
     /// Iterates `[start, end)` in order (or in reverse) over a snapshot
@@ -412,18 +710,25 @@ impl Handle {
     /// Writes the memtable to a table now (horton does this by itself when
     /// the memtable fills).
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.call(Request::Flush)
+        self.shared.with(|e| e.room.flush(&mut e.db))
     }
 
     /// Flushes, then compacts every table once, down to the bottom level,
     /// like `LevelDB`'s `CompactRange(nullptr, nullptr)`. This frees the
     /// space of deleted data.
     pub fn compact(&self) -> Result<(), StoreError> {
-        self.call(Request::CompactAll)
+        self.shared.with(|e| {
+            e.room.flush(&mut e.db)?;
+            e.db.request_compaction(0)?;
+            while e.db.compaction_pending() {
+                e.room.job(&mut e.db)?;
+            }
+            Ok(())
+        })
     }
 
     pub fn stats(&self) -> Result<Stats, StoreError> {
-        self.call(Request::Stats)
+        self.shared.with(|e| Ok(e.stats()))
     }
 }
 
@@ -431,7 +736,7 @@ impl Handle {
 /// taken. Released when dropped.
 pub struct Snapshot {
     seq: u64,
-    tx: Sender<Request>,
+    shared: Arc<Shared>,
 }
 
 impl Snapshot {
@@ -443,7 +748,12 @@ impl Snapshot {
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        let _ = self.tx.send(Request::Release(self.seq));
+        let seq = self.seq;
+        // A closed store has no snapshots left to release.
+        let _ = self.shared.with(|e| {
+            e.db.release_snapshot(seq);
+            Ok(())
+        });
     }
 }
 
@@ -483,14 +793,7 @@ impl Iterator for Iter {
             let resumed = self.resume.is_some();
             let seq = self.snapshot.seq;
             let reverse = self.reverse;
-            let page = self.handle.call(|reply| Request::Scan {
-                start,
-                end,
-                reverse,
-                limit: PAGE,
-                seq,
-                reply,
-            });
+            let page = self.handle.page(&start, end.as_deref(), reverse, PAGE, seq);
             match page {
                 Ok((mut entries, done)) => {
                     // Forward pages restart at the resume key, inclusive.
@@ -510,19 +813,30 @@ impl Iterator for Iter {
     }
 }
 
-/// The store thread's state.
+/// Stack for the thread that builds the database: `KvDb::new` returns the
+/// whole database by value (memtable, cache, buffers) before it is boxed,
+/// and a debug build keeps more than one copy on the way.
+const OPEN_STACK: usize = 64 << 20;
+
+/// The database and what serves it. One thread at a time holds it, under
+/// [`Shared::engine`].
 struct Engine {
     db: Box<KvDb<FileDevice>>,
     room: Room,
     batch: Box<GroupBatch>,
-    /// A request taken off the channel that did not fit the last group.
-    held: Option<Request>,
+    /// The writes of the group being committed (kept to reuse its
+    /// allocation).
+    group: Vec<Arc<Pending>>,
+    /// Where a point read lands before it is copied out.
+    val: Box<[u8; VAL_MAX]>,
     /// Background compaction failed (say, `RegionFull`) when the store
     /// had flushed this many times: leave it to the write path, which
     /// reports the error to a caller, until a flush changes the tables. A
     /// failing job reads its inputs before it fails, so retrying it on
     /// every request would stall them all.
     compaction_stuck: Option<u64>,
+    /// Commits are `fdatasync`ed, so a write group costs a disk flush.
+    sync: bool,
     open: OpenReport,
     groups: u64,
     grouped_writes: u64,
@@ -531,9 +845,9 @@ struct Engine {
 impl Engine {
     #[allow(
         clippy::large_stack_frames,
-        reason = "the database is built on the stack before it is boxed; the store thread has 64 MiB"
+        reason = "the database is built on the stack before it is boxed; the opening thread has 64 MiB"
     )]
-    fn open(device: FileDevice) -> Result<(Self, OpenReport), StoreError> {
+    fn open(device: FileDevice, sync: bool) -> Result<Self, StoreError> {
         let blocks = device.blocks();
         let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
         if blocks < min {
@@ -543,7 +857,7 @@ impl Engine {
         }
         let mut db = Box::new(KvDb::new(device, horton::Config::whole_device(blocks)));
         let open = block_on(db.open())?;
-        let engine = Self {
+        Ok(Self {
             db,
             room: Room {
                 scratch: Box::new(KvCompaction::new()),
@@ -552,42 +866,14 @@ impl Engine {
                 steps: 0,
             },
             batch: Box::new(GroupBatch::new()),
-            held: None,
+            group: Vec::new(),
+            val: Box::new([0u8; VAL_MAX]),
             compaction_stuck: None,
+            sync,
             open,
             groups: 0,
             grouped_writes: 0,
-        };
-        Ok((engine, open))
-    }
-
-    fn run(&mut self, rx: &Receiver<Request>) {
-        loop {
-            let req = if let Some(r) = self.held.take() {
-                r
-            } else if self.background_pending() {
-                match rx.try_recv() {
-                    Ok(r) => r,
-                    Err(TryRecvError::Empty) => {
-                        // Idle: compact.
-                        self.background_step();
-                        continue;
-                    }
-                    Err(TryRecvError::Disconnected) => return,
-                }
-            } else {
-                match rx.recv() {
-                    Ok(r) => r,
-                    Err(_) => return,
-                }
-            };
-            self.serve(req, rx);
-            // Busy: one bounded step between requests keeps a pending job
-            // moving without stalling anyone for a whole job.
-            if self.background_pending() {
-                self.background_step();
-            }
-        }
+        })
     }
 
     fn background_pending(&self) -> bool {
@@ -600,87 +886,79 @@ impl Engine {
         }
     }
 
-    fn serve(&mut self, req: Request, rx: &Receiver<Request>) {
-        match req {
-            Request::Write(batch, reply) => self.write_group(batch, reply, rx),
-            Request::DeleteRange(start, end, reply) => {
-                let r = self
-                    .room
-                    .with_room(&mut self.db, |db| block_on(db.delete_range(&start, &end)));
-                let _ = reply.send(r.map_err(StoreError::Db));
-            }
-            Request::Get(key, seq, reply) => {
-                let mut buf = vec![0u8; VAL_MAX];
-                let r = block_on(self.db.get_at(&key, &mut buf, seq)).map(|n| {
-                    n.map(|n| {
-                        buf.truncate(n);
-                        buf
-                    })
-                });
-                let _ = reply.send(r.map_err(StoreError::Db));
-            }
-            Request::Scan {
-                start,
-                end,
-                reverse,
-                limit,
-                seq,
-                reply,
-            } => {
-                let r = if reverse {
-                    self.scan_rev(&start, end.as_deref(), limit, seq)
-                } else {
-                    self.scan_fwd(&start, end.as_deref(), limit, seq)
-                };
-                let _ = reply.send(r.map_err(StoreError::Db));
-            }
-            Request::Snapshot(reply) => {
-                let _ = reply.send(self.db.snapshot().map_err(StoreError::Db));
-            }
-            Request::Release(seq) => self.db.release_snapshot(seq),
-            Request::Flush(reply) => {
-                let _ = reply.send(self.room.flush(&mut self.db).map_err(StoreError::Db));
-            }
-            Request::CompactAll(reply) => {
-                let r = self.room.flush(&mut self.db).and_then(|()| {
-                    self.db.request_compaction(0)?;
-                    while self.db.compaction_pending() {
-                        self.room.job(&mut self.db)?;
-                    }
-                    Ok(())
-                });
-                let _ = reply.send(r.map_err(StoreError::Db));
-            }
-            Request::Stats(reply) => {
-                let _ = reply.send(Ok(self.stats()));
+    fn get(&mut self, key: &[u8], seq: u64) -> Result<Option<Vec<u8>>, DbError> {
+        let n = block_on(self.db.get_at(key, &mut self.val[..], seq))?;
+        Ok(n.map(|n| self.val[..n].to_vec()))
+    }
+
+    /// Serves the queue from its head, in order: each point read, and
+    /// each run of writes as a group. Stops when the queue is empty or
+    /// after [`SERVE_MAX`] turns.
+    ///
+    /// `me` is the caller's own request. Once it is done the caller goes
+    /// on serving others only while that is cheap: it stops before a
+    /// write group that will be `fdatasync`ed. Its client's next write
+    /// can then join that group instead of waiting a flush behind it,
+    /// which is what makes synced groups large.
+    fn serve(&mut self, queue: &Mutex<VecDeque<Arc<Pending>>>, me: &Pending) {
+        for _ in 0..SERVE_MAX {
+            let leave_writes = self.sync && me.done.get().is_some();
+            let Some(next) = self.take_group(queue, leave_writes) else {
+                return;
+            };
+            match &next.work {
+                Work::Get(key, seq) => {
+                    let r = self.get(key, *seq).map_err(StoreError::Db);
+                    next.finish(r);
+                }
+                Work::Write(_) => self.commit_group(),
             }
         }
     }
 
-    /// Commits `first` together with every write queued behind it that
-    /// fits the same WAL block.
-    fn write_group(&mut self, first: Batch, reply: Reply<u64>, rx: &Receiver<Request>) {
-        let mut bytes = first.wal_bytes();
-        let mut ops = first.ops.len();
-        let mut group = vec![(first, reply)];
-        while let Ok(next) = rx.try_recv() {
-            match next {
-                Request::Write(b, r)
-                    if bytes + b.wal_bytes() <= BLOCK && ops + b.ops.len() <= GROUP_OPS =>
-                {
-                    bytes += b.wal_bytes();
-                    ops += b.ops.len();
-                    group.push((b, r));
-                }
-                other => {
-                    self.held = Some(other);
+    /// Takes the request at the head of `queue`. If it is a write, it and
+    /// every write queued directly behind it that fits the same WAL
+    /// block are moved into `self.group`; with `leave_writes`, a write at
+    /// the head stays queued and nothing is taken.
+    fn take_group(
+        &mut self,
+        queue: &Mutex<VecDeque<Arc<Pending>>>,
+        leave_writes: bool,
+    ) -> Option<Arc<Pending>> {
+        let mut queue = lock(queue);
+        if leave_writes && matches!(queue.front()?.work, Work::Write(_)) {
+            return None;
+        }
+        let head = queue.pop_front()?;
+        if let Work::Write(first) = &head.work {
+            self.group.clear();
+            // The head always goes: `Handle::write` checked that it fits
+            // a block by itself.
+            let (mut bytes, mut ops) = (first.wal_bytes(), first.ops.len());
+            self.group.push(Arc::clone(&head));
+            while let Some(Work::Write(b)) = queue.front().map(|p| &p.work) {
+                bytes += b.wal_bytes();
+                ops += b.ops.len();
+                if bytes > BLOCK || ops > GROUP_OPS {
                     break;
                 }
+                self.group.extend(queue.pop_front());
             }
         }
+        drop(queue);
+        Some(head)
+    }
+
+    /// Commits the writes in `self.group` as one batch and tells each of
+    /// them the result.
+    fn commit_group(&mut self) {
         self.batch.clear();
         let mut result = Ok(());
-        for op in group.iter().flat_map(|(b, _)| &b.ops) {
+        let writes = self.group.iter().filter_map(|p| match &p.work {
+            Work::Write(b) => Some(b),
+            Work::Get(..) => None,
+        });
+        for op in writes.flat_map(|b| &b.ops) {
             let r = match op {
                 BatchOp::Put(k, v) => self.batch.put(k, v),
                 BatchOp::Delete(k) => self.batch.delete(k),
@@ -693,14 +971,17 @@ impl Engine {
             }
         }
         let batch = &*self.batch;
-        let result = result.and_then(|()| {
-            self.room
-                .with_room(&mut self.db, |db| block_on(db.write(batch)))
-        });
+        let result = result
+            .and_then(|()| {
+                self.room
+                    .with_room(&mut self.db, |db| block_on(db.write(batch)))
+            })
+            .map(|_| None)
+            .map_err(StoreError::Db);
         self.groups += 1;
-        self.grouped_writes += group.len() as u64;
-        for (_, reply) in group {
-            let _ = reply.send(result.map_err(StoreError::Db));
+        self.grouped_writes += self.group.len() as u64;
+        for p in self.group.drain(..) {
+            p.finish(result.clone());
         }
     }
 
@@ -1117,5 +1398,104 @@ mod tests {
         let stats = store.stats().expect("stats");
         assert_eq!(stats.slots.used, 0, "{:?}", stats.slots);
         assert_eq!(store.range(b"", None, false).expect("range").count(), 0);
+    }
+
+    /// Flat combining: a thread's request is often served by another
+    /// thread, and requests are served in the order they were queued. So
+    /// a thread always reads its own last write, whoever did the work,
+    /// and never a later or an earlier one.
+    #[test]
+    fn every_thread_reads_its_own_writes_through_the_queue() {
+        let store = TempStore::new("combine");
+        std::thread::scope(|s| {
+            for t in 0..6usize {
+                let h = store.handle();
+                s.spawn(move || {
+                    let k = key(t);
+                    for i in 0..400usize {
+                        let v = format!("{t}:{i}").into_bytes();
+                        h.put(&k, &v).expect("put");
+                        assert_eq!(h.get(&k).expect("get"), Some(v), "thread {t} write {i}");
+                        if i % 50 == 49 {
+                            h.delete(&k).expect("delete");
+                            assert_eq!(h.get(&k).expect("get"), None, "thread {t} delete {i}");
+                        }
+                    }
+                    h.put(&k, b"last").expect("put");
+                });
+            }
+        });
+        for t in 0..6usize {
+            assert_eq!(store.get(&key(t)).expect("get"), Some(b"last".to_vec()));
+        }
+        let stats = store.stats().expect("stats");
+        // 400 puts, 8 deletes and the last put, from each of 6 threads.
+        assert_eq!(stats.grouped_writes, 6 * 409);
+        assert!(stats.groups <= stats.grouped_writes);
+    }
+
+    /// Dropping the `Store` closes it. Handles that outlive it fail
+    /// cleanly, and the file is free to be opened again at once.
+    #[test]
+    fn a_closed_store_refuses_calls_and_frees_its_file() {
+        let mut store = TempStore::new("closed");
+        store.put(b"k", b"v").expect("put");
+        let stale = store.handle();
+        let snapshot = stale.snapshot().expect("snapshot");
+        store.reopen();
+        assert_eq!(stale.get(b"k"), Err(StoreError::Closed));
+        assert_eq!(stale.put(b"k", b"w"), Err(StoreError::Closed));
+        assert_eq!(stale.flush(), Err(StoreError::Closed));
+        assert!(matches!(
+            stale.range(b"", None, false),
+            Err(StoreError::Closed)
+        ));
+        // Releasing a snapshot of a closed store is a no-op, not a panic.
+        drop(snapshot);
+        // The reopened store has the write, and none of the refused ones.
+        assert_eq!(store.get(b"k").expect("get"), Some(b"v".to_vec()));
+    }
+
+    /// Reads, writes, scans and a forced compaction from many threads at
+    /// once: every operation completes (no request is left unserved, no
+    /// thread is left parked) and the store ends up exactly as written.
+    #[test]
+    fn mixed_load_leaves_nothing_waiting() {
+        let store = TempStore::new("mixed");
+        std::thread::scope(|s| {
+            for t in 0..4usize {
+                let h = store.handle();
+                s.spawn(move || {
+                    for i in 0..1500usize {
+                        let k = key(t * 10_000 + i);
+                        h.put(&k, &k).expect("put");
+                        if i % 97 == 0 {
+                            let page = h
+                                .scan(&key(t * 10_000), None, false, 5, None)
+                                .expect("scan");
+                            assert_eq!(page.first().map(|e| e.0.clone()), Some(key(t * 10_000)));
+                        }
+                        if i % 500 == 499 {
+                            h.flush().expect("flush");
+                        }
+                    }
+                });
+            }
+            let h = store.handle();
+            s.spawn(move || {
+                for _ in 0..3 {
+                    h.compact().expect("compact");
+                }
+            });
+        });
+        for t in 0..4usize {
+            let got = keys(
+                &store,
+                &key(t * 10_000),
+                Some(&key(t * 10_000 + 9999)),
+                false,
+            );
+            assert_eq!(got.len(), 1500, "thread {t}");
+        }
     }
 }

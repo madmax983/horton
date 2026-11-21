@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman06" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman07" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -38,7 +38,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman06".
+/// Manifest block magic: ASCII "hrtman07".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -47,10 +47,13 @@ use crate::error::Error;
 /// with the per-table `rdel_blocks` count; "hrtman04" added the persisted
 /// sequence floors `flushed_seq` and `seq_high`; "hrtman05" (v0.17) spreads
 /// a copy over as many blocks as it needs; "hrtman06" adds the per-table
-/// replica-merge origin (`node_id`, `seal_wall`). A foreign magic decodes
+/// replica-merge origin (`node_id`, `seal_wall`); "hrtman07" (v0.20) has
+/// the same layout and names tables in the `hrtsst03` format, so an
+/// image whose tables carry the older bloom filter is rejected when it
+/// is opened, not at its first read. A foreign magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman06");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman07");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.

@@ -25,8 +25,11 @@ history keeps it); its §9 milestone log now lives in
 | [0011](0011-multi-block-manifest-and-edits.md) | Multi-block manifest copies, an optional copy ring, and commits staged as small edits |
 | [0012](0012-nor-flash-endurance.md) | NOR endurance: `WriteBatch` group commit and a manifest ring; no page-program path yet |
 | [0013](0013-capacity-errors-name-their-remedy.md) | `NoSpace` split into errors that each name their remedy |
-| [0014](0014-cache-hits-reverify-crc.md) | Block-cache hits re-verify the CRC; no skip-on-hit, correctness over speed |
+| [0014](0014-cache-hits-reverify-crc.md) | Block-cache hits re-verify the CRC; no skip-on-hit, correctness over speed (superseded by 0016) |
 | [0015](0015-tight-jobs-and-requested-compaction.md) | Tight jobs run at the reserve and never grow the region; `request_compaction` compacts below the triggers |
+
+| [0016](0016-cache-hits-reverify-with-a-ram-checksum.md) | Only CRC-verified blocks are cached; hits re-verify against a per-chunk RAM checksum, not CRC-32 |
+| [0017](0017-bucketed-bloom-and-ranged-reads.md) | Bloom probes stay in one 64-byte bucket; point reads fetch ranges of the footer and bloom blocks (`hrtsst03`) |
 
 ## Adding a record
 

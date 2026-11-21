@@ -1178,22 +1178,25 @@ fn lookup_outcome(reader: &TableReader<MemDevice<BLOCK>, BLOCK, 1024>, key: &[u8
     }
 }
 
-/// A poisoned cache entry must not bypass the read path's checks: the same
-/// poisoned bytes served from the cache and read straight from the device
-/// must produce identical outcomes — CRC, magic, decompression, and parse
-/// checks all run *after* the cache, on identical bytes.
+/// A damaged block must read the same with a cache as without one, the
+/// first time and every time after. The cache holds only images whose
+/// CRC matched (ADR-0016), so a block that fails its CRC is never
+/// inserted and reports the corruption on every read; a block that was
+/// damaged but carries a valid CRC is cached like any other, and the
+/// parse and decompression checks reject it identically from the cache.
 #[test]
 #[allow(clippy::cast_possible_truncation)]
 fn cache_poisoned_block_matches_device() {
     use core::cell::RefCell;
     let base = 200u64;
-    let (dev, pristine, nblocks) = sstable_corpus_compressed(base);
+    let (_dev, pristine, nblocks) = sstable_corpus_compressed(base);
     let footer = base + nblocks - 1;
     let data_block = base; // first data block; ckey000.. live here
     let keys: Vec<Vec<u8>> = (0..12u64)
         .map(|j| format!("ckey{j:03}").into_bytes())
         .collect();
     let iters: usize = if cfg!(miri) { 5 } else { 150 };
+    let (mut cached_valid, mut refused) = (0u32, 0u32);
     for i in 0..iters {
         let mut rng = Lcg::new(SEED.wrapping_add(0xC000 + i as u64));
         // Poisoned image: mutate the true block, sometimes repairing the
@@ -1201,11 +1204,17 @@ fn cache_poisoned_block_matches_device() {
         let mut poisoned = pristine[data_block as usize];
         let repair = rng.next().is_multiple_of(2);
         mutate(&mut rng, core::slice::from_mut(&mut poisoned), repair);
+        let crc_ok = horton::crc::crc32(&poisoned[..BLOCK - 4])
+            == u32::from_le_bytes(poisoned[BLOCK - 4..].try_into().unwrap());
 
-        // Path A: the poisoned image served from the cache.
+        // One device holding the poisoned block, read two ways.
+        let mut dev = MemDevice::<BLOCK>::new();
+        dev.blocks_mut().extend_from_slice(&pristine);
+        dev.blocks_mut()[data_block as usize] = poisoned;
+
+        // Path A: through a cache.
         let cache = RefCell::new(BlockCache::<BLOCK, 8>::new());
         let port: &dyn CachePort<BLOCK> = &cache;
-        port.put(7, data_block, &poisoned, true);
         let mut scratch = [0u8; BLOCK];
         let reader_a = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, 1024>::open_cached(
             &dev,
@@ -1216,24 +1225,43 @@ fn cache_poisoned_block_matches_device() {
         ))
         .unwrap();
 
-        // Path B: the same poisoned bytes read straight from the device.
-        let mut dev_b = MemDevice::<BLOCK>::new();
-        dev_b.blocks_mut().extend_from_slice(&pristine);
-        dev_b.blocks_mut()[data_block as usize] = poisoned;
+        // Path B: straight from the device.
         let mut scratch_b = [0u8; BLOCK];
         let reader_b = block_on(TableReader::<MemDevice<BLOCK>, BLOCK, 1024>::open(
-            &dev_b,
+            &dev,
             &mut scratch_b,
             footer,
         ))
         .unwrap();
 
-        for k in &keys {
-            assert_eq!(
-                lookup_outcome(&reader_a, k),
-                lookup_outcome(&reader_b, k),
-                "iter {i} key {k:?}: cache bypassed a read-path check"
-            );
+        // Twice: the second pass is served from whatever the first cached.
+        for pass in 0..2 {
+            for k in &keys {
+                assert_eq!(
+                    lookup_outcome(&reader_a, k),
+                    lookup_outcome(&reader_b, k),
+                    "iter {i} pass {pass} key {k:?}: the cache changed a read's outcome"
+                );
+            }
         }
+
+        // What the cache kept of the poisoned block: nothing unless its
+        // CRC matched, and then exactly the device's bytes.
+        let mut image = [0u8; BLOCK];
+        let held = cache.borrow_mut().get_into(7, data_block, &mut image);
+        if held {
+            assert!(crc_ok, "iter {i}: a block that fails its CRC was cached");
+            assert_eq!(image, poisoned, "iter {i}: cached bytes differ");
+            cached_valid += 1;
+        } else if !crc_ok {
+            refused += 1;
+        }
+    }
+    if !cfg!(miri) {
+        // Both halves of the rule were exercised.
+        assert!(
+            cached_valid > 0 && refused > 0,
+            "{cached_valid} cached, {refused} refused"
+        );
     }
 }

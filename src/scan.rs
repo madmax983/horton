@@ -519,7 +519,7 @@ impl<
     /// through the flag check would misread a coincidental bit).
     async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
-        sstable::read_block_cached(
+        sstable::read_block_verified(
             db.device(),
             Some(db.cache_port()),
             table_id,
@@ -528,7 +528,6 @@ impl<
             true,
         )
         .await?;
-        sstable::check_block_crc::<D::Error, BLOCK>(&self.block, id)?;
         self.block_id = Some(id);
         Ok(())
     }
@@ -1415,7 +1414,7 @@ impl<
     /// through the flag check would misread a coincidental bit).
     async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         let db = self.db;
-        sstable::read_block_cached(
+        sstable::read_block_verified(
             db.device(),
             Some(db.cache_port()),
             table_id,
@@ -1424,7 +1423,6 @@ impl<
             true,
         )
         .await?;
-        sstable::check_block_crc::<D::Error, BLOCK>(&self.block, id)?;
         self.block_id = Some(id);
         Ok(())
     }
