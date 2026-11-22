@@ -266,21 +266,22 @@ compress by half, four client threads), and
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 263 K | 224 K | 247 K |
-| `fillrandom`, no fsync | 157 K | 66 K | 193 K |
-| `fillrandom`, fdatasync on | 14.4 K (2.6 writes per commit) | | 15.8 K (100 K keys) |
-| `readrandom` | 269 K | 135 K | 386 K |
-| `readmissing` | 626 K | 385 K | 4,289 K |
-| `seekrandom` | 170 K | 52 K | 357 K |
-| `readseq`, entries/s over four scanning threads | 15,444 K | 7,205 K | 20,499 K |
-| `readreverse`, the same | 8,348 K | 4,178 K | 16,838 K |
+| `fillseq`, no fsync | 249 K | 196 K | 242 K |
+| `fillrandom`, no fsync | 151 K | 67 K | 177 K |
+| `fillrandom`, fdatasync on | 14.6 K (2.6 writes per commit) | | 16.2 K (100 K keys) |
+| `readrandom` | 338 K | 185 K | 360 K |
+| `readmissing` | 637 K | 668 K | 4,023 K |
+| `seekrandom` | 74 K | 93 K | 331 K |
+| `readseq`, entries/s over four scanning threads | 11,087 K | 7,712 K | 20,218 K |
+| `readreverse`, the same | 6,540 K | 4,535 K | 15,202 K |
 
-These are single runs, and the read rows move by a third from one run
-to the next with the number of level-0 tables the fills leave.
+These are single runs, and the read rows move from one run to the next
+with the number of level-0 tables the fills leave (`seekrandom` most:
+45 K to 120 K at 1 M keys).
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
 spread, where the time goes, and what v0.20 changed. Against 0.19, at
-1 M keys on four threads, point reads are 19 times faster, reads of
-absent keys 48 times, seeks 26 times and scans 34 times.
+1 M keys on four threads, point reads are 26 times faster, reads of
+absent keys 84 times, seeks 47 times and scans 37 times.
 
 ### Where horton stops at host scale
 
@@ -294,11 +295,11 @@ These are the limits it meets, and each is a property of the library:
   block and a data block, each checked whole, and the data block
   inflated, on every read: the cache keeps the compressed image. A
   block that is not cached costs a 16 KiB CRC in software on top
-  (8 µs). Readers do run in parallel, so four threads get about three
-  and a half cores' worth of such reads. Reads of absent keys, which
+  (8 µs). Readers do run in parallel, so four threads do 3.7 times
+  one thread's rate of such reads. Reads of absent keys, which
   are only the cheap part (1.5 µs), do not scale past one thread's
   rate: every read queues for its memtable probe, and the queue serves
-  four threads at a third of the rate it serves one.
+  four threads at well under half the rate it serves one.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
@@ -312,12 +313,12 @@ These are the limits it meets, and each is a property of the library:
 - **One thread at a time writes.** Writes, flushes and compaction
   steps take turns under the engine lock (the table work of reads,
   scans and seeks runs outside it), so random writes at scale are
-  bound by flush and compaction (66 K ops/s at 1 M keys, where RocksDB's
-  background threads keep it at 193 K).
+  bound by flush and compaction (67 K ops/s at 1 M keys, where RocksDB's
+  background threads keep it at 177 K).
 - **A scan pays for its memory.** With one block for all its table
   cursors, which is what firmware gives it, a merge over overlapping
   tables decodes a block again each time it changes table: 0.5 M
-  entries/s here. Lent 32 blocks it does 1.8 M on one thread. Each
+  entries/s here. Lent 32 blocks it does 1.9 M on one thread. Each
   `next` still compares the head of every table in range, and a
   reverse seek still positions all of them.
 - **Batches are one WAL block**, keys and values have compile-time

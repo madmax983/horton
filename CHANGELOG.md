@@ -25,8 +25,8 @@ unsynced writes 1.4 to 2.4 times; synced writes are unchanged. With
 detached reads the host store's point reads, scans and seeks also run
 on every reader thread at once, and with bloom filters sized to their
 tables a read of an absent key stops at the filter: at 1 M keys on
-four threads, point reads are 19 times 0.19's rate, reads of absent
-keys 48 times, seeks 26 times and scans 34 times.
+four threads, point reads are 26 times 0.19's rate, reads of absent
+keys 84 times, seeks 47 times and scans 37 times.
 
 ### Added
 
