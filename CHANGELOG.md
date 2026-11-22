@@ -149,6 +149,17 @@ keys 48 times, seeks 26 times and scans 34 times.
   its `bench` takes `--read-threads N`, so reads can be measured over
   tables that fills on one thread always leave the same.
 - A compaction job reuses its table writer in place for each output.
+- **The kvstore's block cache is its own, and a hit in it takes no
+  lock and writes nothing shared** (`examples/kvstore/cache.rs`,
+  ADR-0022). Entries are immutable; each reader thread keeps a view of
+  the slots it uses and checks one atomic epoch per slot; the reference
+  bit is tested before it is set; counters are per thread. Hits are
+  still checked against a RAM checksum (ADR-0016), now kept per 256
+  bytes. It replaces the library's `BlockCache` in eight locked
+  shards.
+- The kvstore's `bench` has `readoutside`: reads of keys past every
+  table, which touch no table and no cache, to tell the store's own
+  cost per read from the tables'.
 - **kvstore tables carry up to sixteen bloom blocks** (`bloom_bytes` is
   255 KiB), and the store boxes its flush future, which holds the
   writer and so the filter.
@@ -169,7 +180,7 @@ keys 48 times, seeks 26 times and scans 34 times.
   memtable's part (a probe, or a page's slice) is served through the
   request queue; the caller then reads the tables on its own thread,
   through a read-only handle to the file and a 16 MiB cache shared by
-  all readers (horton's `BlockCache` in eight locked shards). Scans
+  all readers. Scans
   lend each page 32 block buffers. Flush and compaction wait for
   readers in their table phase to leave. The `Db`'s own cache is off:
   no read goes through the `Db` any more. `bench`'s `readseq` and

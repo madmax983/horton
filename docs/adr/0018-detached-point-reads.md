@@ -1,6 +1,7 @@
 # ADR-0018: Detached point reads: the table phase runs without the `Db`
 
-Status: Accepted (unreleased, 2026-11-21)
+Status: Accepted (unreleased, 2026-11-21). The kvstore's reader cache
+described below was replaced by ADR-0022; the protocol stands.
 
 ## Context
 

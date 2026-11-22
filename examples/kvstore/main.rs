@@ -20,6 +20,7 @@
 //! `RocksDB`'s `db_bench`; `docs/THROUGHPUT.md` reads the result.
 
 mod bench;
+mod cache;
 mod crash;
 mod device;
 mod store;
@@ -68,7 +69,7 @@ pub const MEMTABLE_ARENA: usize = 1 << 20;
 // filter in RAM while it writes (`BLOOM_BYTES`, 255 KiB), which is what
 // lets a filter span blocks at all.
 //
-// The block cache is the store's own (`store::SharedCache`, 16 MiB;
+// The block cache is the store's own (`cache::SharedCache`, 16 MiB;
 // LevelDB's default is 8, RocksDB's 32): point reads and scans both run
 // outside the `Db`, on their callers' threads, and share it. The cache
 // inside the `Db` would serve only reads made through the `Db` itself,

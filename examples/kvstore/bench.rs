@@ -200,6 +200,7 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
             "fillrandom" | "overwrite" => fill(&store, &p, true),
             "readrandom" => read_random(&store, &p.readers(), false),
             "readmissing" => read_random(&store, &p.readers(), true),
+            "readoutside" => read_outside(&store, &p.readers()),
             "readseq" => read_seq(&store, &p.readers(), false),
             "readreverse" => read_seq(&store, &p.readers(), true),
             "seekrandom" => seek_random(&store, &p.readers()),
@@ -337,6 +338,31 @@ fn read_random(store: &Store, p: &Params, missing: bool) -> Result<Done, String>
     done.note = format!("({} of {} found)", done.found, done.ops);
     if missing && done.found != 0 {
         return Err(format!("{} missing keys were found", done.found));
+    }
+    Ok(done)
+}
+
+/// Reads of keys past every key in the store. No table's range covers
+/// them, so no table and no cache is consulted: what is left is what a
+/// read costs in the store itself, its queue and its memtable probe.
+/// `db_bench` has no such workload; it is here to tell that cost apart
+/// from the tables'. Not in the default list.
+fn read_outside(store: &Store, p: &Params) -> Result<Done, String> {
+    let mut done = clients(store, p, |h, t, share| {
+        let mut rng = Rng::new(3000 + t);
+        let mut d = Done::default();
+        for _ in 0..share {
+            // '~' sorts after every digit a key is made of.
+            let mut k = [b'~'; 17];
+            k[1..].copy_from_slice(&key(rng.below(p.num)));
+            d.found += u64::from(h.get(&k).map_err(|e| e.to_string())?.is_some());
+        }
+        d.ops = share;
+        Ok(d)
+    })?;
+    done.note = format!("({} of {} found)", done.found, done.ops);
+    if done.found != 0 {
+        return Err(format!("{} keys outside the store were found", done.found));
     }
     Ok(done)
 }

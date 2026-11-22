@@ -64,12 +64,12 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
 - **Synced writes did not change**, and all three engines are within
   a fifth of each other there: each waits for the same `fdatasync`.
 - **What remains.** One thread at a time writes, and flush and
-  compaction run on the writers' time. An absent-key read is now
-  mostly serial: four threads do little more of them than one. A
-  block is 16 KiB, CRC'd in software and cached compressed. Most of
-  that is what makes horton fit in 112 KiB on an ESP32-S3; the serial
-  part of a read is the host store's own, and is the next thing to
-  take out.
+  compaction run on the writers' time. Every point read queues for
+  its memtable probe, and the queue serves four threads no faster
+  than one, so absent-key reads do not scale at all. A block is
+  16 KiB, CRC'd in software and cached compressed. Most of that is
+  what makes horton fit in 112 KiB on an ESP32-S3; the queue is the
+  host store's own, and is the next thing to take out.
 
 ## Method
 
@@ -87,7 +87,7 @@ benchmark list on three configurations and prints ops/s side by side:
 |---|---|---|---|---|
 | **RocksDB, as shipped** | 64 MiB | 32 MiB, uncompressed blocks | 4 KiB, Snappy | background threads |
 | **RocksDB, same memory** | 1 MiB | 16 MiB, uncompressed blocks | 16 KiB, Snappy | background threads |
-| **horton** (`examples/kvstore`) | 1 MiB, 4096 entries | 16 MiB, compressed images, in 8 locked shards; 32 decoded blocks (512 KiB) per scanning thread | 16 KiB, LZ77 | on the calling thread, each holding a 255 KiB bloom filter while it writes a table |
+| **horton** (`examples/kvstore`) | 1 MiB, 4096 entries | 16 MiB, compressed images, read without locks (ADR-0022); 32 decoded blocks (512 KiB) per scanning thread | 16 KiB, LZ77 | on the calling thread, each holding a 255 KiB bloom filter while it writes a table |
 
 All three: 16-byte keys, 100-byte values that compress to half, 10
 bloom bits per key, a write-ahead log, 4 client threads, one file
@@ -419,6 +419,60 @@ sequenceDiagram
     16,814 and 16,905 after), and nothing in the change would make a
     seek cost more: it reads one block fewer.
 
+### Then: a cache whose hits write nothing shared
+
+12. **The readers' cache takes no lock on a hit** (kvstore, ADR-0022).
+    The cache the readers shared was the library's `BlockCache` in
+    eight shards, each behind a lock. Every hit wrote shared memory:
+    the lock, a reference bit, a counter. A cached block is named by
+    its table and block ids, and a table id is never reused, so an
+    entry is never wrong, only evicted. The kvstore's own cache uses
+    that: entries are immutable, each reader thread keeps a view of the
+    slots it uses and compares one atomic epoch per slot, and only an
+    insert or an eviction takes a lock. The RAM checksum on every hit
+    (ADR-0016) is kept, per 256 bytes.
+
+    On identical tables (fills on one thread), 1 M keys, means of two
+    runs at one reader thread and three at four:
+
+    | | reader threads | locked shards | lock-free hits | change |
+    |---|---:|---:|---:|---:|
+    | `readrandom` | 1 | 51,051 | 51,194 | 0% |
+    | `readrandom` | 4 | 152,974 | 182,986 | +20% |
+    | `seekrandom` | 1 | 17,403 | 17,192 | -1% |
+    | `seekrandom` | 4 | 55,966 | 66,003 | +18% |
+    | `readmissing` | 1 | 535,932 | 658,564 | +23% |
+    | `readmissing` | 4 | 570,496 | 635,650 | +11% |
+    | `readoutside` | 1 | 1,670,505 | 1,638,345 | -2% |
+    | `readoutside` | 4 | 577,800 | 635,836 | +10% |
+    | `readseq` | 1 | 1,935,718 | 1,898,063 | -2% |
+    | `readseq` | 4 | 7,290,771 | 7,124,246 | -2% |
+    | `readreverse` | 1 | 1,092,332 | 1,092,159 | 0% |
+    | `readreverse` | 4 | 4,162,125 | 4,288,337 | +3% |
+
+    Where the tables are what a read waits on, four threads gain a
+    fifth: present-key reads and seeks. An absent-key read gains a
+    quarter on one thread (1.87 µs to 1.52 µs).
+
+    On four threads absent-key reads did not gain, and `readoutside`
+    says why. It reads keys past every table, so it consults no table
+    and no cache: it is the request queue and the memtable probe and
+    nothing else. One thread does 1.65 M of those a second. Four
+    threads do 0.6 M between them. Absent-key reads at four threads
+    run at exactly that rate, in both builds. They were bound by the
+    queue before this change and they are bound by it after. (The 10%
+    between the two builds on `readoutside`, which neither build's
+    cache touches, is how far apart two four-thread runs land.)
+
+    Forward scans are 2% slower in both rows. The first version of
+    this cache lost 3% to 5%: a scan evicting a block it had itself
+    read a page earlier still held a reference to it, so the entry
+    could not be reused and each such eviction allocated 17 KiB. The
+    inserting thread now lets go of its own reference first. The 2%
+    that is left is the size of the spread between runs here
+    (`readoutside` on one thread, which this change does not touch,
+    also moved by 2%), and is not explained.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
@@ -427,7 +481,7 @@ sequenceDiagram
 | `fillrandom` | 0.34× | flush and compaction run on the writers' time; RocksDB's run on other cores |
 | `overwrite` | 0.40× | the same |
 | `readrandom` | 0.35× | a read is 21 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
-| `readmissing` | 0.09× to 0.17× | 2.3 µs on one thread, and four threads do little more than one: every probe goes through the engine's queue and then through locks on the shared cache |
+| `readmissing` | 0.09× to 0.17× | 1.5 µs on one thread, and four threads do no more than one: every read queues for its memtable probe, and the queue serves four threads at a third of the rate it serves one |
 | `readseq` | 0.35× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
 | `readreverse` | 0.25× | the same, and stepping backwards through a block's version runs costs more than forwards |
 | `seekrandom` | 0.14× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
@@ -446,18 +500,21 @@ the page copy are served from the request queue. That is the serial
 part: point reads scale by 3.4 on four cores, not 4. Scans, which
 take the lock once per 1,024 entries, scale by 4.
 
-**An absent-key read is now nearly all serial.** With the filters
-doing their work it is the memtable probe and, per table, two small
-reads from the cache: the footer's fields and one bloom bucket. One
-thread does it in 2.3 µs. Four threads do 415 K to 723 K a second
-between them, which is one thread's rate, not four. A profile of four
-threads reading absent keys puts 60% of their time in the shared
-cache's ranged read (44% in the read and its checksum, 8% finding the
-slot, 8% waiting for a shard's lock) and about 14% in the request
-queue. Every reader asks for the same few footers and bloom blocks,
-each hit takes a shard's lock and writes its reference bit and hit
-count, and those cache lines travel between the cores. RocksDB keeps
-a table's filter with the open table and reads it without a lock.
+**The request queue is what four reader threads wait on.** A read's
+memtable probe is served through the queue, by whichever thread holds
+the engine lock. `readoutside`, which does that and nothing else, runs
+at 1.65 M reads a second on one thread and at 0.6 M on four: the queue
+serves four threads at about a third of the rate it serves one. Every
+kind of point read pays it. Absent-key reads, whose table work is now
+under a microsecond, are bound by it outright: four threads do 0.6 M a
+second, where one does 0.66 M.
+
+An earlier profile of four threads reading absent keys put 60% of
+their time in the old cache's ranged read and 14% in the queue, and
+that was read as the cache being the limit. It was where the time
+went, not what the rate waited on: with the cache's locks gone
+(ADR-0022) the four-thread rate did not move. RocksDB takes no lock
+and joins no queue on this path.
 
 **A point read that misses the cache is expensive.** It reads a 16 KiB
 block, CRCs it in software (8.3 µs; `unsafe` is forbidden, so no
@@ -483,11 +540,12 @@ of LZ77, 8 µs of CRC and a write. It is the largest single item in
 
 Measured or scoped while doing this, and left:
 
-- **Cache hits that write nothing shared**, and a memtable probe that
-  does not queue. These two are what an absent-key read now waits on
-  at four threads. The first is the host cache's design (a lock, a
-  reference bit and a counter per hit); the second needs a memtable a
-  reader can search while a writer appends.
+- **A memtable probe that does not queue.** This is what a point read
+  waits on at four threads (`readoutside` above). The probe itself is
+  a search of RAM; what it queues for is the engine lock, which it
+  shares with every write. Letting readers probe side by side needs
+  either a lock readers can share or a memtable a reader can search
+  while a writer appends.
 - **Compaction off the writers' thread.** A compaction job reads
   tables and writes new ones. If its merge ran detached, the way reads
   now do, with only its commit under the lock, it would use the cores

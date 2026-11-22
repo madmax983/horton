@@ -50,8 +50,9 @@
 //!   does not settle the read, the caller is handed the probe and the
 //!   current manifest, and reads the tables itself, on its own thread,
 //!   with its own buffers, through a read-only handle to the file and a
-//!   cache shared by all readers ([`SharedCache`]). Any number of threads
-//!   do that at once, and writes go on meanwhile.
+//!   cache shared by all readers ([`SharedCache`]), in which a hit takes
+//!   no lock and writes nothing another reader reads. Any number of
+//!   threads do that at once, and writes go on meanwhile.
 //! - **So do scans** (ADR-0019). A scan runs a page at a time. For each
 //!   page the queue hands the caller a copy of the slice of the memtable
 //!   the page can reach, the current manifest and a pin; the caller then
@@ -83,11 +84,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use horton::wal::WAL_RECORD_OVERHEAD;
-use horton::{
-    BlockCache, CachePort, CacheStats, Error, OpenReport, Progress, ScanBlock, SlotStats,
-    WriteBatch,
-};
+use horton::{CachePort, Error, OpenReport, Progress, ScanBlock, SlotStats, WriteBatch};
 
+use crate::cache::SharedCache;
 use crate::device::{FileDevice, IoError, IoStats, ReadDevice};
 use crate::{
     BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
@@ -129,11 +128,6 @@ const SERVE_MAX: usize = 64;
 /// woken sooner whenever there is something for it to do; this bounds the
 /// cost of a wake-up that was missed.
 const PARK: Duration = Duration::from_millis(2);
-
-/// Shards of the readers' block cache, each behind its own lock, and the
-/// blocks in each: 8 x 128 x 16 KiB = 16 MiB.
-const CACHE_SHARDS: usize = 8;
-const SHARD_BLOCKS: usize = 128;
 
 /// Block buffers a scanning thread lends each scan: one for every table
 /// the store can hold, and a few for index blocks. 512 KiB a thread.
@@ -442,86 +436,6 @@ impl Pending {
             Some(Err(e)) => Err(e.clone()),
             None => Err(StoreError::Closed),
         }
-    }
-}
-
-/// The block cache point reads share: horton's [`BlockCache`] in
-/// [`CACHE_SHARDS`] shards, each behind a lock, so readers on different
-/// threads rarely wait for one another. A block lives in the shard its
-/// key hashes to.
-///
-/// horton re-checks every hit against a checksum of the cached image
-/// (ADR-0016), and that holds here unchanged: the check runs inside the
-/// shard's `BlockCache`.
-pub struct SharedCache {
-    shards: Vec<Mutex<Box<BlockCache<BLOCK, SHARD_BLOCKS>>>>,
-}
-
-impl SharedCache {
-    /// An empty cache. Each shard is a megabyte and is built on the
-    /// stack before it is boxed: call this on a thread with room.
-    #[allow(
-        clippy::large_stack_frames,
-        reason = "a shard is built on the stack before it is boxed; the opening thread has 64 MiB"
-    )]
-    fn new() -> Self {
-        Self {
-            shards: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(Box::new(BlockCache::new())))
-                .collect(),
-        }
-    }
-
-    fn shard(
-        &self,
-        table_id: u32,
-        block_id: u64,
-    ) -> MutexGuard<'_, Box<BlockCache<BLOCK, SHARD_BLOCKS>>> {
-        // Not the hash `BlockCache` places a block by, so the blocks of
-        // one shard still spread over its slots.
-        let h = (block_id.rotate_left(17) ^ u64::from(table_id))
-            .wrapping_mul(0xD6E8_FEB8_6659_FD93)
-            >> 40;
-        // The remainder is below the shard count: the cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let at = (h % self.shards.len() as u64) as usize;
-        lock(&self.shards[at])
-    }
-}
-
-impl CachePort<BLOCK> for SharedCache {
-    fn get_into(&self, table_id: u32, block_id: u64, out: &mut [u8; BLOCK]) -> bool {
-        self.shard(table_id, block_id)
-            .get_into(table_id, block_id, out)
-    }
-
-    fn get_range_into(&self, table_id: u32, block_id: u64, offset: usize, out: &mut [u8]) -> bool {
-        self.shard(table_id, block_id)
-            .get_range_into(table_id, block_id, offset, out)
-    }
-
-    fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool) {
-        self.shard(table_id, block_id)
-            .put(table_id, block_id, block, hot);
-    }
-
-    fn invalidate_table(&self, table_id: u32) {
-        for shard in &self.shards {
-            lock(shard).invalidate_table(table_id);
-        }
-    }
-
-    fn stats(&self) -> CacheStats {
-        let mut total = CacheStats::default();
-        for shard in &self.shards {
-            let s = lock(shard).stats();
-            total.hits += s.hits;
-            total.misses += s.misses;
-            total.rejected += s.rejected;
-            total.len += s.len;
-            total.capacity += s.capacity;
-        }
-        total
     }
 }
 

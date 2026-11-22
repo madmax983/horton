@@ -232,7 +232,7 @@ thread:
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
 | writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
 | background compaction | one bounded `compact_step` at the end of each operation, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
-| `Get` from many threads at once | a read's memtable probe goes through the queue; the caller then reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers. Flush and compaction wait for readers to leave the tables |
+| `Get` from many threads at once | a read's memtable probe goes through the queue; the caller then reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). Flush and compaction wait for readers to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator`, `Seek` from many threads at once | `range(start, end, reverse)`: pins a snapshot and pages through horton's `Scan` or `RevScan`. Each page copies its memtable keys under the lock, then merges them with the tables on the caller's thread (a detached scan, ADR-0019), with 32 decoded blocks of its own |
 | `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
@@ -287,7 +287,7 @@ absent keys 48 times, seeks 26 times and scans 34 times.
 The example is also a measurement of how far a firmware store stretches.
 These are the limits it meets, and each is a property of the library:
 
-- **A point read costs 21 µs of one core at 1 M keys**, 2.3 µs when the
+- **A point read costs 20 µs of one core at 1 M keys**, 1.5 µs when the
   key is absent. Ruling out a table
   that does not hold the key is cheap (one bloom bucket from the
   cache; the manifest says where it is). The table that may hold it costs an index
@@ -296,9 +296,9 @@ These are the limits it meets, and each is a property of the library:
   block that is not cached costs a 16 KiB CRC in software on top
   (8 µs). Readers do run in parallel, so four threads get about three
   and a half cores' worth of such reads. Reads of absent keys, which
-  are only the cheap part, do not scale past one thread's rate: each
-  still queues for its memtable probe and takes locks on the shared
-  cache.
+  are only the cheap part (1.5 µs), do not scale past one thread's
+  rate: every read queues for its memtable probe, and the queue serves
+  four threads at a third of the rate it serves one.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
