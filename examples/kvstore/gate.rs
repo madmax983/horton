@@ -522,6 +522,16 @@ mod tests {
                 gate.open(2, true);
             })
         };
+        // Once the changer has raised the flag (however long its thread
+        // takes to start), it must stay in `shut` while the pin is up.
+        let since = std::time::Instant::now();
+        while !gate.flags.changing.load(Ordering::SeqCst) {
+            assert!(
+                since.elapsed() < std::time::Duration::from_secs(30),
+                "the changer never shut the gate"
+            );
+            std::thread::yield_now();
+        }
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
             !shut.load(Ordering::SeqCst),
