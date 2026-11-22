@@ -320,8 +320,11 @@ fn read_random(store: &Store, p: &Params, missing: bool) -> Result<Done, String>
             let k = key(rng.below(p.num));
             let v = if missing {
                 // db_bench's readmissing: a key just past a real one.
-                let mut m = k.to_vec();
-                m.push(b'.');
+                // Built on the stack: at a few hundred nanoseconds a
+                // read, an allocation per key is a third of the loop,
+                // and four threads wait on the allocator's lock.
+                let mut m = [b'.'; 17];
+                m[..16].copy_from_slice(&k);
                 h.get(&m)
             } else {
                 h.get(&k)

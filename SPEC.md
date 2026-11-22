@@ -326,6 +326,11 @@ an open request has work.
   rewrite a table under the reader. Writes that reach only the WAL and
   the memtable may run meanwhile. `Db::get` is the same two phases over
   the `Db`'s own manifest, device, buffers and cache.
+  `Db::probe_memtable_into` writes the probe into one the caller keeps.
+  `MemProbe::set_absent` writes, without the `Db`, the probe of a key
+  the memtable holds nothing for (no version, no covering range
+  tombstone), for a caller that knows so by other means (ADR-0023); a
+  false claim answers from the tables alone.
 - **Scans** (`Scan`, `RevScan`): a merge over the memtable and one
   cursor per table in caller-owned state, same winner rule, skipping
   hidden keys; `BufferTooSmall` never consumes an entry. A scan holds

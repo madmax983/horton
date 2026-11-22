@@ -494,3 +494,89 @@ fn a_reused_probe_answers_as_a_fresh_one() {
     assert_eq!(reused.key(), b"");
     assert!(!reused.is_settled());
 }
+
+/// A view of `db`'s tables by `manifest`. It borrows the device, so a
+/// test that goes on writing takes one per question.
+fn view<'a>(
+    db: &'a TestDb<MemDevice<4096>>,
+    manifest: &'a TestManifest,
+) -> TestTables<'a, MemDevice<4096>> {
+    TestTables::new(db.device(), manifest, None)
+}
+
+/// `set_absent` builds, without the `Db`, the probe of a key the
+/// memtable holds nothing for. Wherever that is true it is the probe
+/// `probe_memtable` returns, and resolves to the same answer; and it
+/// says nothing it should not when the claim is false (the read then
+/// answers from the tables alone, which is what the caller asked for).
+#[test]
+fn an_absent_probe_is_the_probe_of_an_empty_memtable() {
+    let (mut db, marks) = populated();
+    // Everything into tables: the memtable holds nothing at all.
+    block_on(db.flush()).unwrap();
+    drain(&mut db);
+    let manifest = *db.manifest();
+    let mut scratch = Box::new(TestScratch::new());
+    let mut absent = Box::new(TestProbe::new());
+    let mut seqs = marks;
+    seqs.extend([0, 1, u64::MAX]);
+    let (mut values, mut missing) = (0, 0);
+    for i in 0..130usize {
+        let k = key(i);
+        for &seq in seqs.iter().filter(|&&s| i % 3 == 0 || s == u64::MAX) {
+            let real: TestProbe = db.probe_memtable(&k, seq).unwrap();
+            assert!(!real.is_settled(), "the memtable is empty");
+            assert!(absent.set_absent(&k, seq));
+            assert_eq!(absent.key(), real.key());
+            assert_eq!(absent.max_seq(), real.max_seq());
+            assert!(!absent.is_settled());
+            for now in [0u64, 75, 10_000] {
+                let (mut want, mut got) = (vec![0u8; 1024], vec![0u8; 1024]);
+                let w = outcome(
+                    block_on(view(&db, &manifest).resolve(&real, &mut scratch, &mut want, now)),
+                    &want,
+                );
+                let g = outcome(
+                    block_on(view(&db, &manifest).resolve(&absent, &mut scratch, &mut got, now)),
+                    &got,
+                );
+                assert_eq!(g, w, "key {i} seq {seq} now {now}");
+                assert_eq!(g, attached(&db, &k, seq, now, 1024));
+                match g {
+                    Outcome::Value(_) => values += 1,
+                    Outcome::Missing => missing += 1,
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+    assert!(values > 100 && missing > 100, "{values} {missing}");
+
+    // A probe that held a value says nothing of it once set absent.
+    block_on(db.put(&key(3), b"in the memtable")).unwrap();
+    db.probe_memtable_into(&key(3), u64::MAX, &mut absent)
+        .unwrap();
+    assert!(absent.is_settled());
+    assert!(absent.set_absent(&key(9), u64::MAX));
+    assert!(!absent.is_settled());
+    assert_eq!(absent.key(), key(9).as_slice());
+    // The caller's claim, made falsely: the memtable's value is not
+    // seen, and the tables' older one is. (This is the hazard the
+    // method's documentation names, pinned here so it stays known.)
+    let table_value = {
+        let mut buf = vec![0u8; 1024];
+        absent.set_absent(&key(3), u64::MAX);
+        outcome(
+            block_on(view(&db, &manifest).resolve(&absent, &mut scratch, &mut buf, 0)),
+            &buf,
+        )
+    };
+    assert_ne!(table_value, Outcome::Value(b"in the memtable".to_vec()));
+    assert_eq!(
+        attached(&db, &key(3), u64::MAX, 0, 1024),
+        Outcome::Value(b"in the memtable".to_vec())
+    );
+    // Too long a key: refused, and the probe reads no key.
+    assert!(!absent.set_absent(&[b'k'; 257], u64::MAX));
+    assert_eq!(absent.key(), b"");
+}

@@ -219,11 +219,12 @@ cargo run --release --example kvstore -- crash 25          # kill -9 the writer 
 
 horton's `Db` is one value with `&mut self` writes and no locks, which
 suits firmware. The example puts it behind one lock and gives every
-thread a `Handle`. A thread that wants a write, a read or a page of a
-scan queues it; whichever thread holds the lock serves the queue in
-order, its own request and everyone else's. Reads and scans take only
-their memtable part from the lock and read the tables on their own
-thread:
+thread a `Handle`. A thread that wants a write queues it; whichever
+thread holds the lock commits the queue in order, its own write and
+everyone else's. Reads and scans read the tables on their own threads.
+A scan page takes the lock to copy its part of the memtable. A point
+read takes it only when the memtable could hold its key, and otherwise
+takes no lock at all:
 
 | LevelDB | here |
 |---|---|
@@ -231,8 +232,8 @@ thread:
 | `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
 | writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
-| background compaction | one bounded `compact_step` at the end of each operation, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
-| `Get` from many threads at once | a read's memtable probe goes through the queue; the caller then reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). Flush and compaction wait for readers to leave the tables |
+| background compaction | one bounded `compact_step` at the end of each write, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
+| `Get` from many threads at once | the caller reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). A read of a key the memtable cannot hold takes no lock anywhere: a filter over the keys written since the last flush and the manifest's published sequence number tell it so (ADR-0023). Any other read takes the engine lock for its memtable probe. Flush and compaction shut the readers' gate and wait for them to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator`, `Seek` from many threads at once | `range(start, end, reverse)`: pins a snapshot and pages through horton's `Scan` or `RevScan`. Each page copies its memtable keys under the lock, then merges them with the tables on the caller's thread (a detached scan, ADR-0019), with 32 decoded blocks of its own |
 | `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
@@ -266,40 +267,38 @@ compress by half, four client threads), and
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 249 K | 196 K | 242 K |
-| `fillrandom`, no fsync | 151 K | 67 K | 177 K |
-| `fillrandom`, fdatasync on | 14.6 K (2.6 writes per commit) | | 16.2 K (100 K keys) |
-| `readrandom` | 338 K | 185 K | 360 K |
-| `readmissing` | 637 K | 668 K | 4,023 K |
-| `seekrandom` | 74 K | 93 K | 331 K |
-| `readseq`, entries/s over four scanning threads | 11,087 K | 7,712 K | 20,218 K |
-| `readreverse`, the same | 6,540 K | 4,535 K | 15,202 K |
+| `fillseq`, no fsync | 263 K | 240 K | 270 K |
+| `fillrandom`, no fsync | 162 K | 70 K | 199 K |
+| `fillrandom`, fdatasync on | 15.0 K (2.6 writes per commit) | | 16.7 K (100 K keys) |
+| `readrandom` | 350 K | 206 K | 395 K |
+| `readmissing` | 4,685 K | 5,838 K | 4,358 K |
+| `seekrandom` | 56 K | 111 K | 363 K |
+| `readseq`, entries/s over four scanning threads | 10,081 K | 7,975 K | 20,651 K |
+| `readreverse`, the same | 5,805 K | 4,529 K | 16,868 K |
 
 These are single runs, and the read rows move from one run to the next
 with the number of level-0 tables the fills leave (`seekrandom` most:
 45 K to 120 K at 1 M keys).
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
 spread, where the time goes, and what v0.20 changed. Against 0.19, at
-1 M keys on four threads, point reads are 26 times faster, reads of
-absent keys 84 times, seeks 47 times and scans 37 times.
+1 M keys on four threads, point reads are 29 times faster, reads of
+absent keys 730 times, seeks 56 times and scans 38 times.
 
 ### Where horton stops at host scale
 
 The example is also a measurement of how far a firmware store stretches.
 These are the limits it meets, and each is a property of the library:
 
-- **A point read costs 20 µs of one core at 1 M keys**, 1.5 µs when the
+- **A point read costs 19 µs of one core at 1 M keys**, 0.9 µs when the
   key is absent. Ruling out a table
   that does not hold the key is cheap (one bloom bucket from the
   cache; the manifest says where it is). The table that may hold it costs an index
   block and a data block, each checked whole, and the data block
   inflated, on every read: the cache keeps the compressed image. A
   block that is not cached costs a 16 KiB CRC in software on top
-  (8 µs). Readers do run in parallel, so four threads do 3.7 times
-  one thread's rate of such reads. Reads of absent keys, which
-  are only the cheap part (1.5 µs), do not scale past one thread's
-  rate: every read queues for its memtable probe, and the queue serves
-  four threads at well under half the rate it serves one.
+  (8 µs). Readers run in parallel and nearly all of them take no
+  lock (ADR-0023), so four threads do 3.8 times one thread's rate of
+  either kind of read.
 - **Capacity is at most `levels × tables_per_level` (64) tables**, and a
   table's index is one block, so the block size bounds a table: about
   7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
@@ -581,7 +580,7 @@ What the suite covers:
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
 | `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
-| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its request queue, group commit and background compaction (`store.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
+| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its write queue, group commit and background compaction (`store.rs`), the readers' block cache (`cache.rs`) and the gate that lets most point reads take no lock (`gate.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
 | `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |

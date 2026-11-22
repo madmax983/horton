@@ -134,7 +134,8 @@ entry it holds a reference to.
   next locks it once. That is one lock per change a reader notices,
   where the old cache took one per lookup.
 - **Not done:** the same for the request queue. A point read still
-  queues for its memtable probe, under the engine lock.
+  queues for its memtable probe, under the engine lock. (Done since:
+  ADR-0023.)
 
 ## References
 

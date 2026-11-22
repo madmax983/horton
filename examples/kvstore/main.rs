@@ -23,6 +23,7 @@ mod bench;
 mod cache;
 mod crash;
 mod device;
+mod gate;
 mod store;
 
 use core::future::Future;
@@ -331,6 +332,10 @@ pub fn print_stats(store: &Handle) -> Result<(), String> {
     println!(
         "work      {} flushes, {} compaction jobs in {} steps",
         s.flushes, s.compaction_jobs, s.compaction_steps
+    );
+    println!(
+        "reads     {} without the engine lock, {} under it, since open",
+        s.reads_unlocked, s.reads_locked
     );
     println!(
         "i/o       {} block reads, {} block writes, {} syncs; cache {} hits, {} misses",

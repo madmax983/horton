@@ -24,9 +24,10 @@ absent key), one thread's scan 9 times and its seek 7 times, and
 unsynced writes 1.4 to 2.4 times; synced writes are unchanged. With
 detached reads the host store's point reads, scans and seeks also run
 on every reader thread at once, and with bloom filters sized to their
-tables a read of an absent key stops at the filter: at 1 M keys on
-four threads, point reads are 26 times 0.19's rate, reads of absent
-keys 84 times, seeks 47 times and scans 37 times.
+tables a read of an absent key stops at the filter, and takes no lock
+on the way: at 1 M keys on four threads, point reads are 29 times
+0.19's rate, reads of absent keys 730 times, seeks 56 times and scans
+38 times.
 
 ### Added
 
@@ -57,6 +58,14 @@ keys 84 times, seeks 47 times and scans 37 times.
   `flush`, `compact_step`, `ingest_table` and `archive_commit` from
   running while a detached read is in its tables. `db_types!` takes
   `TableView`, `MemProbe` and `ReadScratch` aliases.
+- `MemProbe::new`, `Db::probe_memtable_into` and `MemProbe::set_absent`
+  (ADR-0023). A host keeps one probe per reader thread and has the
+  memtable's part of a read written into it. And a host that can tell
+  without the `Db` that the memtable holds nothing for a key (say,
+  from a filter of its own over the keys written since the last flush)
+  builds that probe itself with `set_absent`, so the read does not
+  wait for whoever has the `Db`. The claim is the caller's: a false
+  one answers from the tables alone.
 - **Detached scans** (ADR-0019). `Scan::detached` and
   `RevScan::detached` scan without the `Db`, over a copy of part of the
   memtable made by `Db::copy_memtable_range` / `copy_memtable_range_rev`
@@ -160,6 +169,20 @@ keys 84 times, seeks 47 times and scans 37 times.
 - The kvstore's `bench` has `readoutside`: reads of keys past every
   table, which touch no table and no cache, to tell the store's own
   cost per read from the tables'.
+- **kvstore point reads do not queue, and most take no lock**
+  (`examples/kvstore/gate.rs`, ADR-0023). A read takes the engine lock
+  itself for its memtable probe; the request queue carries only
+  writes. A read of a key the memtable cannot hold takes no lock at
+  all: a filter over the keys written since the last flush, the
+  manifest's published sequence number and a pin in the reader
+  thread's own slot tell it so, and it goes straight to the tables.
+  Flush and each compaction step shut that gate and wait for the pins.
+  A key written since the last flush, and every key after a
+  `delete_range` or a recovery until the next flush, still asks the
+  memtable under the lock. `stats` counts both kinds of read.
+- The kvstore's `bench` builds `readmissing`'s keys on the stack. The
+  allocation per key had become a third of the loop, and a lock that
+  four reader threads waited on.
 - **kvstore tables carry up to sixteen bloom blocks** (`bloom_bytes` is
   255 KiB), and the store boxes its flush future, which holds the
   writer and so the filter.
@@ -177,8 +200,8 @@ keys 84 times, seeks 47 times and scans 37 times.
 - A memtable counts its range tombstones, so a point read no longer
   walks every slot to learn that none covers the key.
 - **kvstore point reads, scans and seeks run in parallel.** The
-  memtable's part (a probe, or a page's slice) is served through the
-  request queue; the caller then reads the tables on its own thread,
+  memtable's part (a probe, or a page's slice) is taken under the
+  engine lock; the caller then reads the tables on its own thread,
   through a read-only handle to the file and a 16 MiB cache shared by
   all readers. Scans
   lend each page 32 block buffers. Flush and compaction wait for
@@ -186,10 +209,9 @@ keys 84 times, seeks 47 times and scans 37 times.
   no read goes through the `Db` any more. `bench`'s `readseq` and
   `readreverse` run one scan per client thread.
 - **kvstore** runs horton under one lock instead of on a store thread.
-  Point reads and writes are queued and served in order by whichever
-  thread holds the lock (flat combining; group commit is the write half
-  of it), waiters spin for 100 µs before they park, and the cache is
-  8 MiB (512 blocks). Dropping the `Store` closes it: surviving handles
+  Writes are queued and committed in order by whichever thread holds
+  the lock (flat combining, which gives group commit), and waiters
+  spin for 100 µs before they park. Dropping the `Store` closes it: surviving handles
   return `Closed`.
 - `compaction_pending()` is also true while a request has work.
 - `compact_step` can return `RegionFull` from a tight job that cannot

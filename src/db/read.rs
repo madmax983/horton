@@ -123,6 +123,34 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize> MemProbe<KEY_MAX, VAL_MAX> {
         }
     }
 
+    /// Makes this the probe of a key the memtable holds nothing for: no
+    /// version of it at any sequence number, and no range tombstone
+    /// covering it. That is exactly what [`Db::probe_memtable_into`]
+    /// leaves when the memtable has neither, so
+    /// [`TableView::resolve`] then answers from the tables alone.
+    ///
+    /// For a host that can tell, without the `Db`, that the memtable
+    /// cannot hold a key (say, from a filter over the keys written since
+    /// the last flush), and wants such a read not to wait for whoever
+    /// has the `Db`. **The claim is the caller's.** If the memtable does
+    /// hold a version of the key, or a range tombstone over it, a read
+    /// resolved from this probe misses it and returns what the tables
+    /// say: an older value, or a deleted one.
+    ///
+    /// Returns `false`, leaving the probe empty, when `key` is longer
+    /// than `KEY_MAX`.
+    pub fn set_absent(&mut self, key: &[u8], max_seq: u64) -> bool {
+        self.key_len = 0;
+        self.max_seq = max_seq;
+        self.acc.clear();
+        let Some(dst) = self.key.get_mut(..key.len()) else {
+            return false;
+        };
+        dst.copy_from_slice(key);
+        self.key_len = key.len();
+        true
+    }
+
     /// The key this probe reads.
     #[must_use]
     pub fn key(&self) -> &[u8] {

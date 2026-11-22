@@ -16,19 +16,21 @@ were just costs.
 v0.20 was done in passes. The first made one read cheaper. The second
 let reads, scans and seeks run on every client thread at once. The
 third gave every table a bloom filter sized to it. The fourth and
-fifth took the footer and the cache's locks out of a reader's way.
+fifth took the footer and the cache's locks out of a reader's way. The
+sixth took point reads out of the store's request queue and, for
+nearly all of them, out of its lock.
 
 | db_bench workload, 1 M keys, 4 threads, ops/s | horton 0.19 | horton 0.20 | against 0.19 | RocksDB, same memory | RocksDB, as shipped | 0.20 / RocksDB, same memory |
 |---|---:|---:|---:|---:|---:|---:|
-| `fillseq` | 90,389 | 196,483 | 2.2× | 242,325 | 489,667 | 0.81× |
-| `fillrandom` | 47,054 | 66,504 | 1.4× | 176,859 | 378,268 | 0.38× |
-| `overwrite` | 44,143 | 62,400 | 1.4× | 157,644 | 337,718 | 0.40× |
-| `readrandom` | 7,190 | 185,377 | 26× | 359,730 | 515,254 | 0.52× |
-| `readmissing` | 7,995 | 668,400 | 84× | 4,023,217 | 2,172,823 | 0.17× |
-| `readseq` | 209,822 | 7,712,270 | 37× | 20,217,533 | 9,954,557 | 0.38× |
-| `readreverse` | 186,400 | 4,535,430 | 24× | 15,202,293 | 8,192,756 | 0.30× |
-| `seekrandom` | 1,964 | 92,540 | 47× | 331,186 | 247,043 | 0.28× |
-| `deleterandom` | 55,882 | 85,055 | 1.5× | 400,319 | 361,487 | 0.21× |
+| `fillseq` | 90,389 | 240,034 | 2.7× | 269,627 | 436,241 | 0.89× |
+| `fillrandom` | 47,054 | 69,934 | 1.5× | 198,957 | 402,716 | 0.35× |
+| `overwrite` | 44,143 | 63,397 | 1.4× | 140,875 | 417,483 | 0.45× |
+| `readrandom` | 7,190 | 206,249 | 29× | 395,493 | 601,476 | 0.52× |
+| `readmissing` | 7,995 | 5,838,092 | 730× | 4,357,531 | 2,436,446 | 1.34× |
+| `readseq` | 209,822 | 7,974,660 | 38× | 20,651,183 | 10,361,514 | 0.39× |
+| `readreverse` | 186,400 | 4,528,756 | 24× | 16,867,533 | 8,833,722 | 0.27× |
+| `seekrandom` | 1,964 | 110,951 | 56× | 362,890 | 290,952 | 0.31× |
+| `deleterandom` | 55,882 | 86,052 | 1.5× | 443,163 | 466,589 | 0.19× |
 
 Every column but the first is one run. The 0.19 column is from an
 earlier run on the same kind of machine. **The read rows move from run
@@ -47,14 +49,20 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
   CRC-32 over blocks that were already in the cache and had already
   passed. One read is now 5 times cheaper, and readers run in parallel
   on top of that.
-- **A read of an absent key is 80 times cheaper on one thread**: 125 µs
-  in 0.19, 12 µs after the first two passes, 1.5 µs now. Most of the
-  last step is the bloom filter. A table's filter was one block whatever the
-  table held, so the large tables that hold most of a store had 1.3
-  bits a key and stopped almost nothing. It is now sized to the table,
-  ten bits a key. Against RocksDB with the same memory that row went
-  from 0.05× to 0.17×, and is now held there by the store's request
-  queue, not by the tables.
+- **A read of an absent key is 140 times cheaper on one thread**:
+  125 µs in 0.19, 12 µs after the first two passes, 0.87 µs now. Most
+  of that is the bloom filter. A table's filter was one block whatever
+  the table held, so the large tables that hold most of a store had
+  1.3 bits a key and stopped almost nothing. It is now sized to the
+  table, ten bits a key.
+- **And four threads now read four times what one does.** With the
+  tables cheap, what an absent-key read waited on was the store
+  itself: every read queued for its memtable probe, and four threads
+  got through the queue more slowly than one. A read of a key the
+  memtable cannot hold now takes no lock at all. Against RocksDB with
+  the same memory that row went from 0.05× to 0.17× (the filters) to
+  1.3× (the lock). It is the one row where horton is ahead, and one
+  run of each engine.
 - **Scans and seeks were three costs, one of them threads.** A scan
   re-decoded a block every time its merge changed table, a seek read
   every table in range before yielding anything, and both held the
@@ -67,12 +75,12 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
 - **Synced writes did not change**, and all three engines are within
   a quarter of each other there: each waits for the same `fdatasync`.
 - **What remains.** One thread at a time writes, and flush and
-  compaction run on the writers' time. Every point read queues for
-  its memtable probe, and the queue serves four threads no faster
-  than one, so absent-key reads do not scale at all. A block is
-  16 KiB, CRC'd in software and cached compressed. Most of that is
-  what makes horton fit in 112 KiB on an ESP32-S3; the queue is the
-  host store's own, and is the next thing to take out.
+  compaction run on the writers' time. A present-key read is 19 µs of
+  one core: a block is 16 KiB, summed whole, cached compressed and
+  inflated on every read, and CRC'd in software when it misses the
+  cache. A seek positions a cursor in every table that could hold its
+  key. Most of that is what makes horton fit in 112 KiB on an
+  ESP32-S3.
 
 ## Method
 
@@ -122,9 +130,10 @@ Read the numbers with these in mind:
 
 ## Results
 
-"horton (before)" in these tables is v0.20 with its reader cache
-behind locks (commit `05a9308`); "horton" is v0.20. For the earlier
-steps see [What changed in v0.20](#what-changed-in-v020).
+"horton (before)" in these tables is v0.20 with every point read
+queued for its memtable probe (commit `4fa1dc9`, with the benchmark
+fix of step 13 in [What changed](#what-changed-in-v020)); "horton" is
+v0.20. For the earlier steps see that section.
 
 ### No fsync (`--no-sync`; db_bench's default)
 
@@ -132,38 +141,41 @@ steps see [What changed in v0.20](#what-changed-in-v020).
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                              489667           242325           181578           196483                     0.81x
-fillrandom                           378268           176859            62895            66504                     0.38x
-overwrite                            337718           157644            60316            62400                     0.40x
-readrandom                           515254           359730           141984           185377                     0.52x
-readmissing                         2172823          4023217           570590           668400                     0.17x
-readseq                             9954557         20217533          6665603          7712270                     0.38x
-readreverse                         8192756         15202293          3983059          4535430                     0.30x
-seekrandom                           247043           331186            47187            92540                     0.28x
-deleterandom                         361487           400319            81198            85055                     0.21x
-readrandom (after compact)         11472593         13128226           264433           273848                     0.02x
+fillseq                              436241           269627           213812           240034                     0.89x
+fillrandom                           402716           198957            68195            69934                     0.35x
+overwrite                            417483           140875            63554            63397                     0.45x
+readrandom                           601476           395493           181034           206249                     0.52x
+readmissing                         2436446          4357531           631293          5838092                     1.34x
+readseq                            10361514         20651183          7363536          7974660                     0.39x
+readreverse                         8833722         16867533          4433409          4528756                     0.27x
+seekrandom                           290952           362890            76351           110951                     0.31x
+deleterandom                         466589           443163            82952            86052                     0.19x
+readrandom (after compact)         11483594         13339247           370389           301320                     0.02x
 ```
 
 The two horton columns are not a like-for-like pair: each fills its
 own store on four threads, and they ended with different numbers of
-level-0 tables. `seekrandom` doubling between them is that, not the
-cache. See the next section, and step 12 of
-[What changed](#what-changed-in-v020) for the pair on equal tables.
+level-0 tables. `seekrandom` moving between them is that. The last
+row went the wrong way in this pair of runs; on identical tables (one
+thread fills, deletes and compacts), reads after a compaction went
+from 0.65 M to 1.10 M a second in each of three pairs. See the next
+section, and step 13 of [What changed](#what-changed-in-v020) for the
+pairs on equal tables.
 
 100 K keys (11 MB: RocksDB as shipped never leaves its memtable):
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                              490508           385940           239448           249365                     0.65x
-fillrandom                           450422           355385           150808           151355                     0.43x
-overwrite                            437914           351679           168828           169461                     0.48x
-readrandom                          2152250          1306156           253613           337529                     0.26x
-readmissing                         2162279          4089268           639972           637060                     0.16x
-readseq                             6728615         23747906         11153993         11086984                     0.47x
-readreverse                         1139830         15320789          6551137          6539903                     0.43x
-seekrandom                           933576           694516            67431            73852                     0.11x
-deleterandom                         446693           446040           196761           194830                     0.44x
-readrandom (after compact)         13327558         13574967           614992           727339                     0.05x
+fillseq                              521208           406778           238727           263098                     0.65x
+fillrandom                           477257           358087           150632           161791                     0.45x
+overwrite                            446741           342010           167305           175496                     0.51x
+readrandom                          2177593          1354123           350202           350471                     0.26x
+readmissing                         2174657          4888780           605003          4684801                     0.96x
+readseq                             6812866         16819684         11745949         10081011                     0.60x
+readreverse                         1102333         17542794          6855518          5805205                     0.33x
+seekrandom                           953227          1050574            84116            56149                     0.05x
+deleterandom                         499713           430750           194430           204261                     0.47x
+readrandom (after compact)         13289478         12962602           664732          1380473                     0.11x
 ```
 
 ### Run to run
@@ -192,10 +204,12 @@ Within a build, `seekrandom` runs from 44 K to 117 K on the level-0
 count alone. Runs 1 and 2 happened to pair equal layouts; run 3 did
 not, and says nothing about the two builds.
 
-Fills on **one** thread leave the same tables every time (4, 5, 0 and
-14 per level). `bench --threads 1 --read-threads N` fills that way and
-reads on N threads, and every comparison between builds from step 11
-on is made like that.
+Fills on **one** thread leave the same tables every time: 4, 5, 0 and
+14 per level in the runs of steps 11 and 12, and 3, 6, 0 and 13 in
+those of step 13, the same in every run and in both builds of each
+pair. `bench --threads 1 --read-threads N` fills that way and reads on
+N threads, and every comparison between builds from step 11 on is made
+like that.
 
 ### Every write synced
 
@@ -204,9 +218,9 @@ disk, so the engines converge: each is waiting for the same device.
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                               16717            17749            14860            15787                     0.89x
-fillrandom                            15960            16202            16562            14602                     0.90x
-overwrite                             14389            16429            15243            14780                     0.90x
+fillseq                               16601            17426            14739            15171                     0.87x
+fillrandom                            14667            16726            15316            14984                     0.90x
+overwrite                             15738            18082            15418            16307                     0.90x
 ```
 
 Both group commits. horton averaged 2.6 client writes per
@@ -218,29 +232,29 @@ Both group commits. horton averaged 2.6 client writes per
 thread); ops/s (entries/s for the two scans). The machine has four
 cores, so eight threads show what oversubscribing costs, not more
 scaling. `readoutside` reads keys past every table: it consults no
-table and no cache, and is what a read costs in the store's own queue.
+table and no cache, and is what a read costs in the store itself.
 
 | reader threads | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| `readrandom` | 49,861 | 99,759 | 184,891 | 188,426 |
-| `seekrandom` | 17,843 | 33,845 | 66,339 | 67,213 |
-| `readseq`, a scan per thread | 1,900,971 | 3,574,009 | 6,964,663 | 7,925,228 |
-| `readreverse`, a scan per thread | 1,101,244 | 2,151,603 | 4,269,029 | 4,796,213 |
-| `readmissing` | 675,395 | 819,222 | 701,478 | 671,982 |
-| `readoutside` | 1,618,663 | 847,974 | 662,834 | 671,085 |
+| `readrandom` | 53,162 | 103,466 | 200,780 | 198,035 |
+| `seekrandom` | 16,295 | 31,522 | 62,747 | 63,089 |
+| `readseq`, a scan per thread | 1,927,267 | 3,701,258 | 7,315,912 | 8,796,726 |
+| `readreverse`, a scan per thread | 1,106,884 | 2,105,024 | 4,202,392 | 4,749,982 |
+| `readmissing` | 1,142,536 | 2,038,601 | 3,818,820 | 4,187,464 |
+| `readoutside` | 5,284,619 | 9,781,863 | 20,785,057 | 17,513,306 |
 
 For comparison, at the start of v0.20's second pass (commit `75063ad`,
 one reader at a time) `readrandom` was 43,594 on one thread and 38,581
-on four, and `seekrandom` 6,956 and 7,962.
+on four, and `seekrandom` 6,956 and 7,962. Before step 13, with every
+point read queued, `readmissing` was 675 K on one thread and 701 K on
+four, and `readoutside` 1.62 M and 0.66 M.
 
-Four threads give 3.7 times one thread's present-key reads, seeks and
-forward scans, and 3.9 times its reverse scans. Absent-key reads do
-not scale: 675 K on one thread, 701 K on four. `readoutside` shows
-what they wait on. Through the request queue alone, one thread does
-1.6 M reads a second, two threads do half that between them, and four
-do 0.66 M. An absent-key read's table work is under a microsecond now,
-so from two threads up it runs at the queue's rate. See
-[the remaining gap](#what-the-remaining-gap-is-made-of).
+Four threads give 3.8 times one thread's present-key reads, seeks,
+forward and reverse scans, 3.3 times its absent-key reads in this run
+(3.7 in the three pairs of step 13) and 3.9 times its reads of keys
+outside the store. Nothing a point read does is serial any more unless
+the memtable could hold its key. A scan takes the engine lock once a
+page.
 
 ## Where horton's time went
 
@@ -482,19 +496,114 @@ sequenceDiagram
     (`readoutside` on one thread, which this change does not touch,
     also moved by 2%), and is not explained.
 
+### Then: point reads that do not queue, and mostly do not lock
+
+13. **A read of a key the memtable cannot hold takes no lock**
+    (kvstore, ADR-0023). Step 12 left every point read queueing for
+    its memtable probe, and `readoutside` showed what that cost: 1.6 M
+    reads a second through the queue on one thread, 0.64 M on four.
+
+    Two things were in the way, and they came out one at a time.
+    First the queue: a read now takes the engine lock itself, probes
+    the memtable into a probe its thread keeps, and lets go. That
+    doubled `readoutside` (3.2 M on one thread, 1.2 M on four, single
+    runs) and left four threads slower than one, because an exclusive
+    lock taken on every read is a cache line every reader writes.
+
+    Then the lock. What a read asks the database is nearly always
+    answered the same way: the memtable has nothing for this key, and
+    the tables are the ones you already have. The store now says both
+    in words that are written only when the answer changes. A filter
+    over the memtable has two bits for each key written since the last
+    flush (32 KiB; a write sets them before it writes the memtable).
+    The manifest's sequence number is published after every table
+    change. A reader raises a pin in a slot of its own, checks that
+    the gate is open, that its manifest copy carries the published
+    number and that the filter does not have its key, and goes to the
+    tables. Flush and compaction raise a flag, wait for every slot to
+    read zero, change the tables and publish. Each side stores and
+    then looks at the other's store, so one of them always sees the
+    other.
+
+    ```mermaid
+    flowchart LR
+        subgraph before["step 12: every read"]
+            direction LR
+            Q1["queue the read<br/>(allocate, lock)"] --> E1["engine lock, held by<br/>whichever thread serves:<br/>probe the memtable"] --> T1["tables"]
+        end
+        subgraph after["step 13: a key the memtable cannot hold"]
+            direction LR
+            P2["raise own pin"] --> C2["3 loads:<br/>gate open, manifest current,<br/>key not in the filter"] --> T2["tables"]
+        end
+    ```
+
+    On identical tables (fills on one thread: 3, 6, 0 and 13 tables
+    per level with this benchmark list), 1 M keys, means of three
+    runs. "Queued" is step 12 with the benchmark fix described below:
+
+    | | reader threads | queued | no lock | change |
+    |---|---:|---:|---:|---:|
+    | `readoutside` | 1 | 1,618,525 | 5,268,530 | 3.3× |
+    | `readoutside` | 2 | 890,113 | 10,114,028 | 11× |
+    | `readoutside` | 4 | 641,223 | 20,840,502 | 33× |
+    | `readmissing` | 1 | 738,739 | 1,153,940 | 1.6× |
+    | `readmissing` | 2 | 859,277 | 2,071,064 | 2.4× |
+    | `readmissing` | 4 | 645,098 | 4,259,914 | 6.6× |
+    | `readrandom` | 1 | 50,945 | 53,775 | +6% |
+    | `readrandom` | 2 | 97,135 | 103,281 | +6% |
+    | `readrandom` | 4 | 188,246 | 204,933 | +9% |
+    | `seekrandom` | 1 | 16,258 | 16,147 | -1% |
+    | `seekrandom` | 4 | 63,468 | 63,429 | 0% |
+    | `readseq` | 1 | 1,965,903 | 1,929,854 | -2% |
+    | `readseq` | 4 | 7,380,259 | 7,352,198 | 0% |
+    | `readreverse` | 1 | 1,119,077 | 1,102,959 | -1% |
+    | `readreverse` | 4 | 4,360,243 | 4,295,793 | -1% |
+    | `fillseq` (one writer; nine pairs) | | 189,423 | 192,846 | +2% |
+    | `fillrandom` | | 52,943 | 52,359 | -1% |
+    | `overwrite` | | 50,814 | 51,259 | +1% |
+
+    A read that touches nothing but the store costs 0.19 µs and four
+    threads do 3.96 times one thread's. An absent-key read is 0.87 µs
+    on one thread, from 1.35, and four threads do 3.7 times one's
+    rate, where they did 0.9 times. A present-key read lost the
+    microsecond the queue cost it, of twenty. Seeks and scans did not
+    change: a page still takes the engine lock once, and at 1,024
+    entries a page that lock was never what a scan waited on. Writes
+    did not change either: two filter bits a key do not show.
+
+    **The benchmark had to be fixed first.** `readmissing` built each
+    key with an allocation and a reallocation. The first measurement
+    of this step had four threads reading absent keys *slower* than
+    one (1.4 M against 2.0 M, on a store with fewer tables than the
+    one above). A profile put a third of their time in the kernel,
+    waking and sleeping on the allocator's lock: at half a microsecond
+    a read, the benchmark's own loop was the contended thing. The key
+    is now built on the stack, as `db_bench` builds its keys. The
+    "queued" column above is the old store with the same fix. The fix
+    did nothing for the old store on four threads (0.65 M here; 0.70 M
+    before it, on slightly different tables): the queue was slower
+    than the allocator, and hid it.
+
+    What still takes the lock: a key written since the last flush
+    (which is how a thread reads its own writes), every key after a
+    range delete or a recovery until the next flush, a thread's first
+    read after each flush or compaction commit, and every page of a
+    scan. In these runs about 800 point reads of three million did
+    (0.03%): the keys the last writes left in the memtable.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
 |---|---:|---|
-| `fillseq` | 0.81× | one writer at a time commits in about 5 µs; nothing to compact when keys arrive in order |
-| `fillrandom` | 0.38× | flush and compaction run on the writers' time; RocksDB's run on other cores |
-| `overwrite` | 0.40× | the same |
-| `readrandom` | 0.52× | a read is 20 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
-| `readmissing` | 0.17× | 1.5 µs on one thread, and four threads do no more than one: every read queues for its memtable probe, and the queue serves four threads at well under half the rate it serves one |
-| `readseq` | 0.38× | 0.53 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
-| `readreverse` | 0.30× | the same, and stepping backwards through a block's version runs costs more than forwards |
-| `seekrandom` | 0.28× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
-| `deleterandom` | 0.21× | as `fillrandom` |
+| `fillseq` | 0.89× | one writer at a time commits in about 5 µs; nothing to compact when keys arrive in order |
+| `fillrandom` | 0.35× | flush and compaction run on the writers' time; RocksDB's run on other cores |
+| `overwrite` | 0.45× | the same |
+| `readrandom` | 0.52× | a read is 19 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
+| `readmissing` | 1.34× | no gap in this run: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
+| `readseq` | 0.39× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
+| `readreverse` | 0.27× | the same, and stepping backwards through a block's version runs costs more than forwards |
+| `seekrandom` | 0.31× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
+| `deleterandom` | 0.19× | as `fillrandom` |
 
 **One thread at a time writes.** `Db` is a single-owner value with
 `&mut self` writes; that is ADR-0002's point, and firmware has one
@@ -504,27 +613,26 @@ horton runs between the writes, and while one runs, new readers wait.
 A horton commit of a sequential write takes about 5 µs, which is why
 `fillseq`, with nothing to compact, keeps up.
 
-**A read still passes through the lock once.** The memtable probe and
-the page copy are served from the request queue. That is the serial
-part. Present-key reads, which spend 20 µs in the tables for every
-pass through the queue, scale by 3.7 on four cores; scans, which take
-the lock once per 1,024 entries, by 3.7 to 3.9.
+**Most point reads take no lock; a scan takes one a page.** A read of
+a key the memtable cannot hold raises a pin of its own and goes to the
+tables (step 13). A key written since the last flush still asks the
+memtable under the engine lock, and so does every key after a range
+delete or a recovery until the next flush. A scan page copies its part
+of the memtable under the lock: once per 1,024 entries, which is why
+scans scale by 3.8 on four cores with it.
 
-**The request queue is what four reader threads wait on.** A read's
-memtable probe is served through the queue, by whichever thread holds
-the engine lock. `readoutside`, which does that and nothing else, runs
-at 1.6 M reads a second on one thread, 0.85 M on two and 0.66 M on
-four: the queue serves several threads at about half the rate it
-serves one. Every kind of point read pays it. Absent-key reads, whose
-table work is now under a microsecond, are bound by it outright: four
-threads do 0.7 M a second, where one does 0.68 M.
-
-An earlier profile of four threads reading absent keys put 60% of
-their time in the old cache's ranged read and 14% in the queue, and
-that was read as the cache being the limit. It was where the time
-went, not what the rate waited on: with the cache's locks gone
-(ADR-0022) the four-thread rate did not move. RocksDB takes no lock
-and joins no queue on this path.
+**What four reader threads waited on was the queue, then the lock, and
+then the benchmark.** An earlier profile of four threads reading
+absent keys put 60% of their time in the old cache's ranged read and
+14% in the queue, and that was read as the cache being the limit. It
+was where the time went, not what the rate waited on: with the cache's
+locks gone (ADR-0022) the four-thread rate did not move. `readoutside`
+was added to measure the store without its tables, and showed the
+queue serving four threads at 0.4 times the rate it served one. With
+the queue gone the engine lock did the same at twice the rate. With
+the lock gone, the benchmark's own allocation per key did. Each was
+found by measuring the thing itself, and each time the profile of the
+whole had pointed somewhere else.
 
 **A point read that misses the cache is expensive.** It reads a 16 KiB
 block, CRCs it in software (8.3 µs; `unsafe` is forbidden, so no
@@ -550,12 +658,13 @@ of LZ77, 8 µs of CRC and a write. It is the largest single item in
 
 Measured or scoped while doing this, and left:
 
-- **A memtable probe that does not queue.** This is what a point read
-  waits on at four threads (`readoutside` above). The probe itself is
-  a search of RAM; what it queues for is the engine lock, which it
-  shares with every write. Letting readers probe side by side needs
-  either a lock readers can share or a memtable a reader can search
-  while a writer appends.
+- **Scan pages that do not lock.** A page copies its slice of the
+  memtable under the engine lock. A page whose range the memtable does
+  not reach could learn that the way a point read does. Not measured:
+  at one lock per 1,024 entries it is not what a scan waits on.
+- **A filter for range tombstones.** One `delete_range` sends every
+  point read back to the engine lock until the next flush (ADR-0023).
+  Remembering the ranges, not a flag, would keep the others out of it.
 - **Compaction off the writers' thread.** A compaction job reads
   tables and writes new ones. If its merge ran detached, the way reads
   now do, with only its commit under the lock, it would use the cores

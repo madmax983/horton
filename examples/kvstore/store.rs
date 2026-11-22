@@ -16,14 +16,14 @@
 //!   thread: the thread holding the lock does the work and returns.
 //!   (Until v0.20 a store thread did everything and every call paid two
 //!   thread switches, a quarter of a read's time and half of a write's.)
-//! - **The lock holder serves everyone waiting.** A point read or a
-//!   write is queued first; then its thread goes for the lock. Whoever
-//!   gets it serves the queue in order, its own request and the others',
-//!   and marks each done. The threads it served see their result and
-//!   never take the lock. This is flat combining, and it matters because
-//!   the database is megabytes of state that would otherwise move
-//!   between CPU caches on every call: four threads taking turns at the
-//!   lock read slower than one thread alone.
+//! - **The lock holder commits for everyone waiting.** A write is queued
+//!   first; then its thread goes for the lock. Whoever gets it commits
+//!   the queue in order, its own write and the others', and marks each
+//!   done. The threads it served see their result and never take the
+//!   lock. This is flat combining, and it matters because the database
+//!   is megabytes of state that would otherwise move between CPU caches
+//!   on every call: four threads taking turns at the lock write slower
+//!   than one thread alone.
 //! - **Group commit** falls out of it: consecutive writes in the queue
 //!   that fit one WAL block are committed as one [`WriteBatch`], one
 //!   block write and one `fdatasync` for all of them. This is `LevelDB`'s
@@ -39,34 +39,40 @@
 //!   WAL or level 0 as an error naming its remedy; the caller holding the
 //!   lock applies the remedy (`flush`, `compact_step`) and retries, so
 //!   clients never see them.
-//! - **Background compaction.** While a job is pending, every operation
+//! - **Background compaction.** While a job is pending, every write
 //!   ends with one bounded `compact_step` before it gives the lock up,
 //!   and a compaction thread runs them back to back whenever no client
 //!   is waiting. Writers are never stalled for a whole compaction, which
 //!   is what `LevelDB`'s L0 slowdown trigger approximates with sleeps.
-//! - **Point reads run in parallel.** A read is two phases (horton's
-//!   detached read, ADR-0018). The memtable probe goes through the queue
-//!   like a write and takes a fraction of a microsecond. If the memtable
-//!   does not settle the read, the caller is handed the probe and the
-//!   current manifest, and reads the tables itself, on its own thread,
-//!   with its own buffers, through a read-only handle to the file and a
-//!   cache shared by all readers ([`SharedCache`]), in which a hit takes
-//!   no lock and writes nothing another reader reads. Any number of
-//!   threads do that at once, and writes go on meanwhile.
+//! - **Point reads run in parallel, and most take no lock** (ADR-0018,
+//!   ADR-0023). A read is two phases: what the memtable holds for the
+//!   key, then the tables. The second runs on the caller's thread, with
+//!   its own buffers, through a read-only handle to the file and a cache
+//!   shared by all readers ([`SharedCache`]), in which a hit takes no
+//!   lock and writes nothing another reader reads. The first needs the
+//!   database only when the memtable could hold the key. A filter over
+//!   the keys written since the last flush says when it cannot, and the
+//!   store publishes which manifest is current; a reader whose own copy
+//!   of the manifest is that one, reading a key the filter does not
+//!   have, goes straight to the tables ([`Gate::enter`]). It takes no
+//!   lock and writes one word, its own. Any other read takes the engine
+//!   lock itself for the memtable probe, a fraction of a microsecond,
+//!   and joins no queue.
 //! - **So do scans** (ADR-0019). A scan runs a page at a time. For each
-//!   page the queue hands the caller a copy of the slice of the memtable
-//!   the page can reach, the current manifest and a pin; the caller then
-//!   merges that copy with the tables on its own thread, with a pool of
-//!   block buffers so that each table's block stays decoded while the
-//!   merge is at another table. The copy says where it stops knowing
-//!   (its horizon), and the page stops there.
+//!   page the caller takes the engine lock, copies the slice of the
+//!   memtable the page can reach, and lets go; then it merges that copy
+//!   with the tables on its own thread, with a pool of block buffers so
+//!   that each table's block stays decoded while the merge is at another
+//!   table. The copy says where it stops knowing (its horizon), and the
+//!   page stops there.
 //! - **Flush and compaction wait for readers.** They are the only calls
 //!   that write tables, and a reader must not have a table rewritten
-//!   under it. A read in its table phase holds a [`Pin`]; flush and
-//!   compaction steps, which run under the engine lock, first wait for
-//!   the pins to drain. No new pin can be taken meanwhile, because pins
-//!   are handed out under the same lock. A table phase is tens of
-//!   microseconds, so the wait is short.
+//!   under it. A read in its table phase holds a [`Pin`]. Flush and each
+//!   compaction step, which run under the engine lock, first shut the
+//!   readers' gate and wait for the pins to drain ([`Gate::shut`]): a
+//!   reader without the lock sees the gate shut and waits for the lock
+//!   like the rest. A table phase is tens of microseconds, so the wait
+//!   is short.
 //! - **Snapshots and iterators.** A [`Snapshot`] is horton's sequence
 //!   watermark, released when dropped. An [`Iter`] pins one for its
 //!   lifetime, like a `LevelDB` iterator, and pages through the range.
@@ -88,6 +94,7 @@ use horton::{CachePort, Error, OpenReport, Progress, ScanBlock, SlotStats, Write
 
 use crate::cache::SharedCache;
 use crate::device::{FileDevice, IoError, IoStats, ReadDevice};
+use crate::gate::{Gate, Pin, Slot};
 use crate::{
     BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
     KvScan, KvTables, LEVELS, VAL_MAX, block_on,
@@ -293,6 +300,10 @@ pub struct Stats {
     pub flushes: u64,
     pub compaction_jobs: u64,
     pub compaction_steps: u64,
+    /// Point reads that reached the tables without the engine lock, and
+    /// point reads that took it.
+    pub reads_unlocked: u64,
+    pub reads_locked: u64,
 }
 
 /// Key-value pairs, in scan order.
@@ -342,28 +353,6 @@ impl Drop for PageLease {
     }
 }
 
-/// A reader in the table phase of a read or a scan page. While any is
-/// alive, flush and compaction wait ([`Room::quiesce`]): they are what
-/// could rewrite a table the reader is in. Dropping it lets them go on.
-///
-/// A pin is only ever made under the engine lock, by the thread whose
-/// read it is, in the same hold of the lock as the read's memtable probe
-/// and its view of the manifest.
-struct Pin<'a>(&'a AtomicUsize);
-
-impl<'a> Pin<'a> {
-    fn new(readers: &'a AtomicUsize) -> Self {
-        readers.fetch_add(1, Ordering::SeqCst);
-        Self(readers)
-    }
-}
-
-impl Drop for Pin<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 /// What a scan page takes from the database before it merges: where its
 /// copy of the memtable stops knowing (the nearest key it does not hold,
 /// where the page must stop; `None` when it holds the rest of the
@@ -397,16 +386,41 @@ impl Pending {
 }
 
 /// What a reader thread keeps for its point reads: the probe the
-/// memtable's part is written into, the manifest it last read by, and
-/// the buffers of the table phase (two blocks and a value).
+/// memtable's part is written into, the manifest it last read by, the
+/// buffers of the table phase (two blocks and a value), and its slot in
+/// the gate of the store it last read.
 struct Reader {
     probe: KvProbe,
     /// The engine's manifest as this thread last saw it. Compared by
     /// address with the engine's under the lock, and replaced only when
-    /// the engine's has: a read then takes no reference count.
+    /// the engine's has: a read then takes no reference count. Without
+    /// the lock, its sequence number is compared with the one the gate
+    /// publishes.
     tables: Option<Arc<KvManifest>>,
     scratch: KvReadScratch,
     val: [u8; VAL_MAX],
+    /// Where this thread's pins go; see [`Gate`].
+    slot: Arc<Slot>,
+    /// [`Gate::id`] of the store `tables` and `slot` belong to (0: none
+    /// yet).
+    store: u64,
+}
+
+impl Reader {
+    /// Makes this thread's reader state `gate`'s store's, and returns
+    /// the thread's slot there.
+    ///
+    /// A thread that last read another store forgets that store's
+    /// manifest here. Two stores' manifests can carry the same sequence
+    /// number, and the number is all a read without the lock compares.
+    fn attach(&mut self, gate: &Gate) -> &Arc<Slot> {
+        if self.store != gate.id() {
+            self.tables = None;
+            self.slot = gate.register();
+            self.store = gate.id();
+        }
+        &self.slot
+    }
 }
 
 thread_local! {
@@ -416,6 +430,8 @@ thread_local! {
         tables: None,
         scratch: KvReadScratch::new(),
         val: [0u8; VAL_MAX],
+        slot: Arc::new(Slot::unregistered()),
+        store: 0,
     }));
 
     /// Every thread that scans keeps its own block buffers to lend its
@@ -458,8 +474,10 @@ struct Shared {
     background_due: AtomicBool,
     /// The store is closing: the compaction thread exits.
     stop: AtomicBool,
-    /// Readers in their table phase (live [`Pin`]s).
-    readers: Arc<AtomicUsize>,
+    /// What lets a read reach the tables without the engine lock, and
+    /// counts the readers in them (live [`Pin`]s). The engine and its
+    /// [`Room`] hold the other references.
+    gate: Arc<Gate>,
     /// The file, for those readers.
     read_device: ReadDevice,
     /// Their block cache.
@@ -516,12 +534,12 @@ impl Locked<'_> {
     /// pending and no reader is in its table phase, then the lock is
     /// released.
     ///
-    /// The step is skipped, not waited for, while readers hold pins: the
-    /// caller may hold one itself (its own read, just served), and a
-    /// step that waited for the pins would then wait for its own caller.
-    /// The compaction thread, and any write that needs room, do wait.
+    /// The step is skipped, not waited for, while readers hold pins: a
+    /// write should not stand behind other threads' reads for the sake
+    /// of compaction. The compaction thread, and any write that needs
+    /// room, do wait.
     fn finish(mut self) {
-        if self.background_pending() && self.room.no_readers() {
+        if self.background_pending() && self.gate.pinned() == 0 {
             self.background_step();
         }
         let pending = self.background_pending();
@@ -637,7 +655,7 @@ impl Shared {
     /// The part of a read that needs the database, under the engine
     /// lock, which this thread takes for itself: `op` is the memtable
     /// probe or page copy, and `pins` says whether what it found needs
-    /// the tables.
+    /// the tables. `slot` is the calling thread's.
     ///
     /// The pin is made here, in the same hold of the lock: flush and
     /// compaction, which need that lock, cannot have started since `op`
@@ -646,17 +664,15 @@ impl Shared {
         clippy::significant_drop_tightening,
         reason = "`release` gives the lock up, right after the pin is made under it"
     )]
-    fn begin<T>(
+    fn begin<'s, T>(
         &self,
+        slot: &'s Slot,
         op: impl FnOnce(&mut Engine) -> Result<T, DbError>,
         pins: impl FnOnce(&T) -> bool,
-    ) -> Result<(T, Option<Pin<'_>>), StoreError> {
+    ) -> Result<(T, Option<Pin<'s>>), StoreError> {
         let mut engine = self.engine_for_read()?;
         let begun = op(&mut engine);
-        let pin = begun
-            .as_ref()
-            .is_ok_and(pins)
-            .then(|| Pin::new(&self.readers));
+        let pin = begun.as_ref().is_ok_and(pins).then(|| Pin::new(slot));
         engine.release();
         Ok((begun.map_err(StoreError::Db)?, pin))
     }
@@ -724,12 +740,22 @@ impl Shared {
 
     /// A point read of `key` as of sequence `seq`.
     ///
-    /// The memtable's part needs the database, so it runs under the
-    /// engine lock: this thread takes the lock itself, probes the
-    /// memtable into its own probe, looks at which manifest is current,
-    /// pins the tables if the read will need them, and lets go. It joins
-    /// no queue and waits for no other thread to serve it. The table
-    /// phase then runs here, alongside every other reader's.
+    /// **Without the engine lock, when the memtable cannot hold the
+    /// key.** The thread raises its pin and looks at three words nobody
+    /// is writing ([`Gate::enter`]): the gate is open, the manifest it
+    /// read by last time is still the current one, and the filter over
+    /// the memtable does not have the key. Then the memtable's part of
+    /// the read is known without asking the database (nothing), and the
+    /// table phase starts at once.
+    ///
+    /// **Otherwise under the engine lock**, which this thread takes
+    /// itself: it probes the memtable into its own probe, looks at which
+    /// manifest is current, pins the tables if the read will need them,
+    /// and lets go. It joins no queue and waits for no other thread to
+    /// serve it.
+    ///
+    /// Either way the table phase runs here, alongside every other
+    /// reader's.
     fn read(&self, key: &[u8], seq: u64) -> Result<Option<Vec<u8>>, StoreError> {
         if key.len() > KEY_MAX {
             // No stored key is this long.
@@ -737,21 +763,39 @@ impl Shared {
         }
         READER.with(|reader| {
             let mut reader = reader.borrow_mut();
+            reader.attach(&self.gate);
             let Reader {
                 probe,
                 tables,
                 scratch,
                 val,
+                slot,
+                ..
             } = &mut **reader;
-            // A read the memtable settled reads no table and needs no
-            // pin.
-            let (_, pin) = self.begin(
-                |engine| {
-                    engine.begin_read(key, seq, probe, tables)?;
-                    Ok(probe.is_settled())
-                },
-                |settled| !settled,
-            )?;
+            let seen = tables.as_deref().map(KvManifest::seq);
+            // Let in, the read knows what the memtable holds for its
+            // key without asking: nothing. (The key fits a probe: its
+            // length was checked above.)
+            let unlocked = self
+                .gate
+                .enter(slot, seen, key)
+                .filter(|_| probe.set_absent(key, seq));
+            slot.count(unlocked.is_some());
+            let pin = if unlocked.is_some() {
+                unlocked
+            } else {
+                // A read the memtable settled reads no table and needs
+                // no pin.
+                self.begin(
+                    slot,
+                    |engine| {
+                        engine.begin_read(key, seq, probe, tables)?;
+                        Ok(probe.is_settled())
+                    },
+                    |settled| !settled,
+                )?
+                .1
+            };
             #[cfg(test)]
             if pin.is_some() {
                 self.hold_if_asked();
@@ -814,8 +858,10 @@ impl Shared {
         let Some(page) = lease.page.as_deref_mut() else {
             return Err(StoreError::Closed);
         };
+        let slot = READER.with(|reader| Arc::clone(reader.borrow_mut().attach(&self.gate)));
         // One more key than the page yields: the key passed over.
         let (begun, pin) = self.begin(
+            &slot,
             |engine| {
                 engine.begin_page(
                     reverse,
@@ -1069,12 +1115,20 @@ impl Drop for Store {
             let _ = t.join();
         }
         // Close: drop the database (and its file) now, whoever still
-        // holds a handle.
-        drop(lock(&shared.engine).take());
+        // holds a handle. The gate is shut for good under the engine
+        // lock, where no flush or compaction step can be about to open
+        // it: from here no read reaches the tables without the lock,
+        // and the lock has nothing behind it.
+        let engine = {
+            let mut guard = lock(&shared.engine);
+            shared.gate.close();
+            guard.take()
+        };
+        drop(engine);
         // Reads already in their table phase finish first: once this
         // returns the file may be opened, and its tables rewritten, by
-        // another store. No new pin can appear: the engine is gone.
-        while shared.readers.load(Ordering::SeqCst) != 0 {
+        // another store. No new pin can appear.
+        while shared.gate.pinned() != 0 {
             std::thread::yield_now();
         }
     }
@@ -1090,13 +1144,11 @@ impl Store {
         // is megabytes: build it on a thread with room.
         let read_device = ReadDevice::open(path)
             .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
-        let readers = Arc::new(AtomicUsize::new(0));
-        let engine_readers = Arc::clone(&readers);
         let (engine, cache, pages): (_, _, Vec<_>) = std::thread::Builder::new()
             .name("horton-open".into())
             .stack_size(OPEN_STACK)
             .spawn(move || {
-                Engine::open(device, options.sync, engine_readers).map(|engine| {
+                Engine::open(device, options.sync).map(|engine| {
                     // Megabyte-sized values, built on the stack before
                     // they are boxed: this thread has the room.
                     let pages = new_scan_pages();
@@ -1107,6 +1159,7 @@ impl Store {
             .join()
             .map_err(|_| StoreError::Open("the opening thread panicked".into()))??;
         let report = engine.open;
+        let gate = Arc::clone(&engine.gate);
         let shared = Arc::new(Shared {
             engine: Mutex::new(Some(engine)),
             queue: Mutex::new(VecDeque::new()),
@@ -1116,7 +1169,7 @@ impl Store {
             // Look once: recovery may have left a job pending.
             background_due: AtomicBool::new(true),
             stop: AtomicBool::new(false),
-            readers,
+            gate,
             read_device,
             cache,
             pages: Arc::new(Mutex::new(pages)),
@@ -1171,8 +1224,14 @@ impl Handle {
         check_key(start)?;
         check_key(end)?;
         self.shared.with(|e| {
+            let gate = &e.gate;
             e.room
-                .with_room(&mut e.db, |db| block_on(db.delete_range(start, end)))
+                .with_room(&mut e.db, |db| {
+                    // Before each try: making room flushes, and a flush
+                    // says the memtable holds no range tombstone.
+                    gate.note_unfiltered();
+                    block_on(db.delete_range(start, end))
+                })
                 .map(drop)
         })
     }
@@ -1268,6 +1327,7 @@ impl Handle {
 
     pub fn stats(&self) -> Result<Stats, StoreError> {
         let mut stats = self.shared.with(|e| Ok(e.stats()))?;
+        (stats.reads_unlocked, stats.reads_locked) = self.shared.gate.reads();
         // Point reads' table phases go through the shared handle and
         // cache, not the engine's.
         let cache = self.shared.cache.stats();
@@ -1360,6 +1420,9 @@ const OPEN_STACK: usize = 64 << 20;
 struct Engine {
     db: Box<KvDb<FileDevice>>,
     room: Room,
+    /// The readers' gate (the room has it too, and [`Shared`]). The
+    /// engine's part is to tell it what the memtable is about to hold.
+    gate: Arc<Gate>,
     batch: Box<GroupBatch>,
     /// The writes of the group being committed (kept to reuse its
     /// allocation).
@@ -1385,7 +1448,7 @@ impl Engine {
         clippy::large_stack_frames,
         reason = "the database is built on the stack before it is boxed; the opening thread has 64 MiB"
     )]
-    fn open(device: FileDevice, sync: bool, readers: Arc<AtomicUsize>) -> Result<Self, StoreError> {
+    fn open(device: FileDevice, sync: bool) -> Result<Self, StoreError> {
         let blocks = device.blocks();
         let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
         if blocks < min {
@@ -1396,15 +1459,20 @@ impl Engine {
         let mut db = Box::new(KvDb::new(device, horton::Config::whole_device(blocks)));
         let open = block_on(db.open())?;
         let tables = Arc::new(*db.manifest());
+        // Records replayed from the WAL are in the memtable, and no
+        // filter bit stands for them: reads ask the memtable until the
+        // first flush.
+        let gate = Arc::new(Gate::new(tables.seq(), open.recovered_records > 0));
         Ok(Self {
             db,
             room: Room {
                 scratch: Box::new(KvCompaction::new()),
-                readers,
+                gate: Arc::clone(&gate),
                 flushes: 0,
                 jobs: 0,
                 steps: 0,
             },
+            gate,
             batch: Box::new(GroupBatch::new()),
             group: Vec::new(),
             tables,
@@ -1432,6 +1500,10 @@ impl Engine {
     fn tables(&mut self) -> &Arc<KvManifest> {
         if self.tables.seq() != self.db.manifest().seq() {
             self.tables = Arc::new(*self.db.manifest());
+            // A flush or a compaction step has published this already.
+            // A commit that left the tables alone has not, and readers
+            // would compare against the old number until the next one.
+            self.gate.publish(self.tables.seq());
         }
         &self.tables
     }
@@ -1549,11 +1621,20 @@ impl Engine {
                 break;
             }
         }
-        let batch = &*self.batch;
+        let (batch, group, gate) = (&*self.batch, &self.group, &self.gate);
         let result = result
             .and_then(|()| {
-                self.room
-                    .with_room(&mut self.db, |db| block_on(db.write(batch)))
+                self.room.with_room(&mut self.db, |db| {
+                    // The filter first, then the memtable: a read that
+                    // starts after this write returns must find the
+                    // bits. And before each try: making room flushes,
+                    // and a flush empties the filter.
+                    for op in group.iter().flat_map(|p| &p.batch.ops) {
+                        let (BatchOp::Put(key, _) | BatchOp::Delete(key)) = op;
+                        gate.note(key);
+                    }
+                    block_on(db.write(batch))
+                })
             })
             .map(drop)
             .map_err(StoreError::Db);
@@ -1592,6 +1673,9 @@ impl Engine {
             flushes: self.room.flushes,
             compaction_jobs: self.room.jobs,
             compaction_steps: self.room.steps,
+            // The gate's; `Handle::stats` fills them in.
+            reads_unlocked: 0,
+            reads_locked: 0,
         }
     }
 }
@@ -1600,8 +1684,8 @@ impl Engine {
 /// of what it did.
 struct Room {
     scratch: Box<KvCompaction>,
-    /// Readers in their table phase; see [`Pin`].
-    readers: Arc<AtomicUsize>,
+    /// Shut around every call that changes the tables; see [`Gate`].
+    gate: Arc<Gate>,
     flushes: u64,
     jobs: u64,
     steps: u64,
@@ -1625,45 +1709,23 @@ impl Room {
         op(db)
     }
 
-    /// Waits until no reader is in its table phase. Called before each
-    /// flush and compaction step, the only calls that write a table or
-    /// give a table's blocks up for reuse: a reader must never have a
-    /// table rewritten under it.
-    ///
-    /// The caller holds the engine lock, and pins are only made under
-    /// that lock, so the count can only fall while this waits, and stays
-    /// at zero until the lock is released. A table phase is a few block
-    /// reads, so the wait is short.
-    ///
-    /// Never call this on a thread that may hold a pin of its own: see
-    /// [`Engine::serve`] and [`Locked::finish`].
-    fn quiesce(&self) {
-        let mut polls = 0usize;
-        while !self.no_readers() {
-            polls += 1;
-            if polls.is_multiple_of(POLLS_PER_YIELD) {
-                std::thread::yield_now();
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    /// True when no reader is in its table phase.
-    fn no_readers(&self) -> bool {
-        self.readers.load(Ordering::SeqCst) == 0
-    }
-
     /// Flushes the memtable, compacting first if level 0 is full.
     ///
     /// A flush holds a table writer, and a writer holds the largest
     /// bloom filter a table can have (`BLOOM_BYTES`, 255 KiB), so the
     /// flush future goes on the heap: this runs on whichever client
     /// thread holds the engine, with whatever stack that thread has.
+    ///
+    /// Each try is made with the gate shut, and the gate is opened
+    /// again before anything else: the compaction between two tries
+    /// shuts it for itself, a step at a time.
     fn flush(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
-        self.quiesce();
         for attempt in 0..=ROOM_TRIES {
-            match block_on(Box::pin(db.flush())) {
+            self.gate.shut();
+            let flushed = block_on(Box::pin(db.flush()));
+            // A flush that returned `Ok` has emptied the memtable.
+            self.gate.open(db.manifest().seq(), flushed.is_ok());
+            match flushed {
                 Err(Error::NeedsCompaction) if attempt < ROOM_TRIES => self.job(db)?,
                 r => {
                     self.flushes += u64::from(r.is_ok());
@@ -1680,10 +1742,12 @@ impl Room {
         Ok(())
     }
 
-    /// One bounded compaction step.
+    /// One bounded compaction step, with the gate shut around it.
     fn step(&mut self, db: &mut KvDb<FileDevice>) -> Result<Progress, DbError> {
-        self.quiesce();
-        let p = block_on(db.compact_step(&mut self.scratch))?;
+        self.gate.shut();
+        let stepped = block_on(db.compact_step(&mut self.scratch));
+        self.gate.open(db.manifest().seq(), false);
+        let p = stepped?;
         self.steps += 1;
         self.jobs += u64::from(p == Progress::Done);
         Ok(p)
@@ -2110,7 +2174,7 @@ mod tests {
     /// not finish while the reader is in there, because they retire the
     /// table it is reading and write new tables into the freed slots.
     /// Once the reader leaves, they finish, and the reader's answer is
-    /// the value as of its probe. Without [`Room::quiesce`] the
+    /// the value as of its probe. Without [`Gate::shut`] the
     /// compaction completes under the reader and this test fails.
     #[test]
     fn flush_and_compaction_wait_for_a_reader_in_its_table_phase() {
@@ -2129,7 +2193,7 @@ mod tests {
                 let h = store.handle();
                 let reader = s.spawn(move || h.get(&key(7)).expect("get"));
                 entered.recv().expect("the reader reached its table phase");
-                assert_eq!(store.handle.shared.readers.load(Ordering::SeqCst), 1);
+                assert_eq!(store.handle.shared.gate.pinned(), 1);
 
                 // Writes do not wait for the reader: they reach only the
                 // WAL and the memtable.
@@ -2154,7 +2218,7 @@ mod tests {
                 mutator.join().expect("mutator");
             });
             assert!(compacted.load(Ordering::SeqCst));
-            assert_eq!(store.handle.shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(store.handle.shared.gate.pinned(), 0);
             let v = store.get(&key(7)).expect("get").expect("present");
             assert_eq!(unstamp(&v), (7, 2));
         });
@@ -2234,7 +2298,7 @@ mod tests {
             );
             assert!(reads.load(Ordering::Relaxed) >= 4 * 300);
             // Every read gave its pin back.
-            assert_eq!(store.handle.shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(store.handle.shared.gate.pinned(), 0);
             for k in 0..KEYS {
                 let v = store.get(&key(k)).expect("get").expect("present");
                 assert_eq!(unstamp(&v), (k, 40));
@@ -2242,13 +2306,14 @@ mod tests {
         });
     }
 
-    /// The thread that serves its own read holds that read's pin until
-    /// it has run the table phase. It must not then wait for readers to
-    /// drain, in a compaction step or a flush, or it waits for itself.
-    /// One thread alone, reading while a compaction job is pending, is
-    /// the case: it is always the thread serving its own request. The
-    /// compaction thread is stopped first, so the job stays pending and
-    /// only this thread can move it.
+    /// A reader holds its pin until it has run the table phase. It must
+    /// not, meanwhile, wait for readers to drain, in a compaction step
+    /// or a flush, or it waits for itself: a read that takes the engine
+    /// lock gives it up without a step ([`Locked::release`]), and a
+    /// read that takes none never had it. One thread alone, reading
+    /// while a compaction job is pending, is the case. The compaction
+    /// thread is stopped first, so the job stays pending and only this
+    /// thread can move it.
     #[test]
     fn a_reader_serving_its_own_request_does_not_wait_for_itself() {
         within_a_minute(|| {
@@ -2271,8 +2336,8 @@ mod tests {
                 round += 1;
                 assert!(round < 20, "no compaction ever became pending");
             }
-            // Each read is served by this thread, comes back pinned (the
-            // memtable is empty), and ends its turn with a job pending.
+            // Each read pins the tables (the memtable is empty) with a
+            // job pending, and leaves the job where it was.
             let mut reads_with_a_job_pending = 0;
             for k in 0..40 {
                 reads_with_a_job_pending += u32::from(pending());
@@ -2284,8 +2349,430 @@ mod tests {
             for k in 0..600 {
                 store.put(&key(k + 1000), &stamped(k, 0)).expect("put");
             }
-            assert_eq!(shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(shared.gate.pinned(), 0);
         });
+    }
+
+    /// The point of the gate: a read of a key the memtable cannot hold
+    /// waits for no lock of the store's. The test holds the engine
+    /// lock, the write queue and the scan pages, all at once, and a
+    /// thread reads flushed keys and absent keys meanwhile. A key that
+    /// is in the memtable still asks the memtable, under the engine
+    /// lock, and so waits for the test to let go.
+    #[test]
+    fn a_read_the_memtable_cannot_settle_waits_for_no_lock() {
+        within_a_minute(|| {
+            let store = TempStore::new("no-lock");
+            for k in 0..60 {
+                store.put(&key(k), &stamped(k, 1)).expect("put");
+            }
+            store.flush().expect("flush");
+            store.put(&key(100), &stamped(100, 1)).expect("put");
+            let shared = &store.handle.shared;
+            std::thread::scope(|s| {
+                let (warm_tx, warm) = std::sync::mpsc::channel();
+                let (go, go_rx) = std::sync::mpsc::channel();
+                let (out_tx, out) = std::sync::mpsc::channel();
+                let h = store.handle();
+                s.spawn(move || {
+                    // A thread's first read takes the lock: it has no
+                    // copy of the manifest yet.
+                    assert!(h.get(&key(0)).expect("get").is_some());
+                    warm_tx.send(()).expect("warm");
+                    go_rx.recv().expect("go");
+                    for k in 0..60 {
+                        let v = h.get(&key(k)).expect("get").expect("present");
+                        assert_eq!(unstamp(&v), (k, 1));
+                    }
+                    for k in 60..90 {
+                        assert_eq!(h.get(&key(k)).expect("get"), None);
+                    }
+                    out_tx.send(()).expect("out");
+                    go_rx.recv().expect("go");
+                    let v = h.get(&key(100)).expect("get").expect("present");
+                    assert_eq!(unstamp(&v), (100, 1));
+                    out_tx.send(()).expect("out");
+                });
+                warm.recv().expect("warm");
+                let before = shared.gate.reads();
+                assert_eq!(before, (0, 1));
+                let engine = lock(&shared.engine);
+                let queue = lock(&shared.queue);
+                let pages = lock(&shared.pages);
+                go.send(()).expect("go");
+                out.recv_timeout(Duration::from_secs(20))
+                    .expect("reads the memtable could not settle waited for a lock");
+                assert_eq!(shared.gate.reads(), (90, 1));
+                go.send(()).expect("go");
+                assert!(
+                    out.recv_timeout(Duration::from_millis(200)).is_err(),
+                    "a read of a key in the memtable did not ask the memtable"
+                );
+                drop((pages, queue, engine));
+                out.recv_timeout(Duration::from_secs(20))
+                    .expect("the read of a memtable key never finished");
+                assert_eq!(shared.gate.reads(), (90, 2));
+            });
+        });
+    }
+
+    /// A read that reached the tables without the engine lock is in
+    /// them like any other: flush and compaction wait for it. The same
+    /// test as the one above for a read that took the lock, with the
+    /// reader's manifest already current, so that it takes none.
+    #[test]
+    fn flush_and_compaction_wait_for_a_reader_that_took_no_lock() {
+        within_a_minute(|| {
+            let store = TempStore::new("gate-unlocked");
+            for k in 0..60 {
+                store.put(&key(k), &stamped(k, 1)).expect("put");
+            }
+            store.flush().expect("flush");
+            let shared = &store.handle.shared;
+            let compacted = Arc::new(AtomicBool::new(false));
+            std::thread::scope(|s| {
+                let (warm_tx, warm) = std::sync::mpsc::channel();
+                let (go, go_rx) = std::sync::mpsc::channel();
+                let h = store.handle();
+                let reader = s.spawn(move || {
+                    assert!(h.get(&key(0)).expect("get").is_some());
+                    warm_tx.send(()).expect("warm");
+                    go_rx.recv().expect("go");
+                    h.get(&key(7)).expect("get")
+                });
+                warm.recv().expect("warm");
+                let (entered_tx, entered) = std::sync::mpsc::channel();
+                let (release, release_rx) = std::sync::mpsc::channel();
+                *lock(&shared.hold_next_reader) = Some((entered_tx, release_rx));
+                go.send(()).expect("go");
+                entered.recv().expect("the reader reached its table phase");
+                assert_eq!(shared.gate.pinned(), 1);
+                assert_eq!(shared.gate.reads(), (1, 1), "the held read took no lock");
+
+                for k in 0..60 {
+                    store.put(&key(k), &stamped(k, 2)).expect("put");
+                }
+                let (h, done) = (store.handle(), Arc::clone(&compacted));
+                let mutator = s.spawn(move || {
+                    h.compact().expect("compact");
+                    done.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(
+                    !compacted.load(Ordering::SeqCst),
+                    "tables were rewritten while a reader was inside them"
+                );
+                // While the gate is shut and waiting, another read does
+                // not slip into the tables; it waits for the engine.
+                release.send(()).expect("release");
+                let v = reader.join().expect("reader").expect("present");
+                assert_eq!(unstamp(&v), (7, 1), "the read is as of when it entered");
+                mutator.join().expect("mutator");
+            });
+            assert!(compacted.load(Ordering::SeqCst));
+            assert_eq!(shared.gate.pinned(), 0);
+            let v = store.get(&key(7)).expect("get").expect("present");
+            assert_eq!(unstamp(&v), (7, 2));
+        });
+    }
+
+    /// The two tests above run a flush and a compaction together, and
+    /// either one waiting would pass them. Here each is alone: a
+    /// compaction step with nothing to flush, then a flush with nothing
+    /// to compact. Neither may finish while a reader is in the tables.
+    #[test]
+    fn a_compaction_step_and_a_flush_each_wait_for_a_reader() {
+        within_a_minute(|| {
+            let store = TempStore::new("each-waits");
+            let shared = &store.handle.shared;
+            // No compaction thread: the job stays pending until this
+            // test steps it.
+            shared.stop.store(true, Ordering::Release);
+            shared.wake_background();
+            let pending = || {
+                lock(&shared.engine)
+                    .as_ref()
+                    .is_some_and(Engine::background_pending)
+            };
+            let mut round = 0u64;
+            while !pending() {
+                for k in 0..40 {
+                    store.put(&key(k), &stamped(k, round)).expect("put");
+                }
+                store.flush().expect("flush");
+                round += 1;
+                assert!(round < 20, "no compaction ever became pending");
+            }
+            // Set when the step, and when the flush, has run.
+            let (step_ran, flush_ran) = (AtomicBool::new(false), AtomicBool::new(false));
+            std::thread::scope(|s| {
+                let (go, go_rx) = std::sync::mpsc::channel();
+                let (out_tx, out) = std::sync::mpsc::channel();
+                let h = store.handle();
+                s.spawn(move || {
+                    while go_rx.recv().is_ok() {
+                        let v = h.get(&key(7)).expect("get").expect("present");
+                        out_tx.send(unstamp(&v)).expect("out");
+                    }
+                });
+                // Holds the reader's next read in its table phase.
+                let hold = || {
+                    let (entered_tx, entered) = std::sync::mpsc::channel();
+                    let (release, release_rx) = std::sync::mpsc::channel();
+                    *lock(&shared.hold_next_reader) = Some((entered_tx, release_rx));
+                    go.send(()).expect("go");
+                    entered.recv().expect("the reader reached its table phase");
+                    assert_eq!(shared.gate.pinned(), 1);
+                    release
+                };
+                go.send(()).expect("go");
+                assert_eq!(out.recv().expect("out"), (7, round - 1));
+
+                // A compaction step, alone.
+                let release = hold();
+                assert!(pending());
+                let stepper = s.spawn(|| {
+                    lock(&shared.engine)
+                        .as_mut()
+                        .expect("open")
+                        .background_step();
+                    step_ran.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(
+                    !step_ran.load(Ordering::SeqCst),
+                    "a compaction step ran while a reader was inside the tables"
+                );
+                release.send(()).expect("release");
+                assert_eq!(out.recv().expect("out"), (7, round - 1));
+                stepper.join().expect("stepper");
+                assert!(step_ran.load(Ordering::SeqCst));
+
+                // A flush, alone: the reader holds its pin, so the put
+                // and the flush end their turns without a compaction
+                // step.
+                let release = hold();
+                store.put(&key(1000), &stamped(1000, 0)).expect("put");
+                let flusher = s.spawn(|| {
+                    store.flush().expect("flush");
+                    flush_ran.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(
+                    !flush_ran.load(Ordering::SeqCst),
+                    "a flush ran while a reader was inside the tables"
+                );
+                release.send(()).expect("release");
+                assert_eq!(out.recv().expect("out"), (7, round - 1));
+                flusher.join().expect("flusher");
+                assert!(flush_ran.load(Ordering::SeqCst));
+                drop(go);
+            });
+            assert_eq!(shared.gate.pinned(), 0);
+        });
+    }
+
+    /// Whichever way a read goes, it sees every write that returned
+    /// before it began. Reads of what only the tables hold take no
+    /// lock; a key written, deleted or created since the last flush
+    /// asks the memtable; so does every key once a range was deleted;
+    /// and a flush makes all of them table reads again.
+    #[test]
+    fn a_read_sees_every_write_before_it_whichever_way_it_goes() {
+        let store = TempStore::new("see-writes");
+        let reads = || store.handle.shared.gate.reads();
+        let get = |k: usize| store.get(&key(k)).expect("get").map(|v| unstamp(&v));
+        for k in 0..200 {
+            store.put(&key(k), &stamped(k, 1)).expect("put");
+        }
+        store.flush().expect("flush");
+        // This thread's first look at the manifest: under the lock.
+        assert_eq!(get(0), Some((0, 1)));
+        assert_eq!(reads(), (0, 1));
+        for k in 0..260 {
+            assert_eq!(get(k), (k < 200).then_some((k, 1)));
+        }
+        assert_eq!(reads(), (260, 1));
+        // An overwrite, a delete and a new key: each seen by the very
+        // next read, which asks the memtable.
+        store.put(&key(3), &stamped(3, 2)).expect("put");
+        assert_eq!(get(3), Some((3, 2)));
+        store.delete(&key(4)).expect("delete");
+        assert_eq!(get(4), None);
+        store.put(&key(230), &stamped(230, 1)).expect("put");
+        assert_eq!(get(230), Some((230, 1)));
+        assert_eq!(reads(), (260, 4));
+        // The keys around them go on taking no lock.
+        assert_eq!(get(5), Some((5, 1)));
+        assert_eq!(get(231), None);
+        assert_eq!(reads(), (262, 4));
+        // A range tombstone is in the memtable under no key a read
+        // could look up: every read asks the memtable.
+        store
+            .delete_range(&key(10), &key(20))
+            .expect("delete_range");
+        for k in 5..25 {
+            assert_eq!(get(k), (!(10..20).contains(&k)).then_some((k, 1)));
+        }
+        assert_eq!(reads(), (262, 24));
+        // A flush empties the memtable. The first read after it finds
+        // its manifest replaced and asks; then none do.
+        store.flush().expect("flush");
+        assert_eq!(get(3), Some((3, 2)));
+        assert_eq!(reads(), (262, 25));
+        assert_eq!(get(3), Some((3, 2)));
+        assert_eq!(get(4), None);
+        assert_eq!(get(15), None);
+        assert_eq!(get(230), Some((230, 1)));
+        assert_eq!(get(5), Some((5, 1)));
+        assert_eq!(reads(), (267, 25));
+        let stats = store.stats().expect("stats");
+        assert_eq!((stats.reads_unlocked, stats.reads_locked), (267, 25));
+    }
+
+    /// Records replayed from the WAL at open are in the memtable, and
+    /// no filter bit was ever set for them. Until a flush, every read
+    /// asks the memtable.
+    #[test]
+    fn a_memtable_recovered_from_the_wal_is_asked_until_it_is_flushed() {
+        let mut store = TempStore::new("recovered");
+        for k in 0..50 {
+            store.put(&key(k), &stamped(k, 1)).expect("put");
+        }
+        store.flush().expect("flush");
+        for k in 0..10 {
+            store.put(&key(k), &stamped(k, 2)).expect("put");
+        }
+        store.delete(&key(20)).expect("delete");
+        store.reopen();
+        assert_eq!(store.stats().expect("stats").open.recovered_records, 11);
+        let check = |store: &TempStore| {
+            for _ in 0..2 {
+                for k in 0..60 {
+                    let want = match k {
+                        0..10 => Some((k, 2)),
+                        20 | 50.. => None,
+                        _ => Some((k, 1)),
+                    };
+                    let got = store.get(&key(k)).expect("get").map(|v| unstamp(&v));
+                    assert_eq!(got, want, "key {k}");
+                }
+            }
+        };
+        check(&store);
+        assert_eq!(store.handle.shared.gate.reads(), (0, 120));
+        store.flush().expect("flush");
+        check(&store);
+        // All but the first, which found a new manifest.
+        assert_eq!(store.handle.shared.gate.reads(), (119, 121));
+    }
+
+    /// A thread keeps one manifest copy for its reads. Two stores'
+    /// manifests can carry the same sequence number, which is all a
+    /// read without the lock compares: a thread that goes from one
+    /// store to another must not read the second by the first's tables.
+    #[test]
+    fn a_thread_reading_two_stores_keeps_their_tables_apart() {
+        let a = TempStore::new("apart-a");
+        let b = TempStore::new("apart-b");
+        // One flush each, so one sequence number; different tables.
+        for k in 0..40 {
+            a.put(&key(k), &stamped(k, 1)).expect("put");
+        }
+        a.flush().expect("flush");
+        for k in 1000..1400 {
+            b.put(&key(k), &stamped(k, 1)).expect("put");
+        }
+        b.flush().expect("flush");
+        let (ga, gb) = (&a.handle.shared.gate, &b.handle.shared.gate);
+        assert_eq!(ga.tables_seq(), gb.tables_seq());
+        let get = |store: &TempStore, k: usize| store.get(&key(k)).expect("get");
+        for round in 0..3 {
+            for k in 0..40 {
+                let far = 1000 + k * 10 + round;
+                assert_eq!(get(&a, k).map(|v| unstamp(&v)), Some((k, 1)));
+                assert_eq!(get(&b, far).map(|v| unstamp(&v)), Some((far, 1)));
+                assert_eq!(get(&a, far), None);
+                assert_eq!(get(&b, k), None);
+            }
+        }
+        // Every read above followed one of the other store: its thread
+        // had that store's manifest no longer, and asked for it.
+        assert_eq!((ga.reads(), gb.reads()), ((0, 240), (0, 240)));
+        // Reads of one store in a row take no lock, as ever.
+        assert_eq!(get(&a, 1).map(|v| unstamp(&v)), Some((1, 1)));
+        assert_eq!(get(&a, 2).map(|v| unstamp(&v)), Some((2, 1)));
+        assert_eq!(ga.reads(), (1, 241));
+        assert_eq!((ga.pinned(), gb.pinned()), (0, 0));
+    }
+
+    /// A write that finds no room (a full memtable, a full WAL) flushes
+    /// and tries again. The flush empties the filter, so the key must
+    /// be noted for the second try as it was for the first: otherwise
+    /// the key is in the memtable, the filter says it is not, and reads
+    /// answer from the tables. The same for a range delete and its
+    /// flag.
+    ///
+    /// Every key is in a table with an old value first. Then each is
+    /// overwritten or range-deleted in turn, and the test looks at the
+    /// ones whose write flushed on the way.
+    #[test]
+    fn a_write_that_had_to_make_room_is_still_seen() {
+        within_a_minute(|| {
+            const KEYS: usize = 3 * crate::MEMTABLE_ENTRIES;
+            let store = TempStore::new("made-room");
+            let flushes = || store.stats().expect("stats").flushes;
+            for k in 0..KEYS {
+                store.put(&key(k), b"old").expect("put");
+            }
+            store.flush().expect("flush");
+            let (mut puts_made_room, mut deletes_made_room) = (0, 0);
+            for k in 0..KEYS {
+                let before = flushes();
+                let want = if k % 2 == 0 {
+                    store.put(&key(k), b"new").expect("put");
+                    Some(b"new".to_vec())
+                } else {
+                    store
+                        .delete_range(&key(k), &key(k + 1))
+                        .expect("delete_range");
+                    None
+                };
+                let made_room = flushes() > before;
+                puts_made_room += usize::from(made_room && k % 2 == 0);
+                deletes_made_room += usize::from(made_room && k % 2 == 1);
+                // After a flush the first read finds a new manifest and
+                // asks the memtable; the next ones would take no lock,
+                // if the filter let them.
+                for _ in 0..if made_room { 6 } else { 1 } {
+                    assert_eq!(store.get(&key(k)).expect("get"), want, "key {k}");
+                }
+            }
+            assert!(
+                puts_made_room >= 2 && deletes_made_room >= 2,
+                "{puts_made_room} puts and {deletes_made_room} range deletes made room"
+            );
+        });
+    }
+
+    /// Closing shuts the gate for good: a thread whose manifest was
+    /// current, and whose reads were taking no lock, is refused like
+    /// any other caller. (It would otherwise go on reading the file by
+    /// a manifest the next store to open it will replace.)
+    #[test]
+    fn a_closed_store_answers_no_read_from_its_tables() {
+        let mut store = TempStore::new("closed-reads");
+        store.put(b"k", b"v").expect("put");
+        store.flush().expect("flush");
+        let stale = store.handle();
+        assert_eq!(stale.get(b"k").expect("get"), Some(b"v".to_vec()));
+        assert_eq!(stale.get(b"k").expect("get"), Some(b"v".to_vec()));
+        assert_eq!(stale.get(b"absent").expect("get"), None);
+        assert_eq!(store.handle.shared.gate.reads(), (2, 1));
+        store.reopen();
+        assert_eq!(stale.get(b"k"), Err(StoreError::Closed));
+        assert_eq!(stale.get(b"absent"), Err(StoreError::Closed));
+        assert_eq!(store.get(b"k").expect("get"), Some(b"v".to_vec()));
     }
 
     /// Reads that end in the memtable, in tables, or nowhere all agree
@@ -2354,7 +2841,7 @@ mod tests {
                 let h = store.handle();
                 let scanner = s.spawn(move || h.scan(&key(10), Some(&key(20)), false, 100, None));
                 entered.recv().expect("the scan reached its table phase");
-                assert_eq!(store.handle.shared.readers.load(Ordering::SeqCst), 1);
+                assert_eq!(store.handle.shared.gate.pinned(), 1);
                 for k in 0..60 {
                     store.put(&key(k), &stamped(k, 2)).expect("put");
                 }
@@ -2376,7 +2863,7 @@ mod tests {
                 mutator.join().expect("mutator");
             });
             let shared = &store.handle.shared;
-            assert_eq!(shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(shared.gate.pinned(), 0);
             assert_eq!(
                 lock(&shared.pages).len(),
                 SCAN_PAGES,
@@ -2524,7 +3011,7 @@ mod tests {
             });
             assert!(scans.load(Ordering::Relaxed) >= 3 * 8);
             let shared = &store.handle.shared;
-            assert_eq!(shared.readers.load(Ordering::SeqCst), 0);
+            assert_eq!(shared.gate.pinned(), 0);
             assert_eq!(lock(&shared.pages).len(), SCAN_PAGES);
         });
     }
