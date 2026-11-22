@@ -289,8 +289,8 @@ These are the limits it meets, and each is a property of the library:
 
 - **A point read costs 21 µs of one core at 1 M keys**, 2.3 µs when the
   key is absent. Ruling out a table
-  that does not hold the key is cheap (a footer's fields and one bloom
-  bucket from the cache). The table that may hold it costs an index
+  that does not hold the key is cheap (one bloom bucket from the
+  cache; the manifest says where it is). The table that may hold it costs an index
   block and a data block, each checked whole, and the data block
   inflated, on every read: the cache keeps the compressed image. A
   block that is not cached costs a 16 KiB CRC in software on top
@@ -393,7 +393,7 @@ rebuilds the slot map from the manifest.
 ```text
 block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
              └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
-               blocks, magic "hrtman08"
+               blocks, magic "hrtman09"
 
 SSTable:    [data]* [rdel]* [bloom]+ [index] [footer]
              │       │        │        │       └ magic "hrtsst04", ids, entry count, k, rdel count, min seq, filter length

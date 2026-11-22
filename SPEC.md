@@ -181,17 +181,28 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   bloom_len u32`. The bloom section is `[bloom_block, index_block)`,
   and must be exactly the blocks `bloom_len` bytes of filter fill.
 
-A CRC failure on a footer, index, data, or rdel block is `CorruptBlock`
-everywhere, never "absent" (which would let an older version win). Every
+A CRC failure on an index, data, or rdel block is `CorruptBlock`
+everywhere, never "absent" (which would let an older version win). The
+footer makes a table self-describing off the device: it is read, and a
+bad one is `CorruptBlock`, where a table is re-attached
+(`ingest_table`) or opened by a tool (`TableReader::open`). A `Db`'s
+reads, scans and compactions do not read it: the manifest record says
+everything it does (ADR-0021). Every
 block a reader parses comes through `sstable::read_block_verified` or
 `read_range_verified`, which check the CRC of whatever the device
 returns; data blocks then go through `sstable::read_data_block`.
 
 A table's `TableRef` carries `first_key` (its **live lower bound**),
 `last_key` (covering both sections, the greatest rdel end inclusively),
-`max_seq`/`min_seq` over both sections, `entry_count`, `rdel_blocks` and
-`bloom_blocks` (so a table's data blocks number `block_count -
-rdel_blocks - bloom_blocks - 2`).
+`max_seq`/`min_seq` over both sections, `entry_count`, `rdel_blocks`,
+and the bloom section: `bloom_blocks`, `bloom_k` (the footer's `k`; 0
+means the record does not describe the filter and readers skip it) and
+`bloom_len`. With the table's block range that locates every section
+(data blocks number `block_count - rdel_blocks - bloom_blocks - 2`;
+the bloom section follows the rdel section; the index follows it), so
+`TableReader::from_ref` builds a reader with no I/O. It refuses a
+record whose counts do not fit its range or whose `bloom_len` does not
+fill exactly `bloom_blocks`.
 Entries and range-tombstone pieces below `first_key` are dead to every
 reader (a compaction narrowed the table past them).
 
@@ -204,13 +215,13 @@ shared by the levels. L0 holds at most `TABLES` refs, oldest first;
 deeper levels hold disjoint runs sorted by first key, in any share of
 the pool.
 
-Storage (format `hrtman08`, ADR-0011): two or more **copies**
+Storage (format `hrtman09`, ADR-0011): two or more **copies**
 (`ManifestLayout::pair` or `ManifestLayout::ring`), each
 `Manifest::max_blocks::<BLOCK>()` blocks long, the compile-time worst
 case. Block layout:
 
 ```
-magic: u64 = "hrtman08" | seq: u64 | index: u16 | count: u16 | len: u32
+magic: u64 = "hrtman09" | seq: u64 | index: u16 | count: u16 | len: u32
 | body chunk[len] | crc32: u32
 ```
 
@@ -336,8 +347,8 @@ an open request has work.
   blocks whose CRC matched are inserted. A hit is not CRC-checked
   again: each slot keeps a RAM checksum of its image in 16 chunks, and
   a hit must match it or it is dropped and read from the device again
-  (ADR-0016). A point read asks for byte ranges of the footer and bloom
-  blocks and pays for the chunks they touch. Above 8 slots a block's
+  (ADR-0016). A point read asks for one bloom bucket as a byte range
+  and pays for the chunk it lies in. Above 8 slots a block's
   slot is one of 8 chosen by hashing its key, so lookups do not grow
   with the cache.
 

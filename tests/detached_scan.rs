@@ -723,9 +723,10 @@ fn a_seek_reads_only_the_tables_around_its_key() {
     block_on(scan.seek(&key(205), None, u64::MAX)).unwrap();
     let (kl, _) = block_on(scan.next(&mut k, &mut v)).unwrap().unwrap();
     assert_eq!(&k[..kl], key(205).as_slice());
-    // The footer, index and data block of the one table that holds the
-    // key; the table after it waits, the two before are pruned.
-    assert_eq!(device.reads.get(), 3, "a seek into one table of four");
+    // The index and data block of the one table that holds the key (the
+    // manifest names the index block; no footer is read); the table
+    // after it waits, the two before are pruned.
+    assert_eq!(device.reads.get(), 2, "a seek into one table of four");
 
     // Reading on opens the next table when the scan reaches it.
     let mut got = vec![k[..kl].to_vec()];
@@ -734,7 +735,7 @@ fn a_seek_reads_only_the_tables_around_its_key() {
     }
     let want: Vec<Vec<u8>> = (205..220).chain(300..320).map(key).collect();
     assert_eq!(got, want);
-    assert_eq!(device.reads.get(), 6, "two tables, three blocks each");
+    assert_eq!(device.reads.get(), 4, "two tables, two blocks each");
 
     // From the very start nothing is read until the first entry is asked
     // for, and an end bound keeps later tables shut for good.
@@ -752,7 +753,7 @@ fn a_seek_reads_only_the_tables_around_its_key() {
     assert_eq!(n, 25, "twenty keys of the first table, five of the second");
     assert_eq!(
         device.reads.get(),
-        before + 6,
+        before + 4,
         "two tables of four were opened"
     );
 }

@@ -383,6 +383,42 @@ sequenceDiagram
     so the remainder is now a mask, and the fills are back within
     noise.
 
+### Then: readers that do not read footers
+
+11. **The manifest record describes a table in full** (library,
+    ADR-0021). With the filters doing their work, a table that does
+    not hold the key cost two small reads from the cache: the footer's
+    fields, to learn where the filter is and how to probe it, and then
+    one bloom bucket. The manifest record already had most of what the
+    footer says, and the rest follows from the table's layout. It now
+    carries the two facts that were missing (the probe count and the
+    filter's length), a reader is built from it with no I/O, and
+    nothing on a read, scan or compaction path reads a footer. A probe
+    the filter turns away is one read of one bucket; a seek reads one
+    block fewer per table it positions.
+
+    Measured on identical tables (fills on one thread, which leaves the
+    same layout every time: 4, 5, 0 and 14 tables per level), 1 M keys,
+    each figure the mean of two or three runs:
+
+    | | reader threads | footer and bucket | bucket only | change |
+    |---|---:|---:|---:|---:|
+    | `readmissing` | 1 | 419,150 | 516,329 | +23% |
+    | `readmissing` | 4 | 431,268 | 587,948 | +36% |
+    | `readrandom` | 1 | 48,377 | 49,453 | +2% |
+    | `readrandom` | 4 | 136,152 | 150,612 | +11% |
+    | `seekrandom` | 1 | 17,121 | 16,872 | -1% |
+    | `seekrandom` | 4 | 51,313 | 55,827 | +9% |
+    | `readseq` | 4 | 7,114,846 | 7,305,777 | +3% |
+
+    An absent-key read on one thread is 1.9 µs, from 2.4. The gains
+    are larger at four threads than at one because what was removed
+    was a read of the shared cache, and the cache is what the threads
+    contend on. The one-thread seek figure is inside the noise of
+    these runs (three pairs: 17,073, 17,179 and 17,110 before; 16,896,
+    16,814 and 16,905 after), and nothing in the change would make a
+    seek cost more: it reads one block fewer.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
@@ -447,11 +483,6 @@ of LZ77, 8 µs of CRC and a write. It is the largest single item in
 
 Measured or scoped while doing this, and left:
 
-- **Point reads without the footer.** A probe reads the footer's
-  fields and then the bloom bucket. The manifest could carry what the
-  footer says (the probe count and the filter's length; it already has
-  the rest), which would halve the cache reads of a probe and take a
-  block out of every seek. A manifest format change.
 - **Cache hits that write nothing shared**, and a memtable probe that
   does not queue. These two are what an absent-key read now waits on
   at four threads. The first is the host cache's design (a lock, a

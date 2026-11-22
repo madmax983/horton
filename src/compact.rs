@@ -1827,8 +1827,8 @@ pub(crate) async fn init_cursor<
     }
     // The first data block whose key range can reach the bound.
     let floor = tref.first_key.as_slice();
-    let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-    let index_id = sstable::footer_index_block(device, None, tref.id, raw, footer).await?;
+    // The manifest names the index block: no footer is read.
+    let index_id = tref.index_block().ok_or(Error::CorruptManifest)?;
     read_block_into(device, index_id, raw).await?;
     sstable::check_block_crc(raw, index_id)?;
     let payload_end = BLOCK - sstable::CRC_LEN;

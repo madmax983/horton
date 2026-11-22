@@ -11,6 +11,12 @@
 //!   clients share the store, so group commit has something to group
 //!   and reads, seeks and scans run side by side; `--batch N` puts N
 //!   writes in each client batch, like `fillbatch`.
+//! - **`--read-threads N` gives the read benchmarks their own thread
+//!   count.** What a read costs depends on how many level-0 tables the
+//!   fills leave, and with several writer threads that number changes
+//!   from run to run. Fills on one thread leave the same tables every
+//!   time, so `--threads 1 --read-threads 4` compares two builds'
+//!   reads on equal terms.
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -24,8 +30,23 @@ struct Params {
     num: u64,
     value_size: usize,
     threads: u64,
+    /// Client threads of the read benchmarks; `None`: as many as
+    /// `threads`.
+    read_threads: Option<u64>,
     batch: u64,
     benchmarks: Vec<String>,
+}
+
+impl Params {
+    /// The parameters a read benchmark runs with: `--read-threads`
+    /// clients when that was given.
+    fn readers(&self) -> Self {
+        Self {
+            threads: self.read_threads.unwrap_or(self.threads),
+            benchmarks: Vec::new(),
+            ..*self
+        }
+    }
 }
 
 fn parse(args: &[String]) -> Result<Params, String> {
@@ -33,6 +54,7 @@ fn parse(args: &[String]) -> Result<Params, String> {
         num: 100_000,
         value_size: 100,
         threads: 4,
+        read_threads: None,
         batch: 1,
         benchmarks: DEFAULT.split(',').map(String::from).collect(),
     };
@@ -47,6 +69,7 @@ fn parse(args: &[String]) -> Result<Params, String> {
             "--num" => p.num = num()?,
             "--value-size" => p.value_size = usize::try_from(num()?).map_err(|e| e.to_string())?,
             "--threads" => p.threads = num()?.max(1),
+            "--read-threads" => p.read_threads = Some(num()?.max(1)),
             "--batch" => p.batch = num()?.max(1),
             "--benchmarks" => {
                 p.benchmarks = it
@@ -175,11 +198,11 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
         let done = match name.as_str() {
             "fillseq" => fill(&store, &p, false),
             "fillrandom" | "overwrite" => fill(&store, &p, true),
-            "readrandom" => read_random(&store, &p, false),
-            "readmissing" => read_random(&store, &p, true),
-            "readseq" => read_seq(&store, &p, false),
-            "readreverse" => read_seq(&store, &p, true),
-            "seekrandom" => seek_random(&store, &p),
+            "readrandom" => read_random(&store, &p.readers(), false),
+            "readmissing" => read_random(&store, &p.readers(), true),
+            "readseq" => read_seq(&store, &p.readers(), false),
+            "readreverse" => read_seq(&store, &p.readers(), true),
+            "seekrandom" => seek_random(&store, &p.readers()),
             "deleterandom" => delete_random(&store, &p),
             "compact" => store
                 .compact()

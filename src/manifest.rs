@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman08" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman09" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -30,7 +30,8 @@
 //!           | fk_len: u16 | fk_bytes[fk_len]
 //!           | lk_len: u16 | lk_bytes[lk_len]
 //!           | max_seq: u64 | min_seq: u64 | entry_count: u32 | rdel_blocks: u32
-//!           | bloom_blocks: u32 | node_id: u32 | seal_wall: u64
+//!           | bloom_blocks: u16 | bloom_k: u8 | bloom_len: u32
+//!           | node_id: u32 | seal_wall: u64
 //! ```
 
 use core::future::{Future, poll_fn};
@@ -39,7 +40,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman08".
+/// Manifest block magic: ASCII "hrtman09".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -50,13 +51,16 @@ use crate::error::Error;
 /// a copy over as many blocks as it needs; "hrtman06" adds the per-table
 /// replica-merge origin (`node_id`, `seal_wall`); "hrtman07" was an
 /// unreleased v0.20 layout naming tables in the `hrtsst03` format;
-/// "hrtman08" (v0.20) adds the per-table `bloom_blocks` count and names
-/// tables in the `hrtsst04` format, so an image whose tables carry an
-/// older bloom filter is rejected when it is opened, not at its first
-/// read. A foreign magic decodes
+/// "hrtman08" was a second unreleased v0.20 layout with a per-table
+/// `bloom_blocks` count; "hrtman09" (v0.20) records each table's bloom
+/// section in full (`bloom_blocks`, `bloom_k`, `bloom_len`), so a reader
+/// needs nothing from a table's footer, and names tables in the
+/// `hrtsst04` format, so an image whose tables carry an older bloom
+/// filter is rejected when it is opened, not at its first read. A
+/// foreign magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman08");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman09");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.
@@ -240,12 +244,17 @@ impl<const KEY_MAX: usize> KeyBound<KEY_MAX> {
 pub struct TableRef<const KEY_MAX: usize> {
     /// Table id, unique per database lifetime.
     pub id: u32,
-    /// First block id of the table. On-device layout (v0.17):
-    /// `[data]* [rdel]* [bloom] [index] [footer]` — see
+    /// First block id of the table. On-device layout:
+    /// `[data]* [rdel]* [bloom]+ [index] [footer]` — see
     /// [`data_first`](Self::data_first), [`rdel_first`](Self::rdel_first),
-    /// and [`footer_block`](Self::footer_block).
+    /// [`bloom_first`](Self::bloom_first),
+    /// [`index_block`](Self::index_block) and
+    /// [`footer_block`](Self::footer_block). Every one of them follows
+    /// from this record, so a reader finds a table's sections without
+    /// reading its footer.
     pub first_block: u64,
-    /// Total blocks: rdel blocks + data blocks + bloom + index + footer.
+    /// Total blocks: data blocks + rdel blocks + bloom blocks + index +
+    /// footer.
     pub block_count: u32,
     /// Live lower bound: the smallest key the table answers for (includes
     /// range-tombstone bounds). Normally the table's smallest key; a
@@ -275,7 +284,15 @@ pub struct TableRef<const KEY_MAX: usize> {
     /// Bloom-filter blocks, stored after the range-tombstone blocks: at
     /// least 1 in a table horton wrote (see
     /// [`BloomShape`](crate::sstable::BloomShape)).
-    pub bloom_blocks: u32,
+    pub bloom_blocks: u16,
+    /// Bloom probes per key, as the table's writer set them. `0` means
+    /// the record does not describe the filter (a hand-built record, for
+    /// one): a reader then skips the filter and goes to the index. It
+    /// never guesses.
+    pub bloom_k: u8,
+    /// Bytes of bloom filter in those blocks. Meaningful when `bloom_k`
+    /// is not 0.
+    pub bloom_len: u32,
     /// Origin node of the table's versions: the primary that sealed it
     /// (`0` = unstamped — a legacy table, or one the host has not stamped
     /// yet). Replicas order same-key versions across primaries by
@@ -304,6 +321,8 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
         entry_count: 0,
         rdel_blocks: 0,
         bloom_blocks: 0,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     };
@@ -329,6 +348,26 @@ impl<const KEY_MAX: usize> TableRef<KEY_MAX> {
     pub const fn rdel_first(&self) -> Option<u64> {
         match self.data_blocks() {
             Some(d) => self.first_block.checked_add(d),
+            None => None,
+        }
+    }
+
+    /// First bloom block: right after the range-tombstone section, or
+    /// `None` for a malformed ref.
+    #[must_use]
+    pub const fn bloom_first(&self) -> Option<u64> {
+        match self.rdel_first() {
+            Some(r) => r.checked_add(self.rdel_blocks as u64),
+            None => None,
+        }
+    }
+
+    /// The index block: the one before the footer, right after the bloom
+    /// section, or `None` for a malformed ref.
+    #[must_use]
+    pub const fn index_block(&self) -> Option<u64> {
+        match self.bloom_first() {
+            Some(b) => b.checked_add(self.bloom_blocks as u64),
             None => None,
         }
     }
@@ -703,7 +742,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
 
     /// The largest body any manifest of this shape can encode to: every
     /// pool entry in use, every key bound at `KEY_MAX` bytes.
-    const MAX_BODY: usize = 8 + 4 + 8 + 8 + 4 + 4 * LEVELS + Self::CAPACITY * (60 + 2 * KEY_MAX);
+    const MAX_BODY: usize = 8 + 4 + 8 + 8 + 4 + 4 * LEVELS + Self::CAPACITY * (63 + 2 * KEY_MAX);
 
     /// Blocks one copy of this manifest shape can need, at most: the size
     /// of every copy in a [`ManifestLayout`]. A compile-time function of
@@ -736,7 +775,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         let mut refs = 0;
         for li in 0..LEVELS {
             self.view_level(edit, li, |t| {
-                refs += 60 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
+                refs += 63 + usize::from(t.first_key.len) + usize::from(t.last_key.len);
             });
         }
         8 + 4 + 8 + 8 + 4 + 4 * LEVELS + refs
@@ -823,7 +862,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 w.u64(tref.min_seq);
                 w.u32(tref.entry_count);
                 w.u32(tref.rdel_blocks);
-                w.u32(tref.bloom_blocks);
+                w.u16(tref.bloom_blocks);
+                w.u8(tref.bloom_k);
+                w.u32(tref.bloom_len);
                 w.u32(tref.node_id);
                 w.u64(tref.seal_wall);
             });
@@ -977,7 +1018,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
             min_seq: src.u64().await?,
             entry_count: src.u32().await?,
             rdel_blocks: src.u32().await?,
-            bloom_blocks: src.u32().await?,
+            bloom_blocks: src.u16().await?,
+            bloom_k: src.u8().await?,
+            bloom_len: src.u32().await?,
             node_id: src.u32().await?,
             seal_wall: src.u64().await?,
         })
@@ -1572,6 +1615,10 @@ impl Window<'_> {
         self.pos = end;
     }
 
+    fn u8(&mut self, v: u8) {
+        self.bytes(&[v]);
+    }
+
     fn u16(&mut self, v: u16) {
         self.bytes(&v.to_le_bytes());
     }
@@ -1592,6 +1639,12 @@ trait BodySource<E> {
     /// Fills `dst` from the body; [`Error::CorruptManifest`] when it runs
     /// out.
     async fn take(&mut self, dst: &mut [u8]) -> Result<(), Error<E>>;
+
+    async fn u8(&mut self) -> Result<u8, Error<E>> {
+        let mut b = [0u8; 1];
+        self.take(&mut b).await?;
+        Ok(b[0])
+    }
 
     async fn u16(&mut self) -> Result<u16, Error<E>> {
         let mut b = [0u8; 2];

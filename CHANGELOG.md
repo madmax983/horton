@@ -12,9 +12,9 @@ misread (SPEC §4.5).
 ## [Unreleased]
 
 The next release is 0.20.0. **The on-disk format changes** (manifest
-`hrtman08`, SSTable `hrtsst04`): v0.19 images, and archives exported by
-v0.19, are rejected, not misread. So are images written by a build of
-`main` from before this release (`hrtman07`, `hrtsst03`).
+`hrtman09`, SSTable `hrtsst04`): v0.19 images, and archives exported by
+v0.19, are rejected, not misread. So are images written by a build
+from before this release (`hrtman07`, `hrtman08`, `hrtsst03`).
 
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
@@ -42,6 +42,11 @@ keys 48 times, seeks 26 times and scans 34 times.
   before.
 - `TableRef::bloom_blocks`, `FinishedTable::bloom_blocks`,
   `TableReader::bloom_blocks` and `bloom_len`.
+- **`TableReader::from_ref`** builds a reader from a table's manifest
+  record, with no I/O (ADR-0021). `TableRef` gains `bloom_k` and
+  `bloom_len`, and `bloom_first()` and `index_block()`;
+  `FinishedTable` gains `bloom_k` and `bloom_len`; `TableReader` gains
+  `bloom_k()`.
 - **Detached point reads** (ADR-0018). `Db::probe_memtable` runs the
   memtable half of a point read and returns a `MemProbe`;
   `TableView::resolve` finishes it over a copy of `Db::manifest`, any
@@ -122,17 +127,27 @@ keys 48 times, seeks 26 times and scans 34 times.
   `CacheStats` a new field, `rejected`.
 - The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk
   sums); the RAM budget is unchanged.
+- **Reads, scans and compaction no longer read table footers**
+  (ADR-0021). The manifest record names every section of a table and
+  its filter's shape, so a point read that the filter turns away is
+  one read of one bloom bucket, and a seek reads one block fewer per
+  table. A damaged footer no longer fails a read; it fails a
+  re-attach (`ingest_table`), which is where a footer is still read.
+  A record whose filter length disagrees with its bloom blocks is
+  `CorruptManifest`. `sstable::footer_index_block` is gone.
 - **The table footer records the filter's length** (`bloom_len`), and
   the manifest each table's bloom-block count. A reader takes the
   filter's size from the table, not from its own `BLOOM_BYTES`, and
   refuses a footer whose length and block ids disagree.
   `TableRef::data_blocks` is `block_count - rdel_blocks - bloom_blocks
-  - 2`. A table reference is 4 bytes longer on the device and 8 in RAM.
+  - 2`. A table reference is 7 bytes longer on the device and 8 in RAM.
 - `BLOOM_BYTES` is no longer limited to `BLOCK - 4`.
 - A bloom probe's bit positions in a whole bucket are reduced with a
   mask where they took a 64-bit division each. The positions are the
   same.
-- The kvstore's `stats` prints the bloom blocks its tables hold.
+- The kvstore's `stats` prints the bloom blocks its tables hold, and
+  its `bench` takes `--read-threads N`, so reads can be measured over
+  tables that fills on one thread always leave the same.
 - A compaction job reuses its table writer in place for each output.
 - **kvstore tables carry up to sixteen bloom blocks** (`bloom_bytes` is
   255 KiB), and the store boxes its flush future, which holds the

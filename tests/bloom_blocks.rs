@@ -153,15 +153,17 @@ fn tables<D: BlockDevice, const BLOOM: usize>(db: &TestDb<D, BLOOM>) -> Vec<Tabl
 
 /// Checks every table against the rule and its own footer; returns the
 /// set of bloom-block counts seen.
-fn check_tables<const BLOOM: usize>(db: &TestDb<Reads, BLOOM>) -> BTreeSet<u32> {
+fn check_tables<const BLOOM: usize>(db: &TestDb<Reads, BLOOM>) -> BTreeSet<u16> {
     let mut seen = BTreeSet::new();
     let mut scratch = [0u8; BLOCK];
     for t in tables(db) {
         let shape = BloomShape::for_entries(BLOOM, BLOCK, u64::from(t.entry_count));
         assert_eq!(
-            t.bloom_blocks, shape.blocks,
+            u32::from(t.bloom_blocks),
+            shape.blocks,
             "table {} ({} entries)",
-            t.id, t.entry_count
+            t.id,
+            t.entry_count
         );
         assert!(
             shape == BloomShape::full(BLOOM, BLOCK)
@@ -184,6 +186,19 @@ fn check_tables<const BLOOM: usize>(db: &TestDb<Reads, BLOOM>) -> BTreeSet<u32> 
         assert_eq!(reader.bloom_blocks(), u64::from(t.bloom_blocks));
         assert_eq!(reader.bloom_len(), shape.len);
         assert_eq!(reader.entry_count(), u64::from(t.entry_count));
+        // And the manifest record says everything the footer does, so a
+        // reader built from the record is the reader built from the
+        // footer.
+        assert_eq!(t.bloom_len as usize, reader.bloom_len());
+        assert_eq!(t.bloom_k, reader.bloom_k());
+        assert!(t.bloom_k >= 1, "a written table's filter is described");
+        assert_eq!(t.rdel_blocks, reader.rdel_blocks());
+        assert_eq!(t.min_seq, reader.min_seq());
+        assert_eq!(t.index_block(), Some(footer - 1));
+        assert_eq!(
+            t.bloom_first(),
+            Some(footer - 1 - u64::from(t.bloom_blocks))
+        );
         seen.insert(t.bloom_blocks);
     }
     seen

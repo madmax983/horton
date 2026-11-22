@@ -29,6 +29,8 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         entry_count: 5,
         rdel_blocks: 0,
         bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     }
@@ -212,17 +214,17 @@ fn old_magic_is_rejected_not_misparsed() {
 #[test]
 fn a_v019_manifest_is_rejected_not_misparsed() {
     // v0.20 changes what a manifest's tables hold (the bucketed bloom
-    // filter, then a filter that may span blocks: `hrtsst04`) and adds a
-    // per-table `bloom_blocks` count, so the magic is "hrtman08". A v0.19
+    // filter, then a filter that may span blocks: `hrtsst04`) and records
+    // each table's bloom section, so the magic is "hrtman09". A v0.19
     // image ("hrtman06"), and one from an unreleased v0.20 build
-    // ("hrtman07"), is refused when it is opened, before any of its
-    // tables is read by the new rule.
+    // ("hrtman07", "hrtman08"), is refused when it is opened, before any
+    // of its tables is read by the new rule.
     let mut m = TestManifest::new();
     m.add_table_to_level::<DevError>(0, tref(0, 100)).unwrap();
     let mut buf = [0u8; BLOCK];
     m.encode::<DevError, BLOCK>(&mut buf).unwrap();
-    assert_eq!(&buf[0..8], b"hrtman08");
-    for old in [b"hrtman06", b"hrtman07"] {
+    assert_eq!(&buf[0..8], b"hrtman09");
+    for old in [b"hrtman06", b"hrtman07", b"hrtman08"] {
         buf[0..8].copy_from_slice(old);
         // A real older block carries a CRC over its own magic.
         let crc = horton::crc32(&buf[..BLOCK - 4]);
@@ -254,6 +256,8 @@ fn encode_crc_tail_is_bounds_checked() {
         entry_count: 5,
         rdel_blocks: 0,
         bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     })
@@ -441,6 +445,8 @@ fn ref_span(id: u32, lo: u64, hi: u64) -> TableRef<16> {
         entry_count: 3,
         rdel_blocks: 0,
         bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     }

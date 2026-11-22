@@ -69,6 +69,9 @@ fn write_single(
         entry_count: u32::try_from(plan.entry_count).expect("entry count fits"),
         rdel_blocks: 0,
         bloom_blocks: 1,
+        // The 1024-byte filter `write_table` wrote, as its footer says.
+        bloom_k: k,
+        bloom_len: 1024,
         node_id: 0,
         seal_wall: 0,
     }
@@ -195,7 +198,8 @@ fn older_tombstone_loses_to_newer_value() {
 #[test]
 fn range_prune_skips_out_of_range_tables() {
     // One table covers "b", the other covers "q". Each consulted table
-    // costs exactly 4 block reads (footer, bloom, index, one data block).
+    // costs exactly 3 block reads (bloom, index, one data block): the
+    // manifest record describes the table, so its footer is not read.
     let mut dev = MemDevice::new();
     let t1 = write_single(&mut dev, slot(0), b"b", b"vb", 1, false, 0);
     let t2 = write_single(&mut dev, slot(1), b"q", b"vq", 2, false, 1);
@@ -215,18 +219,18 @@ fn range_prune_skips_out_of_range_tables() {
         .expect("get")
         .expect("present");
     assert_eq!(&buf[..n], b"vb");
-    assert_eq!(reads.get(), 4);
+    assert_eq!(reads.get(), 3);
 
     // Mirror image: only the "q" table is read.
     let n = block_on(db.get(b"q", &mut buf))
         .expect("get")
         .expect("present");
     assert_eq!(&buf[..n], b"vq");
-    assert_eq!(reads.get(), 8);
+    assert_eq!(reads.get(), 6);
 
     // "m" is covered by neither table: zero table I/O, still a miss.
     assert_eq!(block_on(db.get(b"m", &mut buf)).expect("get"), None);
-    assert_eq!(reads.get(), 8);
+    assert_eq!(reads.get(), 6);
 }
 
 /// Returns `Poll::Pending` once, on the first table-region read
@@ -350,5 +354,5 @@ fn seq_prune_skips_shadowed_tables() {
         .expect("present");
     assert_eq!(&buf[..n], b"v-new");
     // Exactly one table's worth of reads: the older table was pruned.
-    assert_eq!(reads.get(), 4);
+    assert_eq!(reads.get(), 3);
 }

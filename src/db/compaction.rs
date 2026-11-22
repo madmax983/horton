@@ -1190,7 +1190,9 @@ impl<
             min_seq: done.min_seq,
             entry_count: u32::try_from(done.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks,
-            bloom_blocks: done.bloom_blocks,
+            bloom_blocks: u16::try_from(done.bloom_blocks).map_err(|_| Error::TableTooLarge)?,
+            bloom_k: done.bloom_k,
+            bloom_len: done.bloom_len,
             // The job is pure-node and `job_max_wall` is the maximum
             // `seal_wall` over every table whose versions reach this
             // output (inputs and overlapping targets): grouping-

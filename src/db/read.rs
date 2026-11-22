@@ -337,15 +337,10 @@ impl<
         if !tref.covers(key) || !version_gt(bound, acc.best_ver) {
             return Ok(());
         }
-        let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-        let reader = sstable::TableReader::<R, BLOCK, BLOOM_BYTES>::open_cached(
-            self.device,
-            self.cache,
-            tref.id,
-            scratch,
-            footer,
-        )
-        .await?;
+        // From the manifest record, with no I/O: the footer says nothing
+        // the record does not.
+        let reader =
+            sstable::TableReader::<R, BLOCK, BLOOM_BYTES>::from_ref(self.device, self.cache, tref)?;
         // `tmp` (not `acc.stage`) receives the value: only a winning hit is
         // promoted, so a losing hit cannot clobber the staged winner.
         let mut tmp = [0u8; VAL_MAX];
@@ -422,8 +417,9 @@ impl<
     ///
     /// [`Error::BufferTooSmall`] when `val_buf` is smaller than the winning
     /// value, [`Error::CorruptManifest`] when a table's block range is
-    /// malformed, [`Error::CorruptBlock`] when a table's index or footer
-    /// fails verification, [`Error::Busy`] when another `get` on this
+    /// malformed or its record misdescribes its filter,
+    /// [`Error::CorruptBlock`] when a table's index or data block fails
+    /// verification, [`Error::Busy`] when another `get` on this
     /// handle is in flight (reads share the `Db`'s block buffers), or
     /// [`Error::Device`] on I/O failure.
     pub async fn get(

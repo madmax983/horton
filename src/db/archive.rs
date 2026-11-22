@@ -68,6 +68,36 @@ pub struct SealedTable<const KEY_MAX: usize> {
     pub seal_wall: u64,
 }
 
+impl<const KEY_MAX: usize> SealedTable<KEY_MAX> {
+    /// The manifest record for a copy of this table at `first_block`.
+    /// The descriptor does not describe the bloom filter; the copy's
+    /// verified footer does, and the caller passes what it says.
+    const fn placed_at(
+        &self,
+        first_block: u64,
+        bloom_blocks: u16,
+        bloom_k: u8,
+        bloom_len: u32,
+    ) -> TableRef<KEY_MAX> {
+        TableRef {
+            id: self.id,
+            first_block,
+            block_count: self.block_count,
+            first_key: self.first_key,
+            last_key: self.last_key,
+            max_seq: self.max_seq,
+            min_seq: self.min_seq,
+            entry_count: self.entry_count,
+            rdel_blocks: self.rdel_blocks,
+            bloom_blocks,
+            bloom_k,
+            bloom_len,
+            node_id: self.node_id,
+            seal_wall: self.seal_wall,
+        }
+    }
+}
+
 impl<const KEY_MAX: usize> ArchivePlan<KEY_MAX> {
     /// Strips this plan down to its placement-free sealed descriptor.
     ///
@@ -232,12 +262,16 @@ impl<
         {
             return Err(Error::CorruptBlock { id: footer });
         }
-        // The descriptor does not say how many blocks the filter takes:
-        // the table does, in the footer just verified, and
-        // `relocate_table` has checked that count against the table's
-        // length.
+        // The descriptor does not describe the filter: the table does, in
+        // the footer just verified, and `relocate_table` has checked its
+        // block count against the table's length. This is the one place
+        // a footer is read; from here on the manifest record speaks for
+        // the table.
         let bloom_blocks =
-            u32::try_from(reader.bloom_blocks()).map_err(|_| Error::CorruptBlock { id: footer })?;
+            u16::try_from(reader.bloom_blocks()).map_err(|_| Error::CorruptBlock { id: footer })?;
+        let bloom_len =
+            u32::try_from(reader.bloom_len()).map_err(|_| Error::CorruptBlock { id: footer })?;
+        let bloom_k = reader.bloom_k();
         // The ingested table may hold versions older than tombstones an
         // in-flight compaction job is about to drop (the job's drop floor
         // predates it), so the job restarts from scratch.
@@ -251,23 +285,7 @@ impl<
         // must resume above them, or a later local write could lose to an
         // older ingested version under highest-sequence-wins.
         edit.raise_seq_high(self.next_seq.max(sealed.max_seq));
-        edit.add::<D::Error>(
-            0,
-            TableRef {
-                id: sealed.id,
-                first_block: base,
-                block_count: sealed.block_count,
-                first_key: sealed.first_key,
-                last_key: sealed.last_key,
-                max_seq: sealed.max_seq,
-                min_seq: sealed.min_seq,
-                entry_count: sealed.entry_count,
-                rdel_blocks: sealed.rdel_blocks,
-                bloom_blocks,
-                node_id: sealed.node_id,
-                seal_wall: sealed.seal_wall,
-            },
-        )?;
+        edit.add::<D::Error>(0, sealed.placed_at(base, bloom_blocks, bloom_k, bloom_len))?;
         let layout = self.manifest_layout();
         self.manifest
             .commit_edit(

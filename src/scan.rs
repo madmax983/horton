@@ -575,7 +575,7 @@ impl<
     ///
     /// [`Error::KeyTooLarge`] when a bound exceeds `KEY_MAX`,
     /// [`Error::EmptyKey`] for an empty `end` bound,
-    /// [`Error::CorruptBlock`] on a torn index/data block or bad footer,
+    /// [`Error::CorruptBlock`] on a torn index or data block,
     /// [`Error::CorruptManifest`] on a malformed table range, or
     /// [`Error::Device`] on I/O failure.
     pub async fn seek(
@@ -704,8 +704,8 @@ impl<
     /// # Errors
     ///
     /// [`Error::BufferTooSmall`] with the required length, [`Error::CorruptBlock`]
-    /// on a torn data block (or a torn index block or bad footer of a
-    /// table the scan reaches for the first time),
+    /// on a torn data block (or a torn index block of a table the scan
+    /// reaches for the first time),
     /// [`Error::CorruptManifest`] on a malformed table range, or
     /// [`Error::Device`] on I/O failure.
     pub async fn next(
@@ -1009,18 +1009,8 @@ impl<
         // blocks only.
         let data_first = tref.data_first();
         let data_blocks = Self::data_blocks_of(tref)?;
-        let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-        let db = self.src;
-        let index_id = sstable::footer_index_block(
-            db.device,
-            db.cache,
-            tref.id,
-            // Only the footer's fields are fetched: the read buffer will
-            // do, and no block buffer is disturbed.
-            &mut self.blocks.raw,
-            footer,
-        )
-        .await?;
+        // The manifest names the index block: no footer is read.
+        let index_id = tref.index_block().ok_or(Error::CorruptManifest)?;
         self.read_verify_index(tref.id, index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
         let data_id = sstable::index_lookup::<D::Error>(
@@ -1554,7 +1544,7 @@ impl<
     /// # Errors
     ///
     /// [`Error::KeyTooLarge`] when a bound exceeds `KEY_MAX`,
-    /// [`Error::CorruptBlock`] on a torn index/data block or bad footer,
+    /// [`Error::CorruptBlock`] on a torn index or data block,
     /// [`Error::CorruptManifest`] on a malformed table range, or
     /// [`Error::Device`] on I/O failure.
     pub async fn seek_prev(
@@ -1925,18 +1915,8 @@ impl<
             // walk the manifest, not the cursors.
             return Ok(());
         }
-        let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-        let db = self.src;
-        let index_id = sstable::footer_index_block(
-            db.device,
-            db.cache,
-            tref.id,
-            // Only the footer's fields are fetched: the read buffer will
-            // do, and no block buffer is disturbed.
-            &mut self.blocks.raw,
-            footer,
-        )
-        .await?;
+        // The manifest names the index block: no footer is read.
+        let index_id = tref.index_block().ok_or(Error::CorruptManifest)?;
         self.read_verify_index(tref.id, index_id).await?;
         let payload_end = BLOCK - sstable::CRC_LEN;
         // Last data block whose first key sorts at/before `from`; empty

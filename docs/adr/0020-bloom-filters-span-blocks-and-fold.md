@@ -130,7 +130,7 @@ memtable.
 - **Firmware pays 4 bytes of manifest per table on the device and 8
   in RAM** (a `TableRef` grows from 120 to 128 bytes in the ESP32-S3
   profile), and nothing else: 200 bytes of the profile's peak, which
-  stays inside its 112 KiB with 656 to spare (BUDGET.md).
+  stays inside its 112 KiB (BUDGET.md).
 - **Device space follows the table.** A flush in the kvstore still
   writes one bloom block. A full table writes up to sixteen, 256 KiB
   beside 7 MiB of data.

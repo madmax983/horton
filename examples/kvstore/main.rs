@@ -159,8 +159,9 @@ commands:
                                 print the keys in [START, END)
   compact                       flush, then compact every table once
   stats                         the layout, the levels and the counters
-  bench [--num N] [--value-size N] [--threads N] [--batch N]
-        [--benchmarks a,b,...]  db_bench's workloads on a fresh store
+  bench [--num N] [--value-size N] [--threads N] [--read-threads N]
+        [--batch N] [--benchmarks a,b,...]
+                                db_bench's workloads on a fresh store
   crash [N] [--threads N] [--seed N] [--sync]
                                 kill -9 a writing process N times (default
                                 20), reopen, and check every acknowledged

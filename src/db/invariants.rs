@@ -59,7 +59,7 @@ impl<
                     return Err("a table has no room for bloom, index, and footer");
                 }
                 let bloom = crate::sstable::BloomShape::full(BLOOM_BYTES, BLOCK).blocks;
-                if t.bloom_blocks == 0 || t.bloom_blocks > bloom {
+                if t.bloom_blocks == 0 || u32::from(t.bloom_blocks) > bloom {
                     return Err("a table's bloom blocks are not within 1..=the configured filter");
                 }
                 if t.entry_count > 0 && t.min_seq > t.max_seq {

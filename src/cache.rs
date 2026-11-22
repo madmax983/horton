@@ -67,8 +67,8 @@
 //! device, so it is not part of the format.
 //!
 //! An image is summed in [`SUM_CHUNKS`] chunks, one sum each, so a
-//! reader that needs a few bytes of a block (a footer's fields, one
-//! bloom bucket) asks for that range with
+//! reader that needs a few bytes of a block (one bloom bucket, a
+//! footer's fields) asks for that range with
 //! [`get_range_into`](BlockCache::get_range_into) and pays for the
 //! chunks the range touches, not for the block. The rule is the same
 //! at either size: a lookup is a hit only if the sum over every chunk

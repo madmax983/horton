@@ -85,7 +85,7 @@ impl<
         id: u32,
         base: u64,
         total: u64,
-        bloom_blocks: u32,
+        (bloom, bloom_k): (sstable::BloomShape, u8),
         plan: &sstable::TablePlan<KEY_MAX>,
         rdel_plan: &sstable::RdelPlan<'_>,
     ) -> Result<TableRef<KEY_MAX>, Error<D::Error>> {
@@ -107,7 +107,11 @@ impl<
             min_seq: plan.min_seq.min(rdel_plan.min_seq),
             entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks: rdel_plan.blocks,
-            bloom_blocks,
+            // What the writer put in the footer: readers take it from
+            // here.
+            bloom_blocks: u16::try_from(bloom.blocks).map_err(|_| Error::TableTooLarge)?,
+            bloom_k,
+            bloom_len: u32::try_from(bloom.len).map_err(|_| Error::TableTooLarge)?,
             // The memtable holds this handle's own mutations; the
             // wall-clock half of the origin arrives post-seal via
             // Db::stamp_table (horton is clock-free).
@@ -186,11 +190,10 @@ impl<
         // The entry count is known, so the filter's size and its probe
         // count are exact.
         let k = sstable::TableWriter::<BLOCK, BLOOM_BYTES, KEY_MAX>::probes_for(plan.entry_count);
-        let bloom_blocks =
-            sstable::BloomShape::for_entries(BLOOM_BYTES, BLOCK, plan.entry_count).blocks;
+        let bloom = sstable::BloomShape::for_entries(BLOOM_BYTES, BLOCK, plan.entry_count);
         let total = u64::from(rdel_plan.blocks)
             .checked_add(plan.data_blocks)
-            .and_then(|n| n.checked_add(u64::from(bloom_blocks)))
+            .and_then(|n| n.checked_add(u64::from(bloom.blocks)))
             .and_then(|n| n.checked_add(2))
             .ok_or(Error::TableTooLarge)?;
         // Pick a free slot; it is claimed only once the manifest commit
@@ -228,7 +231,10 @@ impl<
             let done = w
                 .finish_meta(&mut *device, rdel_written, rdel_plan.min_seq)
                 .await?;
-            debug_assert_eq!(done.bloom_blocks, bloom_blocks);
+            debug_assert_eq!(
+                (done.bloom_blocks, done.bloom_len as usize, done.bloom_k),
+                (bloom.blocks, bloom.len, k)
+            );
         }
         // The manifest commit is the atomic visibility point. Stage the
         // change as an edit, applied in memory only once the commit lands,
@@ -242,7 +248,7 @@ impl<
             id,
             base,
             total,
-            bloom_blocks,
+            (bloom, k),
             &plan,
             &rdel_plan,
         )?;

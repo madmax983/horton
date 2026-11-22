@@ -32,7 +32,8 @@ history keeps it); its §9 milestone log now lives in
 | [0017](0017-bucketed-bloom-and-ranged-reads.md) | Bloom probes stay in one 64-byte bucket; point reads fetch ranges of the footer and bloom blocks (`hrtsst03`; extended by 0020) |
 | [0018](0018-detached-point-reads.md) | A point read is a memtable probe plus a table phase that runs without the `Db`; the caller keeps table writes away from detached readers |
 | [0019](0019-detached-scans-block-pool-lazy-seek.md) | Scans read from parts and can run without the `Db` (the memtable copied a page at a time); a scan can be lent block buffers; a forward seek reads only the tables that hold its key |
-| [0020](0020-bloom-filters-span-blocks-and-fold.md) | A bloom filter may span blocks; the writer builds it at full length and folds it to the table's entry count (`hrtsst04`, `hrtman08`) |
+| [0020](0020-bloom-filters-span-blocks-and-fold.md) | A bloom filter may span blocks; the writer builds it at full length and folds it to the table's entry count (`hrtsst04`) |
+| [0021](0021-the-manifest-record-describes-a-table.md) | The manifest record names every section of a table and its filter's shape; readers, scans and compaction do not read footers (`hrtman09`) |
 
 ## Adding a record
 

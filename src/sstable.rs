@@ -55,7 +55,7 @@ use crate::compress::{CompressScratch, decompress};
 use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::KeyBound;
+use crate::manifest::{KeyBound, TableRef};
 use crate::wal::Op;
 
 /// Footer magic: ASCII "hrtsst04" as stored on device.
@@ -770,6 +770,10 @@ pub struct FinishedTable<const KEY_MAX: usize> {
     pub data_blocks: u64,
     /// Bloom blocks written: at least 1 (see [`BloomShape`]).
     pub bloom_blocks: u32,
+    /// Bytes of bloom filter in those blocks, as the footer records.
+    pub bloom_len: u32,
+    /// Bloom probes per key, as the footer records.
+    pub bloom_k: u8,
     /// Key/value entries written (including tombstones).
     pub entry_count: u64,
     /// Highest sequence number written.
@@ -1234,6 +1238,8 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         Ok(FinishedTable {
             data_blocks: self.data_blocks,
             bloom_blocks: shape.blocks,
+            bloom_len,
+            bloom_k: self.k,
             entry_count: self.entry_count,
             max_seq: self.max_seq,
             min_seq,
@@ -1245,7 +1251,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// Seals the trailing data block and writes the bloom, index, and
     /// footer blocks for a table with no range-tombstone section, then
     /// flushes the device. Reports the table's shape for the manifest's
-    /// [`TableRef`](crate::manifest::TableRef).
+    /// [`TableRef`].
     ///
     /// # Errors
     ///
@@ -2129,47 +2135,6 @@ pub(crate) fn index_last_le_block<E>(
     Ok(index_partition(payload, index_id, |fkey| fkey <= key)?.last_matching)
 }
 
-/// Reads and verifies a table footer, returning its index block id.
-/// Used by the scan iterator to position cursors via the block index
-/// without opening a full [`TableReader`].
-///
-/// # Errors
-///
-/// [`Error::CorruptBlock`] when the footer is missing or fails
-/// verification, or [`Error::Device`] on I/O failure.
-pub(crate) async fn footer_index_block<D: BlockDevice, const BLOCK: usize>(
-    device: &D,
-    cache: Option<&dyn CachePort<BLOCK>>,
-    table_id: u32,
-    scratch: &mut [u8; BLOCK],
-    footer_block: u64,
-) -> Result<u64, Error<D::Error>> {
-    read_range_verified(
-        device,
-        cache,
-        table_id,
-        footer_block,
-        scratch,
-        0..FOOTER_LEN,
-        true,
-    )
-    .await?;
-    let magic = u64::from_le_bytes(
-        scratch[0..8]
-            .try_into()
-            .map_err(|_| Error::CorruptBlock { id: footer_block })?,
-    );
-    if magic != SSTABLE_MAGIC {
-        return Err(Error::CorruptBlock { id: footer_block });
-    }
-    let index_block = u64::from_le_bytes(
-        scratch[8..16]
-            .try_into()
-            .map_err(|_| Error::CorruptBlock { id: footer_block })?,
-    );
-    Ok(index_block)
-}
-
 /// One parsed data-block entry, borrowing the block.
 struct ParsedEntry<'a> {
     key: &'a [u8],
@@ -2565,6 +2530,12 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
 
 /// Point-lookup reader over one table. Holds a shared device reference;
 /// every lookup reuses the caller's scratch block.
+///
+/// A `Db` builds one from the table's manifest record
+/// ([`from_ref`](Self::from_ref)), which costs no I/O: the record names
+/// every section of the table. [`open`](Self::open) reads the same facts
+/// from the table's footer, for a table no manifest describes yet (a
+/// copy being ingested) and for tools.
 pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize> {
     device: &'d D,
     /// Owning table's id: first half of the block-cache key. Table ids
@@ -2579,6 +2550,8 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
     /// Filter bytes, from the verified footer (see [`BloomShape`]).
     bloom_len: usize,
     entry_count: u64,
+    /// Bloom probes per key; 0 when the reader was built from a record
+    /// that does not describe the filter, and the gate is then skipped.
     k: u8,
     /// First block of the range-tombstone section: `bloom_block -
     /// rdel_blocks` (the section follows the data blocks).
@@ -2592,6 +2565,54 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
 impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     TableReader<'d, D, BLOCK, BLOOM_BYTES>
 {
+    /// A reader for the table `tref` describes, with no I/O: the manifest
+    /// record gives the table's sections, its entry count, and its bloom
+    /// filter's size and probe count, which is everything the footer
+    /// says. `Db` point reads use this, so a probe the filter turns away
+    /// costs one read of one bloom bucket.
+    ///
+    /// The record is trusted as far as the manifest is (its blocks are
+    /// CRC'd and its magic names this table format), and checked for
+    /// self-consistency: a filter length that does not fill exactly the
+    /// record's bloom blocks could send a probe into another section.
+    /// A record with `bloom_k == 0` does not describe the filter; the
+    /// reader then looks every key up in the index.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptManifest`] when the record's counts do not fit
+    /// its block range or its filter length disagrees with its bloom
+    /// blocks.
+    pub fn from_ref<const KEY_MAX: usize>(
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        tref: &TableRef<KEY_MAX>,
+    ) -> Result<Self, Error<D::Error>> {
+        let rdel_first = tref.rdel_first().ok_or(Error::CorruptManifest)?;
+        let bloom_block = tref.bloom_first().ok_or(Error::CorruptManifest)?;
+        let index_block = tref.index_block().ok_or(Error::CorruptManifest)?;
+        let bloom_len = usize::try_from(tref.bloom_len).map_err(|_| Error::CorruptManifest)?;
+        if tref.bloom_blocks == 0
+            || (tref.bloom_k != 0
+                && bloom_section_blocks::<BLOCK>(bloom_len) != u64::from(tref.bloom_blocks))
+        {
+            return Err(Error::CorruptManifest);
+        }
+        Ok(Self {
+            device,
+            table_id: tref.id,
+            cache,
+            index_block,
+            bloom_block,
+            bloom_len,
+            entry_count: u64::from(tref.entry_count),
+            k: tref.bloom_k,
+            rdel_first,
+            rdel_blocks: tref.rdel_blocks,
+            min_seq: tref.min_seq,
+        })
+    }
+
     /// Opens the table ending at `footer_block` without a cache: reads and
     /// verifies the footer (magic + CRC); every block is read from the
     /// device. Used for pre-visibility reads (ingest validation) that must
@@ -2726,6 +2747,13 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     #[must_use]
     pub const fn bloom_len(&self) -> usize {
         self.bloom_len
+    }
+
+    /// Bloom probes per key in this table (0: the reader does not know
+    /// the filter and skips it; see [`from_ref`](Self::from_ref)).
+    #[must_use]
+    pub const fn bloom_k(&self) -> u8 {
+        self.k
     }
 
     /// Lowest sequence number in the table (entries and range
@@ -2880,36 +2908,39 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         // optimization, never the lookup; a device error is still an
         // error). The key's probes all fall in one bucket of the filter,
         // so only that bucket is read, from the one block that holds it.
-        let probe = BloomProbe::new(self.bloom_len, key);
-        let (nth, range) = BloomShape::locate(BLOCK, &probe.range());
-        let bloom_block = self
-            .bloom_block
-            .checked_add(nth)
-            .filter(|&b| b < self.index_block)
-            .ok_or(Error::CorruptBlock {
-                id: self.bloom_block,
-            })?;
-        match read_range_verified(
-            device,
-            self.cache,
-            self.table_id,
-            bloom_block,
-            scratch,
-            range.clone(),
-            true,
-        )
-        .await
-        {
-            Ok(()) => {
-                if scratch
-                    .get(range)
-                    .is_some_and(|bucket| !probe.matches(bucket, self.k))
-                {
-                    return Ok(Lookup::Missing);
+        // A reader that was not told the filter's shape skips the gate.
+        if self.k != 0 {
+            let probe = BloomProbe::new(self.bloom_len, key);
+            let (nth, range) = BloomShape::locate(BLOCK, &probe.range());
+            let bloom_block = self
+                .bloom_block
+                .checked_add(nth)
+                .filter(|&b| b < self.index_block)
+                .ok_or(Error::CorruptBlock {
+                    id: self.bloom_block,
+                })?;
+            match read_range_verified(
+                device,
+                self.cache,
+                self.table_id,
+                bloom_block,
+                scratch,
+                range.clone(),
+                true,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if scratch
+                        .get(range)
+                        .is_some_and(|bucket| !probe.matches(bucket, self.k))
+                    {
+                        return Ok(Lookup::Missing);
+                    }
                 }
+                Err(Error::CorruptBlock { .. }) => {}
+                Err(e) => return Err(e),
             }
-            Err(Error::CorruptBlock { .. }) => {}
-            Err(e) => return Err(e),
         }
         // Index: structural; corruption is an error, never a silent miss.
         read_block_verified(
