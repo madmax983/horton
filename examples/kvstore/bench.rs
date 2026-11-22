@@ -19,6 +19,7 @@
 //!   reads on equal terms.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::store::{Batch, Handle, Store};
@@ -201,6 +202,7 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
             "readrandom" => read_random(&store, &p.readers(), false),
             "readmissing" => read_random(&store, &p.readers(), true),
             "readoutside" => read_outside(&store, &p.readers()),
+            "readwhilewriting" => read_while_writing(&store, &p),
             "readseq" => read_seq(&store, &p.readers(), false),
             "readreverse" => read_seq(&store, &p.readers(), true),
             "seekrandom" => seek_random(&store, &p.readers()),
@@ -342,6 +344,41 @@ fn read_random(store: &Store, p: &Params, missing: bool) -> Result<Done, String>
     if missing && done.found != 0 {
         return Err(format!("{} missing keys were found", done.found));
     }
+    Ok(done)
+}
+
+/// `db_bench`'s `readwhilewriting`: the reader threads read random keys
+/// while one more thread overwrites random keys for as long as they
+/// run. The rate reported is the readers'. It is what a read costs
+/// while the store is flushing and compacting under it.
+fn read_while_writing(store: &Store, p: &Params) -> Result<Done, String> {
+    let stop = AtomicBool::new(false);
+    let (read, written) = std::thread::scope(|s| {
+        let h = store.handle();
+        let stop = &stop;
+        let writer = s.spawn(move || -> Result<u64, String> {
+            let mut rng = Rng::new(77);
+            let mut values = Values::new(p.value_size);
+            let mut written = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                h.put(&key(rng.below(p.num)), values.next(p.value_size))
+                    .map_err(|e| e.to_string())?;
+                written += 1;
+            }
+            Ok(written)
+        });
+        let read = read_random(store, &p.readers(), false);
+        stop.store(true, Ordering::Relaxed);
+        let written = writer
+            .join()
+            .unwrap_or_else(|_| Err("the writer panicked".into()));
+        (read, written)
+    });
+    let (mut done, written) = (read?, written?);
+    done.note = format!(
+        "({} of {} found; {written} writes meanwhile)",
+        done.found, done.ops
+    );
     Ok(done)
 }
 

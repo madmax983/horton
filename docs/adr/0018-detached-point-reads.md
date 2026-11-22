@@ -3,7 +3,8 @@
 Status: Accepted (unreleased, 2026-11-21). The library's part stands.
 Of the kvstore's protocol described below, the reader cache was
 replaced by ADR-0022, and the request queue and the pins made only
-under the engine lock by ADR-0023.
+under the engine lock by ADR-0023; compaction's merge left the engine
+lock in ADR-0024.
 
 ## Context
 

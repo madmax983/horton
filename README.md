@@ -232,7 +232,7 @@ takes no lock at all:
 | `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
 | writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
-| background compaction | one bounded `compact_step` at the end of each write, and a compaction thread that runs them back to back when no client is waiting; full memtables, WALs and level 0s are handled under the lock, so callers never see those errors |
+| background compaction | a compaction thread that merges outside the engine lock (horton's detached merge, ADR-0024), through a file handle of its own. A step under the lock selects a job, or seals and commits an output; whichever thread has the lock takes it. A full memtable or WAL is flushed under the lock by the write that finds it. A write that finds level 0 full waits for compaction without the lock, so callers never see those errors and readers do not wait behind them |
 | `Get` from many threads at once | the caller reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). A read of a key the memtable cannot hold takes no lock anywhere: a filter over the keys written since the last flush and the manifest's published sequence number tell it so (ADR-0023). Any other read takes the engine lock for its memtable probe. Flush and compaction shut the readers' gate and wait for them to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator`, `Seek` from many threads at once | `range(start, end, reverse)`: pins a snapshot and pages through horton's `Scan` or `RevScan`. Each page copies its memtable keys under the lock, then merges them with the tables on the caller's thread (a detached scan, ADR-0019), with 32 decoded blocks of its own |
@@ -267,22 +267,23 @@ compress by half, four client threads), and
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 263 K | 240 K | 270 K |
-| `fillrandom`, no fsync | 162 K | 70 K | 199 K |
-| `fillrandom`, fdatasync on | 15.0 K (2.6 writes per commit) | | 16.7 K (100 K keys) |
-| `readrandom` | 350 K | 206 K | 395 K |
-| `readmissing` | 4,685 K | 5,838 K | 4,358 K |
-| `seekrandom` | 56 K | 111 K | 363 K |
-| `readseq`, entries/s over four scanning threads | 10,081 K | 7,975 K | 20,651 K |
-| `readreverse`, the same | 5,805 K | 4,529 K | 16,868 K |
+| `fillseq`, no fsync | 307 K | 237 K | 256 K |
+| `fillrandom`, no fsync | 179 K | 67 K | 178 K |
+| `fillrandom`, fdatasync on | 15.6 K (2.6 writes per commit) | | 16.1 K (100 K keys) |
+| `readrandom` | 434 K | 194 K | 373 K |
+| `readmissing` | 16,758 K | 5,481 K | 5,136 K |
+| `seekrandom` | 394 K | 106 K | 356 K |
+| `readwhilewriting`, four readers and a writer | 287 K | 135 K | 217 K |
+| `readseq`, entries/s over four scanning threads | 18,060 K | 7,906 K | 20,227 K |
+| `readreverse`, the same | 8,784 K | 4,533 K | 15,074 K |
 
 These are single runs, and the read rows move from one run to the next
 with the number of level-0 tables the fills leave (`seekrandom` most:
-45 K to 120 K at 1 M keys).
+45 K to 120 K at 1 M keys, and 59 K to 394 K at 100 K).
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
 spread, where the time goes, and what v0.20 changed. Against 0.19, at
-1 M keys on four threads, point reads are 29 times faster, reads of
-absent keys 730 times, seeks 56 times and scans 38 times.
+1 M keys on four threads, point reads are 27 times faster, reads of
+absent keys 690 times, seeks 54 times and scans 38 times.
 
 ### Where horton stops at host scale
 
@@ -309,11 +310,13 @@ These are the limits it meets, and each is a property of the library:
   largest one, 255 KiB, in RAM while it writes. With one block per
   table, which is what firmware uses, a 100,000-entry table had 1.3
   bits a key and filtered almost nothing (ADR-0020).
-- **One thread at a time writes.** Writes, flushes and compaction
-  steps take turns under the engine lock (the table work of reads,
-  scans and seeks runs outside it), so random writes at scale are
-  bound by flush and compaction (67 K ops/s at 1 M keys, where RocksDB's
-  background threads keep it at 177 K).
+- **One thread at a time writes, and one job at a time compacts.**
+  Writes and flushes take turns under the engine lock. Compaction's
+  merge runs on a thread of its own outside it (ADR-0024), so reads go
+  on while the store is written to (four readers get 135 K reads a
+  second with a fifth thread writing), but there is one merge, and
+  random writes wait for it: 67 K ops/s at 1 M keys, where RocksDB's
+  background threads keep it at 178 K.
 - **A scan pays for its memory.** With one block for all its table
   cursors, which is what firmware gives it, a merge over overlapping
   tables decodes a block again each time it changes table: 0.5 M
@@ -580,7 +583,7 @@ What the suite covers:
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
 | `examples/quickstart.rs` | The quick start, complete |
 | `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
-| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its write queue, group commit and background compaction (`store.rs`), the readers' block cache (`cache.rs`) and the gate that lets most point reads take no lock (`gate.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
+| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its write queue, group commit and background compaction (`store.rs`), the readers' block cache (`cache.rs`), the gate that lets most point reads take no lock (`gate.rs`) and the hand-off that lets compaction merge outside the lock (`handoff.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
 | `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
 | `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
 | `benches/` | `harness = false` callgrind/cachegrind harnesses |

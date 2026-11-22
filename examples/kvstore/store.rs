@@ -36,14 +36,22 @@
 //!   the thread that serves its request, or, if it is at the head of the
 //!   queue, by whoever releases the lock.
 //! - **Capacity errors are handled here.** horton reports a full memtable,
-//!   WAL or level 0 as an error naming its remedy; the caller holding the
-//!   lock applies the remedy (`flush`, `compact_step`) and retries, so
-//!   clients never see them.
-//! - **Background compaction.** While a job is pending, every write
-//!   ends with one bounded `compact_step` before it gives the lock up,
-//!   and a compaction thread runs them back to back whenever no client
-//!   is waiting. Writers are never stalled for a whole compaction, which
-//!   is what `LevelDB`'s L0 slowdown trigger approximates with sleeps.
+//!   WAL or level 0 as an error naming its remedy. A full memtable or
+//!   WAL is flushed by the write that finds it, under the lock. A full
+//!   level 0 needs a compaction job, and the write waits for the
+//!   compaction thread to make room, *without* the lock: its group
+//!   stays at the head of the queue and its thread comes back to look
+//!   ([`Engine::commit_group`]). Clients never see these errors.
+//! - **Compaction merges outside the lock** (ADR-0024). A compaction
+//!   job is mostly merge: reading its input tables and writing its
+//!   output's blocks. horton runs that part without the database, so
+//!   the compaction thread does it with no lock, through a file handle
+//!   of its own. What needs the database (choosing a job, sealing and
+//!   committing an output) is a short step under the engine lock, taken
+//!   by whichever thread has the lock: a writer ending its turn, or the
+//!   compaction thread. The job's scratch is handed back and forth
+//!   ([`Handoff`]). Readers of the tables are not kept out while a merge
+//!   runs: it writes only blocks nothing points at yet.
 //! - **Point reads run in parallel, and most take no lock** (ADR-0018,
 //!   ADR-0023). A read is two phases: what the memtable holds for the
 //!   key, then the tables. The second runs on the caller's thread, with
@@ -65,14 +73,15 @@
 //!   that each table's block stays decoded while the merge is at another
 //!   table. The copy says where it stops knowing (its horizon), and the
 //!   page stops there.
-//! - **Flush and compaction wait for readers.** They are the only calls
-//!   that write tables, and a reader must not have a table rewritten
-//!   under it. A read in its table phase holds a [`Pin`]. Flush and each
-//!   compaction step, which run under the engine lock, first shut the
-//!   readers' gate and wait for the pins to drain ([`Gate::shut`]): a
-//!   reader without the lock sees the gate shut and waits for the lock
-//!   like the rest. A table phase is tens of microseconds, so the wait
-//!   is short.
+//! - **Flush and compaction's commits wait for readers.** They are what
+//!   changes which tables exist and gives a table's blocks up for
+//!   reuse, and a reader must not have that happen under it. A read in
+//!   its table phase holds a [`Pin`]. A flush, and each of compaction's
+//!   steps with the database, run under the engine lock and first shut
+//!   the readers' gate and wait for the pins to drain ([`Gate::shut`]):
+//!   a reader without the lock sees the gate shut and waits for the
+//!   lock like the rest. A table phase is tens of microseconds, so the
+//!   wait is short.
 //! - **Snapshots and iterators.** A [`Snapshot`] is horton's sequence
 //!   watermark, released when dropped. An [`Iter`] pins one for its
 //!   lifetime, like a `LevelDB` iterator, and pages through the range.
@@ -84,17 +93,20 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use horton::wal::WAL_RECORD_OVERHEAD;
-use horton::{CachePort, Error, OpenReport, Progress, ScanBlock, SlotStats, WriteBatch};
+use horton::{
+    BlockDevice, CachePort, Detached, Error, OpenReport, Progress, ScanBlock, SlotStats, WriteBatch,
+};
 
 use crate::cache::SharedCache;
 use crate::device::{FileDevice, IoError, IoStats, ReadDevice};
 use crate::gate::{Gate, Pin, Slot};
+use crate::handoff::{Handoff, Next};
 use crate::{
     BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
     KvScan, KvTables, LEVELS, VAL_MAX, block_on,
@@ -150,9 +162,31 @@ const SCAN_BLOCKS: usize = 32;
 /// wait their turn.
 const SCAN_PAGES: usize = 8;
 
-/// How long the compaction thread stands back when clients are waiting
-/// for the lock (they run the compaction steps themselves meanwhile).
-const BACKGROUND_PAUSE: Duration = Duration::from_micros(200);
+/// How long the compaction thread waits before it tries the engine lock
+/// again, when a step with the database is due and a client has the
+/// lock. It never blocks on that lock: the client may be a writer
+/// waiting, lock in hand, for this thread to merge.
+const BACKGROUND_PAUSE: Duration = Duration::from_micros(100);
+
+/// How long a writer whose write waits for compaction sleeps before it
+/// looks again. It holds no lock meanwhile; each look takes the engine
+/// lock for a moment and gives compaction a step if one is due.
+const STALL_PAUSE: Duration = Duration::from_micros(200);
+
+/// What a call that finds no room does when making room takes a
+/// compaction job.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stall {
+    /// Sees the job through, engine lock in hand.
+    Wait,
+    /// Returns [`Error::NeedsCompaction`], for a caller that can give
+    /// the engine lock up while compaction runs.
+    Report,
+}
+
+/// The compaction scratch's way between the engine and the compaction
+/// thread, with the manifest copy a merge reads its targets from.
+type KvHandoff = Handoff<Box<KvCompaction>, Arc<KvManifest>>;
 
 /// Why a store call failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,7 +333,11 @@ pub struct Stats {
     pub grouped_writes: u64,
     pub flushes: u64,
     pub compaction_jobs: u64,
+    /// Steps compaction took: those with the database, under the engine
+    /// lock, and the merge quanta the compaction thread ran outside it.
     pub compaction_steps: u64,
+    /// The merge quanta among them that ran outside the engine lock.
+    pub detached_steps: u64,
     /// Point reads that reached the tables without the engine lock, and
     /// point reads that took it.
     pub reads_unlocked: u64,
@@ -488,9 +526,22 @@ struct Shared {
     /// the sender and stays there, pinned, until the receiver yields.
     #[cfg(test)]
     hold_next_reader: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    /// Where the compaction thread sleeps until `background_due` or
-    /// `stop`.
-    wake: (Mutex<()>, Condvar),
+    /// Where the compaction scratch changes hands, and where the
+    /// compaction thread sleeps until a scratch is lent, or
+    /// `background_due` or `stop` is raised. The engine's [`Room`] has
+    /// the other reference.
+    handoff: Arc<KvHandoff>,
+    /// Merge quanta the compaction thread ran outside the engine lock,
+    /// and the I/O of its handle to the file (reads, writes, syncs).
+    detached_steps: AtomicU64,
+    merge_io: [AtomicU64; 3],
+    /// Test hook: the next merge the compaction thread picks up reports
+    /// in on the sender and waits, scratch in hand, for the receiver.
+    #[cfg(test)]
+    hold_next_merge: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Test hook: the next merge fails before its first quantum.
+    #[cfg(test)]
+    fail_next_merge: AtomicBool,
 }
 
 /// The lock guard of plain data that a panic cannot leave half changed.
@@ -534,12 +585,18 @@ impl Locked<'_> {
     /// pending and no reader is in its table phase, then the lock is
     /// released.
     ///
-    /// The step is skipped, not waited for, while readers hold pins: a
-    /// write should not stand behind other threads' reads for the sake
-    /// of compaction. The compaction thread, and any write that needs
-    /// room, do wait.
+    /// The step is one with the database: choosing a job, or sealing
+    /// and committing the output a merge has filled. The merge itself is
+    /// the compaction thread's, outside this lock; the step ends by
+    /// lending it the scratch.
+    ///
+    /// The step is skipped, not waited for, while the scratch is out
+    /// merging, and while readers hold pins: a write should not stand
+    /// behind a merge or other threads' reads for the sake of
+    /// compaction. The compaction thread, and any write that needs room,
+    /// do wait.
     fn finish(mut self) {
-        if self.background_pending() && self.gate.pinned() == 0 {
+        if self.background_pending() && self.room.ready() && self.gate.pinned() == 0 {
             self.background_step();
         }
         let pending = self.background_pending();
@@ -702,8 +759,15 @@ impl Shared {
                 Some(Ok(mut engine)) => {
                     // The queue is served from its head, which may not
                     // reach this request in one turn; then go again.
-                    engine.serve(self, &me);
+                    let stalled = engine.serve(self, &me);
                     engine.finish();
+                    if stalled && me.done.get().is_none() {
+                        // The head of the queue waits for compaction to
+                        // make room, and this write with it. Not under
+                        // the engine lock: readers need it meanwhile,
+                        // and so do compaction's own steps.
+                        std::thread::park_timeout(STALL_PAUSE);
+                    }
                 }
                 Some(Err(e)) => {
                     // Closed: nobody will serve this request (unless
@@ -1027,56 +1091,144 @@ impl Shared {
         if !self.background_due.load(Ordering::Acquire)
             && !self.background_due.swap(true, Ordering::AcqRel)
         {
-            let _g = lock(&self.wake.0);
-            self.wake.1.notify_one();
+            self.handoff.wake();
         }
     }
 
-    /// The compaction thread: sleeps until a job is pending, then runs
-    /// bounded steps back to back, standing back whenever a client is
-    /// waiting for the lock.
-    fn background(&self) {
-        loop {
-            let mut asleep = lock(&self.wake.0);
-            while !self.background_due.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire)
-            {
-                asleep = self
-                    .wake
-                    .1
-                    .wait(asleep)
-                    .unwrap_or_else(PoisonError::into_inner);
+    /// The compaction thread. It merges: whenever a step with the
+    /// database leaves a job in its merge, the scratch is lent to this
+    /// thread, which reads the job's tables and writes its output
+    /// through `device`, a handle of its own to the file, under no lock
+    /// (horton's detached merge, ADR-0024). When the merge needs the
+    /// database again it gives the scratch back, and whichever thread
+    /// has the engine lock first takes the next step: a writer ending
+    /// its turn, or this thread.
+    fn background(&self, mut device: FileDevice) {
+        /// Tells the handoff the thread has gone, however it goes: a
+        /// writer waiting for a merge must not wait for one that will
+        /// never be run.
+        struct Leaving<'a>(&'a KvHandoff);
+        impl Drop for Leaving<'_> {
+            fn drop(&mut self) {
+                self.0.leave();
             }
-            drop(asleep);
+        }
+        let _leaving = Leaving(&self.handoff);
+        loop {
+            match self.handoff.next(&self.stop, &self.background_due) {
+                Next::Stop => return,
+                Next::Merge(mut scratch, tables) => {
+                    self.merge(&mut scratch, &tables, &mut device);
+                    self.handoff.give_back(scratch);
+                    if self.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                }
+                Next::Look => {}
+            }
+            // A step with the database is due, unless a writer has taken
+            // it already and lent the scratch again. The engine lock is
+            // tried, never waited for: its holder may be a writer that
+            // is waiting, lock in hand, for this thread to merge.
             loop {
                 if self.stop.load(Ordering::Acquire) {
                     return;
                 }
-                if self.waiting.load(Ordering::Relaxed) > 0 {
-                    std::thread::sleep(BACKGROUND_PAUSE);
-                    continue;
+                if self.handoff.is_lent() {
+                    break;
                 }
-                let Ok(mut guard) = self.engine.lock() else {
-                    return;
+                let mut guard = match self.engine.try_lock() {
+                    Ok(guard) => guard,
+                    Err(TryLockError::Poisoned(_)) => return,
+                    Err(TryLockError::WouldBlock) => {
+                        std::thread::sleep(BACKGROUND_PAUSE);
+                        continue;
+                    }
                 };
                 let Some(engine) = guard.as_mut() else {
                     return;
                 };
                 self.engine_held.store(true, Ordering::Relaxed);
-                let pending = engine.background_pending();
-                if pending {
-                    engine.background_step();
-                } else {
-                    // Cleared under the engine lock: a client that leaves
-                    // a job pending after this sets it again.
+                if !engine.background_pending() {
+                    // Cleared under the engine lock: a client that
+                    // leaves a job pending after this sets it again.
                     self.background_due.store(false, Ordering::Release);
+                } else if engine.room.ready() {
+                    engine.background_step();
                 }
                 self.engine_held.store(false, Ordering::Relaxed);
                 drop(guard);
-                if !pending {
-                    break;
-                }
                 self.wake_queue();
+                break;
             }
+        }
+    }
+
+    /// Merges with a lent scratch until the merge needs the database
+    /// (its output is full, or its inputs are exhausted), the engine
+    /// recalls the scratch, or the store closes. No lock is held: the
+    /// scratch is this thread's until it gives it back, `tables` is the
+    /// manifest as the engine lent it, and `device` is its own.
+    ///
+    /// A merge that fails gives its job up ([`Compaction::abandon`]):
+    /// the next step with the database ends the job, and the store
+    /// leaves compaction to the write path, which reports the error to
+    /// a caller.
+    ///
+    /// [`Compaction::abandon`]: horton::Compaction::abandon
+    fn merge(&self, scratch: &mut KvCompaction, tables: &KvManifest, device: &mut FileDevice) {
+        #[cfg(test)]
+        self.hold_merge_if_asked();
+        // horton does not panic. If it did here, the scratch would be
+        // lost with this thread, and a writer waiting for it would wait
+        // for good: the scratch goes back whatever happens.
+        let merged = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if self.fail_next_merge.swap(false, Ordering::SeqCst) {
+                return Err(Error::CorruptManifest);
+            }
+            let mut wrote = false;
+            let merged = loop {
+                if self.handoff.recalled() || self.stop.load(Ordering::Acquire) {
+                    break Ok(());
+                }
+                match block_on(scratch.merge_detached(device, tables)) {
+                    Ok(Detached::More) => {
+                        wrote = true;
+                        self.detached_steps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Detached::NeedsDb) => break Ok(()),
+                    Err(e) => break Err(e),
+                }
+            };
+            // The database syncs the file before it commits an output.
+            // That covers these blocks wherever a sync is the file's;
+            // this handle syncs what it wrote all the same.
+            if wrote && merged.is_ok() {
+                block_on(core::future::poll_fn(|cx| device.poll_flush(cx)))
+                    .map_err(Error::Device)?;
+            }
+            merged
+        }));
+        if !matches!(merged, Ok(Ok(()))) {
+            scratch.abandon();
+            self.handoff.fail();
+        }
+        let io = device.stats();
+        for (total, now) in self.merge_io.iter().zip([io.reads, io.writes, io.syncs]) {
+            total.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// Test hook: holds the compaction thread here, a lent scratch in
+    /// hand and no quantum run yet, if a test asked for the next merge
+    /// to be held.
+    #[cfg(test)]
+    fn hold_merge_if_asked(&self) {
+        let hold = lock(&self.hold_next_merge).take();
+        if let Some((entered, release)) = hold {
+            let _ = entered.send(());
+            let _ = release.recv();
         }
     }
 }
@@ -1106,11 +1258,11 @@ impl core::ops::Deref for Store {
 impl Drop for Store {
     fn drop(&mut self) {
         let shared = &self.handle.shared;
+        // The compaction thread stops after the quantum it is in and
+        // gives its scratch back. A job cut short there has written only
+        // blocks nothing points at.
         shared.stop.store(true, Ordering::Release);
-        {
-            let _g = lock(&shared.wake.0);
-            shared.wake.1.notify_one();
-        }
+        shared.handoff.wake();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -1158,8 +1310,13 @@ impl Store {
             .map_err(|e| StoreError::Open(e.to_string()))?
             .join()
             .map_err(|_| StoreError::Open("the opening thread panicked".into()))??;
+        // The compaction thread's own handle to the file. Opened, not
+        // duplicated: see `ReadDevice`.
+        let merge_device = FileDevice::open(path, options.create_blocks, options.sync)
+            .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
         let report = engine.open;
         let gate = Arc::clone(&engine.gate);
+        let handoff = Arc::clone(&engine.room.handoff);
         let shared = Arc::new(Shared {
             engine: Mutex::new(Some(engine)),
             queue: Mutex::new(VecDeque::new()),
@@ -1175,12 +1332,18 @@ impl Store {
             pages: Arc::new(Mutex::new(pages)),
             #[cfg(test)]
             hold_next_reader: Mutex::new(None),
-            wake: (Mutex::new(()), Condvar::new()),
+            handoff,
+            detached_steps: AtomicU64::new(0),
+            merge_io: [const { AtomicU64::new(0) }; 3],
+            #[cfg(test)]
+            hold_next_merge: Mutex::new(None),
+            #[cfg(test)]
+            fail_next_merge: AtomicBool::new(false),
         });
         let background = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("horton-compact".into())
-            .spawn(move || background.background())
+            .spawn(move || background.background(merge_device))
             .map_err(|e| StoreError::Open(e.to_string()))?;
         Ok((
             Self {
@@ -1226,7 +1389,7 @@ impl Handle {
         self.shared.with(|e| {
             let gate = &e.gate;
             e.room
-                .with_room(&mut e.db, |db| {
+                .with_room(&mut e.db, Stall::Wait, |db| {
                     // Before each try: making room flushes, and a flush
                     // says the memtable holds no range tombstone.
                     gate.note_unfiltered();
@@ -1317,6 +1480,10 @@ impl Handle {
     pub fn compact(&self) -> Result<(), StoreError> {
         self.shared.with(|e| {
             e.room.flush(&mut e.db)?;
+            // A new request ends the job in flight and frees the slot it
+            // is writing: the scratch comes home first, so that no merge
+            // is still writing there.
+            e.room.home()?;
             e.db.request_compaction(0)?;
             while e.db.compaction_pending() {
                 e.room.job(&mut e.db)?;
@@ -1328,6 +1495,13 @@ impl Handle {
     pub fn stats(&self) -> Result<Stats, StoreError> {
         let mut stats = self.shared.with(|e| Ok(e.stats()))?;
         (stats.reads_unlocked, stats.reads_locked) = self.shared.gate.reads();
+        // The compaction thread's merge quanta, and its handle's I/O.
+        stats.detached_steps = self.shared.detached_steps.load(Ordering::Relaxed);
+        stats.compaction_steps += stats.detached_steps;
+        let [reads, writes, syncs] = &self.shared.merge_io;
+        stats.io.reads += reads.load(Ordering::Relaxed);
+        stats.io.writes += writes.load(Ordering::Relaxed);
+        stats.io.syncs += syncs.load(Ordering::Relaxed);
         // Point reads' table phases go through the shared handle and
         // cache, not the engine's.
         let cache = self.shared.cache.stats();
@@ -1441,6 +1615,11 @@ struct Engine {
     open: OpenReport,
     groups: u64,
     grouped_writes: u64,
+    /// `Some` while the writes in `group` wait for compaction to make
+    /// room: the manifest's sequence number when they were refused. No
+    /// table has changed, and so no room has been made, until that
+    /// number has.
+    stalled: Option<u64>,
 }
 
 impl Engine {
@@ -1466,7 +1645,8 @@ impl Engine {
         Ok(Self {
             db,
             room: Room {
-                scratch: Box::new(KvCompaction::new()),
+                scratch: Some(Box::new(KvCompaction::new())),
+                handoff: Arc::new(Handoff::new()),
                 gate: Arc::clone(&gate),
                 flushes: 0,
                 jobs: 0,
@@ -1481,6 +1661,7 @@ impl Engine {
             open,
             groups: 0,
             grouped_writes: 0,
+            stalled: None,
         })
     }
 
@@ -1488,8 +1669,14 @@ impl Engine {
         self.db.compaction_pending() && self.compaction_stuck != Some(self.room.flushes)
     }
 
+    /// One step with the database for the background's sake, ending
+    /// with the scratch lent to the compaction thread if a job is in its
+    /// merge. A step that fails, or one that follows a merge that
+    /// failed, leaves compaction to the write path until the next flush
+    /// (see `compaction_stuck`).
     fn background_step(&mut self) {
-        if self.room.step(&mut self.db).is_err() {
+        let merge_failed = self.room.handoff.take_failed();
+        if self.room.background_step(&mut self.db).is_err() || merge_failed {
             self.compaction_stuck = Some(self.room.flushes);
         }
     }
@@ -1555,7 +1742,11 @@ impl Engine {
     }
 
     /// Commits the queue from its head, in order, a group at a time.
-    /// Stops when the queue is empty or after [`SERVE_MAX`] groups.
+    /// Stops when the queue is empty or after [`SERVE_MAX`] groups, and
+    /// returns false; or at a group that has to wait for compaction to
+    /// make room, and returns true. That group stays at the head, in
+    /// `self.group`, and is tried again first by whichever thread comes
+    /// next.
     ///
     /// `me` is the caller's own write. The queue is first in, first out,
     /// so by the time `me` is committed so is everything that was
@@ -1564,14 +1755,19 @@ impl Engine {
     /// It stops before a group that will be `fdatasync`ed, so that its
     /// client's next write can join that group instead of waiting a
     /// flush behind it, which is what makes synced groups large.
-    fn serve(&mut self, shared: &Shared, me: &Pending) {
+    fn serve(&mut self, shared: &Shared, me: &Pending) -> bool {
         for _ in 0..SERVE_MAX {
-            let committed = me.done.get().is_some();
-            if !self.take_group(shared, self.sync && committed) {
-                return;
+            if self.stalled.is_none() {
+                let committed = me.done.get().is_some();
+                if !self.take_group(shared, self.sync && committed) {
+                    return false;
+                }
             }
-            self.commit_group();
+            if !self.commit_group() {
+                return true;
+            }
         }
+        false
     }
 
     /// Moves the write at the head of the queue, and every write queued
@@ -1605,8 +1801,23 @@ impl Engine {
     }
 
     /// Commits the writes in `self.group` as one batch and tells each of
-    /// them the result.
-    fn commit_group(&mut self) {
+    /// them the result. Returns false, with the group kept, when the
+    /// batch has to wait for compaction to make room.
+    ///
+    /// A write that finds the memtable full flushes it here, under the
+    /// engine lock. When the flush is refused because level 0 or the
+    /// table region is full, room takes a compaction job, and that is
+    /// not waited for here: the compaction thread merges outside this
+    /// lock, and a writer that sat on the lock until it was done would
+    /// keep out every reader that needs the memtable, and the steps the
+    /// job itself needs the database for. The caller gives the lock up
+    /// and comes back ([`Shared::submit`]).
+    fn commit_group(&mut self) -> bool {
+        if self.stalled == Some(self.db.manifest().seq()) && self.background_pending() {
+            // No table has changed since the group was refused.
+            return false;
+        }
+        self.stalled = None;
         self.batch.clear();
         let mut result = Ok(());
         for op in self.group.iter().flat_map(|p| &p.batch.ops) {
@@ -1621,28 +1832,43 @@ impl Engine {
                 break;
             }
         }
-        let (batch, group, gate) = (&*self.batch, &self.group, &self.gate);
-        let result = result
-            .and_then(|()| {
-                self.room.with_room(&mut self.db, |db| {
-                    // The filter first, then the memtable: a read that
-                    // starts after this write returns must find the
-                    // bits. And before each try: making room flushes,
-                    // and a flush empties the filter.
-                    for op in group.iter().flat_map(|p| &p.batch.ops) {
-                        let (BatchOp::Put(key, _) | BatchOp::Delete(key)) = op;
-                        gate.note(key);
-                    }
-                    block_on(db.write(batch))
-                })
-            })
-            .map(drop)
-            .map_err(StoreError::Db);
+        let mut result = result.and_then(|()| self.write_group(Stall::Report));
+        if result == Err(Error::NeedsCompaction) {
+            if self.background_pending() {
+                self.stalled = Some(self.db.manifest().seq());
+                return false;
+            }
+            // Compaction is not running in the background (it failed
+            // there): the job is run here, and what stops it is this
+            // write's answer.
+            result = self.write_group(Stall::Wait);
+        }
+        let result = result.map_err(StoreError::Db);
         self.groups += 1;
         self.grouped_writes += self.group.len() as u64;
         for p in self.group.drain(..) {
             p.finish(result.clone());
         }
+        true
+    }
+
+    /// Writes `self.batch`, the writes of `self.group`, making room as
+    /// `stall` says.
+    fn write_group(&mut self, stall: Stall) -> Result<(), DbError> {
+        let (batch, group, gate) = (&*self.batch, &self.group, &self.gate);
+        self.room
+            .with_room(&mut self.db, stall, |db| {
+                // The filter first, then the memtable: a read that
+                // starts after this write returns must find the bits.
+                // And before each try: making room flushes, and a flush
+                // empties the filter.
+                for op in group.iter().flat_map(|p| &p.batch.ops) {
+                    let (BatchOp::Put(key, _) | BatchOp::Delete(key)) = op;
+                    gate.note(key);
+                }
+                block_on(db.write(batch))
+            })
+            .map(drop)
     }
 
     fn stats(&self) -> Stats {
@@ -1673,6 +1899,8 @@ impl Engine {
             flushes: self.room.flushes,
             compaction_jobs: self.room.jobs,
             compaction_steps: self.room.steps,
+            // The compaction thread's; `Handle::stats` fills it in.
+            detached_steps: 0,
             // The gate's; `Handle::stats` fills them in.
             reads_unlocked: 0,
             reads_locked: 0,
@@ -1683,7 +1911,10 @@ impl Engine {
 /// Makes room when horton asks for it: the compaction scratch, and counts
 /// of what it did.
 struct Room {
-    scratch: Box<KvCompaction>,
+    /// The compaction scratch; `None` while it is lent to the compaction
+    /// thread (see [`Handoff`]).
+    scratch: Option<Box<KvCompaction>>,
+    handoff: Arc<KvHandoff>,
     /// Shut around every call that changes the tables; see [`Gate`].
     gate: Arc<Gate>,
     flushes: u64,
@@ -1693,16 +1924,21 @@ struct Room {
 
 impl Room {
     /// Runs `op`; when horton says the database needs room, makes it the
-    /// way the error says and tries again.
+    /// way the error says and tries again. Room that takes a compaction
+    /// job is made or reported, as `stall` says.
     fn with_room<T>(
         &mut self,
         db: &mut KvDb<FileDevice>,
+        stall: Stall,
         mut op: impl FnMut(&mut KvDb<FileDevice>) -> Result<T, DbError>,
     ) -> Result<T, DbError> {
         for _ in 0..ROOM_TRIES {
             match op(db) {
-                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => self.flush(db)?,
-                Err(Error::NeedsCompaction) => self.job(db)?,
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => match stall {
+                    Stall::Wait => self.flush(db)?,
+                    Stall::Report => self.try_flush(db)?,
+                },
+                Err(Error::NeedsCompaction) if stall == Stall::Wait => self.job(db)?,
                 r => return r,
             }
         }
@@ -1710,46 +1946,104 @@ impl Room {
     }
 
     /// Flushes the memtable, compacting first if level 0 is full.
+    fn flush(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
+        for _ in 0..ROOM_TRIES {
+            match self.try_flush(db) {
+                Err(Error::NeedsCompaction) => self.job(db)?,
+                r => return r,
+            }
+        }
+        self.try_flush(db)
+    }
+
+    /// One try at flushing the memtable: [`Error::NeedsCompaction`] when
+    /// level 0 or the table region has no room for the table.
     ///
     /// A flush holds a table writer, and a writer holds the largest
     /// bloom filter a table can have (`BLOOM_BYTES`, 255 KiB), so the
     /// flush future goes on the heap: this runs on whichever client
     /// thread holds the engine, with whatever stack that thread has.
     ///
-    /// Each try is made with the gate shut, and the gate is opened
-    /// again before anything else: the compaction between two tries
-    /// shuts it for itself, a step at a time.
-    fn flush(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
-        for attempt in 0..=ROOM_TRIES {
-            self.gate.shut();
-            let flushed = block_on(Box::pin(db.flush()));
-            // A flush that returned `Ok` has emptied the memtable.
-            self.gate.open(db.manifest().seq(), flushed.is_ok());
-            match flushed {
-                Err(Error::NeedsCompaction) if attempt < ROOM_TRIES => self.job(db)?,
-                r => {
-                    self.flushes += u64::from(r.is_ok());
-                    return r;
-                }
+    /// The try is made with the gate shut, and the gate is opened again
+    /// before anything else: a compaction that follows shuts it for
+    /// itself, a step at a time.
+    fn try_flush(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
+        self.gate.shut();
+        let flushed = block_on(Box::pin(db.flush()));
+        // A flush that returned `Ok` has emptied the memtable.
+        self.gate.open(db.manifest().seq(), flushed.is_ok());
+        self.flushes += u64::from(flushed.is_ok());
+        flushed
+    }
+
+    /// Runs one compaction job (or finishes the one in flight) for a
+    /// caller that needs the room now and holds the engine lock until
+    /// it has it.
+    ///
+    /// The steps with the database are taken here. The merge between
+    /// them stays with the compaction thread: this thread lends the
+    /// scratch and waits for it. It could merge itself, and would be no
+    /// slower; but a step taken here shuts the readers' gate, and a
+    /// merge on the compaction thread does not, so reads of the tables
+    /// go on while a write waits for room.
+    fn job(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
+        loop {
+            if self.scratch.is_none() {
+                // A merge is under way: let it finish where it is.
+                self.scratch = self.handoff.await_back();
+            }
+            if self.background_step(db)? == Progress::Done {
+                return Ok(());
             }
         }
-        Err(Error::NeedsCompaction)
     }
 
-    /// Runs one compaction job (or finishes the one in flight).
-    fn job(&mut self, db: &mut KvDb<FileDevice>) -> Result<(), DbError> {
-        while self.step(db)? == Progress::More {}
-        Ok(())
+    /// True when a step can be taken without waiting for the compaction
+    /// thread: the scratch is here, or back from its merge (or lent to a
+    /// thread that has gone, and then the merge is run here).
+    fn ready(&self) -> bool {
+        self.scratch.is_some() || self.handoff.is_back()
     }
 
-    /// One bounded compaction step, with the gate shut around it.
+    /// Brings the scratch home, waiting for the compaction thread to let
+    /// go of it if it is merging.
+    fn home(&mut self) -> Result<(), DbError> {
+        if self.scratch.is_none() {
+            self.scratch = self.handoff.reclaim();
+        }
+        // Never missing: the scratch is here or with the handoff.
+        self.scratch.as_ref().map(drop).ok_or(Error::NotOpen)
+    }
+
+    /// One bounded compaction step with the database, with the gate
+    /// shut around it. The scratch comes home for it first.
     fn step(&mut self, db: &mut KvDb<FileDevice>) -> Result<Progress, DbError> {
+        // Before the gate is shut: waiting for a merge quantum to end
+        // must not keep readers out.
+        self.home()?;
+        let Some(scratch) = self.scratch.as_deref_mut() else {
+            return Err(Error::NotOpen);
+        };
         self.gate.shut();
-        let stepped = block_on(db.compact_step(&mut self.scratch));
+        let stepped = block_on(db.compact_step(scratch));
         self.gate.open(db.manifest().seq(), false);
         let p = stepped?;
         self.steps += 1;
         self.jobs += u64::from(p == Progress::Done);
+        Ok(p)
+    }
+
+    /// One step with the database, and then the scratch is lent to the
+    /// compaction thread if the step left a job in its merge.
+    fn background_step(&mut self, db: &mut KvDb<FileDevice>) -> Result<Progress, DbError> {
+        let p = self.step(db)?;
+        if self.scratch.as_ref().is_some_and(|s| s.wants_merge())
+            && let Some(scratch) = self.scratch.take()
+        {
+            // The merge reads its target tables by the manifest as this
+            // step left it.
+            self.handoff.lend(scratch, Arc::new(*db.manifest()));
+        }
         Ok(p)
     }
 }
@@ -2773,6 +3067,284 @@ mod tests {
         assert_eq!(stale.get(b"k"), Err(StoreError::Closed));
         assert_eq!(stale.get(b"absent"), Err(StoreError::Closed));
         assert_eq!(store.get(b"k").expect("get"), Some(b"v".to_vec()));
+    }
+
+    /// A value like [`stamped`], padded with letters that do not
+    /// compress: tables of these have blocks for a merge to write.
+    fn noisy(k: usize, version: u64) -> Vec<u8> {
+        let mut v = format!("{k}:{version}:").into_bytes();
+        let mut x = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ version;
+        while v.len() < 700 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            v.push(b'a' + u8::try_from(x % 26).expect("a letter"));
+        }
+        v
+    }
+
+    /// Arms the hook that holds the compaction thread at its next merge,
+    /// scratch in hand. Returns the channel it reports in on and the one
+    /// that lets it go.
+    fn hold_next_merge(
+        shared: &Shared,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *lock(&shared.hold_next_merge) = Some((entered_tx, release_rx));
+        (entered, release)
+    }
+
+    fn job_pending(shared: &Shared) -> bool {
+        lock(&shared.engine)
+            .as_ref()
+            .is_some_and(Engine::background_pending)
+    }
+
+    /// Flushes tables of fresh keys until level 0 wants compacting: the
+    /// flush that fills it ends its turn by starting the job and lending
+    /// the scratch. Returns how many keys there are, `0..n`.
+    fn fill_level_zero(store: &TempStore) -> usize {
+        let mut n = 0;
+        while !job_pending(&store.handle.shared) {
+            for k in n..n + 40 {
+                store.put(&key(k), &noisy(k, 1)).expect("put");
+            }
+            n += 40;
+            store.flush().expect("flush");
+            assert!(n < 800, "no compaction ever became pending");
+        }
+        n
+    }
+
+    /// Polls `what` until it holds, for up to half a minute.
+    fn eventually(what: &str, holds: impl Fn() -> bool) {
+        let since = Instant::now();
+        while !holds() {
+            assert!(since.elapsed() < Duration::from_secs(30), "never: {what}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The point of the handoff: a compaction job's merge runs on the
+    /// compaction thread with no lock of the store's. The test holds the
+    /// engine lock from before the first quantum until the merge has
+    /// run to where it needs the database.
+    #[test]
+    fn the_merge_runs_while_the_engine_lock_is_held() {
+        within_a_minute(|| {
+            let store = TempStore::new("merge-unlocked");
+            let shared = &store.handle.shared;
+            let (entered, release) = hold_next_merge(shared);
+            let n = fill_level_zero(&store);
+            entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the compaction thread never picked the merge up");
+            assert_eq!(shared.detached_steps.load(Ordering::Relaxed), 0);
+            {
+                let _engine = lock(&shared.engine);
+                release.send(()).expect("release");
+                eventually("the merge came back", || shared.handoff.is_back());
+                // It wrote the output's blocks, every one of them here.
+                assert!(shared.detached_steps.load(Ordering::Relaxed) >= 3);
+            }
+            // The step that seals and commits is anybody's with the
+            // lock; then nothing is pending and every key is there.
+            eventually("the job was committed", || !job_pending(shared));
+            for k in 0..n {
+                let v = store.get(&key(k)).expect("get").expect("present");
+                assert_eq!(v, noisy(k, 1));
+            }
+            let stats = store.stats().expect("stats");
+            assert!(stats.detached_steps >= 3);
+            assert!(stats.compaction_steps > stats.detached_steps);
+            assert!(stats.compaction_jobs >= 1);
+        });
+    }
+
+    /// A write that has to wait for compaction waits without the engine
+    /// lock. The compaction thread is held at its merge, a writer writes
+    /// until level 0 is full again and its write can go no further, and
+    /// then: the engine lock is free, reads that need it are answered,
+    /// and the write is still waiting. Let go, the merge runs and the
+    /// writer writes on.
+    #[test]
+    fn a_write_waiting_for_compaction_holds_no_lock() {
+        within_a_minute(|| {
+            let store = TempStore::new("stall-unlocked");
+            let shared = &store.handle.shared;
+            let (entered, release) = hold_next_merge(shared);
+            let written = AtomicUsize::new(0);
+            let stop = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let h = store.handle();
+                let (written, stop) = (&written, &stop);
+                let writer = s.spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let k = written.load(Ordering::SeqCst);
+                        h.put(&key(k), &noisy(k, 1)).expect("put");
+                        written.store(k + 1, Ordering::SeqCst);
+                    }
+                });
+                entered
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the compaction thread never picked a merge up");
+                eventually("a write is waiting for room", || {
+                    lock(&shared.engine)
+                        .as_ref()
+                        .is_some_and(|e| e.stalled.is_some())
+                });
+                let stuck_at = written.load(Ordering::SeqCst);
+                assert!(stuck_at > 0);
+                // Reads that take the engine lock (a thread's first read
+                // of a store does) are answered while the write waits.
+                let before = shared.gate.reads();
+                for k in 0..20 {
+                    let h = store.handle();
+                    let v = s.spawn(move || h.get(&key(k))).join().expect("reader");
+                    assert_eq!(v.expect("get"), Some(noisy(k, 1)));
+                }
+                assert_eq!(shared.gate.reads().1, before.1 + 20);
+                assert_eq!(
+                    written.load(Ordering::SeqCst),
+                    stuck_at,
+                    "a write got through a full level 0"
+                );
+                assert!(
+                    lock(&shared.engine)
+                        .as_ref()
+                        .is_some_and(|e| e.stalled.is_some())
+                );
+                // Compaction goes on, and so does the writer.
+                release.send(()).expect("release");
+                eventually("the writer wrote on", || {
+                    written.load(Ordering::SeqCst) > stuck_at + 2000
+                });
+                stop.store(true, Ordering::SeqCst);
+                writer.join().expect("writer");
+            });
+            for k in 0..written.load(Ordering::SeqCst) {
+                let v = store.get(&key(k)).expect("get").expect("present");
+                assert_eq!(v, noisy(k, 1), "key {k}");
+            }
+        });
+    }
+
+    /// The engine can have the scratch back in the middle of a merge:
+    /// `compact` ends the job in flight, so it recalls the scratch
+    /// first and waits for the compaction thread to let go of it.
+    #[test]
+    fn compact_recalls_a_merge_in_flight() {
+        within_a_minute(|| {
+            let store = TempStore::new("recall");
+            let shared = &store.handle.shared;
+            let (entered, release) = hold_next_merge(shared);
+            let n = fill_level_zero(&store);
+            entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the compaction thread never picked the merge up");
+            let compacted = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let compacting = s.spawn(|| {
+                    store.compact().expect("compact");
+                    compacted.store(true, Ordering::SeqCst);
+                });
+                eventually("the scratch was recalled", || shared.handoff.recalled());
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(
+                    !compacted.load(Ordering::SeqCst),
+                    "compact went ahead while a merge held the scratch"
+                );
+                release.send(()).expect("release");
+                compacting.join().expect("compact");
+            });
+            assert!(compacted.load(Ordering::SeqCst));
+            assert!(!job_pending(shared));
+            for k in 0..n {
+                let v = store.get(&key(k)).expect("get").expect("present");
+                assert_eq!(v, noisy(k, 1));
+            }
+            let stats = store.stats().expect("stats");
+            assert_eq!(stats.level_tables[0], 0, "compact left tables in level 0");
+        });
+    }
+
+    /// A merge that fails loses its job and nothing else. The store
+    /// stops compacting in the background until the next flush (the
+    /// write path, which has a caller to tell, takes over), and the job
+    /// is done over.
+    #[test]
+    fn a_failed_merge_gives_its_job_up_and_the_store_goes_on() {
+        within_a_minute(|| {
+            let store = TempStore::new("merge-failed");
+            let shared = &store.handle.shared;
+            shared.fail_next_merge.store(true, Ordering::SeqCst);
+            let n = fill_level_zero(&store);
+            // Stuck: until the store has flushed again.
+            let stuck = || {
+                lock(&shared.engine)
+                    .as_ref()
+                    .is_some_and(|e| e.compaction_stuck == Some(e.room.flushes))
+            };
+            eventually("the failure reached the engine", stuck);
+            assert!(!shared.fail_next_merge.load(Ordering::SeqCst));
+            assert_eq!(shared.detached_steps.load(Ordering::Relaxed), 0);
+            // The job was given up: nothing of it is reserved, and the
+            // tables are the ones the flushes left.
+            let stats = store.stats().expect("stats");
+            assert_eq!(stats.slots.reserved, 0);
+            assert_eq!(stats.compaction_jobs, 1, "the step that ended the job");
+            for k in 0..n {
+                assert_eq!(store.get(&key(k)).expect("get"), Some(noisy(k, 1)));
+            }
+            // Writes go on, the job is done over, and nothing is lost.
+            for k in n..n + 3000 {
+                store.put(&key(k), &noisy(k, 1)).expect("put");
+            }
+            store.compact().expect("compact");
+            assert!(!stuck(), "a flush did not clear the failure");
+            for k in 0..n + 3000 {
+                assert_eq!(store.get(&key(k)).expect("get"), Some(noisy(k, 1)));
+            }
+            assert!(shared.detached_steps.load(Ordering::Relaxed) > 0);
+        });
+    }
+
+    /// Closing waits for the compaction thread, which stops after the
+    /// quantum it is in and gives the scratch back. The job it left is
+    /// blocks nothing points at: the store reopens with every write.
+    #[test]
+    fn closing_stops_a_merge_and_loses_nothing() {
+        within_a_minute(|| {
+            let mut store = TempStore::new("close-merging");
+            let (entered, release) = hold_next_merge(&store.handle.shared);
+            let n = fill_level_zero(&store);
+            entered
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the compaction thread never picked the merge up");
+            let closed = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                let (store, closed) = (&mut store, &closed);
+                let closing = s.spawn(move || {
+                    store.reopen();
+                    closed.store(true, Ordering::SeqCst);
+                });
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(
+                    !closed.load(Ordering::SeqCst),
+                    "the store closed with its compaction thread still merging"
+                );
+                release.send(()).expect("release");
+                closing.join().expect("close");
+            });
+            for k in 0..n {
+                assert_eq!(store.get(&key(k)).expect("get"), Some(noisy(k, 1)));
+            }
+            store.compact().expect("compact");
+            for k in 0..n {
+                assert_eq!(store.get(&key(k)).expect("get"), Some(noisy(k, 1)));
+            }
+        });
     }
 
     /// Reads that end in the memtable, in tables, or nowhere all agree

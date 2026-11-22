@@ -306,6 +306,22 @@ an open request has work.
   leaves the tree as of the last landed commit, and the next job merges
   on from the narrowed inputs. Crash tests enumerate every write of
   multi-output jobs.
+- **Detached merge** (ADR-0024): the merge between two commits needs
+  the device and the target level's table list, and nothing else of the
+  `Db`. After a `compact_step` that returned `More`,
+  `Compaction::merge_detached(device, manifest)` runs one merge quantum
+  over any handle to the device and a copy of `Db::manifest`, and
+  returns `Detached::More` or, when the output is full or the inputs
+  are exhausted, `Detached::NeedsDb`; the next `compact_step` with that
+  scratch seals and commits without repeating the quantum. A quantum
+  that fails loses the job (the next `compact_step` abandons it), and
+  `Compaction::abandon` does the same on the caller's word. Until that
+  next `compact_step`, the caller must not run `compact_step` with
+  another scratch, `request_compaction`, `ingest_table`,
+  `archive_commit` or `open` on the `Db`: they free the slot the merge
+  is writing. Everything that may run between two `compact_step`s may
+  run meanwhile. The result is the tree `compact_step` alone leaves,
+  block for block.
 
 ### 4.8 Read path
 

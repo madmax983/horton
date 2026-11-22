@@ -24,6 +24,7 @@ mod cache;
 mod crash;
 mod device;
 mod gate;
+mod handoff;
 mod store;
 
 use core::future::Future;
@@ -330,8 +331,8 @@ pub fn print_stats(store: &Handle) -> Result<(), String> {
         float(s.grouped_writes) / float(s.groups.max(1))
     );
     println!(
-        "work      {} flushes, {} compaction jobs in {} steps",
-        s.flushes, s.compaction_jobs, s.compaction_steps
+        "work      {} flushes, {} compaction jobs in {} steps, {} of them outside the engine lock",
+        s.flushes, s.compaction_jobs, s.compaction_steps, s.detached_steps
     );
     println!(
         "reads     {} without the engine lock, {} under it, since open",

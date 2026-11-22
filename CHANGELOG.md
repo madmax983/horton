@@ -25,9 +25,10 @@ unsynced writes 1.4 to 2.4 times; synced writes are unchanged. With
 detached reads the host store's point reads, scans and seeks also run
 on every reader thread at once, and with bloom filters sized to their
 tables a read of an absent key stops at the filter, and takes no lock
-on the way: at 1 M keys on four threads, point reads are 29 times
-0.19's rate, reads of absent keys 730 times, seeks 56 times and scans
-38 times.
+on the way: at 1 M keys on four threads, point reads are 27 times
+0.19's rate, reads of absent keys 690 times, seeks 54 times and scans
+38 times. Compaction's merge runs outside the host store's lock, so
+reads go on while it is written to.
 
 ### Added
 
@@ -66,6 +67,19 @@ on the way: at 1 M keys on four threads, point reads are 29 times
   builds that probe itself with `set_absent`, so the read does not
   wait for whoever has the `Db`. The claim is the caller's: a false
   one answers from the tables alone.
+- **Detached compaction merges** (ADR-0024).
+  `Compaction::merge_detached` runs a job's merge quanta without the
+  `Db`, over any handle to the device and a copy of `Db::manifest`;
+  `Db::compact_step` selects the job, and seals and commits each
+  output the merge fills. `Compaction::wants_merge` says when a
+  quantum is next, `Detached` is what one returns, and
+  `Compaction::abandon` gives a job up. A host runs the merge outside
+  the lock that guards its `Db`. The caller must not run
+  `request_compaction`, `ingest_table`, `archive_commit`, `open` or
+  another scratch's `compact_step` while a merge is detached. The
+  result is the tree `compact_step` alone leaves, block for block;
+  firmware's `compact_step` loop is unchanged and the scratch is the
+  size it was.
 - **Detached scans** (ADR-0019). `Scan::detached` and
   `RevScan::detached` scan without the `Db`, over a copy of part of the
   memtable made by `Db::copy_memtable_range` / `copy_memtable_range_rev`
@@ -180,6 +194,20 @@ on the way: at 1 M keys on four threads, point reads are 29 times
   A key written since the last flush, and every key after a
   `delete_range` or a recovery until the next flush, still asks the
   memtable under the lock. `stats` counts both kinds of read.
+- **kvstore compaction merges outside the engine lock**
+  (`examples/kvstore/handoff.rs`, ADR-0024). The compaction thread
+  has a handle of its own to the file. A step under the engine lock
+  selects a job, or seals and commits an output; the scratch is then
+  lent to the compaction thread, which merges with no lock and without
+  shutting the readers' gate, and gives it back. `stats` counts the
+  steps that ran outside the lock.
+- **A kvstore write that waits for compaction gives the engine lock
+  up.** When level 0 or the table region is full, the group at the
+  head of the queue is kept there and its thread lets go of the lock
+  until compaction has made room. Reads that need the memtable are no
+  longer held for the length of a compaction job.
+- The kvstore's `bench` has db_bench's `readwhilewriting`: reader
+  threads read random keys while one more thread overwrites.
 - The kvstore's `bench` builds `readmissing`'s keys on the stack. The
   allocation per key had become a third of the loop, and a lock that
   four reader threads waited on.

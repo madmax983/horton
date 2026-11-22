@@ -190,7 +190,9 @@ fix (below); means of three runs, reads a second.
   Reads are then what they were after step 1: the engine lock, no
   queue.
 - **A read during compaction is as before.** Each step shuts the gate,
-  and a reader that finds it shut waits for the engine lock.
+  and a reader that finds it shut waits for the engine lock. (Changed
+  since: ADR-0024 takes the merge out of the engine lock, and the gate
+  is shut only for a job's short steps with the database.)
 - **A reader that is descheduled while pinned delays a flush**, as it
   did.
 - **The order "filter, then memtable" is load-bearing**, and so is

@@ -50,7 +50,7 @@ mkdir -p "$work"
 if [ "$sync" = 1 ]; then
   benchmarks=fillseq,fillrandom,overwrite
 else
-  benchmarks=fillseq,fillrandom,overwrite,readrandom,readmissing,readseq,readreverse,seekrandom,deleterandom,compact,readrandom
+  benchmarks=fillseq,fillrandom,overwrite,readrandom,readmissing,readseq,readreverse,seekrandom,readwhilewriting,deleterandom,compact,readrandom
 fi
 
 cargo build --release --example kvstore >&2
