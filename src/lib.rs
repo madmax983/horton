@@ -72,6 +72,7 @@ pub mod profile;
 #[cfg(feature = "multiwriter")]
 pub mod ring;
 pub mod scan;
+pub mod sketch;
 pub mod slots;
 pub mod sstable;
 pub(crate) mod version;
@@ -91,6 +92,7 @@ pub use fingerprint::Fingerprint;
 pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestEdit, ManifestLayout, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
 pub use scan::{RevScan, Scan};
+pub use sketch::Sketch;
 pub use slots::{MAX_SLOTS, SlotMap};
 pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
 // Low-level table construction, for tests and tooling: `Db` builds its

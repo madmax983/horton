@@ -58,13 +58,8 @@ impl Fingerprint {
     /// Folds in one entry. Key and value are length-prefixed, so
     /// `("ab", "c")` and `("a", "bc")` hash differently.
     pub const fn add(&mut self, key: &[u8], val: &[u8]) {
-        let mut h = FNV_OFFSET;
-        h = fnv(h, &(key.len() as u64).to_le_bytes());
-        h = fnv(h, key);
-        h = fnv(h, &(val.len() as u64).to_le_bytes());
-        h = fnv(h, val);
         self.count = self.count.wrapping_add(1);
-        self.sum = self.sum.wrapping_add(mix(h));
+        self.sum = self.sum.wrapping_add(entry_hash(key, val));
     }
 
     /// The fingerprint of the union of two *disjoint* entry sets.
@@ -123,9 +118,20 @@ const fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
+/// The 64-bit hash of one entry: length-prefixed FNV-1a, then [`mix`].
+/// Shared with [`sketch`](crate::sketch), whose entry ids are these.
+pub(crate) const fn entry_hash(key: &[u8], val: &[u8]) -> u64 {
+    let mut h = FNV_OFFSET;
+    h = fnv(h, &(key.len() as u64).to_le_bytes());
+    h = fnv(h, key);
+    h = fnv(h, &(val.len() as u64).to_le_bytes());
+    h = fnv(h, val);
+    mix(h)
+}
+
 /// `SplitMix64` finalizer: spreads FNV's output over all 64 bits before
 /// summing, so the sum is not a linear function of the inputs.
-const fn mix(mut z: u64) -> u64 {
+pub(crate) const fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)

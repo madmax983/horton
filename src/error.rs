@@ -148,6 +148,13 @@ pub enum Error<E> {
     /// of the `drainer::payload::encode_*` constructors. The drainer is
     /// poisoned and nothing was written.
     BadPayload,
+    /// A [`Sketch`](crate::sketch::Sketch) difference did not peel: the
+    /// two sides differ in more entries than its cells can recover.
+    /// Nothing is lost. **Remedy:** a sketch with more cells, or narrow
+    /// the range first with
+    /// [`fingerprint_buckets`](crate::fingerprint::fingerprint_buckets)
+    /// and sketch each bucket that disagrees.
+    SketchTooSmall,
     /// The underlying block device reported an error.
     Device(E),
 }
@@ -188,6 +195,7 @@ impl Error<core::convert::Infallible> {
             Self::NotOpen => Error::NotOpen,
             Self::RingFull => Error::RingFull,
             Self::BadPayload => Error::BadPayload,
+            Self::SketchTooSmall => Error::SketchTooSmall,
             Self::Device(e) => match e {},
         }
     }
@@ -236,6 +244,9 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
             Self::NotOpen => f.write_str("database is not open"),
             Self::RingFull => f.write_str("admission ring is full: let the drainer sweep"),
             Self::BadPayload => f.write_str("ring payload did not decode"),
+            Self::SketchTooSmall => {
+                f.write_str("too many differences for the sketch: use more cells or bisect")
+            }
             Self::Device(e) => write!(f, "device error: {e}"),
         }
     }
