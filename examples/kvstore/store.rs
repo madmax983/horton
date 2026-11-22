@@ -129,6 +129,11 @@ const SERVE_MAX: usize = 64;
 /// cost of a wake-up that was missed.
 const PARK: Duration = Duration::from_millis(2);
 
+/// Looks a reader takes at a held engine lock before it counts itself
+/// as waiting. Another reader holds the lock for well under a
+/// microsecond, so the lock is usually free again within these.
+const READ_POLLS: usize = 32;
+
 /// Block buffers a scanning thread lends each scan: one for every table
 /// the store can hold, and a few for index blocks. 512 KiB a thread.
 const SCAN_BLOCKS: usize = 32;
@@ -293,35 +298,6 @@ pub struct Stats {
 /// Key-value pairs, in scan order.
 pub type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// What a queued request asks for.
-enum Work {
-    Write(Batch),
-    /// A point read of a key as of a sequence number.
-    Get(Vec<u8>, u64),
-    /// The memtable's share of one page of a scan.
-    Page {
-        /// Descending.
-        reverse: bool,
-        /// Where the page begins: the first key of a forward page, the
-        /// greatest of a reverse one (empty: the last key).
-        from: Vec<u8>,
-        /// A forward page's exclusive end.
-        end: Option<Vec<u8>>,
-        /// Most memtable keys to copy.
-        max_keys: usize,
-        /// The buffer to copy them into, taken by whoever serves this.
-        into: Mutex<Option<PageLease>>,
-    },
-}
-
-impl Work {
-    /// A read: its caller has a table phase of its own to run once the
-    /// memtable part is served.
-    const fn is_read(&self) -> bool {
-        matches!(self, Self::Get(..) | Self::Page { .. })
-    }
-}
-
 /// A memtable-page buffer on loan from the store's pool; it goes back
 /// when dropped, whichever thread drops it.
 struct PageLease {
@@ -366,88 +342,78 @@ impl Drop for PageLease {
     }
 }
 
-/// A reader in the table phase of a point read. While any is alive,
-/// flush and compaction wait ([`Room::quiesce`]): they are what could
-/// rewrite a table the reader is in. Dropping it lets them go on.
+/// A reader in the table phase of a read or a scan page. While any is
+/// alive, flush and compaction wait ([`Room::quiesce`]): they are what
+/// could rewrite a table the reader is in. Dropping it lets them go on.
 ///
-/// A pin is only ever made under the engine lock, by the thread serving
-/// the read's memtable probe.
-struct Pin(Arc<AtomicUsize>);
+/// A pin is only ever made under the engine lock, by the thread whose
+/// read it is, in the same hold of the lock as the read's memtable probe
+/// and its view of the manifest.
+struct Pin<'a>(&'a AtomicUsize);
 
-impl Pin {
-    fn new(readers: &Arc<AtomicUsize>) -> Self {
+impl<'a> Pin<'a> {
+    fn new(readers: &'a AtomicUsize) -> Self {
         readers.fetch_add(1, Ordering::SeqCst);
-        Self(Arc::clone(readers))
+        Self(readers)
     }
 }
 
-impl Drop for Pin {
+impl Drop for Pin<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// What a served request got.
-enum Reply {
-    /// A write is durable (`None`), or a read was settled by the memtable
-    /// (its value, or `None` for a deleted key).
-    Done(Option<Vec<u8>>),
-    /// A read the memtable did not settle: the caller finishes it in the
-    /// tables. `tables` is the manifest as of the probe; the pin keeps
-    /// those tables in place until this reply is dropped.
-    Tables {
-        probe: Box<KvProbe>,
-        tables: Arc<KvManifest>,
-        _pin: Pin,
-    },
-    /// A scan page's share of the memtable: the caller merges it with
-    /// the tables. `horizon` is the nearest key the copy does not hold
-    /// (the page must stop there), or `None` when it holds the rest of
-    /// the range. `tables` and the pin are as for a point read.
-    Page {
-        memtable: PageLease,
-        horizon: Option<Vec<u8>>,
-        tables: Arc<KvManifest>,
-        node: u32,
-        _pin: Pin,
-    },
+/// What a scan page takes from the database before it merges: where its
+/// copy of the memtable stops knowing (the nearest key it does not hold,
+/// where the page must stop; `None` when it holds the rest of the
+/// range), the manifest of that moment, and the node id.
+struct PageStart {
+    horizon: Option<Vec<u8>>,
+    tables: Arc<KvManifest>,
+    node: u32,
 }
 
-/// A request in the queue. The thread that serves it sets `done`; its
+/// A write in the queue. The thread that commits it sets `done`; its
 /// caller returns as soon as it sees that.
 struct Pending {
-    work: Work,
-    done: OnceLock<Result<Reply, StoreError>>,
+    batch: Batch,
+    done: OnceLock<Result<(), StoreError>>,
     /// The thread that queued it, to wake when it is done.
     waiter: std::thread::Thread,
 }
 
 impl Pending {
-    fn finish(&self, result: Result<Reply, StoreError>) {
+    fn finish(&self, result: Result<(), StoreError>) {
         let _ = self.done.set(result);
         // Free unless the thread has parked.
         self.waiter.unpark();
     }
 
-    /// The reply, once served.
-    fn reply(&self) -> Result<&Reply, StoreError> {
-        match self.done.get() {
-            Some(Ok(reply)) => Ok(reply),
-            Some(Err(e)) => Err(e.clone()),
-            None => Err(StoreError::Closed),
-        }
+    /// The outcome, once committed.
+    fn reply(&self) -> Result<(), StoreError> {
+        self.done.get().cloned().unwrap_or(Err(StoreError::Closed))
     }
 }
 
-/// A reader thread's buffers for the table phase: two blocks and a value.
+/// What a reader thread keeps for its point reads: the probe the
+/// memtable's part is written into, the manifest it last read by, and
+/// the buffers of the table phase (two blocks and a value).
 struct Reader {
+    probe: KvProbe,
+    /// The engine's manifest as this thread last saw it. Compared by
+    /// address with the engine's under the lock, and replaced only when
+    /// the engine's has: a read then takes no reference count.
+    tables: Option<Arc<KvManifest>>,
     scratch: KvReadScratch,
     val: [u8; VAL_MAX],
 }
 
 thread_local! {
-    /// Every thread that reads keeps its own (36 KiB).
+    /// Every thread that reads keeps its own (40 KiB).
     static READER: RefCell<Box<Reader>> = RefCell::new(Box::new(Reader {
+        probe: KvProbe::new(),
+        tables: None,
         scratch: KvReadScratch::new(),
         val: [0u8; VAL_MAX],
     }));
@@ -471,10 +437,20 @@ struct Cursor {
 struct Shared {
     /// The database. `None` once the store is closed.
     engine: Mutex<Option<Engine>>,
-    /// Point reads and writes waiting to be served, oldest first. Taken
-    /// after the engine lock by the thread serving and alone by a thread
-    /// queueing, never the other way round.
+    /// Writes waiting to be committed, oldest first. Taken after the
+    /// engine lock by the thread committing and alone by a thread
+    /// queueing, never the other way round. Reads do not come here.
     queue: Mutex<VecDeque<Arc<Pending>>>,
+    /// How many writes are in `queue`. A reader giving up the engine
+    /// looks at this, not at the queue: while no write waits it reads a
+    /// word nobody is writing.
+    queued: AtomicUsize,
+    /// A hint that the engine lock is held, kept by whoever holds it. A
+    /// reader that finds the lock taken watches this instead of trying
+    /// the lock again and again: a failed try still writes the lock's
+    /// cache line, and four readers doing that keep it from the thread
+    /// that needs it to let go. Nothing depends on the hint being right.
+    engine_held: AtomicBool,
     /// Client threads polling or parked for the engine lock. The
     /// compaction thread stands back while this is nonzero.
     waiting: AtomicUsize,
@@ -527,6 +503,14 @@ impl core::ops::DerefMut for Locked<'_> {
     }
 }
 
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        // Before the guard goes (fields drop after this): see
+        // `Shared::engine_held`.
+        self.shared.engine_held.store(false, Ordering::Relaxed);
+    }
+}
+
 impl Locked<'_> {
     /// Ends a client operation: one bounded compaction step if a job is
     /// pending and no reader is in its table phase, then the lock is
@@ -550,6 +534,25 @@ impl Locked<'_> {
     }
 }
 
+impl Locked<'_> {
+    /// Ends a read's hold of the engine: the lock is released and
+    /// nothing else is done under it. No compaction step: the reader
+    /// holds a pin, and a step would wait for it. If a write is queued
+    /// its thread is woken, in case it parked while readers had the
+    /// lock.
+    fn release(self) {
+        let pending = self.background_pending();
+        let shared = self.shared;
+        drop(self);
+        if shared.queued.load(Ordering::Relaxed) > 0 {
+            shared.wake_queue();
+        }
+        if pending {
+            shared.wake_background();
+        }
+    }
+}
+
 impl Shared {
     /// The locked engine, or [`StoreError::Closed`] once it is gone.
     fn opened<'a>(
@@ -557,6 +560,7 @@ impl Shared {
         guard: MutexGuard<'a, Option<Engine>>,
     ) -> Result<Locked<'a>, StoreError> {
         if guard.is_some() {
+            self.engine_held.store(true, Ordering::Relaxed);
             Ok(Locked {
                 shared: self,
                 guard,
@@ -610,17 +614,68 @@ impl Shared {
         r
     }
 
-    /// Queues `work` and returns the request once some thread has served
-    /// it: this one, if it gets the engine lock first, in which case it
-    /// serves the rest of the queue too. The reply is in the request
-    /// ([`Pending::reply`]).
-    fn submit(&self, work: Work) -> Result<Arc<Pending>, StoreError> {
+    /// Takes the engine lock for a read. A reader holds it for a
+    /// fraction of a microsecond, so another reader that finds it taken
+    /// looks again a few times before it joins the threads counted as
+    /// waiting ([`engine`](Self::engine)).
+    fn engine_for_read(&self) -> Result<Locked<'_>, StoreError> {
+        for round in 0..READ_POLLS {
+            if !self.engine_held.load(Ordering::Relaxed)
+                && let Some(r) = self.poll_engine()
+            {
+                return r;
+            }
+            // Back off a little longer each time, so that readers who
+            // collided do not all come back at once.
+            for _ in 0..(1usize << round.min(4)) {
+                core::hint::spin_loop();
+            }
+        }
+        self.engine()
+    }
+
+    /// The part of a read that needs the database, under the engine
+    /// lock, which this thread takes for itself: `op` is the memtable
+    /// probe or page copy, and `pins` says whether what it found needs
+    /// the tables.
+    ///
+    /// The pin is made here, in the same hold of the lock: flush and
+    /// compaction, which need that lock, cannot have started since `op`
+    /// read the manifest, and will wait for the pin before they do.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "`release` gives the lock up, right after the pin is made under it"
+    )]
+    fn begin<T>(
+        &self,
+        op: impl FnOnce(&mut Engine) -> Result<T, DbError>,
+        pins: impl FnOnce(&T) -> bool,
+    ) -> Result<(T, Option<Pin<'_>>), StoreError> {
+        let mut engine = self.engine_for_read()?;
+        let begun = op(&mut engine);
+        let pin = begun
+            .as_ref()
+            .is_ok_and(pins)
+            .then(|| Pin::new(&self.readers));
+        engine.release();
+        Ok((begun.map_err(StoreError::Db)?, pin))
+    }
+
+    /// Queues `batch` and returns the request once some thread has
+    /// committed it: this one, if it gets the engine lock first, in
+    /// which case it commits the rest of the queue too. The outcome is
+    /// in the request ([`Pending::reply`]).
+    fn submit(&self, batch: Batch) -> Result<Arc<Pending>, StoreError> {
         let me = Arc::new(Pending {
-            work,
+            batch,
             done: OnceLock::new(),
             waiter: std::thread::current(),
         });
-        lock(&self.queue).push_back(Arc::clone(&me));
+        {
+            let mut queue = lock(&self.queue);
+            queue.push_back(Arc::clone(&me));
+            self.queued.store(queue.len(), Ordering::Relaxed);
+        }
         let mut waiting_since: Option<Instant> = None;
         let mut polls = 0usize;
         let closed = loop {
@@ -631,13 +686,16 @@ impl Shared {
                 Some(Ok(mut engine)) => {
                     // The queue is served from its head, which may not
                     // reach this request in one turn; then go again.
-                    engine.serve(&self.queue, &me);
+                    engine.serve(self, &me);
                     engine.finish();
                 }
                 Some(Err(e)) => {
                     // Closed: nobody will serve this request (unless
                     // somebody just did).
-                    lock(&self.queue).retain(|p| !Arc::ptr_eq(p, &me));
+                    let mut queue = lock(&self.queue);
+                    queue.retain(|p| !Arc::ptr_eq(p, &me));
+                    self.queued.store(queue.len(), Ordering::Relaxed);
+                    drop(queue);
                     break me.done.get().is_none().then_some(e);
                 }
                 None => {
@@ -664,31 +722,48 @@ impl Shared {
         closed.map_or(Ok(me), Err)
     }
 
-    /// A point read of `key` as of sequence `seq`. The memtable probe is
-    /// queued and served under the engine lock; the table phase, if the
-    /// read needs one, runs here, on the calling thread, alongside every
-    /// other reader's.
+    /// A point read of `key` as of sequence `seq`.
+    ///
+    /// The memtable's part needs the database, so it runs under the
+    /// engine lock: this thread takes the lock itself, probes the
+    /// memtable into its own probe, looks at which manifest is current,
+    /// pins the tables if the read will need them, and lets go. It joins
+    /// no queue and waits for no other thread to serve it. The table
+    /// phase then runs here, alongside every other reader's.
     fn read(&self, key: &[u8], seq: u64) -> Result<Option<Vec<u8>>, StoreError> {
         if key.len() > KEY_MAX {
             // No stored key is this long.
             return Ok(None);
         }
-        let served = self.submit(Work::Get(key.to_vec(), seq))?;
-        match served.reply()? {
-            Reply::Done(value) => Ok(value.clone()),
-            // A point read is never answered with a scan page.
-            Reply::Page { .. } => Err(StoreError::Closed),
-            Reply::Tables { probe, tables, .. } => READER.with(|reader| {
-                #[cfg(test)]
+        READER.with(|reader| {
+            let mut reader = reader.borrow_mut();
+            let Reader {
+                probe,
+                tables,
+                scratch,
+                val,
+            } = &mut **reader;
+            // A read the memtable settled reads no table and needs no
+            // pin.
+            let (_, pin) = self.begin(
+                |engine| {
+                    engine.begin_read(key, seq, probe, tables)?;
+                    Ok(probe.is_settled())
+                },
+                |settled| !settled,
+            )?;
+            #[cfg(test)]
+            if pin.is_some() {
                 self.hold_if_asked();
-                let mut reader = reader.borrow_mut();
-                let Reader { scratch, val } = &mut **reader;
-                let view = KvTables::new(&self.read_device, tables, Some(&self.cache));
-                let n = block_on(view.resolve(probe, scratch, &mut val[..], 0))?;
-                Ok(n.map(|n| val[..n].to_vec()))
-            }),
-        }
-        // `served` is dropped here, and the reader's pin with it.
+            }
+            let Some(tables) = tables.as_deref() else {
+                return Err(StoreError::Closed);
+            };
+            let view = KvTables::new(&self.read_device, tables, Some(&self.cache));
+            let n = block_on(view.resolve(probe, scratch, &mut val[..], 0))?;
+            drop(pin);
+            Ok(n.map(|n| val[..n].to_vec()))
+        })
     }
 
     /// Test hook: holds the calling reader here, in its table phase and
@@ -707,9 +782,9 @@ impl Shared {
     /// from the range's own bound), and where the next page goes on
     /// (`None`: the range is exhausted).
     ///
-    /// The memtable's share is copied under the engine lock, through the
-    /// queue; the merge with the tables runs here, on the calling
-    /// thread, alongside every other reader's. A page can come back
+    /// The memtable's share is copied under the engine lock, which this
+    /// thread takes itself, as a point read does; the merge with the
+    /// tables runs here too, alongside every other reader's. A page can come back
     /// short of `limit` with more to follow: it stops at the horizon of
     /// its memtable copy.
     fn page(
@@ -734,31 +809,34 @@ impl Shared {
             (None, false) => (start, None),
             (None, true) => (end.unwrap_or(&[]), end),
         };
-        let served = self.submit(Work::Page {
-            reverse,
-            from: from.to_vec(),
-            end: end.filter(|_| !reverse).map(<[u8]>::to_vec),
-            // One more than the page yields: the key passed over.
-            max_keys: limit.saturating_add(1),
-            into: Mutex::new(Some(PageLease::take(&self.pages))),
-        })?;
-        let Reply::Page {
-            memtable,
+        // The buffer first: waiting for one must not hold the engine.
+        let mut lease = PageLease::take(&self.pages);
+        let Some(page) = lease.page.as_deref_mut() else {
+            return Err(StoreError::Closed);
+        };
+        // One more key than the page yields: the key passed over.
+        let (begun, pin) = self.begin(
+            |engine| {
+                engine.begin_page(
+                    reverse,
+                    from,
+                    end.filter(|_| !reverse),
+                    limit.saturating_add(1),
+                    page,
+                )
+            },
+            |_| true,
+        )?;
+        let PageStart {
             horizon,
             tables,
             node,
-            ..
-        } = served.reply()?
-        else {
-            return Err(StoreError::Closed);
-        };
-        let Some(memtable) = memtable.page.as_deref() else {
-            return Err(StoreError::Closed);
-        };
+        } = begun;
+        let memtable: &KvMemPage = page;
         #[cfg(test)]
         self.hold_if_asked();
         let horizon = horizon.as_deref();
-        let parts = (memtable, &**tables, *node);
+        let parts = (memtable, &*tables, node);
         let mut out = Vec::new();
         let more = SCAN_POOL.with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -803,8 +881,9 @@ impl Shared {
             }),
             _ => None,
         };
+        drop(pin);
         Ok((out, next))
-        // `served` is dropped here: the pin and the page buffer with it.
+        // The page buffer goes back to the pool here.
     }
 
     /// The table phase of a forward page: merges `memtable` with the
@@ -896,7 +975,12 @@ impl Shared {
     }
 
     fn wake_background(&self) {
-        if !self.background_due.swap(true, Ordering::AcqRel) {
+        // Looked at before it is set: readers call this on every read
+        // while a job is pending, and a flag that is already up should
+        // not be written again.
+        if !self.background_due.load(Ordering::Acquire)
+            && !self.background_due.swap(true, Ordering::AcqRel)
+        {
             let _g = lock(&self.wake.0);
             self.wake.1.notify_one();
         }
@@ -931,14 +1015,20 @@ impl Shared {
                 let Some(engine) = guard.as_mut() else {
                     return;
                 };
-                if !engine.background_pending() {
+                self.engine_held.store(true, Ordering::Relaxed);
+                let pending = engine.background_pending();
+                if pending {
+                    engine.background_step();
+                } else {
                     // Cleared under the engine lock: a client that leaves
                     // a job pending after this sets it again.
                     self.background_due.store(false, Ordering::Release);
+                }
+                self.engine_held.store(false, Ordering::Relaxed);
+                drop(guard);
+                if !pending {
                     break;
                 }
-                engine.background_step();
-                drop(guard);
                 self.wake_queue();
             }
         }
@@ -1020,6 +1110,8 @@ impl Store {
         let shared = Arc::new(Shared {
             engine: Mutex::new(Some(engine)),
             queue: Mutex::new(VecDeque::new()),
+            queued: AtomicUsize::new(0),
+            engine_held: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
             // Look once: recovery may have left a job pending.
             background_due: AtomicBool::new(true),
@@ -1070,7 +1162,7 @@ impl Handle {
     /// Applies `batch` atomically. Returns once it is durable.
     pub fn write(&self, batch: Batch) -> Result<(), StoreError> {
         batch.check()?;
-        self.shared.submit(Work::Write(batch))?.reply().map(drop)
+        self.shared.submit(batch)?.reply()
     }
 
     /// Deletes every key in `[start, end)` with one range tombstone, like
@@ -1272,15 +1364,9 @@ struct Engine {
     /// The writes of the group being committed (kept to reuse its
     /// allocation).
     group: Vec<Arc<Pending>>,
-    /// Where a point read the memtable settles lands before it is copied
-    /// out, and the block buffers its (empty) table phase is handed.
-    val: Box<[u8; VAL_MAX]>,
-    scratch: Box<KvReadScratch>,
     /// The manifest as readers were last given it; replaced when the
     /// database's has moved on.
     tables: Arc<KvManifest>,
-    /// Readers in their table phase; see [`Pin`].
-    readers: Arc<AtomicUsize>,
     /// Background compaction failed (say, `RegionFull`) when the store
     /// had flushed this many times: leave it to the write path, which
     /// reports the error to a caller, until a flush changes the tables. A
@@ -1314,17 +1400,14 @@ impl Engine {
             db,
             room: Room {
                 scratch: Box::new(KvCompaction::new()),
-                readers: Arc::clone(&readers),
+                readers,
                 flushes: 0,
                 jobs: 0,
                 steps: 0,
             },
             batch: Box::new(GroupBatch::new()),
             group: Vec::new(),
-            val: Box::new([0u8; VAL_MAX]),
-            scratch: Box::new(KvReadScratch::new()),
             tables,
-            readers,
             compaction_stuck: None,
             sync,
             open,
@@ -1343,149 +1426,110 @@ impl Engine {
         }
     }
 
-    /// The first phase of a point read: the memtable probe. A probe the
-    /// memtable settles is answered here (its table phase reads nothing).
-    /// Any other is handed back with the manifest of this moment and a
-    /// pin, for the caller to finish in the tables on its own thread.
-    fn begin_read(&mut self, key: &[u8], seq: u64) -> Result<Reply, DbError> {
-        let probe = self.db.probe_memtable(key, seq)?;
-        if probe.is_settled() {
-            let view = KvTables::new(self.db.device(), self.db.manifest(), None);
-            let n = block_on(view.resolve(&probe, &mut self.scratch, &mut self.val[..], 0))?;
-            return Ok(Reply::Done(n.map(|n| self.val[..n].to_vec())));
-        }
-        // Every manifest commit moves `seq`, so an equal `seq` is the
-        // same set of tables.
+    /// The engine's manifest for readers, brought up to date. Every
+    /// manifest commit moves `seq`, so an equal `seq` is the same set of
+    /// tables.
+    fn tables(&mut self) -> &Arc<KvManifest> {
         if self.tables.seq() != self.db.manifest().seq() {
             self.tables = Arc::new(*self.db.manifest());
         }
-        // Pinned here, under the engine lock: flush and compaction, which
-        // need the same lock, cannot have started since the manifest was
-        // read, and will wait for the pin before they do.
-        Ok(Reply::Tables {
-            probe: Box::new(probe),
-            tables: Arc::clone(&self.tables),
-            _pin: Pin::new(&self.readers),
-        })
+        &self.tables
     }
 
-    /// The memtable's share of one page of a scan: copies into `lease`
-    /// the at most `max_keys` keys of the memtable the page reaches
-    /// first, and hands it back with the copy's horizon, the manifest of
-    /// this moment and a pin, for the caller to merge with the tables on
-    /// its own thread.
+    /// The part of a point read that needs the database: the memtable
+    /// probe, written into the caller's `probe`, and the manifest of
+    /// this moment in `tables`. The caller's `tables` is replaced only
+    /// when it is not the engine's current one, so a reader whose
+    /// manifest is still current touches no reference count.
+    fn begin_read(
+        &mut self,
+        key: &[u8],
+        seq: u64,
+        probe: &mut KvProbe,
+        tables: &mut Option<Arc<KvManifest>>,
+    ) -> Result<(), DbError> {
+        self.db.probe_memtable_into(key, seq, probe)?;
+        let current = self.tables();
+        if !tables.as_ref().is_some_and(|t| Arc::ptr_eq(t, current)) {
+            *tables = Some(Arc::clone(current));
+        }
+        Ok(())
+    }
+
+    /// The part of a scan page that needs the database: copies into
+    /// `page` the at most `max_keys` keys of the memtable the page
+    /// reaches first, and returns the copy's horizon (the nearest key it
+    /// does not hold, where the page must stop; `None` when it holds the
+    /// rest of the range), the manifest of this moment, and the node id.
     fn begin_page(
         &mut self,
         reverse: bool,
         from: &[u8],
         end: Option<&[u8]>,
         max_keys: usize,
-        mut lease: PageLease,
-    ) -> Result<Reply, DbError> {
-        let Some(page) = lease.page.as_deref_mut() else {
-            return Err(Error::Busy);
-        };
+        page: &mut KvMemPage,
+    ) -> Result<PageStart, DbError> {
         let horizon = if reverse {
             self.db
                 .copy_memtable_range_rev(from, None, max_keys, page)?
         } else {
             self.db.copy_memtable_range(from, end, max_keys, page)?
         };
-        if self.tables.seq() != self.db.manifest().seq() {
-            self.tables = Arc::new(*self.db.manifest());
-        }
-        // Pinned under the engine lock, as for a point read.
-        Ok(Reply::Page {
-            memtable: lease,
+        Ok(PageStart {
             horizon: horizon.map(|h| h.as_slice().to_vec()),
-            tables: Arc::clone(&self.tables),
+            tables: Arc::clone(self.tables()),
             node: self.db.node_id(),
-            _pin: Pin::new(&self.readers),
         })
     }
 
-    /// Serves the queue from its head, in order: each point read's
-    /// memtable probe, and each run of writes as a group. Stops when the
-    /// queue is empty or after [`SERVE_MAX`] turns.
+    /// Commits the queue from its head, in order, a group at a time.
+    /// Stops when the queue is empty or after [`SERVE_MAX`] groups.
     ///
-    /// `me` is the caller's own request. The queue is first in, first
-    /// out, so by the time `me` is served so is everything that was
-    /// waiting when it queued. What the caller does then depends on what
-    /// it asked for:
-    ///
-    /// - **A read stops at once.** Its reply may carry a [`Pin`], and
-    ///   its table phase is still to run. Flush and compaction wait for
-    ///   pins, so a thread that went on to a write needing a flush would
-    ///   wait for itself.
-    /// - **A write goes on serving** while that is cheap, which keeps the
-    ///   database in one CPU's cache: it holds no pin. It stops before a
-    ///   write group that will be `fdatasync`ed, so that its client's
-    ///   next write can join that group instead of waiting a flush
-    ///   behind it, which is what makes synced groups large.
-    fn serve(&mut self, queue: &Mutex<VecDeque<Arc<Pending>>>, me: &Pending) {
+    /// `me` is the caller's own write. The queue is first in, first out,
+    /// so by the time `me` is committed so is everything that was
+    /// waiting when it queued. The caller goes on committing others
+    /// while that is cheap, which keeps the database in one CPU's cache.
+    /// It stops before a group that will be `fdatasync`ed, so that its
+    /// client's next write can join that group instead of waiting a
+    /// flush behind it, which is what makes synced groups large.
+    fn serve(&mut self, shared: &Shared, me: &Pending) {
         for _ in 0..SERVE_MAX {
-            let served = me.done.get().is_some();
-            if served && me.work.is_read() {
+            let committed = me.done.get().is_some();
+            if !self.take_group(shared, self.sync && committed) {
                 return;
             }
-            let Some(next) = self.take_group(queue, self.sync && served) else {
-                return;
-            };
-            match &next.work {
-                Work::Get(key, seq) => {
-                    let r = self.begin_read(key, *seq).map_err(StoreError::Db);
-                    next.finish(r);
-                }
-                Work::Page {
-                    reverse,
-                    from,
-                    end,
-                    max_keys,
-                    into,
-                } => {
-                    let lease = lock(into).take();
-                    let r = lease.ok_or(StoreError::Closed).and_then(|lease| {
-                        self.begin_page(*reverse, from, end.as_deref(), *max_keys, lease)
-                            .map_err(StoreError::Db)
-                    });
-                    next.finish(r);
-                }
-                Work::Write(_) => self.commit_group(),
-            }
+            self.commit_group();
         }
     }
 
-    /// Takes the request at the head of `queue`. If it is a write, it and
-    /// every write queued directly behind it that fits the same WAL
-    /// block are moved into `self.group`; with `leave_writes`, a write at
-    /// the head stays queued and nothing is taken.
-    fn take_group(
-        &mut self,
-        queue: &Mutex<VecDeque<Arc<Pending>>>,
-        leave_writes: bool,
-    ) -> Option<Arc<Pending>> {
-        let mut queue = lock(queue);
-        if leave_writes && matches!(queue.front()?.work, Work::Write(_)) {
-            return None;
+    /// Moves the write at the head of the queue, and every write queued
+    /// directly behind it that fits the same WAL block, into
+    /// `self.group`. False when there is nothing to take, or when
+    /// `leave` asks for the queue to be left as it is.
+    fn take_group(&mut self, shared: &Shared, leave: bool) -> bool {
+        if leave {
+            return false;
         }
-        let head = queue.pop_front()?;
-        if let Work::Write(first) = &head.work {
-            self.group.clear();
-            // The head always goes: `Handle::write` checked that it fits
-            // a block by itself.
-            let (mut bytes, mut ops) = (first.wal_bytes(), first.ops.len());
-            self.group.push(Arc::clone(&head));
-            while let Some(Work::Write(b)) = queue.front().map(|p| &p.work) {
-                bytes += b.wal_bytes();
-                ops += b.ops.len();
-                if bytes > BLOCK || ops > GROUP_OPS {
-                    break;
-                }
-                self.group.extend(queue.pop_front());
+        let mut queue = lock(&shared.queue);
+        let Some(head) = queue.pop_front() else {
+            return false;
+        };
+        self.group.clear();
+        // The head always goes: `Handle::write` checked that it fits a
+        // block by itself.
+        let (mut bytes, mut ops) = (head.batch.wal_bytes(), head.batch.ops.len());
+        self.group.push(head);
+        while let Some(next) = queue.front() {
+            bytes += next.batch.wal_bytes();
+            ops += next.batch.ops.len();
+            if bytes > BLOCK || ops > GROUP_OPS {
+                break;
             }
+            self.group.extend(queue.pop_front());
         }
+        shared.queued.store(queue.len(), Ordering::Relaxed);
         drop(queue);
-        Some(head)
+        true
     }
 
     /// Commits the writes in `self.group` as one batch and tells each of
@@ -1493,11 +1537,7 @@ impl Engine {
     fn commit_group(&mut self) {
         self.batch.clear();
         let mut result = Ok(());
-        let writes = self.group.iter().filter_map(|p| match &p.work {
-            Work::Write(b) => Some(b),
-            Work::Get(..) | Work::Page { .. } => None,
-        });
-        for op in writes.flat_map(|b| &b.ops) {
+        for op in self.group.iter().flat_map(|p| &p.batch.ops) {
             let r = match op {
                 BatchOp::Put(k, v) => self.batch.put(k, v),
                 BatchOp::Delete(k) => self.batch.delete(k),
@@ -1520,7 +1560,7 @@ impl Engine {
         self.groups += 1;
         self.grouped_writes += self.group.len() as u64;
         for p in self.group.drain(..) {
-            p.finish(result.clone().map(|()| Reply::Done(None)));
+            p.finish(result.clone());
         }
     }
 

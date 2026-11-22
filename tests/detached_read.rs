@@ -406,3 +406,91 @@ fn a_probe_needs_an_open_db_and_a_key_that_fits() {
         None
     );
 }
+
+/// `probe_memtable_into` fills a probe the caller keeps, and one probe
+/// used for read after read answers each as a fresh probe would:
+/// nothing of the key, value, tombstone or range tombstone a probe held
+/// before shows through. A probe that fails to fill reads no key.
+#[test]
+fn a_reused_probe_answers_as_a_fresh_one() {
+    let (mut db, marks) = populated();
+    // Leave something in the memtable of every kind: a value, a longer
+    // value, a tombstone, a range tombstone, an expiring value.
+    block_on(db.put(&key(3), &[b'L'; 700])).unwrap();
+    block_on(db.put(&key(4), b"s")).unwrap();
+    block_on(db.delete(&key(5))).unwrap();
+    block_on(db.delete_range(&key(60), &key(64))).unwrap();
+    block_on(db.put_with_ttl(&key(7), b"ttl", 900)).unwrap();
+    let manifest = *db.manifest();
+    let mut seqs = marks;
+    seqs.extend([0, 1, u64::MAX]);
+
+    let mut reused = Box::new(TestProbe::new());
+    let mut scratch = Box::new(TestScratch::new());
+    let view = TestTables::new(db.device(), &manifest, None);
+    let (mut values, mut missing, mut settled) = (0, 0, 0);
+    // An order that follows long values with short ones, values with
+    // tombstones, and hits with misses.
+    let order = (0..125usize)
+        .map(|i| (i * 37) % 125)
+        .chain([3, 5, 4, 61, 3, 7, 200, 4]);
+    for i in order {
+        let k = key(i);
+        // Every snapshot for the keys the memtable holds and every
+        // fourth other; the latest view for the rest.
+        let full = i % 4 == 0 || [3, 4, 5, 7, 61].contains(&i);
+        for &seq in seqs.iter().filter(|&&s| full || s == u64::MAX) {
+            for now in [0u64, 1_000] {
+                let fresh: TestProbe = db.probe_memtable(&k, seq).unwrap();
+                db.probe_memtable_into(&k, seq, &mut reused).unwrap();
+                assert_eq!(reused.key(), fresh.key());
+                assert_eq!(reused.max_seq(), fresh.max_seq());
+                assert_eq!(reused.is_settled(), fresh.is_settled());
+                settled += usize::from(reused.is_settled());
+                let mut want = vec![0u8; 1024];
+                let mut got = vec![0u8; 1024];
+                let w = outcome(
+                    block_on(view.resolve(&fresh, &mut scratch, &mut want, now)),
+                    &want,
+                );
+                let g = outcome(
+                    block_on(view.resolve(&reused, &mut scratch, &mut got, now)),
+                    &got,
+                );
+                assert_eq!(g, w, "key {i} seq {seq} now {now}");
+                assert_eq!(g, attached(&db, &k, seq, now, 1024), "key {i} seq {seq}");
+                match g {
+                    Outcome::Value(_) => values += 1,
+                    Outcome::Missing => missing += 1,
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+    assert!(
+        values > 150 && missing > 150 && settled > 20,
+        "{values} {missing} {settled}"
+    );
+
+    // A probe that cannot be filled is emptied, not left answering for
+    // the key before it.
+    db.probe_memtable_into(&key(3), u64::MAX, &mut reused)
+        .unwrap();
+    assert!(reused.is_settled());
+    let long = [b'k'; 257];
+    assert!(matches!(
+        db.probe_memtable_into(&long, u64::MAX, &mut reused),
+        Err(Error::KeyTooLarge { len: 257, max: 256 })
+    ));
+    assert_eq!(reused.key(), b"");
+    assert!(!reused.is_settled());
+    let closed = TestDb::new(MemDevice::<4096>::new(), test_config());
+    db.probe_memtable_into(&key(3), u64::MAX, &mut reused)
+        .unwrap();
+    assert!(matches!(
+        closed.probe_memtable_into(&key(3), u64::MAX, &mut reused),
+        Err(Error::NotOpen)
+    ));
+    assert_eq!(reused.key(), b"");
+    assert!(!reused.is_settled());
+}

@@ -61,6 +61,15 @@ struct ReadAcc<const VAL_MAX: usize> {
 }
 
 impl<const VAL_MAX: usize> ReadAcc<VAL_MAX> {
+    /// Back to "nothing found yet". The staging buffer keeps its bytes:
+    /// they are read only up to the length a later winner records.
+    const fn clear(&mut self) {
+        self.best = Best::Missing;
+        self.best_ver = Version::ZERO;
+        self.best_expire_at = 0;
+        self.cover_ver = Version::ZERO;
+    }
+
     const fn new() -> Self {
         Self {
             stage: [0u8; VAL_MAX],
@@ -93,7 +102,27 @@ pub struct MemProbe<const KEY_MAX: usize, const VAL_MAX: usize> {
     acc: ReadAcc<VAL_MAX>,
 }
 
+impl<const KEY_MAX: usize, const VAL_MAX: usize> Default for MemProbe<KEY_MAX, VAL_MAX> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<const KEY_MAX: usize, const VAL_MAX: usize> MemProbe<KEY_MAX, VAL_MAX> {
+    /// An empty probe, for [`Db::probe_memtable_into`] to fill. A probe
+    /// is `KEY_MAX + VAL_MAX` bytes and more: a reader that makes many
+    /// reads keeps one and fills it each time, where
+    /// [`Db::probe_memtable`] builds (and zeroes) a new one per read.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            key: [0u8; KEY_MAX],
+            key_len: 0,
+            max_seq: 0,
+            acc: ReadAcc::new(),
+        }
+    }
+
     /// The key this probe reads.
     #[must_use]
     pub fn key(&self) -> &[u8] {
@@ -510,13 +539,35 @@ impl<
         key: &[u8],
         max_seq: u64,
     ) -> Result<MemProbe<KEY_MAX, VAL_MAX>, Error<D::Error>> {
+        let mut probe = MemProbe::new();
+        self.probe_memtable_into(key, max_seq, &mut probe)?;
+        Ok(probe)
+    }
+
+    /// [`probe_memtable`](Db::probe_memtable) into a probe the caller
+    /// already has: the same result, without building a new probe. What
+    /// `probe` held before is gone, whatever it was.
+    ///
+    /// This is the part of a detached read that needs the `Db`, so a
+    /// host that shares a `Db` between threads runs it under its lock;
+    /// it is a search of RAM and a copy of at most one value.
+    ///
+    /// # Errors
+    ///
+    /// As [`probe_memtable`](Db::probe_memtable). On an error `probe` is
+    /// left empty: it reads no key.
+    pub fn probe_memtable_into(
+        &self,
+        key: &[u8],
+        max_seq: u64,
+        probe: &mut MemProbe<KEY_MAX, VAL_MAX>,
+    ) -> Result<(), Error<D::Error>> {
+        // Emptied first: a probe that failed to fill must not go on
+        // answering for the key it held before.
+        probe.key_len = 0;
+        probe.max_seq = max_seq;
+        probe.acc.clear();
         self.ensure_open()?;
-        let mut probe = MemProbe {
-            key: [0u8; KEY_MAX],
-            key_len: key.len(),
-            max_seq,
-            acc: self.memtable_acc(key, max_seq),
-        };
         probe
             .key
             .get_mut(..key.len())
@@ -525,7 +576,9 @@ impl<
                 max: KEY_MAX,
             })?
             .copy_from_slice(key);
-        Ok(probe)
+        probe.key_len = key.len();
+        self.fill_memtable_acc(key, max_seq, &mut probe.acc);
+        Ok(())
     }
 
     /// The committed manifest: the tables at each level, as the last
@@ -584,11 +637,21 @@ impl<
     /// What the memtable holds for `key` at `max_seq`: the newest visible
     /// version, staged, and the newest covering range tombstone.
     fn memtable_acc(&self, key: &[u8], max_seq: u64) -> ReadAcc<VAL_MAX> {
+        let mut acc = ReadAcc::<VAL_MAX>::new();
+        self.fill_memtable_acc(key, max_seq, &mut acc);
+        acc
+    }
+
+    /// [`memtable_acc`](Self::memtable_acc) into an accumulator the
+    /// caller has: every field is set, and the staging buffer is written
+    /// only as far as the winning value goes (nothing past that length
+    /// is ever read).
+    fn fill_memtable_acc(&self, key: &[u8], max_seq: u64, acc: &mut ReadAcc<VAL_MAX>) {
         // The winning value's bytes are staged here; table lookups copy
         // into a per-table buffer first so a losing hit can never clobber
         // the winner. Values are at most VAL_MAX bytes (enforced on the
         // write path), so the staging always fits.
-        let mut acc = ReadAcc::<VAL_MAX>::new();
+        acc.clear();
         if let Some(entry) = self.table.get_at(key, max_seq) {
             // The memtable holds the newest mutations; `get_at` already
             // selected the newest version at or below the snapshot, and
@@ -609,7 +672,6 @@ impl<
         if let Some(q) = self.table.max_covering_rdel(key, max_seq) {
             acc.cover_ver = Version::memtable(self.node_id(), q);
         }
-        acc
     }
 
     /// The point-read rule, shared by every `get` variant and the archive
