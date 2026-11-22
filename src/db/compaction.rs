@@ -289,6 +289,12 @@ impl<
     /// that fit for full levels and region pressure, and before their
     /// tight jobs.
     ///
+    /// The merge itself can run without the `Db`: after a call that
+    /// returned [`Progress::More`],
+    /// [`Compaction::merge_detached`] runs merge quanta over any handle
+    /// to the device, and the next `compact_step` picks up where they
+    /// stopped. A host runs them outside the lock that guards its `Db`.
+    ///
     /// The scratch is reusable across jobs and droppable mid-job: output
     /// not yet committed is invisible, and its reserved slots are released
     /// when the next `compact_step` (with any scratch) abandons the stale
@@ -316,6 +322,17 @@ impl<
         // device: its reservations are gone.
         if scratch.state != State::Idle && (!self.job_active || scratch.job_gen != self.job_gen) {
             scratch.reset();
+        }
+        if scratch.state == State::Failed {
+            // A detached merge quantum failed, and its caller has the
+            // error. The job ends as it does when a step fails here.
+            if scratch.manual {
+                self.manual_skip_sources(scratch);
+            }
+            self.abort_job();
+            scratch.reset();
+            self.manual_settle();
+            return Ok(Progress::Done);
         }
         let step = if scratch.state == State::Idle {
             // One job at a time: a job some other scratch left behind
@@ -349,8 +366,20 @@ impl<
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<Progress, Error<D::Error>> {
-        let tgt_level = self.manifest.level(c.target_level).unwrap_or(&[]);
-        let outcome = c.merge_step(self.wal.device_mut(), tgt_level).await?;
+        // A detached quantum (`Compaction::merge_detached`) may have run
+        // the merge up to an outcome only the `Db` can act on: take that
+        // outcome, and do not merge again. (Should this step be dropped
+        // at a device wait below and run again, the merge returns the
+        // same outcome: a split consumes nothing of the next key, and
+        // exhausted inputs stay exhausted.)
+        let outcome = match core::mem::replace(&mut c.state, State::Merging) {
+            State::Split => MergeOutcome::Split,
+            State::Exhausted => MergeOutcome::Exhausted,
+            _ => {
+                let tgt_level = self.manifest.level(c.target_level).unwrap_or(&[]);
+                c.merge_step(self.wal.device_mut(), tgt_level).await?
+            }
+        };
         match outcome {
             MergeOutcome::More => Ok(Progress::More),
             MergeOutcome::Split => {

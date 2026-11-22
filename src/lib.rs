@@ -81,7 +81,7 @@ pub mod writer;
 
 pub use batch::WriteBatch;
 pub use cache::{BlockCache, CachePort, CacheStats};
-pub use compact::{COMPACTION_KMAX, Compaction, Progress};
+pub use compact::{COMPACTION_KMAX, Compaction, Detached, Progress};
 pub use crc::crc32;
 pub use db::{
     ArchivePlan, Config, Db, MemProbe, OpenReport, ReadScratch, SealedTable, SlotStats, TableView,
