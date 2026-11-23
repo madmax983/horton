@@ -26,10 +26,10 @@ not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 25,848 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
+| `Db` | 25,912 | memtable (with its sorted view: ADR-0026), WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
 | `Scan` | 10,904 | one decoded block, the physical read buffer, cursors; block buffers lent with `use_block_pool` are the caller's and not counted (the profile lends none) |
 | `Compaction` | 59,640 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,728 bytes: F16, F22) |
-| **Structs** | **96,392** | |
+| **Structs** | **96,456** | |
 
 ## Measured futures
 
@@ -43,7 +43,7 @@ future, and the executor stores the future: in a static task arena
 | `flush()` | 17,640 | table writer (data + index blocks) and trial-compression scratch |
 | `open()` | 7,216 | WAL recovery |
 | `compact_step()` | 3,032 | merge state lives in the caller's `Compaction` |
-| `get()` | 1,304 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |
+| `get()` | 1,376 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |
 | `ingest_table()` | 608 | copies through the `Db`'s block scratch |
 | `put()`, `delete()`, `write()`, … | ≤ 496 | |
 | `Scan::next()`, `RevScan::prev()` | ≤ 1,280 | |
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 96,392 + max(17,688, 1,304 + 1,288) = 114,080 bytes
+= 96,456 + max(17,688, 1,376 + 1,288) = 114,144 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in

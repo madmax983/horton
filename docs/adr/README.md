@@ -38,6 +38,7 @@ history keeps it); its §9 milestone log now lives in
 | [0023](0023-host-point-reads-take-no-lock.md) | The host store's point reads leave the request queue, and take no lock when a filter over the memtable says it cannot hold the key; flush and compaction shut a gate and wait for per-thread pins |
 | [0024](0024-detached-compaction-merges.md) | A compaction job's merge runs without the `Db` (`Compaction::merge_detached`); the host store merges on its compaction thread outside the engine lock, and a write that waits for room gives the lock up |
 | [0025](0025-two-compaction-jobs-at-a-time.md) | Two compaction jobs at a time (`Db::compact_step_in`, one job a lane); flush keeps a reserve for each lane that is stepped, and with two lanes pressure merges level 0 first; the host store has a compaction thread for each lane |
+| [0026](0026-hot-path-pass-crc-codec-cache-memtable.md) | The hot path measured again: CRC-32 in three chains and across zero runs, a faster LZ77 codec, cache images lent in place (`CachePort::with_range`), no value buffer zeroed per probed table, and a sorted view of positions over the memtable; why no hardware CRC and no group commit across WAL blocks |
 
 ## Adding a record
 

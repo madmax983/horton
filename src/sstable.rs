@@ -2512,6 +2512,14 @@ async fn fetch_block<D: BlockDevice, const BLOCK: usize>(
 /// let an older version in a deeper table win (a silent stale read). A
 /// flag or decoding failure is `CorruptBlock` too.
 ///
+/// A cache that lends its images ([`CachePort::with_range`]) is asked
+/// once: the block is checked whole against its RAM checksums and, if
+/// compressed, inflated where it lies, with no copy; a block stored raw
+/// is copied into `raw`. A miss goes straight to the device. Either way
+/// one block read is one lookup, so [`CacheStats`](crate::CacheStats)
+/// counts it once. When the inflate succeeds, `raw` holds nothing of the
+/// block; no caller reads `raw` after a `true` return.
+///
 /// # Errors
 ///
 /// [`Error::CorruptBlock`] as above, or [`Error::Device`] on I/O failure.
@@ -2524,8 +2532,124 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
     logical: &mut [u8; BLOCK],
     hot: bool,
 ) -> Result<bool, Error<D::Error>> {
+    if let Some(c) = cache {
+        match inflate_lent::<D::Error, BLOCK>(c, table_id, block_id, raw, logical) {
+            Lent::Done(inflated) => return inflated,
+            Lent::Miss => {
+                // Not cached: to the device, without asking the cache a
+                // second time.
+                fetch_block(device, cache, table_id, block_id, raw, hot).await?;
+                return inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id);
+            }
+            Lent::Copy => {}
+        }
+    }
     read_block_verified(device, cache, table_id, block_id, raw, hot).await?;
     inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)
+}
+
+/// What [`inflate_lent`] made of one lookup.
+enum Lent<E> {
+    /// A hit: the block was inflated into `logical` (`Ok(true)`), copied
+    /// into `raw` as stored (`Ok(false)`), or failed to decode.
+    Done(Result<bool, Error<E>>),
+    /// Not cached, or rejected by its checksums: read the device.
+    Miss,
+    /// The cache does not lend its images: copy one out instead.
+    Copy,
+}
+
+/// The hit path of [`read_data_block`] for a cache that lends: one
+/// lookup of the whole image, which is inflated where it lies (or, when
+/// stored raw, copied into `raw`).
+fn inflate_lent<E, const BLOCK: usize>(
+    cache: &dyn CachePort<BLOCK>,
+    table_id: u32,
+    block_id: u64,
+    raw: &mut [u8; BLOCK],
+    logical: &mut [u8; BLOCK],
+) -> Lent<E> {
+    let mut done = None;
+    let lent = cache.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
+        done = Some(inflate_image::<E, BLOCK>(image, raw, logical, block_id));
+    });
+    match (lent, done) {
+        (Some(true), Some(result)) => Lent::Done(result),
+        (Some(_), _) => Lent::Miss,
+        (None, _) => Lent::Copy,
+    }
+}
+
+/// [`inflate_data_block`] over a lent image: a compressed block inflates
+/// from `image` into `logical` (`true`); a raw one is copied into `raw`
+/// (`false`).
+fn inflate_image<E, const BLOCK: usize>(
+    image: &[u8],
+    raw: &mut [u8; BLOCK],
+    logical: &mut [u8; BLOCK],
+    block_id: u64,
+) -> Result<bool, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
+    let flag = image
+        .get(body_end.wrapping_sub(2)..body_end)
+        .and_then(|b| b.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(corrupt)?;
+    if flag & 0x8000 == 0 {
+        if image.len() != BLOCK {
+            return Err(corrupt());
+        }
+        raw.copy_from_slice(image);
+        return Ok(false);
+    }
+    let clen = usize::from(flag & 0x7FFF);
+    let stream = image
+        .get(..clen)
+        .filter(|_| clen < body_end)
+        .ok_or_else(corrupt)?;
+    decompress(stream, &mut logical[..body_end]).map_err(|_| corrupt())?;
+    Ok(true)
+}
+
+/// Runs `parse` over bytes `..len` of block `block_id`'s verified image,
+/// for a reader that parses a block once and keeps nothing of it (the
+/// index search). A cache that lends its images (see
+/// [`CachePort::with_range`]) has it parsed in place, with no copy;
+/// otherwise the block is read into `scratch` as
+/// [`read_block_verified`] reads it, and parsed there.
+///
+/// # Errors
+///
+/// As [`read_block_verified`].
+async fn parse_verified<D: BlockDevice, R, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    scratch: &mut [u8; BLOCK],
+    len: usize,
+    mut parse: impl FnMut(&[u8]) -> R,
+) -> Result<R, Error<D::Error>> {
+    let len = len.min(BLOCK);
+    if let Some(c) = cache {
+        let mut out = None;
+        let lent = c.with_range(table_id, block_id, 0, len, &mut |bytes| {
+            out = Some(parse(bytes));
+        });
+        match (lent, out) {
+            (Some(true), Some(r)) => return Ok(r),
+            (Some(false), _) => {
+                // A miss: straight to the device, without asking the
+                // cache a second time.
+                fetch_block(device, cache, table_id, block_id, scratch, true).await?;
+                return Ok(parse(&scratch[..len]));
+            }
+            _ => {}
+        }
+    }
+    read_block_verified(device, cache, table_id, block_id, scratch, true).await?;
+    Ok(parse(&scratch[..len]))
 }
 
 /// Point-lookup reader over one table. Holds a shared device reference;
@@ -2943,18 +3067,18 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             }
         }
         // Index: structural; corruption is an error, never a silent miss.
-        read_block_verified(
+        // Searched where it lies in the cache when the cache lends it.
+        let index_block = self.index_block;
+        let Some((mut block_id, mut remaining)) = parse_verified(
             device,
             self.cache,
             self.table_id,
-            self.index_block,
+            index_block,
             scratch,
-            true,
+            BLOCK - CRC_LEN,
+            |payload| index_lookup::<D::Error>(payload, key, index_block),
         )
-        .await?;
-        let payload_end = BLOCK - CRC_LEN;
-        let Some((mut block_id, mut remaining)) =
-            index_lookup::<D::Error>(&scratch[..payload_end], key, self.index_block)?
+        .await??
         else {
             return Ok(Lookup::Missing);
         };

@@ -87,16 +87,17 @@ becomes visible in exactly one manifest commit.
 
 ### 4.1 MemTable — sorted slots over a bump arena
 
-`MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>`: `CAP` slots sorted by
-`(key, seq desc)`, key and value bytes bump-allocated in an `ARENA`-byte
-array. Every mutation takes a fresh slot (the memtable keeps each key's
+`MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>`: `CAP` slots in arrival order
+behind a sorted view (`u32` slot positions ordered by `(key, seq
+desc)`), key and value bytes bump-allocated in an `ARENA`-byte array. Every mutation takes a fresh slot (the memtable keeps each key's
 whole version chain, newest first, because snapshots can observe older
 versions). Range tombstones take a slot too (`start` as the key, `end` as
 the value, flagged). A full memtable rejects the write with `TableFull`
 (slots) or `ArenaFull` (bytes); the caller flushes. `Db` requires
 `ARENA ≥ KEY_MAX + VAL_MAX` at compile time, so a flushed (empty)
-memtable always accepts a maximal entry. O(n) insert by `copy_within`,
-O(log n) lookup.
+memtable always accepts a maximal entry. O(n) insert by `copy_within`
+of the 4-byte positions (the slots never move: ADR-0026), O(log n)
+lookup.
 
 ### 4.2 WAL — append-only framed log
 
