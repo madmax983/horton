@@ -1,5 +1,6 @@
-//! The compaction scratch's way between the engine and the compaction
-//! thread (ADR-0024).
+//! A compaction scratch's way between the engine and its compaction
+//! thread (ADR-0024). The store has one of these for each compaction
+//! lane (ADR-0025): a scratch, a thread and a handoff apiece.
 //!
 //! A compaction job is mostly merging: reading the input tables and
 //! writing the output's blocks. horton runs that part without the
@@ -139,27 +140,19 @@ impl<S, M> Handoff<S, M> {
         }
     }
 
-    /// Engine side: waits for the merge to come back by itself, without
-    /// recalling it, and takes the scratch. For a caller that needs the
-    /// whole job done and can do nothing meanwhile: the merge is better
-    /// left where it is running. If the compaction thread has gone, a
-    /// lent scratch is taken back as it is (the caller merges). `None`
-    /// if the scratch was never lent.
-    pub fn await_back(&self) -> Option<S> {
+    /// Engine side: takes the scratch if it is there for the taking
+    /// ([`is_back`](Self::is_back)), and does not wait or recall if it
+    /// is not. For a caller that needs a job done and can do nothing
+    /// meanwhile: the merge is better left where it is running.
+    pub fn try_back(&self) -> Option<S> {
         let mut baton = self.baton();
-        loop {
-            let gone = self.gone.load(Ordering::Acquire);
-            match core::mem::replace(&mut *baton, Baton::Home) {
-                Baton::Home => return None,
-                Baton::Back(scratch) => return Some(scratch),
-                Baton::Lent(scratch, _) if gone => return Some(scratch),
-                waiting => {
-                    *baton = waiting;
-                    baton = self
-                        .moved
-                        .wait(baton)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
+        let gone = self.gone.load(Ordering::Acquire);
+        match core::mem::replace(&mut *baton, Baton::Home) {
+            Baton::Back(scratch) => Some(scratch),
+            Baton::Lent(scratch, _) if gone => Some(scratch),
+            elsewhere => {
+                *baton = elsewhere;
+                None
             }
         }
     }
@@ -209,7 +202,7 @@ impl<S, M> Handoff<S, M> {
     }
 
     /// Compaction thread: its last word. From here on a lent scratch is
-    /// picked up by nobody, and [`await_back`](Self::await_back) hands
+    /// picked up by nobody, and [`try_back`](Self::try_back) hands
     /// it straight back to the engine. Raised under the baton's lock,
     /// so a waiter sees either the flag or the wake-up.
     pub fn leave(&self) {
@@ -217,6 +210,12 @@ impl<S, M> Handoff<S, M> {
         self.gone.store(true, Ordering::Release);
         drop(baton);
         self.moved.notify_all();
+    }
+
+    /// True once the compaction thread has gone.
+    #[cfg(test)]
+    pub fn has_left(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
     }
 
     /// Compaction thread: records that the merge failed.
@@ -334,62 +333,37 @@ mod tests {
         assert!(!h.take_failed());
     }
 
-    /// Waiting for a merge does not interrupt it: no recall is raised,
-    /// and the wait ends when the thread gives the scratch back.
+    /// Taking the scratch only if it is there interrupts nothing: no
+    /// recall is raised, and a scratch that is lent or out stays put.
     #[test]
-    fn await_back_waits_without_recalling() {
-        let h = Arc::new(H::new());
+    fn try_back_takes_only_what_is_there() {
+        let h = H::new();
         let (stop, due) = flags();
-        assert_eq!(h.await_back(), None, "it was never lent");
+        assert_eq!(h.try_back(), None, "it was never lent");
         h.lend("scratch", 1);
-        let waiter = {
-            let h = Arc::clone(&h);
-            std::thread::spawn(move || h.await_back())
-        };
-        // Lent and not picked up: the waiter leaves it for the thread.
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!waiter.is_finished(), "the waiter took a lent scratch");
+        assert_eq!(h.try_back(), None, "a lent scratch is the thread's");
+        assert!(h.is_lent());
         let Next::Merge(scratch, _) = h.next(&stop, &due) else {
             panic!("not handed over");
         };
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(!waiter.is_finished(), "the waiter did not wait");
-        assert!(!h.recalled(), "waiting recalled the merge");
+        assert_eq!(h.try_back(), None, "the scratch is out");
+        assert!(!h.recalled(), "looking recalled the merge");
         h.give_back(scratch);
-        assert_eq!(waiter.join().expect("waiter"), Some("scratch"));
+        assert_eq!(h.try_back(), Some("scratch"));
+        assert_eq!(h.try_back(), None);
     }
 
     /// With the compaction thread gone, nobody will pick a lent scratch
-    /// up: the waiter takes it back as it is, whether the thread left
-    /// before the wait began or during it.
+    /// up: it is there for the engine to take back as it is.
     #[test]
-    fn await_back_takes_a_lent_scratch_once_the_thread_has_gone() {
-        for leaves_first in [true, false] {
-            let h = Arc::new(H::new());
-            let stop = Arc::new(AtomicBool::new(false));
-            let due = AtomicBool::new(false);
-            h.lend("scratch", 1);
-            if leaves_first {
-                stop.store(true, Ordering::Release);
-                assert!(matches!(h.next(&stop, &due), Next::Stop));
-                h.leave();
-            }
-            // Lent, and whether it is there for the taking depends on
-            // whether anyone is left to pick it up.
-            assert_eq!(h.is_back(), leaves_first);
-            let waiter = {
-                let h = Arc::clone(&h);
-                std::thread::spawn(move || h.await_back())
-            };
-            if !leaves_first {
-                std::thread::sleep(Duration::from_millis(50));
-                assert!(!waiter.is_finished());
-                stop.store(true, Ordering::Release);
-                assert!(matches!(h.next(&stop, &due), Next::Stop));
-                h.leave();
-            }
-            assert_eq!(waiter.join().expect("waiter"), Some("scratch"));
-        }
+    fn a_lent_scratch_is_the_engines_once_the_thread_has_gone() {
+        let h = H::new();
+        h.lend("scratch", 1);
+        assert!(!h.is_back());
+        assert_eq!(h.try_back(), None);
+        h.leave();
+        assert!(h.is_back());
+        assert_eq!(h.try_back(), Some("scratch"));
     }
 
     /// A thread asleep in `next` is woken by a lending, and by `wake`

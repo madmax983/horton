@@ -232,7 +232,7 @@ takes no lock at all:
 | `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
 | writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
-| background compaction | a compaction thread that merges outside the engine lock (horton's detached merge, ADR-0024), through a file handle of its own. A step under the lock selects a job, or seals and commits an output; whichever thread has the lock takes it. A full memtable or WAL is flushed under the lock by the write that finds it. A write that finds level 0 full waits for compaction without the lock, so callers never see those errors and readers do not wait behind them |
+| background compaction | two compaction threads, one for each of horton's two compaction lanes (ADR-0025), each merging outside the engine lock (horton's detached merge, ADR-0024) through a file handle of its own. Two jobs run side by side when they share no table and write to different levels. A step under the lock selects a job, or seals and commits an output; whichever thread has the lock takes it. A full memtable or WAL is flushed under the lock by the write that finds it. A write that finds level 0 full waits for compaction without the lock, so callers never see those errors and readers do not wait behind them |
 | `Get` from many threads at once | the caller reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). A read of a key the memtable cannot hold takes no lock anywhere: a filter over the keys written since the last flush and the manifest's published sequence number tell it so (ADR-0023). Any other read takes the engine lock for its memtable probe. Flush and compaction shut the readers' gate and wait for them to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
 | `NewIterator`, `Seek` from many threads at once | `range(start, end, reverse)`: pins a snapshot and pages through horton's `Scan` or `RevScan`. Each page copies its memtable keys under the lock, then merges them with the tables on the caller's thread (a detached scan, ADR-0019), with 32 decoded blocks of its own |
@@ -267,23 +267,25 @@ compress by half, four client threads), and
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 307 K | 237 K | 256 K |
-| `fillrandom`, no fsync | 179 K | 67 K | 178 K |
-| `fillrandom`, fdatasync on | 15.6 K (2.6 writes per commit) | | 16.1 K (100 K keys) |
-| `readrandom` | 434 K | 194 K | 373 K |
-| `readmissing` | 16,758 K | 5,481 K | 5,136 K |
-| `seekrandom` | 394 K | 106 K | 356 K |
-| `readwhilewriting`, four readers and a writer | 287 K | 135 K | 217 K |
-| `readseq`, entries/s over four scanning threads | 18,060 K | 7,906 K | 20,227 K |
-| `readreverse`, the same | 8,784 K | 4,533 K | 15,074 K |
+| `fillseq`, no fsync | 251 K | 222 K | 242 K |
+| `fillrandom`, no fsync | 168 K | 133 K | 190 K |
+| `overwrite`, no fsync | 169 K | 129 K | 134 K |
+| `fillrandom`, fdatasync on | 16.4 K (2.6 writes per commit) | | 16.0 K (100 K keys) |
+| `readrandom` | 443 K | 190 K | 357 K |
+| `readmissing` | 6,441 K | 4,958 K | 4,761 K |
+| `seekrandom` | 96 K | 118 K | 302 K |
+| `readwhilewriting`, four readers and a writer | 272 K | 102 K | 192 K |
+| `readseq`, entries/s over four scanning threads | 12,040 K | 8,149 K | 16,119 K |
+| `readreverse`, the same | 6,783 K | 4,839 K | 16,524 K |
 
 These are single runs, and the read rows move from one run to the next
 with the number of level-0 tables the fills leave (`seekrandom` most:
 45 K to 120 K at 1 M keys, and 59 K to 394 K at 100 K).
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
 spread, where the time goes, and what v0.20 changed. Against 0.19, at
-1 M keys on four threads, point reads are 27 times faster, reads of
-absent keys 690 times, seeks 54 times and scans 38 times.
+1 M keys on four threads, point reads are 26 times faster, reads of
+absent keys 620 times, seeks 60 times, scans 39 times and random
+writes 2.8 times.
 
 ### Where horton stops at host scale
 
@@ -310,13 +312,16 @@ These are the limits it meets, and each is a property of the library:
   largest one, 255 KiB, in RAM while it writes. With one block per
   table, which is what firmware uses, a 100,000-entry table had 1.3
   bits a key and filtered almost nothing (ADR-0020).
-- **One thread at a time writes, and one job at a time compacts.**
+- **One thread at a time writes, and level 0 compacts as one job.**
   Writes and flushes take turns under the engine lock. Compaction's
-  merge runs on a thread of its own outside it (ADR-0024), so reads go
-  on while the store is written to (four readers get 135 K reads a
-  second with a fifth thread writing), but there is one merge, and
-  random writes wait for it: 67 K ops/s at 1 M keys, where RocksDB's
-  background threads keep it at 178 K.
+  merges run on two threads outside it, a job each (ADR-0024,
+  ADR-0025), so reads go on while the store is written to (four
+  readers get 102 K reads a second with a fifth thread writing 90 K),
+  and random writes at 1 M keys are 133 K ops/s, where RocksDB's
+  background threads keep it at 190 K. Two jobs run side by side only
+  on different levels: with slots to spare nearly all the work is
+  level 0 draining into level 1, on one thread (75 K random writes a
+  second at 600,000 keys).
 - **A scan pays for its memory.** With one block for all its table
   cursors, which is what firmware gives it, a merge over overlapping
   tables decodes a block again each time it changes table: 0.5 M

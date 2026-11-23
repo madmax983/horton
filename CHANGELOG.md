@@ -21,14 +21,16 @@ Read throughput is the subject:
 key-value store against RocksDB on db_bench's workloads, before and
 after. Against 0.19, one point read is 5 times cheaper (10 for an
 absent key), one thread's scan 9 times and its seek 7 times, and
-unsynced writes 1.4 to 2.4 times; synced writes are unchanged. With
+unsynced writes 2.5 to 2.9 times; synced writes are unchanged. With
 detached reads the host store's point reads, scans and seeks also run
 on every reader thread at once, and with bloom filters sized to their
 tables a read of an absent key stops at the filter, and takes no lock
-on the way: at 1 M keys on four threads, point reads are 27 times
-0.19's rate, reads of absent keys 690 times, seeks 54 times and scans
-38 times. Compaction's merge runs outside the host store's lock, so
-reads go on while it is written to.
+on the way: at 1 M keys on four threads, point reads are 26 times
+0.19's rate, reads of absent keys 620 times, seeks 60 times and scans
+39 times. Compaction's merge runs outside the host store's lock, so
+reads go on while it is written to, and two compaction jobs run at a
+time: random writes at 1 M keys are at 0.7 of RocksDB's rate given
+the same memory, from 0.37.
 
 ### Added
 
@@ -80,6 +82,19 @@ reads go on while it is written to.
   result is the tree `compact_step` alone leaves, block for block;
   firmware's `compact_step` loop is unchanged and the scratch is the
   size it was.
+- **Two compaction jobs at a time** (ADR-0025).
+  `Db::compact_step_in(lane, scratch)` steps the job of one of two
+  lanes (`Lane`, `COMPACTION_LANES`), each with a scratch of its own;
+  `Db::lane_target` says what level a lane's job writes to. Two jobs
+  run side by side when they share no table and write to different
+  levels; tight and requested jobs run alone. For a caller that steps
+  both lanes, flush keeps a compaction reserve for each (four slots)
+  while the region has seven slots or more above its bottom level,
+  and under region pressure level 0 is merged before a deeper table is
+  pushed down. `compact_step` is unchanged: one job, one reserve,
+  deepest first, and when it selects a job it abandons every lane's.
+  The ESP32-S3 profile's `Db` is 40 bytes larger and its
+  `compact_step` future 160.
 - **Detached scans** (ADR-0019). `Scan::detached` and
   `RevScan::detached` scan without the `Db`, over a copy of part of the
   memtable made by `Db::copy_memtable_range` / `copy_memtable_range_rev`
@@ -206,6 +221,13 @@ reads go on while it is written to.
   head of the queue is kept there and its thread lets go of the lock
   until compaction has made room. Reads that need the memtable are no
   longer held for the length of a compaction job.
+- **The kvstore runs two compaction jobs at a time** (ADR-0025): a
+  compaction thread, a scratch and a file handle for each of horton's
+  two lanes. The steps with the database are taken for both lanes by
+  whichever thread has the engine lock, and a lane that found no job
+  is not asked again until the tables or the other lane's job change.
+  `stats` counts the merges that began while another was running, and
+  `bench` reports them with each fill.
 - The kvstore's `bench` has db_bench's `readwhilewriting`: reader
   threads read random keys while one more thread overwrites.
 - The kvstore's `bench` builds `readmissing`'s keys on the stack. The

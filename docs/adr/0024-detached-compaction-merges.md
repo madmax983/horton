@@ -1,6 +1,9 @@
 # ADR-0024: A compaction job's merge runs without the `Db`; the host store merges outside its lock, and a write that waits for room gives the lock up
 
-Status: Accepted (unreleased, 2026-11-22)
+Status: Accepted (unreleased, 2026-11-22). The host store now has a
+compaction thread and a scratch for each of two lanes
+([ADR-0025](0025-two-compaction-jobs-at-a-time.md)); what is said here
+of "the compaction thread" holds for each.
 
 ## Context
 
@@ -185,6 +188,8 @@ and the full table.
   engine lock, for a few milliseconds every 4,096 entries. More than
   one job at a time, or a merge split across threads, would be what
   lifts random writes further; both are the library's to offer.
+  (Changed since: ADR-0025 runs two jobs at a time, each merging on a
+  thread of its own.)
 
 ## References
 

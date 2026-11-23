@@ -19,20 +19,21 @@ third gave every table a bloom filter sized to it. The fourth and
 fifth took the footer and the cache's locks out of a reader's way. The
 sixth took point reads out of the store's request queue and, for
 nearly all of them, out of its lock. The seventh took compaction's
-merge out of that lock, and writers that wait for it.
+merge out of that lock, and writers that wait for it. The eighth runs
+two compaction jobs at a time.
 
 | db_bench workload, 1 M keys, 4 threads, ops/s | horton 0.19 | horton 0.20 | against 0.19 | RocksDB, same memory | RocksDB, as shipped | 0.20 / RocksDB, same memory |
 |---|---:|---:|---:|---:|---:|---:|
-| `fillseq` | 90,389 | 237,290 | 2.6× | 255,781 | 394,342 | 0.93× |
-| `fillrandom` | 47,054 | 66,547 | 1.4× | 177,573 | 327,745 | 0.37× |
-| `overwrite` | 44,143 | 60,733 | 1.4× | 139,492 | 312,899 | 0.44× |
-| `readrandom` | 7,190 | 194,129 | 27× | 372,643 | 544,929 | 0.52× |
-| `readmissing` | 7,995 | 5,480,704 | 690× | 5,136,113 | 2,031,786 | 1.07× |
-| `readseq` | 209,822 | 7,905,716 | 38× | 20,227,143 | 9,578,682 | 0.39× |
-| `readreverse` | 186,400 | 4,532,973 | 24× | 15,074,261 | 7,649,214 | 0.30× |
-| `seekrandom` | 1,964 | 106,273 | 54× | 355,991 | 243,255 | 0.30× |
-| `readwhilewriting` | not measured | 134,918 | | 216,634 | 395,620 | 0.62× |
-| `deleterandom` | 55,882 | 86,953 | 1.6× | 418,870 | 379,182 | 0.21× |
+| `fillseq` | 90,389 | 222,118 | 2.5× | 241,835 | 408,901 | 0.92× |
+| `fillrandom` | 47,054 | 133,455 | 2.8× | 189,794 | 330,383 | 0.70× |
+| `overwrite` | 44,143 | 128,749 | 2.9× | 133,682 | 336,217 | 0.96× |
+| `readrandom` | 7,190 | 190,269 | 26× | 356,681 | 626,371 | 0.53× |
+| `readmissing` | 7,995 | 4,958,200 | 620× | 4,761,060 | 1,505,577 | 1.04× |
+| `readseq` | 209,822 | 8,148,692 | 39× | 16,118,609 | 7,860,138 | 0.51× |
+| `readreverse` | 186,400 | 4,839,314 | 26× | 16,524,470 | 4,419,448 | 0.29× |
+| `seekrandom` | 1,964 | 117,645 | 60× | 301,626 | 221,475 | 0.39× |
+| `readwhilewriting` | not measured | 101,688 | | 191,614 | 419,316 | 0.53× |
+| `deleterandom` | 55,882 | 196,918 | 3.5× | 362,007 | 347,232 | 0.54× |
 
 Every column but the first is one run. The 0.19 column is from an
 earlier run on the same kind of machine. **The read rows move from run
@@ -70,27 +71,31 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
   needed the engine lock waited behind a writer that held it for the
   length of a compaction job. Compaction's merge now runs on its own
   thread outside the lock, and a write that waits for it waits without
-  the lock. Four readers get 135 K reads a second while a fifth thread
-  writes, from 17 K; RocksDB with the same memory gets 217 K.
+  the lock. Four readers went from 17 K reads a second to 135 K while
+  a fifth thread wrote. They get 102 K now that the writer writes
+  twice as fast (the eighth pass); RocksDB with the same memory gets
+  192 K.
 - **Scans and seeks were three costs, one of them threads.** A scan
   re-decoded a block every time its merge changed table, a seek read
   every table in range before yielding anything, and both held the
   engine for their whole length. A scanning thread is now 3.6 times
   faster by itself and four of them do 3.7 times one's work.
 - **Unsynced writes were bound by thread hand-offs**, two per
-  operation, and then by compaction on the writers' own time.
-  Sequential fills are 2.6 times faster and within 10% of RocksDB
-  given the same memory; random fills are 1.4 times faster and still
-  2.7 times behind it. Moving the merge to its own thread bought
-  random fills 12% to 18% in every configuration measured but one
-  (four writers on the comparison's 256 MiB file, where it bought
-  nothing): there is one merge at a time, on one thread, and it is
-  what random writes wait for.
+  operation, and then by compaction: first on the writers' own time,
+  then as one merge on one thread, and at this size in a region with
+  no slot for a second. Sequential fills are 2.5 times faster and
+  within 10% of RocksDB given the same memory. Random fills are 2.8
+  times faster, at 0.7 of RocksDB's rate, and overwrites are level
+  with it. Half of that came last: two compaction jobs at a time, with
+  a slot reserve for each, took random fills from 66 K to 133 K a
+  second. Less than half of *that* is the second thread; the rest is
+  that the jobs now rewrite less (step 15).
 - **Synced writes did not change**, and all three engines are within
   a quarter of each other there: each waits for the same `fdatasync`.
 - **What remains.** One thread at a time writes, flushes run on the
-  writers' time, and one compaction job runs at a time on one thread.
-  A present-key read is 19 µs of one core: a block is 16 KiB, summed
+  writers' time, and level 0 drains as one merge on one thread, which
+  is nearly all the compaction a store with slots to spare has. A
+  present-key read is 19 µs of one core: a block is 16 KiB, summed
   whole, cached compressed and inflated on every read, and CRC'd in
   software when it misses the cache. A seek positions a cursor in
   every table that could hold its key. Most of that is what makes
@@ -112,7 +117,7 @@ benchmark list on three configurations and prints ops/s side by side:
 |---|---|---|---|---|
 | **RocksDB, as shipped** | 64 MiB | 32 MiB, uncompressed blocks | 4 KiB, Snappy | background threads |
 | **RocksDB, same memory** | 1 MiB | 16 MiB, uncompressed blocks | 16 KiB, Snappy | background threads |
-| **horton** (`examples/kvstore`) | 1 MiB, 4096 entries | 16 MiB, compressed images, read without locks (ADR-0022); 32 decoded blocks (512 KiB) per scanning thread | 16 KiB, LZ77 | flush on the calling thread, holding a 255 KiB bloom filter while it writes a table; compaction's merge on one background thread (ADR-0024) |
+| **horton** (`examples/kvstore`) | 1 MiB, 4096 entries | 16 MiB, compressed images, read without locks (ADR-0022); 32 decoded blocks (512 KiB) per scanning thread | 16 KiB, LZ77 | flush on the calling thread, holding a 255 KiB bloom filter while it writes a table; compaction's merges on two background threads, a job each (ADR-0024, ADR-0025) |
 
 All three: 16-byte keys, 100-byte values that compress to half, 10
 bloom bits per key, a write-ahead log, 4 client threads, one file
@@ -144,10 +149,9 @@ Read the numbers with these in mind:
 
 ## Results
 
-"horton (before)" in these tables is v0.20 with compaction under the
-engine lock (commit `5e14da9`, with the `readwhilewriting` benchmark
-added to it); "horton" is v0.20. For the earlier steps see
-[What changed in v0.20](#what-changed-in-v020).
+"horton (before)" in these tables is v0.20 with one compaction job at
+a time (commit `3b3583e`); "horton" is v0.20. For the earlier steps
+see [What changed in v0.20](#what-changed-in-v020).
 
 ### No fsync (`--no-sync`; db_bench's default)
 
@@ -155,48 +159,52 @@ added to it); "horton" is v0.20. For the earlier steps see
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                              394342           255781           212315           237290                     0.93x
-fillrandom                           327745           177573            65551            66547                     0.37x
-overwrite                            312899           139492            58326            60733                     0.44x
-readrandom                           544929           372643           182004           194129                     0.52x
-readmissing                         2031786          5136113          3427774          5480704                     1.07x
-readseq                             9578682         20227143          6498172          7905716                     0.39x
-readreverse                         7649214         15074261          4012348          4532973                     0.30x
-seekrandom                           243255           355991            54872           106273                     0.30x
-readwhilewriting                     395620           216634            16648           134918                     0.62x
-deleterandom                         379182           418870            86315            86953                     0.21x
-readrandom (after compact)         12978964         13062034           281376           317284                     0.02x
+fillseq                              408901           241835           211344           222118                     0.92x
+fillrandom                           330383           189794            65959           133455                     0.70x
+overwrite                            336217           133682            61733           128749                     0.96x
+readrandom                           626371           356681           205233           190269                     0.53x
+readmissing                         1505577          4761060          5996121          4958200                     1.04x
+readseq                             7860138         16118609          8213468          8148692                     0.51x
+readreverse                         4419448         16524470          4684071          4839314                     0.29x
+seekrandom                           221475           301626           113878           117645                     0.39x
+readwhilewriting                     419316           191614           146314           101688                     0.53x
+deleterandom                         347232           362007            79775           196918                     0.54x
+readrandom (after compact)         11958646         13065277           319013           419701                     0.03x
 ```
 
-The two horton columns are not a like-for-like pair: each fills its
-own store on four threads, and they ended with different numbers of
-level-0 tables. `seekrandom`, `readmissing` and the scans moving
-between them is that; nothing in this step touches a read of a quiet
-store, and pairs on equal tables show none of it (step 14 of
-[What changed](#what-changed-in-v020)). `readwhilewriting` is this
-step.
+The three write rows and `deleterandom` are this step: two compaction
+jobs at a time (step 15 of [What changed](#what-changed-in-v020)).
+`readwhilewriting` fell with it: its writer now does twice the writes
+in the same time, on the same four cores (see
+[Reader threads](#reader-threads)). The read rows of a quiet store are
+not a like-for-like pair (each column fills its own store and they end
+with different tables), and pairs show none of them slower.
 
 100 K keys (11 MB: RocksDB as shipped never leaves its memtable):
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                              465719           360404           235220           307075                     0.85x
-fillrandom                           416982           368097           159162           179409                     0.49x
-overwrite                            392272           368975           172868           177852                     0.48x
-readrandom                          1791954          1357496           405754           433942                     0.32x
-readmissing                         1729490          3863689          4777151         16757658                     4.34x
-readseq                             6273861         22443646         10361289         18060197                     0.80x
-readreverse                         1095734         14036930          6145470          8783732                     0.63x
-seekrandom                           800171           555595            58960           393963                     0.71x
-readwhilewriting                    1260203           675892            75036           286705                     0.42x
-deleterandom                         403592           507489           200122           270352                     0.53x
-readrandom (after compact)         13256006         13512144          1459630          1424699                     0.11x
+fillseq                              482342           382459           260254           251052                     0.66x
+fillrandom                           424282           353330           185010           167703                     0.47x
+overwrite                            407590           340425           155260           168782                     0.50x
+readrandom                          1790991          1205705           461059           443471                     0.37x
+readmissing                         1869438          3888440         11888848          6440671                     1.66x
+readseq                             6161479         22991030         15645962         12039519                     0.52x
+readreverse                         1105526         16100016          8202155          6783045                     0.42x
+seekrandom                           758813           651918           220440            96049                     0.15x
+readwhilewriting                    1339154           669747           306924           271808                     0.41x
+deleterandom                         411099           462118           243263           208249                     0.45x
+readrandom (after compact)         13183915         13038659          1408637          1443382                     0.11x
 ```
 
-At this size the read rows are decided by the tables the fills happen
-to leave ([Run to run](#run-to-run)): the two horton columns are 3 to
-7 times apart on `readmissing` and `seekrandom`, and no pair on equal
-tables shows a read of a quiet store changing in this step.
+A store this small has slots to spare and one job's worth of
+compaction, so this step should change nothing here, and it does not.
+Each run is half a second of writing, and single runs spread by more
+than the columns differ: four more pairs of the write rows had
+`fillrandom` at 154,696 before and 166,998 after, `overwrite` at
+153,318 and 171,536, `fillseq` at 238,504 and 277,988, and
+`deleterandom` at 205,880 and 217,433. The read rows are decided by
+the tables the fills happen to leave ([Run to run](#run-to-run)).
 
 ### Run to run
 
@@ -231,6 +239,12 @@ pair. `bench --threads 1 --read-threads N` fills that way and reads on
 N threads, and every comparison between builds from step 11 on is made
 like that.
 
+From step 15 that is no longer exact. Two compaction threads finish
+their jobs in an order that timing decides, and four one-thread fills
+of the same keys ended with 1, 4, 1 and 2 tables in level 0 (over 2,
+1 or 0, and 17 below). Comparisons of reads across step 15 are made
+over several pairs for that reason.
+
 ### Every write synced
 
 100 K keys. A synced commit is one `fdatasync`, about 150 µs on this
@@ -238,9 +252,9 @@ disk, so the engines converge: each is waiting for the same device.
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                               14895            16304            16224            15816                     0.97x
-fillrandom                            14992            16070            15532            15551                     0.97x
-overwrite                             15311            16589            15057            16325                     0.98x
+fillseq                               14570            16606            16025            15580                     0.94x
+fillrandom                            15204            16020            16642            16429                     1.03x
+overwrite                             14662            15492            16544            16994                     1.10x
 ```
 
 Both group commits. horton averaged 2.6 client writes per
@@ -256,13 +270,14 @@ table and no cache, and is what a read costs in the store itself.
 
 | reader threads | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| `readrandom` | 53,162 | 103,466 | 200,780 | 198,035 |
-| `seekrandom` | 16,295 | 31,522 | 62,747 | 63,089 |
-| `readseq`, a scan per thread | 1,927,267 | 3,701,258 | 7,315,912 | 8,796,726 |
-| `readreverse`, a scan per thread | 1,106,884 | 2,105,024 | 4,202,392 | 4,749,982 |
-| `readmissing` | 1,142,536 | 2,038,601 | 3,818,820 | 4,187,464 |
-| `readoutside` | 5,284,619 | 9,781,863 | 20,785,057 | 17,513,306 |
-| `readwhilewriting`, one more thread overwriting | 49,775 | 96,203 | 138,328 | 147,106 |
+| `readrandom` | 51,005 | 104,821 | 195,858 | 192,441 |
+| `seekrandom` | 18,354 | 63,483 | 95,603 | 116,775 |
+| `readseq`, a scan per thread | 1,839,372 | 4,054,988 | 7,752,425 | 9,357,889 |
+| `readreverse`, a scan per thread | 1,103,978 | 2,291,408 | 4,543,204 | 5,053,304 |
+| `readmissing` | 1,039,691 | 3,304,857 | 5,248,717 | 5,844,051 |
+| `readoutside` | 5,192,464 | 11,617,632 | 22,196,069 | 20,235,544 |
+| `readwhilewriting`, one more thread overwriting | 47,037 | 81,792 | 104,912 | 119,651 |
+| the writer meanwhile, writes/s | 134,000 | 123,000 | 95,000 | 75,000 |
 
 For comparison, at the start of v0.20's second pass (commit `75063ad`,
 one reader at a time) `readrandom` was 43,594 on one thread and 38,581
@@ -270,19 +285,26 @@ on four, and `seekrandom` 6,956 and 7,962. Before step 13, with every
 point read queued, `readmissing` was 675 K on one thread and 701 K on
 four, and `readoutside` 1.62 M and 0.66 M.
 
-Four threads give 3.8 times one thread's present-key reads, seeks,
-forward and reverse scans, 3.3 times its absent-key reads in this run
-(3.7 in the three pairs of step 13) and 3.9 times its reads of keys
-outside the store. Nothing a point read does is serial any more unless
-the memtable could hold its key. A scan takes the engine lock once a
-page.
+Four threads give 3.8 times one thread's present-key reads, 4.2 times
+its forward and 4.1 times its reverse scans, and 4.3 times its reads
+of keys outside the store. Nothing a point read does is serial any
+more unless the memtable could hold its key. A scan takes the engine
+lock once a page. Each column is a run of its own, and a ratio a
+little over four is the spread between runs. The `seekrandom` and
+`readmissing` rows are the tables: since step 15 a fill on one thread
+no longer leaves the same tables each time, and these four columns
+had 1, 4, 1 and 2 tables in level 0 ([Run to run](#run-to-run)). On
+equal tables `seekrandom` scaled by 3.8 and `readmissing` by 3.7.
 
 `readwhilewriting` is `readrandom` with a writer running: one, two
-and four readers get 94%, 93% and 69% of the rate they get from a
-quiet store, and the writer 59 K, 58 K and 46 K writes a second. At
-four readers there are six threads at work on four cores (the readers,
-the writer and the compaction thread). Before step 14 the same
-readers got 8 K and 28 K at one and four threads.
+and four readers get 92%, 78% and 54% of the rate they get from a
+quiet store, while the writer does 134 K, 123 K and 95 K writes a
+second. At four readers there are seven threads at work on four cores
+(the readers, the writer and two compaction threads). Before step 15,
+with one compaction thread, the same readers got 94%, 93% and 69%,
+and the writer 59 K, 58 K and 46 K: the writer has more than doubled
+and the readers have paid for part of it. Before step 14 the readers
+got 8 K and 28 K at one and four threads.
 
 ## Where horton's time went
 
@@ -704,34 +726,138 @@ sequenceDiagram
     whole wait of the calls that are not queued (`delete_range`,
     `flush`, `compact`) when they need room.
 
+### Then: two compaction jobs at a time, and room for the second
+
+15. **Two compaction jobs at a time** (library and kvstore, ADR-0025).
+    `Db::compact_step_in` steps a job in each of two lanes. Two jobs
+    run side by side when they share no table, write to different
+    levels and neither is tight or requested. The kvstore has a
+    compaction thread, a scratch and a file handle for each lane, and
+    the steps with the database are taken for both by whichever thread
+    has the engine lock.
+
+    Step 14's profile said what to expect: 70% of merge quanta wrote
+    level 1, 28% the bottom level and 3% the level above it, so a
+    second job could overlap a quarter of the work.
+
+    **The lanes alone changed nothing.** At 1 M keys a second job
+    passed the three rules 866 times in a random fill and was refused
+    865 times, for slots. The region has 28; the bottom level held 17
+    tables; flush filled what was left down to the two-slot reserve,
+    and the job in flight held those two. A second job has work when
+    the region is under pressure, and that is when it had nowhere to
+    write.
+
+    So a caller that steps two lanes has a reserve for each: flush
+    stops four slots short, not two. That took `fillrandom` at 1 M
+    keys from 53 K to 164 K, and at 1.2 M keys, nine tenths of what the
+    store holds, from 15 K to 6 K. With the second reserve taken out of it,
+    a nearly full region has two slots left to batch flushes in, and
+    every other flush pushes a table at the bottom level, which
+    rewrites the bottom level.
+
+    Two more rules came out of measuring that:
+
+    - **The second reserve is kept while the region has room for it**
+      (seven slots or more above the bottom level). In a fuller region
+      the reserve is one job's while compaction is idle and both
+      lanes' once a job runs.
+    - **With two lanes, pressure merges level 0 first.** One job at a
+      time pushes the deepest table above the bottom down first. A
+      level 0 table is one flush in a slot that could hold fifteen:
+      merging level 0 frees the most slots for the least rewriting,
+      and it can go on beside the long merge below.
+
+    `fillrandom`, one writer, on a store filled in order; single runs
+    of each rule, writes a second:
+
+    | reserve | order under pressure | 1.0 M keys | 1.1 M | 1.2 M | 1.3 M |
+    |---|---|---:|---:|---:|---:|
+    | one job's (before) | deepest first | 52,959 | 22,569 | 15,484 | 11,373 |
+    | both lanes', always | deepest first | 163,564 | 125,013 | 6,430 | 5,840 |
+    | both lanes', always | level 0 first | 136,738 | 106,110 | 58,860 | 5,910 |
+    | one job more than in flight | deepest first | 85,535 | 23,235 | 15,648 | |
+    | one job more than in flight | level 0 first | 27,549 | 48,891 | 61,546 | 58,826 |
+    | **both with room, else one more** | **level 0 first** | 138,949 | 107,333 | 58,734 | 58,571 |
+
+    Every rule but the last is the best somewhere and collapses
+    somewhere else. One lane with level 0 first did 29,954 at 1.0 M,
+    against 52,959: the order is right only with a second job to run
+    beside, so `compact_step` keeps the order and the reserve it had.
+
+    Before and after, one writer, the default 256 MiB file (the 1 M
+    row is the mean of three pairs, the others one pair each):
+
+    | keys | `fillrandom` before | after | | `overwrite` before | after | |
+    |---:|---:|---:|---:|---:|---:|---:|
+    | 300,000 | 70,244 | 69,326 | 1.0× | 73,909 | 72,082 | 1.0× |
+    | 600,000 | 67,825 | 75,399 | 1.1× | 67,096 | 74,856 | 1.1× |
+    | 1,000,000 | 54,936 | 141,377 | 2.6× | 54,010 | 135,558 | 2.5× |
+    | 1,100,000 | 23,291 | 112,521 | 4.8× | 22,565 | 103,523 | 4.6× |
+    | 1,200,000 | 15,273 | 58,697 | 3.8× | 15,003 | 59,811 | 4.0× |
+    | 1,300,000 | 11,398 | 58,351 | 5.1× | 11,403 | 55,480 | 4.9× |
+
+    With four writers at 1 M keys (two pairs): `fillrandom` 65,596 to
+    139,818 and `overwrite` 61,571 to 133,139. `fillseq` did not move
+    (284 K and 321 K on one writer, 230 K and 216 K on four, inside
+    what it moves between runs). Both builds hold 1.3 M keys and
+    refuse 1.4 M.
+
+    **What the 2.6 times is made of.** For the same million random
+    writes the merges did 27% less work, 166,010 quanta against
+    227,990, and did it on two threads: 12.3 s of CPU in 7.0 s, where
+    it had been 16.7 s in 17.9 s. About 1.4 times from rewriting less
+    and 1.9 times from two merges at once. That is more than the
+    quarter the profile promised, because the profile was of the old
+    schedule: with the bottom level's job running beside it, level 0
+    is merged into a level 1 that the pressure rules keep nearly
+    empty.
+
+    **Where it does nothing.** Up to 600,000 keys the store has slots
+    to spare and nearly all its compaction is level 0 draining into
+    level 1, one job whatever the lanes. That is still one merge on
+    one thread.
+
+    Reads of a quiet store are not slower (four reader threads, two
+    pairs: `readrandom` 190,783 before and 194,878 after). Reads
+    beside a writer are: the writer does twice the writes, and there
+    are two compaction threads on the same four cores
+    ([Reader threads](#reader-threads)).
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
 |---|---:|---|
-| `fillseq` | 0.93× | one writer at a time commits in about 4 µs; little to compact when keys arrive in order |
-| `fillrandom` | 0.37× | compaction is one job at a time on one thread, at about 80 µs for each 16 KiB block it writes, and it writes about thirty times what the writers do; RocksDB's jobs run side by side and cost less each |
-| `overwrite` | 0.44× | the same |
-| `readrandom` | 0.52× | a read is 19 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
-| `readmissing` | 1.07× | no gap: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
-| `readseq` | 0.39× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
-| `readreverse` | 0.30× | the same, and stepping backwards through a block's version runs costs more than forwards |
-| `seekrandom` | 0.30× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
-| `readwhilewriting` | 0.62× | `readrandom`'s 19 µs, on cores shared with the writer and the merge; and every table compaction writes is new to the cache |
-| `deleterandom` | 0.21× | as `fillrandom` |
+| `fillseq` | 0.92× | one writer at a time commits in about 4 µs; little to compact when keys arrive in order |
+| `fillrandom` | 0.70× | each 16 KiB block compaction writes is about 80 µs of one core, and it writes some twenty times what the writers do; two jobs run at once, where RocksDB's cost less each |
+| `overwrite` | 0.96× | the same work; RocksDB's own rate falls by a third from `fillrandom` to here, and horton's does not |
+| `readrandom` | 0.53× | a read is 19 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
+| `readmissing` | 1.04× | no gap: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
+| `readseq` | 0.51× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
+| `readreverse` | 0.29× | the same, and stepping backwards through a block's version runs costs more than forwards |
+| `seekrandom` | 0.39× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
+| `readwhilewriting` | 0.53× | `readrandom`'s 19 µs, on four cores shared with a writer and two merges; and every table compaction writes is new to the cache |
+| `deleterandom` | 0.54× | as `fillrandom` |
 
-**One thread at a time writes, and one job at a time compacts.** `Db`
+**One thread at a time writes, and level 0 drains as one job.** `Db`
 is a single-owner value with `&mut self` writes; that is ADR-0002's
 point, and firmware has one core. A commit of a sequential write
 takes about 4 µs, which is why `fillseq`, with little to compact,
-keeps up. `fillrandom` at 1 M keys waits for compaction. The merge
-now runs on a thread of its own, outside the engine lock (step 14),
-and that thread is busy for the whole of the benchmark (100% of a
-core, with the one writer at 10% of another): about 420,000 blocks
-written for two million random writes, each block about 80 µs of
-reading, merging, compressing, summing and writing. The writers'
-keys land all over level 1, so each job of level 0 rewrites all of
-it. RocksDB at the same memtable size compacts with several threads,
-4 KiB blocks, Snappy and a hardware CRC.
+keeps up. `fillrandom` waits for compaction. The merges run on two
+threads outside the engine lock (steps 14 and 15), and at 1 M keys
+both are busy for most of the benchmark: about 166,000 blocks written
+for a million random writes, each block about 80 µs of reading,
+merging, compressing, summing and writing. In a store with slots to
+spare there is one job to run, level 0 into level 1, and one thread
+does it. RocksDB at the same memtable size flushes and compacts on
+background threads, with 4 KiB blocks, Snappy and a hardware CRC.
+
+**The store is small for the benchmark.** Four levels of seven tables
+is 28 slots, and a table's index is one block, so a table holds about
+7 MiB. A million db_bench entries leave eleven slots above the bottom
+level; 1.35 M fill the region. Much of what step 15 measured is how a
+region that full is compacted, which RocksDB, growing its files as it
+goes, never has to ask.
 
 **Most point reads take no lock; a scan takes one a page.** A read of
 a key the memtable cannot hold raises a pin of its own and goes to the
@@ -785,12 +911,24 @@ Measured or scoped while doing this, and left:
 - **A filter for range tombstones.** One `delete_range` sends every
   point read back to the engine lock until the next flush (ADR-0023).
   Remembering the ranges, not a flag, would keep the others out of it.
-- **More than one compaction job at a time, or a merge split across
-  threads.** The merge is off the engine lock now (ADR-0024) and one
-  thread is all it has. A second job on other levels, or the output
-  half of a merge (compress, sum, write) on a thread of its own, is
-  what random writes would gain from next. Both are the library's to
-  offer: a `Db` knows one job.
+- **A level 0 merge split across threads.** Two jobs run at a time
+  now (ADR-0025), but level 0 draining into level 1 is one job, and in
+  a store with slots to spare it is nearly all the work: 75 K random
+  writes a second at 600,000 keys, where step 15 changed nothing.
+  Splitting that merge by key range, or giving its output half
+  (compress, sum, write) a thread of its own, is what would lift it.
+  Both are the library's to offer.
+- **The order under pressure for one job at a time.** Left as it was:
+  the deepest table above the bottom level goes down first, one at a
+  time, and near capacity that is a rewrite of the bottom level for
+  every table or two that is flushed (11 K writes a second at 1.3 M
+  keys). Level 0 first, which is right with two lanes, is slower with
+  one at 1 M keys. Something between the two would help firmware near
+  a full region, where it also means flash wear. Not designed.
+- **More slots.** `LEVELS × TABLES` is at most 64 and a job reads
+  through at most 8 cursors, which caps `TABLES` at 7. A larger
+  region, or tables larger than one index block allows, is a format
+  question.
 - **Flush off the writers' thread.** A flush writes a table of 4,096
   entries under the engine lock, a few milliseconds every 4,096
   writes, with the readers' gate shut. Its table could be written

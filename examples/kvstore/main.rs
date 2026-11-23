@@ -335,6 +335,10 @@ pub fn print_stats(store: &Handle) -> Result<(), String> {
         s.flushes, s.compaction_jobs, s.compaction_steps, s.detached_steps
     );
     println!(
+        "          {} merges began while another was running",
+        s.merges_side_by_side
+    );
+    println!(
         "reads     {} without the engine lock, {} under it, since open",
         s.reads_unlocked, s.reads_locked
     );

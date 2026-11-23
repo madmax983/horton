@@ -308,8 +308,10 @@ fn fill(store: &Store, p: &Params, random: bool) -> Result<Done, String> {
     let commits = after.groups - before.groups;
     let writes = after.grouped_writes - before.grouped_writes;
     done.note = format!(
-        "[{commits} commits, {:.1} client batches each]",
-        float(writes) / float(commits.max(1))
+        "[{commits} commits, {:.1} client batches each; {} compaction jobs, {} merges beside another]",
+        float(writes) / float(commits.max(1)),
+        after.compaction_jobs - before.compaction_jobs,
+        after.merges_side_by_side - before.merges_side_by_side,
     );
     Ok(done)
 }

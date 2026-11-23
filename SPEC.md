@@ -254,7 +254,8 @@ map from the manifest and refuses a slot smaller than a full memtable's
 table (`BadConfig`). Flush and ingest claim a free slot after their
 manifest commit; a compaction job reserves its output slot for the job's
 life. Two slots are kept free for compaction; a tight job needs only
-one (§4.7). Every table writer is
+one (§4.7). A caller that steps two compaction lanes has two more kept,
+while the region has room for them (§4.7). Every table writer is
 capped at its slot (`TableTooLarge`). Allocation is next-fit, which
 spreads flash wear.
 
@@ -322,6 +323,25 @@ an open request has work.
   is writing. Everything that may run between two `compact_step`s may
   run meanwhile. The result is the tree `compact_step` alone leaves,
   block for block.
+- **Two jobs at a time** (ADR-0025): `compact_step_in(lane, scratch)`
+  steps the job of one of two lanes (`Lane`, `COMPACTION_LANES`), each
+  with a scratch of its own. A lane selects as `compact_step` does, and
+  beside a job in the other lane only a job that shares no table with
+  it (source or target) and writes to a different level; a tight job
+  and a requested job run alone. Level 0 drains oldest first, so it has
+  one job at a time. A lane that finds no such job returns `Done`;
+  `RegionFull` is returned only with no job in the other lane. A job is
+  admitted into the free slots the other job has not been admitted for.
+  `lane_target(lane)` is the level a lane's job writes to. Each lane's
+  merge may be detached.
+  For a caller that steps both lanes, two things differ. Flush keeps
+  the reserve for each lane (four slots) while the region has seven
+  slots or more above its bottom level, and otherwise for one job more
+  than is in flight. And under pressure level 0 is merged before a
+  table between level 0 and the bottom is pushed down.
+  `compact_step` is unchanged: one job, one reserve, deepest first.
+  When it selects a job it abandons every lane's, so a caller uses one
+  call or the other.
 
 ### 4.8 Read path
 
@@ -410,6 +430,8 @@ impl Db<…> {
     pub async fn get_with_time(&self, key: &[u8], val_buf: &mut [u8], now: u64) -> Result<Option<usize>, …>;
     pub async fn flush(&mut self) -> Result<(), …>;
     pub async fn compact_step(&mut self, scratch: &mut Compaction<…>) -> Result<Progress, …>;
+    pub async fn compact_step_in(&mut self, lane: Lane, scratch: &mut Compaction<…>) -> Result<Progress, …>;
+    pub fn lane_target(&self, lane: Lane) -> Option<usize>;
     pub fn compaction_pending(&self) -> bool;
     pub fn request_compaction(&mut self, level: usize) -> Result<(), …>;
     pub const fn snapshot(&mut self) -> Result<u64, …>;
