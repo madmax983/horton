@@ -73,6 +73,7 @@ pub mod profile;
 pub mod ring;
 pub mod scan;
 pub mod slots;
+pub mod split;
 pub mod sstable;
 pub(crate) mod version;
 pub mod wal;
@@ -95,6 +96,7 @@ pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestEdit, ManifestLay
 pub use memtable::{Entry as MemTableEntry, MemTable};
 pub use scan::{RevScan, Scan, ScanBlock};
 pub use slots::{MAX_SLOTS, SlotMap};
+pub use split::Splitter;
 pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
 // Low-level table construction, for tests and tooling: `Db` builds its
 // tables itself.

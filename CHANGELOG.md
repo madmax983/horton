@@ -124,6 +124,14 @@ the same memory, from 0.37.
   give equal fingerprints whatever the write history, flushes or
   compactions; per-range fingerprints merge, for bucketed anti-entropy
   between a device and its replica.
+- `horton::split`: `Splitter`, a fixed-memory, one-pass sampler of an
+  ascending key stream, and `sample` to feed it from a positioned `Scan`
+  (or any `SortedEntries`). `Splitter::splits` returns split keys that
+  cut the keys into buckets of near-equal count (each within two
+  strides of ideal), however skewed the key space, ready for
+  `fingerprint_buckets`. Deterministic: a device samples its keys and
+  sends the splits to its replica, and both fingerprint the same
+  balanced buckets.
 - `horton::diff`: `Diff` merge-joins two positioned ascending sources
   and yields a `Delta` (`OnlyLeft`, `OnlyRight`, `Differs`) for every key
   whose visible value differs, in one pass over four caller-owned
