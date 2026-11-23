@@ -496,7 +496,7 @@ impl<
         // is untouched on refusal.
         self.check_no_resurrection(&plan.table).await?;
         let slot = self.slot_of(&plan.table);
-        if slot.is_some_and(|s| self.job_inputs & (1u64 << s) != 0) {
+        if slot.is_some_and(|s| self.job_inputs() & (1u64 << s) != 0) {
             self.abort_job();
         }
         let mut edit = ManifestEdit::new();

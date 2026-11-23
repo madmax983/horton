@@ -33,7 +33,7 @@
 //!
 //! [`Manifest::narrow_table`]: crate::manifest::Manifest::narrow_table
 
-use super::{Db, MAX_SNAPSHOTS};
+use super::{COMPACTION_LANES, Db, Job, Lane, MAX_SNAPSHOTS};
 use crate::cache::CachePort;
 use crate::compact::{
     COMPACTION_KMAX, Compaction, Input, MergeOutcome, Progress, RdelDrop, RdelMerger, RdelStats,
@@ -115,7 +115,16 @@ impl<
     /// is true.
     #[must_use]
     pub fn compaction_pending(&self) -> bool {
-        self.job_active || self.full_level().is_some() || self.manual_pending()
+        self.job_active() || self.full_level().is_some() || self.manual_pending()
+    }
+
+    /// The level the job in `lane` is writing its outputs to, or `None`
+    /// when the lane has no job in flight. For a host's statistics, and
+    /// for tests of what runs beside what.
+    #[must_use]
+    pub fn lane_target(&self, lane: Lane) -> Option<usize> {
+        let job = &self.jobs[lane.index()];
+        job.active.then_some(usize::from(job.target))
     }
 
     /// Requests a compaction of every table from `level` down to the
@@ -202,7 +211,7 @@ impl<
     /// wrote there was written at the bottom already. Nothing moves while
     /// a job runs: the job can still add tables to the next level.
     fn manual_settle(&mut self) {
-        if self.job_active {
+        if self.job_active() {
             return;
         }
         while let Some(l) = self.manual_level {
@@ -227,8 +236,8 @@ impl<
 
     /// True when flush and ingest are down to the compaction reserve: the
     /// next table would eat into the headroom compaction keeps.
-    const fn under_pressure(&self) -> bool {
-        self.slots.free_slots() + self.slots.reserved_slots() <= Self::COMPACTION_RESERVE
+    fn under_pressure(&self) -> bool {
+        self.slots.free_slots() + self.slots.reserved_slots() <= self.compaction_reserve()
     }
 
     /// Whether level `l` (above the bottom) wants a job: it is full, or the
@@ -316,11 +325,91 @@ impl<
         &mut self,
         scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
     ) -> Result<Progress, Error<D::Error>> {
+        self.compact_step_lane(Lane::First.index(), true, scratch)
+            .await
+    }
+
+    /// [`compact_step`](Db::compact_step) for a `Db` that runs more than
+    /// one compaction job at a time (ADR-0025): one bounded step of the
+    /// job in `lane`, using that lane's `scratch`.
+    ///
+    /// Each [`Lane`] has a scratch of its own and at most one job. A
+    /// call with an idle scratch selects a job for its lane as
+    /// `compact_step` does, among the jobs that can run beside the
+    /// other lane's:
+    ///
+    /// - the two jobs share no table, as source or as target;
+    /// - they write to different levels (two jobs writing one level
+    ///   could give it overlapping tables);
+    /// - neither is a tight job nor serves a request: those run alone.
+    ///
+    /// When no such job exists the call does nothing and returns
+    /// [`Progress::Done`]: the lane waits for the other to finish. A
+    /// level's jobs are therefore still one at a time; what runs side by
+    /// side is, say, level 0 draining into level 1 and a table of level
+    /// 2 merging into level 3. Each job commits its own outputs, and the
+    /// tree is consistent after every commit of either.
+    ///
+    /// A host drives each lane from the lock that guards its `Db` and
+    /// runs each lane's merge quanta outside it
+    /// ([`Compaction::merge_detached`]), on a thread per lane.
+    ///
+    /// Stepping the second lane changes two things, from that call until
+    /// the next `compact_step` or `open`:
+    ///
+    /// - **Flush keeps a reserve for each lane.** A second job is
+    ///   admitted only into slots the first leaves, and flush fills the
+    ///   region down to the reserve, so with one job's reserve a second
+    ///   job would find room only in a region that has slots to spare.
+    ///   The reserve is doubled (four slots) while the region has seven
+    ///   slots or more above its bottom level; in a fuller region it is
+    ///   kept for one job more than is in flight. A region that is full
+    ///   holds what it held: [`Error::RegionFull`] comes where it did.
+    /// - **Under region pressure, level 0 goes first.** `compact_step`
+    ///   pushes the deepest table above the bottom level down first.
+    ///   With two lanes level 0 is merged first: its tables are a slot
+    ///   each for one flush's data, so merging them frees the most slots
+    ///   for the least rewriting, and it is the job that can go on
+    ///   beside a long merge into the bottom level.
+    ///
+    /// Use `compact_step` or this, not both: `compact_step` is for one
+    /// job at a time, and when it selects a job it abandons whatever
+    /// any lane has in flight. A scratch belongs to the lane it started
+    /// its job in; in another lane it is stale and resets itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`compact_step`](Db::compact_step). [`Error::RegionFull`] is
+    /// returned only when no job is in flight in the other lane.
+    pub async fn compact_step_in(
+        &mut self,
+        lane: Lane,
+        scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<Progress, Error<D::Error>> {
+        self.compact_step_lane(lane.index(), false, scratch).await
+    }
+
+    /// One step of the job in `lane`. `only` is `compact_step`'s rule:
+    /// one job at a time, so selecting one abandons every lane's.
+    async fn compact_step_lane(
+        &mut self,
+        lane: usize,
+        only: bool,
+        scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<Progress, Error<D::Error>> {
         self.ensure_open()?;
-        // A scratch whose job is no longer the active one (another scratch
-        // selected a job, or the job was aborted) must not touch the
-        // device: its reservations are gone.
-        if scratch.state != State::Idle && (!self.job_active || scratch.job_gen != self.job_gen) {
+        // The lanes the caller steps, for the reserve flush keeps.
+        if only {
+            self.lanes_driven = 1;
+        } else {
+            self.lanes_driven |= 1 << lane;
+        }
+        // A scratch whose job is no longer its lane's (another scratch
+        // selected a job there, or the job was aborted) must not touch
+        // the device: its reservation is gone.
+        if scratch.state != State::Idle
+            && (!self.jobs[lane].active || scratch.job_gen != self.jobs[lane].generation)
+        {
             scratch.reset();
         }
         if scratch.state == State::Failed {
@@ -329,22 +418,26 @@ impl<
             if scratch.manual {
                 self.manual_skip_sources(scratch);
             }
-            self.abort_job();
+            self.abort_lane(lane);
             scratch.reset();
             self.manual_settle();
             return Ok(Progress::Done);
         }
         let step = if scratch.state == State::Idle {
-            // One job at a time: a job some other scratch left behind
-            // is abandoned.
-            self.abort_job();
-            match self.compact_select(scratch).await {
+            // A job some other scratch left behind is abandoned: this
+            // lane's, or, for `compact_step`, every lane's.
+            if only {
+                self.abort_job();
+            } else {
+                self.abort_lane(lane);
+            }
+            match self.compact_select(scratch, lane).await {
                 Ok(Selected::Idle | Selected::Moved | Selected::Skipped) => Ok(Progress::Done),
-                Ok(Selected::Merging) => self.compact_advance(scratch).await,
+                Ok(Selected::Merging) => self.compact_advance(scratch, lane).await,
                 Err(e) => Err(e),
             }
         } else {
-            self.compact_advance(scratch).await
+            self.compact_advance(scratch, lane).await
         };
         if step.is_err() {
             // A requested job that fails would fail again: the request
@@ -352,11 +445,39 @@ impl<
             if scratch.manual {
                 self.manual_skip_sources(scratch);
             }
-            self.abort_job();
+            self.abort_lane(lane);
             scratch.reset();
         }
         self.manual_settle();
         step
+    }
+
+    /// What the jobs in the lanes other than `lane` hold: the slots of
+    /// their input tables, the levels they write to (one bit each), the
+    /// free slots they were admitted for and have not yet taken, and
+    /// whether one of them must run alone.
+    fn other_jobs(&self, lane: usize) -> (u64, u64, u64, bool) {
+        let (mut inputs, mut targets, mut need, mut alone) = (0u64, 0u64, 0u64, false);
+        for (i, job) in self.jobs.iter().enumerate() {
+            if i != lane && job.active {
+                inputs |= job.inputs;
+                targets |= 1u64 << job.target;
+                // The output slot it has reserved is already out of the
+                // free slots.
+                let reserved = u64::from(job.reserved != Job::NO_SLOT);
+                need += u64::from(job.need).saturating_sub(reserved);
+                alone |= job.alone;
+            }
+        }
+        (inputs, targets, need, alone)
+    }
+
+    /// Whether table `t` is an input of a job whose inputs are `busy`.
+    fn is_busy(&self, t: &TableRef<KEY_MAX>, busy: u64) -> bool {
+        busy != 0
+            && self
+                .slot_of(t)
+                .is_none_or(|slot| busy & (1u64 << slot) != 0)
     }
 
     /// One merge quantum of the active job, plus whatever it triggers: a
@@ -365,6 +486,7 @@ impl<
     async fn compact_advance(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        lane: usize,
     ) -> Result<Progress, Error<D::Error>> {
         // A detached quantum (`Compaction::merge_detached`) may have run
         // the merge up to an outcome only the `Db` can act on: take that
@@ -383,28 +505,27 @@ impl<
         match outcome {
             MergeOutcome::More => Ok(Progress::More),
             MergeOutcome::Split => {
-                let out = self.compact_seal_output(c, false).await?;
+                let out = self.compact_seal_output(c, false, lane).await?;
                 if c.tight && !self.tight_commit_ok(c, out.as_ref(), false) {
-                    return self.compact_give_up(c, out.is_some());
+                    return self.compact_give_up(c, out.is_some(), lane);
                 }
-                self.compact_commit(c, out, false).await?;
-                if self.compact_open_output(c).is_err() {
+                self.compact_commit(c, out, false, lane).await?;
+                if self.compact_open_output(c, lane).is_err() {
                     // No slot for the next output: the job ends here, with
                     // everything up to the last output committed. The next
                     // select merges on from the narrowed inputs.
-                    self.job_active = false;
-                    self.job_inputs = 0;
+                    self.jobs[lane] = Job::IDLE;
                     c.reset();
                     return Ok(Progress::Done);
                 }
                 Ok(Progress::More)
             }
             MergeOutcome::Exhausted => {
-                let out = self.compact_seal_output(c, true).await?;
+                let out = self.compact_seal_output(c, true, lane).await?;
                 if c.tight && !self.tight_commit_ok(c, out.as_ref(), true) {
-                    return self.compact_give_up(c, out.is_some());
+                    return self.compact_give_up(c, out.is_some(), lane);
                 }
-                self.compact_commit(c, out, true).await?;
+                self.compact_commit(c, out, true, lane).await?;
                 Ok(Progress::Done)
             }
         }
@@ -455,6 +576,7 @@ impl<
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         sealed: bool,
+        lane: usize,
     ) -> Result<Progress, Error<D::Error>> {
         if sealed {
             self.slots.release(c.out_slot);
@@ -464,8 +586,7 @@ impl<
             self.manual_skip_sources(c);
         }
         let manual = c.manual;
-        self.job_active = false;
-        self.job_inputs = 0;
+        self.jobs[lane] = Job::IDLE;
         c.reset();
         if manual || progressed {
             Ok(Progress::Done)
@@ -617,15 +738,28 @@ impl<
     async fn compact_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        lane: usize,
     ) -> Result<Selected, Error<D::Error>> {
         if LEVELS < 2 {
+            return Ok(Selected::Idle);
+        }
+        // A job in another lane: this one must fit beside it (see
+        // `try_select_group`), and when that job runs alone, nothing
+        // does.
+        let beside = (0..COMPACTION_LANES).any(|i| i != lane && self.jobs[i].active);
+        if self.other_jobs(lane).3 {
             return Ok(Selected::Idle);
         }
         let pressure = self.under_pressure();
         let mut wanted = false;
         for tight in [false, true] {
             if tight {
-                if let Some(sel) = self.manual_select(c).await? {
+                // Requests and tight jobs run alone: their slot
+                // arithmetic assumes no other job takes or frees a slot.
+                if beside {
+                    break;
+                }
+                if let Some(sel) = self.manual_select(c, lane).await? {
                     return Ok(sel);
                 }
                 if !wanted || self.slots.free_slots() == 0 {
@@ -637,23 +771,33 @@ impl<
                 manual: false,
             };
             // Full levels first, deepest first; then, under pressure, the
-            // levels pressure wants.
+            // levels pressure wants: deepest first for a caller that
+            // runs one job at a time, level 0 first for one that steps
+            // two lanes (see `compact_step_in`).
             for pass in [false, true] {
                 if pass && !pressure {
                     break;
                 }
-                for src in (0..LEVELS - 1).rev() {
+                let level0_first = pass && self.lanes_driven.count_ones() > 1;
+                for i in 0..LEVELS - 1 {
+                    let src = match (level0_first, i) {
+                        (true, 0) => 0,
+                        (true, _) => LEVELS - 1 - i,
+                        (false, _) => LEVELS - 2 - i,
+                    };
                     if !self.wants_job(src, pass) || (pass && self.wants_job(src, false)) {
                         continue;
                     }
                     wanted = true;
-                    if let Some(sel) = self.try_select(c, src, pick).await? {
+                    if let Some(sel) = self.try_select(c, src, pick, lane).await? {
                         return Ok(sel);
                     }
                 }
             }
         }
-        if wanted {
+        // Beside another job, "nothing fits" is not a full region: the
+        // lane waits for that job's tables and slots.
+        if wanted && !beside {
             Err(Error::RegionFull)
         } else {
             Ok(Selected::Idle)
@@ -670,6 +814,7 @@ impl<
     async fn manual_select(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        lane: usize,
     ) -> Result<Option<Selected>, Error<D::Error>> {
         self.manual_settle();
         let Some(l) = self.manual_level.map(usize::from) else {
@@ -681,7 +826,7 @@ impl<
                 tight,
                 manual: true,
             };
-            if let Some(sel) = self.try_select(c, l, pick).await? {
+            if let Some(sel) = self.try_select(c, l, pick, lane).await? {
                 return Ok(Some(sel));
             }
         }
@@ -732,6 +877,7 @@ impl<
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         src: usize,
         pick: Pick,
+        lane: usize,
     ) -> Result<Option<Selected>, Error<D::Error>> {
         // Distinct node_ids at the source level, oldest-first (the level
         // slice is oldest-first at L0, key-ordered below; either way the
@@ -748,7 +894,7 @@ impl<
             }
         }
         for node in nodes.iter().take(n_nodes).copied() {
-            if let Some(sel) = self.try_select_group(c, src, node, pick).await? {
+            if let Some(sel) = self.try_select_group(c, src, node, pick, lane).await? {
                 return Ok(Some(sel));
             }
         }
@@ -757,19 +903,39 @@ impl<
 
     /// Selects a job for one node group at level `src` (sources from
     /// `pick_sources`), or moves its table down outright. `None` when the
-    /// group has no job: no source, nothing fits, or a foreign target
-    /// table overlaps the range (veto).
+    /// group has no job: no source, nothing fits, a foreign target
+    /// table overlaps the range (veto), or the job cannot run beside
+    /// the one in another lane.
+    ///
+    /// Beside another job, a job must write to a different level and
+    /// share no table with it. Two jobs writing one level could give it
+    /// overlapping tables: each merges the tables of that level its own
+    /// range overlaps, and neither sees the other's outputs. Sharing no
+    /// table is then enough for the rest: a job's targets are *all* the
+    /// tables of its target level that its range overlaps, so a table
+    /// outside its inputs lies outside its range there, and whatever
+    /// another job does with that table (moves it down, or merges it
+    /// with the level below) happens beside the range, not in it. A
+    /// table move counts as a job here, for the level it moves into.
     async fn try_select_group(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         src: usize,
         node: u32,
         pick: Pick,
+        lane: usize,
     ) -> Result<Option<Selected>, Error<D::Error>> {
         let rewrite = src == LEVELS - 1;
         let tgt = if rewrite { src } else { src + 1 };
         let tight = pick.tight || rewrite;
-        let free = u64::from(self.slots.free_slots());
+        let (busy, busy_targets, held, _) = self.other_jobs(lane);
+        if busy_targets & (1u64 << tgt) != 0 {
+            c.reset();
+            return Ok(None);
+        }
+        // Slots another job was admitted for are its own: each job then
+        // has what it would have been admitted with alone.
+        let free = u64::from(self.slots.free_slots()).saturating_sub(held);
         // A requested job is optional work: unless it is tight, it leaves
         // the reserve to the jobs flush waits for.
         let keep = if pick.manual {
@@ -778,7 +944,7 @@ impl<
             0
         };
         let budget = free.saturating_sub(keep);
-        let Some(src_data) = self.pick_sources(c, src, node, pick, budget) else {
+        let Some(src_data) = self.pick_sources(c, src, node, pick, budget, busy) else {
             c.reset();
             return Ok(None);
         };
@@ -794,6 +960,12 @@ impl<
             last = last.max(input.tref.last_key);
         }
         let (mut a, mut b) = Self::overlap_run(tgt_tables, first, last);
+        // A target another job holds: `pick_sources` chose sources whose
+        // targets are free where it could, so this group has no job now.
+        if tgt_tables[a..b].iter().any(|t| self.is_busy(t, busy)) {
+            c.reset();
+            return Ok(None);
+        }
         // Veto: a foreign target table overlapping the job's range means
         // the two nodes' ranges still interleave at the target level —
         // merging now would conflate origins. The foreign side drains
@@ -829,10 +1001,12 @@ impl<
         // ones instead of each holding a slot forever. The neighbour is
         // adjacent in key order, so the widened range swallows no other
         // table; the node filter keeps the job pure-node.
-        if a > 0 && tgt_tables[a - 1].node_id == node && self.is_small(&tgt_tables[a - 1]) {
+        let joins =
+            |t: &TableRef<KEY_MAX>| t.node_id == node && self.is_small(t) && !self.is_busy(t, busy);
+        if a > 0 && joins(&tgt_tables[a - 1]) {
             a -= 1;
         }
-        if b < tgt_tables.len() && tgt_tables[b].node_id == node && self.is_small(&tgt_tables[b]) {
+        if b < tgt_tables.len() && joins(&tgt_tables[b]) {
             b += 1;
         }
         for (k, t) in tgt_tables[a..b].iter().enumerate() {
@@ -843,7 +1017,9 @@ impl<
         c.n_tgt = b - a;
         c.tight = tight;
         c.manual = pick.manual;
-        self.compact_start(c, tgt, first, last).await?;
+        let need = if tight { 1 } else { self.job_need(src_data) };
+        self.compact_start(c, tgt, first, last, (lane, need))
+            .await?;
         Ok(Some(Selected::Merging))
     }
 
@@ -866,6 +1042,7 @@ impl<
         node: u32,
         pick: Pick,
         budget: u64,
+        busy: u64,
     ) -> Option<u64> {
         let src_tables = self.manifest.level(src).unwrap_or(&[]);
         let eligible =
@@ -884,6 +1061,15 @@ impl<
         c.reset();
         let mut src_data = 0u64;
         if src == 0 {
+            // Level 0 drains oldest first: with one of the node's tables
+            // in another job, a job here would take newer data down
+            // past it.
+            if src_tables
+                .iter()
+                .any(|t| eligible(t) && self.is_busy(t, busy))
+            {
+                return None;
+            }
             for t in src_tables.iter().filter(|t| eligible(t)) {
                 let d = src_data + data(t);
                 if c.n_src > 0 && (pick.tight || self.job_need(d) > budget) {
@@ -908,10 +1094,22 @@ impl<
             }
         } else {
             let tgt_tables = self.manifest.level(src + 1).unwrap_or(&[]);
-            let t = src_tables.iter().filter(|t| eligible(t)).min_by_key(|t| {
-                let (a, b) = Self::overlap_run(tgt_tables, t.first_key, t.last_key);
-                b - a
-            })?;
+            let run =
+                |t: &TableRef<KEY_MAX>| Self::overlap_run(tgt_tables, t.first_key, t.last_key);
+            // Beside another job: only a table that job does not hold,
+            // whose targets it does not hold either.
+            let free = |t: &&TableRef<KEY_MAX>| {
+                let (a, b) = run(t);
+                !self.is_busy(t, busy) && !tgt_tables[a..b].iter().any(|u| self.is_busy(u, busy))
+            };
+            let t = src_tables
+                .iter()
+                .filter(|t| eligible(t))
+                .filter(free)
+                .min_by_key(|t| {
+                    let (a, b) = run(t);
+                    b - a
+                })?;
             push(c, *t);
             src_data = data(t);
         }
@@ -950,6 +1148,7 @@ impl<
         tgt: usize,
         first: KeyBound<KEY_MAX>,
         last: KeyBound<KEY_MAX>,
+        (lane, need): (usize, u64),
     ) -> Result<(), Error<D::Error>> {
         c.target_level = tgt;
         // The first output's range tombstones are clipped to the job's
@@ -1047,23 +1246,8 @@ impl<
         );
         // The job is live from here: its first output slot is reserved,
         // and archiving any of its inputs aborts it.
-        self.job_active = true;
-        self.job_gen = self.job_gen.wrapping_add(1);
-        c.job_gen = self.job_gen;
-        self.job_inputs = 0;
-        for i in 0..c.n_src {
-            if let Some(slot) = self.slot_of(&c.inputs[i].tref) {
-                self.job_inputs |= 1u64 << slot;
-            }
-        }
-        for t in self.manifest.level(tgt).unwrap_or(&[]) {
-            if c.tgt[..c.n_tgt].contains(&t.id)
-                && let Some(slot) = self.slot_of(t)
-            {
-                self.job_inputs |= 1u64 << slot;
-            }
-        }
-        self.compact_open_output(c)?;
+        self.job_begin(c, tgt, lane, need);
+        self.compact_open_output(c, lane)?;
         // Position one cursor per source, and the concatenating cursor on
         // the first target with entries.
         let device = self.wal.device();
@@ -1081,12 +1265,52 @@ impl<
         Ok(())
     }
 
+    /// Makes the job in `c` its lane's: stamps a generation into both and
+    /// records what other lanes must keep off (its input tables' slots
+    /// and its target level), and what it was admitted for.
+    fn job_begin(
+        &mut self,
+        c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        tgt: usize,
+        lane: usize,
+        need: u64,
+    ) {
+        self.job_gen = self.job_gen.wrapping_add(1);
+        c.job_gen = self.job_gen;
+        let mut inputs = 0u64;
+        for i in 0..c.n_src {
+            if let Some(slot) = self.slot_of(&c.inputs[i].tref) {
+                inputs |= 1u64 << slot;
+            }
+        }
+        for t in self.manifest.level(tgt).unwrap_or(&[]) {
+            if c.tgt[..c.n_tgt].contains(&t.id)
+                && let Some(slot) = self.slot_of(t)
+            {
+                inputs |= 1u64 << slot;
+            }
+        }
+        self.jobs[lane] = Job {
+            generation: self.job_gen,
+            active: true,
+            alone: c.tight || c.manual,
+            // A level index and a slot count: both under 64.
+            target: u8::try_from(tgt).unwrap_or(u8::MAX),
+            reserved: Job::NO_SLOT,
+            need: u8::try_from(need).unwrap_or(u8::MAX),
+            inputs,
+        };
+    }
+
     /// Reserves a slot for the next output and points a fresh writer at it.
     fn compact_open_output(
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+        lane: usize,
     ) -> Result<(), Error<D::Error>> {
         let slot = self.slots.reserve().ok_or(Error::RegionFull)?;
+        // At most 64 slots.
+        self.jobs[lane].reserved = u8::try_from(slot).unwrap_or(Job::NO_SLOT);
         c.out_slot = slot;
         c.out_base = self.slots.slot_base(slot);
         // The writer's block limit is the data budget: a merge that would
@@ -1115,6 +1339,7 @@ impl<
         &mut self,
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         last_output: bool,
+        lane: usize,
     ) -> Result<Option<TableRef<KEY_MAX>>, Error<D::Error>> {
         let device = self.wal.device_mut();
         let data_blocks = c
@@ -1174,6 +1399,7 @@ impl<
         }
         if c.writer.entry_count() == 0 && rdel_blocks == 0 {
             self.slots.release(c.out_slot);
+            self.jobs[lane].reserved = Job::NO_SLOT;
             return Ok(None);
         }
         let done = c
@@ -1266,6 +1492,7 @@ impl<
         c: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
         out: Option<TableRef<KEY_MAX>>,
         last_commit: bool,
+        lane: usize,
     ) -> Result<(), Error<D::Error>> {
         // The frontier: everything at or below `k` is in the outputs.
         let k = match out {
@@ -1335,6 +1562,7 @@ impl<
         // repeat, so stale entries could never be read).
         if out.is_some() {
             self.slots.commit(c.out_slot);
+            self.jobs[lane].reserved = Job::NO_SLOT;
             c.outputs = c.outputs.saturating_add(1);
         }
         for slot in 0..64u32 {
@@ -1350,12 +1578,11 @@ impl<
         for &id in &c.tgt[c.tgt_retired..retired_tgt] {
             self.cache.invalidate_table(id);
         }
-        self.job_inputs &= !freed;
+        self.jobs[lane].inputs &= !freed;
         c.src_retired |= retired_src;
         c.tgt_retired = retired_tgt;
         if last_commit {
-            self.job_active = false;
-            self.job_inputs = 0;
+            self.jobs[lane] = Job::IDLE;
             c.reset();
         }
         Ok(())
