@@ -730,6 +730,9 @@ fn mut_manifest_l0_is_full_reports_full() {
             min_seq: 0,
             entry_count: 5,
             rdel_blocks: 0,
+            bloom_blocks: 1,
+            bloom_k: 0,
+            bloom_len: 0,
             node_id: 0,
             seal_wall: 0,
         }
@@ -785,16 +788,16 @@ fn mut_manifest_decode_accepts_exact_fit() {
 
     // Manifest<1, 1, 8> with one table whose bounds are 1-byte keys, as a
     // one-block copy: header 24 (magic, seq, index, count, len), body
-    // 8 + 4 + 8 + 8 + 4 (fixed fields) + 4 (level count) + 58 (the ref:
-    // 56 fixed + 2 key bytes) = 94, total = 24 + 94 + 4 = 122.
-    const BLOCK: usize = 122;
-    const CRC_END: usize = 118;
+    // 8 + 4 + 8 + 8 + 4 (fixed fields) + 4 (level count) + 65 (the ref:
+    // 63 fixed + 2 key bytes) = 101, total = 24 + 101 + 4 = 129.
+    const BLOCK: usize = 129;
+    const CRC_END: usize = 125;
     let mut buf = [0u8; BLOCK];
     buf[0..8].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
     buf[8..16].copy_from_slice(&7u64.to_le_bytes()); // seq
     buf[16..18].copy_from_slice(&0u16.to_le_bytes()); // block index
     buf[18..20].copy_from_slice(&1u16.to_le_bytes()); // block count
-    buf[20..24].copy_from_slice(&94u32.to_le_bytes()); // body bytes
+    buf[20..24].copy_from_slice(&101u32.to_le_bytes()); // body bytes
     let mut off = 24;
     w64(&mut buf, &mut off, 0); // wal_head
     w32(&mut buf, &mut off, 0); // next_table_id
@@ -815,6 +818,10 @@ fn mut_manifest_decode_accepts_exact_fit() {
     w64(&mut buf, &mut off, 3); // min_seq
     w32(&mut buf, &mut off, 5); // entry_count
     w32(&mut buf, &mut off, 0); // rdel_blocks
+    w16(&mut buf, &mut off, 1); // bloom_blocks
+    buf[off] = 6; // bloom_k
+    off += 1;
+    w32(&mut buf, &mut off, 1024); // bloom_len
     w32(&mut buf, &mut off, 0); // node_id
     w64(&mut buf, &mut off, 0); // seal_wall
     assert_eq!(off, CRC_END);
@@ -826,6 +833,10 @@ fn mut_manifest_decode_accepts_exact_fit() {
     assert_eq!(m.seq(), 7);
     assert_eq!(m.l0().len(), 1);
     assert_eq!((m.l0()[0].node_id, m.l0()[0].seal_wall), (0, 0));
+    assert_eq!((m.l0()[0].rdel_blocks, m.l0()[0].bloom_blocks), (0, 1));
+    assert_eq!((m.l0()[0].bloom_k, m.l0()[0].bloom_len), (6, 1024));
+    assert_eq!(m.l0()[0].index_block(), Some(102));
+    assert_eq!(m.l0()[0].data_blocks(), Some(1));
 }
 
 /// Slot boundary: a table ending exactly at its slot's end fits; one block
@@ -860,6 +871,9 @@ fn mut_manifest_decode_bound_accepts_key_max() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     })
@@ -890,6 +904,9 @@ fn mut_manifest_decode_bound_rejects_overlong() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     })
@@ -922,7 +939,7 @@ fn mut_manifest_decode_bound_rejects_overlong() {
 fn mut_manifest_encode_accepts_exact_fit() {
     use horton::{KeyBound, Manifest, TableRef};
 
-    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 122.
+    // Same shape as `mut_manifest_decode_accepts_exact_fit`: total = 129.
     let mut m = Manifest::<1, 1, 8>::new();
     m.add_l0_table::<Infallible>(TableRef {
         id: 7,
@@ -934,17 +951,20 @@ fn mut_manifest_encode_accepts_exact_fit() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     })
     .unwrap();
-    let mut buf = [0u8; 122];
-    m.encode::<Infallible, 122>(&mut buf)
+    let mut buf = [0u8; 129];
+    m.encode::<Infallible, 129>(&mut buf)
         .expect("exact-fit manifest must encode");
-    assert_eq!(m.encoded_blocks::<122>(), 1, "exactly one block");
-    assert_eq!(m.encoded_blocks::<121>(), 2, "one byte short spills over");
+    assert_eq!(m.encoded_blocks::<129>(), 1, "exactly one block");
+    assert_eq!(m.encoded_blocks::<128>(), 2, "one byte short spills over");
     // And it must round-trip through decode.
-    let back = Manifest::<1, 1, 8>::decode::<Infallible, 122>(&buf)
+    let back = Manifest::<1, 1, 8>::decode::<Infallible, 129>(&buf)
         .expect("exact-fit manifest must decode");
     assert_eq!(back.seq(), 0);
     assert_eq!(back.l0().len(), 1);
@@ -968,6 +988,9 @@ fn mut_manifest_encode_rejects_oversized() {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     })

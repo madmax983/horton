@@ -19,17 +19,17 @@ not counted here.
 | `VAL_MAX` | 64 | small values |
 | `CAP` / `ARENA` | 16 / 2048 | memtable: 16 entries, 2 KiB arena |
 | `LEVELS` / `TABLES` | 4 / 4 | 16 table slots |
-| `BLOOM_BYTES` | 64 | 512-bit bloom per table |
+| `BLOOM_BYTES` | 64 | 512-bit bloom per table: one bucket, one block (a filter that fits a block is never folded: ADR-0020) |
 | `CACHE` | 2 | two cached block images |
 
 ## Measured static RAM
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 25,672 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
-| `Scan` | 10,824 | logical block buffer, physical read buffer, cursors |
-| `Compaction` | 59,568 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,728 bytes: F16, F22) |
-| **Structs** | **96,064** | |
+| `Db` | 25,848 | memtable, WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
+| `Scan` | 10,904 | one decoded block, the physical read buffer, cursors; block buffers lent with `use_block_pool` are the caller's and not counted (the profile lends none) |
+| `Compaction` | 59,640 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,728 bytes: F16, F22) |
+| **Structs** | **96,392** | |
 
 ## Measured futures
 
@@ -39,15 +39,15 @@ future, and the executor stores the future: in a static task arena
 
 | Future | Bytes | Notes |
 |---|---|---|
-| `archive_commit()` | 17,680 | the resurrection review's entry stream over the candidate |
-| `flush()` | 17,608 | table writer (data + index blocks) and trial-compression scratch |
-| `open()` | 7,008 | WAL recovery |
-| `compact_step()` | 2,864 | merge state lives in the caller's `Compaction` |
-| `get()` | 1,184 | blocks are read through the `Db`'s shared buffers |
-| `ingest_table()` | 592 | copies through the `Db`'s block scratch |
-| `put()`, `delete()`, `write()`, … | ≤ 488 | |
-| `Scan::next()`, `RevScan::prev()` | ≤ 1,264 | |
-| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,240 | |
+| `archive_commit()` | 17,688 | the resurrection review's entry stream over the candidate |
+| `flush()` | 17,640 | table writer (data + index blocks) and trial-compression scratch |
+| `open()` | 7,216 | WAL recovery |
+| `compact_step()` | 3,032 | merge state lives in the caller's `Compaction` |
+| `get()` | 1,304 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |
+| `ingest_table()` | 608 | copies through the `Db`'s block scratch |
+| `put()`, `delete()`, `write()`, … | ≤ 496 | |
+| `Scan::next()`, `RevScan::prev()` | ≤ 1,280 | |
+| `Scan::seek()`, `RevScan::seek_prev()` | ≤ 1,288 | |
 
 At most one `&mut self` call runs at a time, and it excludes scans
 (a `Scan` borrows the `Db`). A `get` can run alongside a scan step. The
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 96,064 + max(17,680, 1,184 + 1,264) = 113,744 bytes
+= 96,392 + max(17,688, 1,304 + 1,288) = 114,080 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
@@ -74,9 +74,21 @@ History:
   table writer's idle data block, and commits the manifest as a small
   `ManifestEdit` instead of a full copy. `get()` returns `Error::Busy`
   instead of carrying two fallback block buffers in every future.
-- Still 112 KiB at v0.20, with 944 bytes to spare: the block cache
+- Still 112 KiB at v0.20, with 608 bytes to spare: the block cache
   keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
-  and the read futures carry a bloom probe and a byte range.
+  and the read futures carry a bloom probe and a byte range. `get()`
+  grew by another 152 bytes when its table phase became shared with
+  detached reads (ADR-0018); it is not the peak. A `Scan` grew by 80
+  bytes (the bookkeeping for lent block buffers and for tables it has
+  not reached yet: ADR-0019) and the memtable by 8 (a count of its
+  range tombstones). A table reference grew from 120 to 128 bytes (its
+  bloom section: its block count, probe count and length, ADR-0020 and
+  ADR-0021), which is 128 bytes in the `Db`'s 16-table manifest, 72 in
+  `Compaction`, and most of the 208 bytes `open()` gained. `get()`
+  gave 56 back when it stopped reading footers. The `Db` grew by 40
+  bytes for the bookkeeping of a second compaction job, and
+  `compact_step()` by 160 for the lane it steps (ADR-0025); firmware
+  that runs one job at a time pays those and nothing else.
 
 ## Context
 

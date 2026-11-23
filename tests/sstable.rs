@@ -553,7 +553,8 @@ fn odd_bloom_sizes_have_no_false_negatives() {
 
 /// A table written before v0.20 carries the unbucketed filter under the
 /// magic "hrtsst02". Read by today's rule it would report keys it holds
-/// as absent, so its footer is refused outright.
+/// as absent, so its footer is refused outright. So is "hrtsst03", an
+/// unreleased v0.20 footer with no filter length in it.
 #[test]
 fn a_table_with_the_old_magic_is_rejected() {
     let mut dev = MemDevice::<BLOCK>::new();
@@ -561,7 +562,7 @@ fn a_table_with_the_old_magic_is_rejected() {
     let (n, _) = write(&items, &mut dev);
     let footer = BASE + n - 1;
     assert_eq!(get(&dev, footer, b"k").unwrap(), Some(b"v".to_vec()));
-    for old in [b"hrtsst02", b"lsmtable"] {
+    for old in [b"hrtsst03", b"hrtsst02", b"lsmtable"] {
         let mut blk = read_block(&dev, footer);
         blk[..8].copy_from_slice(old);
         reseal(&mut blk);
@@ -572,5 +573,403 @@ fn a_table_with_the_old_magic_is_rejected() {
             "{:?}: {err:?}",
             core::str::from_utf8(old)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.20: a filter may span blocks (`hrtsst04`).
+// ---------------------------------------------------------------------------
+
+mod spanning {
+    use std::cell::RefCell;
+    use std::task::{Context, Poll};
+
+    use super::{BASE, BLOCK, KEY_MAX, entry, read_block, reseal, write_block};
+    use crate::common::{MemDevice, block_on};
+    use horton::sstable::{
+        BLOOM_BITS_PER_KEY, BLOOM_BUCKET_BYTES, BloomShape, SstEntry, TableReader, TableWriter,
+        write_table,
+    };
+    use horton::{BlockDevice, Error};
+
+    /// Buckets in a 4 KiB bloom block.
+    const PER_BLOCK: usize = (BLOCK - 4) / BLOOM_BUCKET_BYTES;
+    /// A filter of up to eight blocks.
+    const WIDE: usize = 8 * PER_BLOCK * BLOOM_BUCKET_BYTES;
+
+    /// Records the id of every block read.
+    struct Reads {
+        inner: MemDevice<BLOCK>,
+        log: RefCell<Vec<u64>>,
+    }
+
+    impl BlockDevice for Reads {
+        type Error = core::convert::Infallible;
+        const BLOCK: usize = BLOCK;
+
+        fn poll_read_block(
+            &self,
+            cx: &mut Context<'_>,
+            id: u64,
+            buf: &mut [u8],
+        ) -> Poll<Result<(), Self::Error>> {
+            self.log.borrow_mut().push(id);
+            self.inner.poll_read_block(cx, id, buf)
+        }
+
+        fn poll_write_block(
+            &mut self,
+            cx: &mut Context<'_>,
+            id: u64,
+            buf: &[u8],
+        ) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_write_block(cx, id, buf)
+        }
+
+        fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_flush(cx)
+        }
+    }
+
+    fn key(i: u32) -> Vec<u8> {
+        format!("w{i:06}").into_bytes()
+    }
+
+    /// What a table of `n` keys (the even numbers below `2 * n`) came
+    /// out as.
+    struct Written {
+        dev: MemDevice<BLOCK>,
+        blocks: u64,
+        data_blocks: u64,
+        shape: BloomShape,
+    }
+
+    impl Written {
+        const fn footer(&self) -> u64 {
+            BASE + self.blocks - 1
+        }
+
+        const fn bloom_first(&self) -> u64 {
+            BASE + self.data_blocks
+        }
+    }
+
+    fn write_wide<const BLOOM: usize>(n: u32) -> Written {
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| key(i * 2)).collect();
+        let items: Vec<SstEntry<'_>> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| entry(k, b"v", i as u64 + 1))
+            .collect();
+        let mut dev = MemDevice::<BLOCK>::new();
+        let k = TableWriter::<BLOCK, BLOOM, KEY_MAX>::probes_for(u64::from(n));
+        let blocks = block_on(write_table::<MemDevice<BLOCK>, BLOCK, BLOOM, KEY_MAX>(
+            &mut dev,
+            BASE,
+            k,
+            items.iter().copied(),
+            None,
+        ))
+        .unwrap();
+        let shape = BloomShape::for_entries(BLOOM, BLOCK, u64::from(n));
+        let data_blocks = blocks - 2 - u64::from(shape.blocks);
+        Written {
+            dev,
+            blocks,
+            data_blocks,
+            shape,
+        }
+    }
+
+    type Reader<'d, D> = TableReader<'d, D, BLOCK, WIDE>;
+
+    fn lookup<D: BlockDevice>(reader: &Reader<'_, D>, key: &[u8]) -> Result<bool, Error<D::Error>> {
+        let mut scratch = [0u8; BLOCK];
+        let mut decomp = [0u8; BLOCK];
+        let mut buf = [0u8; 8];
+        Ok(block_on(reader.get(&mut scratch, &mut decomp, key, &mut buf))?.is_some())
+    }
+
+    /// A table gets the fewest bloom blocks that give its entries
+    /// `BLOOM_BITS_PER_KEY` bits each, the footer says how much filter
+    /// that is, and a lookup reads one bloom block: the one holding the
+    /// key's bucket. No key is lost, and the filter still filters.
+    #[test]
+    fn a_table_stores_the_filter_its_entry_count_calls_for() {
+        let mut seen_blocks = std::collections::BTreeSet::new();
+        for n in [0u32, 1, 500, 3_300, 8_000, 12_000, 28_000] {
+            let t = write_wide::<WIDE>(n);
+            seen_blocks.insert(t.shape.blocks);
+            let dev = Reads {
+                inner: t.dev.clone(),
+                log: RefCell::new(Vec::new()),
+            };
+            let mut scratch = [0u8; BLOCK];
+            let reader = block_on(Reader::open(&dev, &mut scratch, t.footer())).unwrap();
+            assert_eq!(reader.entry_count(), u64::from(n));
+            assert_eq!(reader.bloom_len(), t.shape.len, "{n} entries");
+            assert_eq!(reader.bloom_blocks(), u64::from(t.shape.blocks));
+            let bits = t.shape.len as u64 * 8;
+            assert!(
+                t.shape.blocks == 8 || bits >= u64::from(n) * BLOOM_BITS_PER_KEY,
+                "{n} entries got {bits} bits"
+            );
+
+            let bloom = t.bloom_first()..t.bloom_first() + u64::from(t.shape.blocks);
+            let index = bloom.end;
+            // Every key is found, through exactly one bloom block.
+            for i in (0..n).step_by((n as usize / 800).max(1)) {
+                dev.log.borrow_mut().clear();
+                assert!(
+                    lookup(&reader, &key(i * 2)).unwrap(),
+                    "{n} entries lost {i}"
+                );
+                let log = dev.log.borrow();
+                assert_eq!(log.iter().filter(|id| bloom.contains(id)).count(), 1);
+                assert!(log.contains(&index));
+            }
+            // Absent keys inside the table's range: the filter turns
+            // nearly all of them away after that one block.
+            let (mut passed, mut asked) = (0u32, 0u32);
+            let mut touched = std::collections::BTreeSet::new();
+            for i in (0..n).step_by((n as usize / 2_000).max(1)) {
+                dev.log.borrow_mut().clear();
+                assert!(!lookup(&reader, &key(i * 2 + 1)).unwrap());
+                let log = dev.log.borrow();
+                let blooms: Vec<u64> = log
+                    .iter()
+                    .copied()
+                    .filter(|id| bloom.contains(id))
+                    .collect();
+                assert_eq!(blooms.len(), 1);
+                touched.insert(blooms[0]);
+                asked += 1;
+                passed += u32::from(log.contains(&index));
+            }
+            if n >= 3_300 {
+                assert!(
+                    passed * 100 <= asked * 3,
+                    "{n} entries: {passed} of {asked} absent keys passed the filter"
+                );
+                assert_eq!(
+                    u32::try_from(touched.len()).unwrap(),
+                    t.shape.blocks,
+                    "keys spread over every bloom block"
+                );
+            }
+        }
+        // The sizes above span one block to the full eight.
+        assert_eq!(seen_blocks.into_iter().collect::<Vec<_>>(), [1, 2, 3, 4, 8]);
+    }
+
+    /// The filter a wide configuration folds a table's keys into is, byte
+    /// for byte, the filter a configuration of exactly that size builds.
+    #[test]
+    fn a_folded_table_filter_equals_the_one_built_at_that_size() {
+        /// Two blocks' worth: what 6,000 entries fold an eight-block
+        /// filter to.
+        const TWO: usize = 2 * PER_BLOCK * BLOOM_BUCKET_BYTES;
+        let wide = write_wide::<WIDE>(6_000);
+        let exact = write_wide::<TWO>(6_000);
+        assert_eq!(wide.shape.len, TWO);
+        assert_eq!(wide.shape, exact.shape);
+        assert_eq!(wide.blocks, exact.blocks);
+        for i in 0..wide.blocks - 1 {
+            // Every block but the footer, which names the same layout.
+            assert_eq!(
+                read_block(&wide.dev, BASE + i)[..],
+                read_block(&exact.dev, BASE + i)[..],
+                "block {i}"
+            );
+        }
+        assert_eq!(
+            read_block(&wide.dev, wide.footer())[..],
+            read_block(&exact.dev, exact.footer())[..]
+        );
+    }
+
+    /// A compaction job reuses one writer for all its outputs, restarted
+    /// in place. Whatever the table before left in it (filter bits, index
+    /// bytes, counters, a block limit), the next table comes out as a new
+    /// writer would have written it.
+    #[test]
+    fn a_restarted_writer_writes_what_a_new_one_does() {
+        fn push_keys(
+            w: &mut TableWriter<BLOCK, WIDE, KEY_MAX>,
+            dev: &mut MemDevice<BLOCK>,
+            keys: impl Iterator<Item = u32>,
+        ) -> u64 {
+            for (seq, i) in keys.enumerate() {
+                block_on(w.push(dev, entry(&key(i), b"v", seq as u64 + 1), None)).unwrap();
+            }
+            let done = block_on(w.finish(dev, None)).unwrap();
+            done.data_blocks + u64::from(done.bloom_blocks) + 2
+        }
+        let k = TableWriter::<BLOCK, WIDE, KEY_MAX>::probes_for(4_000);
+
+        let mut fresh_dev = MemDevice::<BLOCK>::new();
+        let mut fresh = Box::new(TableWriter::<BLOCK, WIDE, KEY_MAX>::new(BASE, k));
+        let blocks = push_keys(&mut fresh, &mut fresh_dev, (0..4_000).map(|i| i * 3));
+
+        // The same table from a writer that has just written a larger
+        // one, with other keys, another probe count and a block limit.
+        let mut used_dev = MemDevice::<BLOCK>::new();
+        let mut used = Box::new(TableWriter::<BLOCK, WIDE, KEY_MAX>::new(BASE + 5_000, 3));
+        used.set_block_limit(1_000);
+        push_keys(&mut used, &mut used_dev, (0..9_000).map(|i| i * 7 + 1));
+        used.restart(BASE, k);
+        assert_eq!(
+            (used.entry_count(), used.data_blocks(), used.index_len()),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            push_keys(&mut used, &mut used_dev, (0..4_000).map(|i| i * 3)),
+            blocks
+        );
+        for i in 0..blocks {
+            assert_eq!(
+                read_block(&used_dev, BASE + i)[..],
+                read_block(&fresh_dev, BASE + i)[..],
+                "block {i}"
+            );
+        }
+        // The block limit did not carry over: a restarted writer is
+        // unbounded until it is told otherwise.
+        used.restart(BASE, k);
+        used.set_block_limit(1);
+        let mut err = None;
+        for i in 0..4_000u32 {
+            if let Err(e) = block_on(used.push(&mut used_dev, entry(&key(i), b"v", 1), None)) {
+                err = Some(e);
+                break;
+            }
+        }
+        assert!(matches!(err, Some(Error::TableTooLarge)), "{err:?}");
+    }
+
+    /// A caller whose `finish_meta` future was dropped at a device wait
+    /// calls it again (a resumed compaction step does). The second call
+    /// must write the table the first would have: a filter folded twice
+    /// has its bits in buckets no key hashes to, and reports keys the
+    /// table holds as absent.
+    #[test]
+    fn finishing_a_table_twice_writes_the_same_table() {
+        let n = 6_000u32;
+        let once = write_wide::<WIDE>(n);
+        assert_eq!(once.shape.blocks, 2, "a filter that is folded");
+
+        let mut dev = MemDevice::<BLOCK>::new();
+        let k = TableWriter::<BLOCK, WIDE, KEY_MAX>::probes_for(u64::from(n));
+        let mut w = Box::new(TableWriter::<BLOCK, WIDE, KEY_MAX>::new(BASE, k));
+        for i in 0..n {
+            block_on(w.push(&mut dev, entry(&key(i * 2), b"v", u64::from(i) + 1), None)).unwrap();
+        }
+        block_on(w.seal_data(&mut dev, None)).unwrap();
+        let first = block_on(w.finish_meta(&mut dev, 0, u64::MAX)).unwrap();
+        let second = block_on(w.finish_meta(&mut dev, 0, u64::MAX)).unwrap();
+        assert_eq!(first.bloom_blocks, second.bloom_blocks);
+        for i in 0..once.blocks {
+            assert_eq!(
+                read_block(&dev, BASE + i)[..],
+                read_block(&once.dev, BASE + i)[..],
+                "block {i}"
+            );
+        }
+        let mut scratch = [0u8; BLOCK];
+        let reader = block_on(Reader::open(&dev, &mut scratch, once.footer())).unwrap();
+        for i in (0..n).step_by(3) {
+            assert!(lookup(&reader, &key(i * 2)).unwrap(), "lost key {i}");
+        }
+    }
+
+    /// A bloom block that fails its CRC disables the filter for the keys
+    /// whose bucket it holds and for no others. Nothing is reported
+    /// absent that is present, and nothing errors.
+    #[test]
+    fn one_bad_bloom_block_only_stops_filtering_its_own_keys() {
+        let n = 12_000u32;
+        let mut t = write_wide::<WIDE>(n);
+        assert_eq!(t.shape.blocks, 4);
+        let bad = t.bloom_first() + 2;
+        let mut blk = read_block(&t.dev, bad);
+        blk[100] ^= 0x40;
+        write_block(&mut t.dev, bad, &blk);
+
+        let dev = Reads {
+            inner: t.dev.clone(),
+            log: RefCell::new(Vec::new()),
+        };
+        let mut scratch = [0u8; BLOCK];
+        let reader = block_on(Reader::open(&dev, &mut scratch, t.footer())).unwrap();
+        let index = t.bloom_first() + 4;
+        for i in (0..n).step_by(11) {
+            assert!(lookup(&reader, &key(i * 2)).unwrap(), "lost key {i}");
+        }
+        let (mut through_bad, mut filtered) = (0u32, 0u32);
+        for i in (0..n).step_by(6) {
+            dev.log.borrow_mut().clear();
+            assert!(!lookup(&reader, &key(i * 2 + 1)).unwrap());
+            let log = dev.log.borrow();
+            if log.contains(&bad) {
+                // Unfiltered: the lookup went on to the index.
+                assert!(log.contains(&index));
+                through_bad += 1;
+            } else if !log.contains(&index) {
+                filtered += 1;
+            }
+        }
+        assert!(
+            through_bad > 300,
+            "{through_bad} absent keys hashed to the bad block"
+        );
+        assert!(
+            filtered > 1_200,
+            "{filtered} absent keys were still filtered"
+        );
+    }
+
+    /// The footer's filter length and its two block ids must agree. A
+    /// footer that claims more or less filter than the section holds is
+    /// corrupt: a probe must never read an index or data block as filter.
+    #[test]
+    fn a_footer_whose_filter_length_disagrees_with_its_blocks_is_refused() {
+        let t = write_wide::<WIDE>(6_000);
+        assert_eq!(t.shape.blocks, 2);
+        let footer = t.footer();
+        let good = read_block(&t.dev, footer);
+        assert_eq!(
+            u32::from_le_bytes(good[45..49].try_into().unwrap()) as usize,
+            t.shape.len
+        );
+        for claimed in [
+            0u32,
+            64,
+            u32::try_from(PER_BLOCK * BLOOM_BUCKET_BYTES).unwrap(),
+            u32::try_from(4 * PER_BLOCK * BLOOM_BUCKET_BYTES).unwrap(),
+            u32::MAX,
+        ] {
+            let mut dev = t.dev.clone();
+            let mut blk = good;
+            blk[45..49].copy_from_slice(&claimed.to_le_bytes());
+            reseal(&mut blk);
+            write_block(&mut dev, footer, &blk);
+            let mut scratch = [0u8; BLOCK];
+            let err = block_on(Reader::open(&dev, &mut scratch, footer))
+                .err()
+                .unwrap_or_else(|| panic!("a footer claiming {claimed} filter bytes opened"));
+            assert!(matches!(err, Error::CorruptBlock { id } if id == footer));
+        }
+        // And the index pointer moved off the end of the bloom section.
+        let mut dev = t.dev;
+        let mut blk = good;
+        let index = u64::from_le_bytes(blk[8..16].try_into().unwrap());
+        blk[8..16].copy_from_slice(&(index + 1).to_le_bytes());
+        reseal(&mut blk);
+        write_block(&mut dev, footer, &blk);
+        let mut scratch = [0u8; BLOCK];
+        assert!(matches!(
+            block_on(Reader::open(&dev, &mut scratch, footer)),
+            Err(Error::CorruptBlock { id }) if id == footer
+        ));
     }
 }

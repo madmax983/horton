@@ -174,3 +174,27 @@ fn clear_resets() {
     insert(&mut t, b"a", b"v2", 2);
     assert_eq!(t.get(b"a").unwrap().val, b"v2");
 }
+
+/// The covering-tombstone search is skipped while the table holds no
+/// range tombstone, and that bookkeeping must follow every way the table
+/// changes: a tombstone is found among ordinary entries inserted before
+/// and after it, forgotten by `clear`, and found again when one returns.
+#[test]
+fn range_tombstones_are_tracked_across_inserts_and_clear() {
+    let mut t = Small::new();
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), None);
+    insert(&mut t, b"m", b"v", 1);
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), None);
+    t.insert_range_del::<Infallible>(b"a", b"z", 2).unwrap();
+    insert(&mut t, b"b", b"v", 3);
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), Some(2));
+    assert_eq!(t.max_covering_rdel(b"m", 1), None);
+
+    t.clear();
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), None);
+    insert(&mut t, b"m", b"v", 4);
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), None);
+    t.insert_range_del::<Infallible>(b"k", b"n", 5).unwrap();
+    assert_eq!(t.max_covering_rdel(b"m", u64::MAX), Some(5));
+    assert_eq!(t.max_covering_rdel(b"a", u64::MAX), None);
+}

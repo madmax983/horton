@@ -38,7 +38,7 @@
 /// | `memtable_arena` | RAM bytes for those writes' keys and values. | About `memtable_entries` × your typical key + value size. When full, writes fail with `ArenaFull`: call `flush()`. | 128 per entry, and at least `key_max + val_max` |
 /// | `levels` | Levels of tables on the device. | 4 suits most uses. | 4 |
 /// | `tables_per_level` | Tables each level holds. | Below 8. `levels × tables_per_level` (at most 64) is how many tables exist; the table region is split into that many equal slots. More tables mean more data between compactions, more tables to check per read, and smaller slots. | 4 |
-/// | `bloom_bytes` | Per-table filter that lets a read skip tables that cannot hold the key. | About 1.25 bytes per key in a table gives about 1% wasted reads. More costs device space and a little compaction RAM. | 256 |
+/// | `bloom_bytes` | The most filter a table carries: what lets a read skip tables that cannot hold the key. | About 1.25 bytes per key in the largest table gives about 1% wasted reads. Up to `block - 4` it is one block per table. More than that spans blocks, each table storing what its entry count calls for: use a whole number of blocks, such as `16 * ((block - 4) / 64) * 64`. The table writer holds all of it in RAM during a flush or a compaction. | 256 |
 /// | `cache_blocks` | Recently read blocks kept in RAM, `block` bytes each. | 0 turns it off. A few blocks speed up repeated reads. | 0 |
 ///
 /// Where the data goes on the device is a separate choice:
@@ -207,5 +207,21 @@ macro_rules! __db_type_alias {
         ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
         $(#[$meta])*
         $vis type $name = $crate::Compaction<{ $b }, { $k }, { $v }, { $bl }>;
+    };
+    (TableView [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name<'a, R> =
+            $crate::TableView<'a, R, { $b }, { $k }, { $v }, { $l }, { $t }, { $bl }>;
+    };
+    (MemProbe [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name = $crate::MemProbe<{ $k }, { $v }>;
+    };
+    (ReadScratch [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name = $crate::ReadScratch<{ $b }>;
     };
 }

@@ -81,20 +81,25 @@ pub mod writer;
 
 pub use batch::WriteBatch;
 pub use cache::{BlockCache, CachePort, CacheStats};
-pub use compact::{COMPACTION_KMAX, Compaction, Progress};
+pub use compact::{COMPACTION_KMAX, Compaction, Detached, Progress};
 pub use crc::crc32;
-pub use db::{ArchivePlan, Config, Db, OpenReport, SealedTable, SlotStats};
+pub use db::{
+    ArchivePlan, COMPACTION_LANES, Config, Db, Lane, MemProbe, OpenReport, ReadScratch,
+    SealedTable, SlotStats, TableView,
+};
 pub use device::BlockDevice;
 pub use diff::{Delta, Diff, SortedEntries};
 pub use error::Error;
 pub use fingerprint::Fingerprint;
 pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestEdit, ManifestLayout, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
-pub use scan::{RevScan, Scan};
+pub use scan::{RevScan, Scan, ScanBlock};
 pub use slots::{MAX_SLOTS, SlotMap};
 pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
 // Low-level table construction, for tests and tooling: `Db` builds its
 // tables itself.
 #[doc(hidden)]
-pub use sstable::{SstEntry, TablePlan, bloom_k, bloom_maybe_contains, plan_table, write_table};
+pub use sstable::{
+    BloomShape, SstEntry, TablePlan, bloom_k, bloom_maybe_contains, plan_table, write_table,
+};
 pub use wal::{BatchRecord, BatchReport, Op, RecoverState, WalWriter};

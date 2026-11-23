@@ -20,8 +20,11 @@
 //! `RocksDB`'s `db_bench`; `docs/THROUGHPUT.md` reads the result.
 
 mod bench;
+mod cache;
 mod crash;
 mod device;
+mod gate;
+mod handoff;
 mod store;
 
 use core::future::Future;
@@ -45,31 +48,64 @@ pub const KEY_MAX: usize = 128;
 pub const VAL_MAX: usize = 4096;
 /// Levels of tables.
 pub const LEVELS: usize = 4;
+/// Tables per level.
+pub const TABLES_PER_LEVEL: usize = 7;
+/// The most bloom filter a table carries: sixteen blocks of 64-byte
+/// buckets, about 2 million bits. A table gets as many of those blocks
+/// as its entry count calls for (`horton::BloomShape`).
+pub const BLOOM_BYTES: usize = 16 * ((BLOCK - 4) / 64) * 64;
+/// Writes the memtable holds before it is flushed to a table.
+pub const MEMTABLE_ENTRIES: usize = 4096;
+/// Bytes of keys and values the memtable holds.
+pub const MEMTABLE_ARENA: usize = 1 << 20;
 
 // The shape of the store: 4 levels of up to 7 tables, so at most 28
 // tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
 // file gives each table an 8 MiB slot). The memtable (4096 writes, 1 MiB)
-// is what one flush turns into a table; the bloom filter takes a whole
-// block; the cache keeps 512 blocks (8 MiB, LevelDB's default) of
-// recently read tables. A point read probes up to 7 tables in level 0
-// and one per level below.
+// is what one flush turns into a table. A point read probes up to 7
+// tables in level 0 and one per level below.
+//
+// A table's bloom filter is sized to it, 10 bits a key: one 16 KiB block
+// for the 4096 entries of a flush, up to sixteen for the 100,000 and
+// more of a full table at the bottom. The writer keeps the largest
+// filter in RAM while it writes (`BLOOM_BYTES`, 255 KiB), which is what
+// lets a filter span blocks at all.
+//
+// The block cache is the store's own (`cache::SharedCache`, 16 MiB;
+// LevelDB's default is 8, RocksDB's 32): point reads and scans both run
+// outside the `Db`, on their callers' threads, and share it. The cache
+// inside the `Db` would serve only reads made through the `Db` itself,
+// and the store makes none, so it is switched off.
 horton::db_types! {
     block: BLOCK,
     key_max: KEY_MAX,
     val_max: VAL_MAX,
-    memtable_entries: 4096,
-    memtable_arena: 1 << 20,
+    memtable_entries: MEMTABLE_ENTRIES,
+    memtable_arena: MEMTABLE_ARENA,
     levels: LEVELS,
-    tables_per_level: 7,
-    bloom_bytes: BLOCK - 4,
-    cache_blocks: 512;
+    tables_per_level: TABLES_PER_LEVEL,
+    bloom_bytes: BLOOM_BYTES,
+    cache_blocks: 0;
 
     /// The store's database, over any device.
     pub type Db = KvDb;
     pub type Scan = KvScan;
     pub type RevScan = KvRevScan;
     pub type Compaction = KvCompaction;
+    /// The tables of the store, read without the `Db` (a detached read).
+    pub type TableView = KvTables;
+    /// A point read between its memtable probe and its table phase.
+    pub type MemProbe = KvProbe;
+    /// A reader thread's block buffers.
+    pub type ReadScratch = KvReadScratch;
 }
+
+/// A copy of part of the memtable, for one page of a detached scan: a
+/// memtable of the database's own shape, so any slice of it fits.
+pub type KvMemPage = horton::MemTable<MEMTABLE_ENTRIES, MEMTABLE_ARENA, KEY_MAX, VAL_MAX>;
+
+/// The manifest: which tables exist, level by level.
+pub type KvManifest = horton::Manifest<LEVELS, TABLES_PER_LEVEL, KEY_MAX>;
 
 /// horton ships no executor. The file device completes every call before
 /// returning, so every future is ready the first time it is polled.
@@ -126,8 +162,9 @@ commands:
                                 print the keys in [START, END)
   compact                       flush, then compact every table once
   stats                         the layout, the levels and the counters
-  bench [--num N] [--value-size N] [--threads N] [--batch N]
-        [--benchmarks a,b,...]  db_bench's workloads on a fresh store
+  bench [--num N] [--value-size N] [--threads N] [--read-threads N]
+        [--batch N] [--benchmarks a,b,...]
+                                db_bench's workloads on a fresh store
   crash [N] [--threads N] [--seed N] [--sync]
                                 kill -9 a writing process N times (default
                                 20), reopen, and check every acknowledged
@@ -283,8 +320,9 @@ pub fn print_stats(store: &Handle) -> Result<(), String> {
         mib(s.slots.slot_blocks)
     );
     println!(
-        "tables    {} used, {} free; per level {:?}; {} blocks of range tombstones",
-        s.slots.used, s.slots.free, s.level_tables, s.rdel_blocks
+        "tables    {} used, {} free; per level {:?}; {} blocks of bloom filter, {} of range \
+         tombstones",
+        s.slots.used, s.slots.free, s.level_tables, s.bloom_blocks, s.rdel_blocks
     );
     println!(
         "writes    {} client writes in {} commits since open ({:.1} per commit)",
@@ -293,8 +331,16 @@ pub fn print_stats(store: &Handle) -> Result<(), String> {
         float(s.grouped_writes) / float(s.groups.max(1))
     );
     println!(
-        "work      {} flushes, {} compaction jobs in {} steps",
-        s.flushes, s.compaction_jobs, s.compaction_steps
+        "work      {} flushes, {} compaction jobs in {} steps, {} of them outside the engine lock",
+        s.flushes, s.compaction_jobs, s.compaction_steps, s.detached_steps
+    );
+    println!(
+        "          {} merges began while another was running",
+        s.merges_side_by_side
+    );
+    println!(
+        "reads     {} without the engine lock, {} under it, since open",
+        s.reads_unlocked, s.reads_locked
     );
     println!(
         "i/o       {} block reads, {} block writes, {} syncs; cache {} hits, {} misses",

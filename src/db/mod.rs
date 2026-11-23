@@ -35,6 +35,7 @@ mod invariants;
 mod read;
 
 pub use archive::{ArchivePlan, SealedTable};
+pub use read::{MemProbe, ReadScratch, TableView};
 
 /// Where the database lives on the device, in block ids.
 ///
@@ -207,6 +208,72 @@ pub struct OpenReport {
     pub l0_tables: usize,
 }
 
+/// How many compaction jobs a [`Db`] can have in flight at once: one per
+/// [`Lane`].
+pub const COMPACTION_LANES: usize = 2;
+
+/// Which of a [`Db`]'s compaction jobs a
+/// [`compact_step_in`](Db::compact_step_in) call drives. Each lane has
+/// its own [`Compaction`](crate::Compaction) scratch and at most one job (ADR-0025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// The lane [`compact_step`](Db::compact_step) uses.
+    First,
+    /// A second job, alongside the first.
+    Second,
+}
+
+impl Lane {
+    /// Every lane.
+    pub const ALL: [Self; COMPACTION_LANES] = [Self::First, Self::Second];
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::First => 0,
+            Self::Second => 1,
+        }
+    }
+}
+
+/// A compaction job in flight, as the `Db` knows it: enough to keep two
+/// jobs off each other's tables and to give back what one holds when it
+/// is abandoned. The job's working state is in its scratch.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Job {
+    /// The job's generation; its scratch carries the same.
+    pub(crate) generation: u32,
+    /// True while the job holds its inputs and, between outputs, a slot.
+    pub(crate) active: bool,
+    /// The job runs alone: it is tight or serves a request, and its
+    /// slot arithmetic assumes no other job takes or frees a slot.
+    pub(crate) alone: bool,
+    /// The level the job writes its outputs to.
+    pub(crate) target: u8,
+    /// The slot reserved for the output being written
+    /// ([`Job::NO_SLOT`]: none).
+    pub(crate) reserved: u8,
+    /// Free slots the job was admitted for.
+    pub(crate) need: u8,
+    /// Slots of the job's live input tables, one bit per slot. No other
+    /// job may take one of them, and archiving one aborts the job (its
+    /// merge still reads the table).
+    pub(crate) inputs: u64,
+}
+
+impl Job {
+    pub(crate) const NO_SLOT: u8 = u8::MAX;
+
+    pub(crate) const IDLE: Self = Self {
+        generation: 0,
+        active: false,
+        alone: false,
+        target: 0,
+        reserved: Self::NO_SLOT,
+        need: 0,
+        inputs: 0,
+    };
+}
+
 /// Maximum live snapshots. Snapshot slots are plain `u64`s in the `Db`;
 /// the bound keeps that state tiny and the exhaustion error explicit.
 pub(crate) const MAX_SNAPSHOTS: usize = 8;
@@ -228,7 +295,7 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 /// | `ARENA` | memtable key/value bytes | at least `KEY_MAX + VAL_MAX` |
 /// | `LEVELS` | LSM levels. `1` disables compaction: level 0 fills, then flush reports [`Error::RegionFull`] | `LEVELS * TABLES` within `1..=64` |
 /// | `TABLES` | tables per level (L0's limit; deeper levels share the pool) | below [`COMPACTION_KMAX`] |
-/// | `BLOOM_BYTES` | bloom filter bytes per table | `1..=BLOCK-4` |
+/// | `BLOOM_BYTES` | most bloom filter bytes per table; over `BLOCK-4` it spans blocks | `>= 1` |
 /// | `CACHE` | block-cache slots; `0` disables the cache | |
 ///
 /// The region layout in [`Config`] is checked by [`open`](Db::open)
@@ -279,16 +346,18 @@ pub struct Db<
     /// The table region as `LEVELS * TABLES` fixed slots, one table each
     /// (see [`SlotMap`]). Rebuilt from the manifest by `open()`.
     slots: SlotMap,
-    /// Generation of the compaction job in flight, stamped into its
-    /// [`Compaction`] scratch at select time. A scratch whose stamp no
-    /// longer matches (another scratch started a job, or the job was
-    /// aborted) is stale and is reset before it can touch the device.
+    /// Counts compaction jobs: each job takes the next value as its
+    /// generation, stamped into its [`Compaction`] scratch and its lane
+    /// at select time. A scratch whose stamp is not its lane's (another
+    /// scratch started a job there, or the job was aborted) is stale and
+    /// is reset before it can touch the device.
     job_gen: u32,
-    /// True while a compaction job holds slot reservations.
-    job_active: bool,
-    /// Slots of the active job's input tables, one bit per slot. Archiving
-    /// one of them aborts the job (its merge still reads the table).
-    job_inputs: u64,
+    /// The compaction jobs in flight, one per [`Lane`].
+    jobs: [Job; COMPACTION_LANES],
+    /// The lanes the caller steps, one bit each: `compact_step` leaves
+    /// only the first, `compact_step_in` adds its own. Flush keeps the
+    /// compaction reserve once for each (see `compaction_reserve`).
+    lanes_driven: u8,
     /// The level that an open [`request_compaction`](Db::request_compaction)
     /// is at, or `None` when no request is open. In memory only.
     manual_level: Option<u8>,
@@ -401,8 +470,9 @@ impl<
         "BLOCK must fit the largest WAL record"
     );
     const ASSERT_BLOOM: () = assert!(
-        BLOOM_BYTES >= 1 && BLOOM_BYTES + 4 <= BLOCK,
-        "BLOOM_BYTES must be within 1..=BLOCK-4"
+        BLOOM_BYTES >= 1 && (BLOOM_BYTES + 4 <= BLOCK || BLOCK >= 68),
+        "BLOOM_BYTES must be at least 1, and a block must hold a filter under 64 bytes \
+         whole or at least one 64-byte bucket of a longer one"
     );
     const ASSERT_SLOTS: () = assert!(
         LEVELS >= 1 && TABLES >= 1 && LEVELS * TABLES <= MAX_SLOTS,
@@ -431,7 +501,8 @@ impl<
 
     /// Smallest usable slot: a full memtable's table must fit one, or the
     /// write path could wedge on a flush that never fits.
-    const MIN_SLOT_BLOCKS: u64 = sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX);
+    const MIN_SLOT_BLOCKS: u64 =
+        sstable::max_flush_blocks::<BLOCK>(CAP, ARENA, KEY_MAX, VAL_MAX, BLOOM_BYTES);
 
     /// The smallest device, in blocks, that [`Config::whole_device`]
     /// accepts for this shape with the default manifest pair. A manifest
@@ -511,8 +582,8 @@ impl<
             manifest: Manifest::new(),
             slots: SlotMap::new(),
             job_gen: 0,
-            job_active: false,
-            job_inputs: 0,
+            jobs: [Job::IDLE; COMPACTION_LANES],
+            lanes_driven: 1,
             manual_level: None,
             manual_mark: 0,
             manual_start: 0,
@@ -549,7 +620,8 @@ impl<
     /// other operation can take it in between, and a future dropped
     /// mid-write leaks nothing. Compaction keeps [`COMPACTION_RESERVE`]
     /// slots of headroom — free, or already reserved by the running job —
-    /// that flush and ingest never take.
+    /// that flush and ingest never take; and as much again for a second
+    /// lane, in a region with room for one (see `jobs_reserved`).
     ///
     /// # Errors
     ///
@@ -564,7 +636,7 @@ impl<
             return Err(Error::TableTooLarge);
         }
         let headroom = self.slots.free_slots() + self.slots.reserved_slots();
-        let slot = if headroom > Self::COMPACTION_RESERVE {
+        let slot = if headroom > self.compaction_reserve() {
             self.slots.find_free()
         } else {
             None
@@ -591,11 +663,49 @@ impl<
     /// consistent tree whose inputs were retired or narrowed past each
     /// committed output — and a later select merges on from there.
     const fn abort_job(&mut self) {
-        if self.job_active {
-            self.slots.release_all();
-            self.job_active = false;
-            self.job_inputs = 0;
+        let mut lane = 0;
+        while lane < COMPACTION_LANES {
+            self.abort_lane(lane);
+            lane += 1;
         }
+    }
+
+    /// Abandons the job in `lane`, if any: its reserved output slot
+    /// returns to the free set and its scratch goes stale. The other
+    /// lane's job is untouched.
+    const fn abort_lane(&mut self, lane: usize) {
+        let job = &mut self.jobs[lane];
+        if job.active {
+            if job.reserved != Job::NO_SLOT {
+                self.slots.release(job.reserved as u32);
+            }
+            *job = Job::IDLE;
+        }
+    }
+
+    /// Whether any lane has a job in flight.
+    const fn job_active(&self) -> bool {
+        let mut lane = 0;
+        while lane < COMPACTION_LANES {
+            if self.jobs[lane].active {
+                return true;
+            }
+            lane += 1;
+        }
+        false
+    }
+
+    /// Slots of every in-flight job's input tables, one bit per slot.
+    const fn job_inputs(&self) -> u64 {
+        let mut inputs = 0;
+        let mut lane = 0;
+        while lane < COMPACTION_LANES {
+            if self.jobs[lane].active {
+                inputs |= self.jobs[lane].inputs;
+            }
+            lane += 1;
+        }
+        inputs
     }
 
     /// Slots of headroom compaction keeps for itself — free, or already
@@ -606,6 +716,63 @@ impl<
     /// `compact_select`), shrinking an L0 job to its oldest tables when
     /// slots are short. A single-level tree never compacts.
     const COMPACTION_RESERVE: u32 = if LEVELS >= 2 { 2 } else { 0 };
+
+    /// The headroom compaction keeps right now: the reserve, once for
+    /// each job it should have room for (`jobs_reserved`). Compaction is
+    /// under pressure at this mark (`under_pressure`), and flush stops
+    /// at it (`free_slot_for`).
+    fn compaction_reserve(&self) -> u32 {
+        Self::COMPACTION_RESERVE * self.jobs_reserved()
+    }
+
+    /// How many jobs the reserve is kept for.
+    ///
+    /// A caller that steps one job at a time (`compact_step`) has one
+    /// job's reserve, as ever. A caller that steps both lanes
+    /// ([`compact_step_in`](Db::compact_step_in)) has a reserve for
+    /// each: a second job is admitted only into what the first leaves,
+    /// and if flush filled the region down to one job's reserve the
+    /// second lane would find a job to take only while the region had
+    /// slots to spare, which is when it matters least.
+    ///
+    /// That holds while the region has room for a second job to be of
+    /// use: above its bottom level, both reserves, two tables in level
+    /// 0 (the fewest a level 0 job takes under pressure) and one slot
+    /// more for what that job leaves. In a region fuller than that the
+    /// second reserve would be most of what flush has to batch in, and
+    /// the reserve is kept for one job more than is in flight: one
+    /// job's worth while compaction is idle, so flush can fill level 0,
+    /// and a second lane's once a job is running.
+    ///
+    /// A second lane costs no capacity. A region flush cannot write to
+    /// and compaction has no work in (the caller's
+    /// [`Error::RegionFull`]) has no table between level 0 and the
+    /// bottom and at most one in level 0: with the reserve unspent that
+    /// is five slots above the bottom at most, a region without room
+    /// for the second reserve, and with no job in flight the reserve is
+    /// one job's.
+    fn jobs_reserved(&self) -> u32 {
+        let lanes = self.lanes_driven.count_ones();
+        if lanes < 2 {
+            return 1;
+        }
+        // At most 64 slots.
+        let bottom = self.manifest.level(LEVELS - 1).map_or(0, <[_]>::len);
+        let bottom = u32::try_from(bottom).unwrap_or(u32::MAX);
+        let above = self.slots.slots().saturating_sub(bottom);
+        if above >= 2 * Self::COMPACTION_RESERVE + 3 {
+            return lanes;
+        }
+        let mut jobs = 0u32;
+        let mut lane = 0;
+        while lane < COMPACTION_LANES {
+            if self.jobs[lane].active {
+                jobs += 1;
+            }
+            lane += 1;
+        }
+        if jobs + 1 < lanes { jobs + 1 } else { lanes }
+    }
 
     /// Where the manifest's copies live.
     const fn manifest_layout(&self) -> ManifestLayout {
@@ -739,7 +906,7 @@ impl<
 
     /// The block cache, for the scan iterators' block reads. Scans borrow
     /// it through the same [`CachePort`] view the point-read path uses.
-    pub(crate) fn cache_port(&self) -> &dyn CachePort<BLOCK> {
+    pub(crate) const fn cache_port(&self) -> &dyn CachePort<BLOCK> {
         &self.cache
     }
 
@@ -795,8 +962,8 @@ impl<
         // A failed or interrupted open leaves the handle closed.
         self.opened = false;
         self.table.clear();
-        self.job_active = false;
-        self.job_inputs = 0;
+        self.jobs = [Job::IDLE; COMPACTION_LANES];
+        self.lanes_driven = 1;
         self.job_gen = self.job_gen.wrapping_add(1);
         self.manual_level = None;
         self.check_regions()?;

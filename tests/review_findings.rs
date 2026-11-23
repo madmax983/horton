@@ -545,9 +545,22 @@ fn f13_corrupt_newer_block_is_an_error_not_a_stale_read() {
         ),
         "a corrupt newer version must not silently fall back to the older one"
     );
+    // A scan reads a table when it reaches it (a table that starts
+    // after the seek key is not opened by the seek), so the corruption
+    // is reported by the seek or by the first `next`: either way before
+    // the scan yields anything, and never as the older value.
+    let mut s = Box::new(Scan::new(&db));
+    let (mut key, mut val) = ([0u8; 8], [0u8; 8]);
+    let first =
+        block_on(s.seek(b"", None, u64::MAX)).and_then(|()| block_on(s.next(&mut key, &mut val)));
+    assert!(
+        matches!(first, Err(Error::CorruptBlock { .. })),
+        "a scan must report the corrupt block, got {first:?}"
+    );
+    // Seeking straight into the table reads it at once.
     let mut s = Box::new(Scan::new(&db));
     assert!(matches!(
-        block_on(s.seek(b"", None, u64::MAX)),
+        block_on(s.seek(b"k", None, u64::MAX)),
         Err(Error::CorruptBlock { .. })
     ));
 }

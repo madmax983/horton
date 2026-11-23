@@ -91,7 +91,7 @@ What it guarantees, for two images of equal length:
   to that rule.
 - **RAM.** A slot carries 16 sums: 144 bytes of tag and sums against 16
   bytes before. The ESP32-S3 profile's two slots add 264 bytes to
-  `Db`; the 112 KiB budget holds with 944 bytes to spare (BUDGET.md).
+  `Db`; the 112 KiB budget holds (BUDGET.md).
 - **`BlockCache::put` trusts its caller.** The cache hands back exactly
   what it was given. Code outside horton that inserts unverified bytes
   gets them back unverified.

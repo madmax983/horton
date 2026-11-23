@@ -151,7 +151,7 @@ All I/O is whole blocks (`buf.len() == BLOCK`, else `BadBufferLen`). The
 ### 4.4 SSTable — immutable sorted run
 
 ```
-[data block]* [rdel block]* [bloom block] [index block] [footer block]
+[data block]* [rdel block]* [bloom block]+ [index block] [footer block]
 ```
 
 Every block is `BLOCK` bytes ending in a CRC32 of its payload.
@@ -163,25 +163,46 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   inflate transparently.
 - **Rdel block:** range tombstones `start_len u16 | end_len u16 | seq u64
   | start | end`, sorted by start, then a `u16` count. Never compressed.
-- **Bloom block:** `BLOOM_BYTES × 8` bits in 64-byte buckets. A key
-  hashes to one bucket and its `k` probes are double-hashed inside that
-  bucket's 512 bits, so a reader needs 64 bytes of the block (ADR-0017).
-  A filter under 64 bytes is one bucket. Advisory: a bad CRC disables
-  the filter.
+- **Bloom blocks:** a bit array in 64-byte buckets. A key hashes to one
+  bucket (`(h × buckets) >> 32`) and its `k` probes are double-hashed
+  inside that bucket's 512 bits, so a reader needs 64 bytes of one
+  block (ADR-0017). A filter under 64 bytes is one bucket. `BLOOM_BYTES`
+  is the most filter a table can have. One that fits a block is stored
+  whole. A longer one fills consecutive blocks, `(BLOCK - 4) / 64`
+  buckets each, and is stored at the size the table's entry count
+  calls for: the writer builds it at full length and folds it (ORs
+  runs of neighbouring buckets) to the fewest blocks that give each
+  entry 10 bits (ADR-0020). Advisory: a bad CRC disables the filter
+  for the keys whose bucket is in that block.
 - **Index block:** per data block `first_key_len u16 | first_key |
   block_id u64 | max_seq u64`.
-- **Footer:** `magic u64 = "hrtsst03" | index_block u64 | bloom_block u64
-  | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64`.
+- **Footer:** `magic u64 = "hrtsst04" | index_block u64 | bloom_block u64
+  | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64 |
+  bloom_len u32`. The bloom section is `[bloom_block, index_block)`,
+  and must be exactly the blocks `bloom_len` bytes of filter fill.
 
-A CRC failure on a footer, index, data, or rdel block is `CorruptBlock`
-everywhere, never "absent" (which would let an older version win). Every
+A CRC failure on an index, data, or rdel block is `CorruptBlock`
+everywhere, never "absent" (which would let an older version win). The
+footer makes a table self-describing off the device: it is read, and a
+bad one is `CorruptBlock`, where a table is re-attached
+(`ingest_table`) or opened by a tool (`TableReader::open`). A `Db`'s
+reads, scans and compactions do not read it: the manifest record says
+everything it does (ADR-0021). Every
 block a reader parses comes through `sstable::read_block_verified` or
 `read_range_verified`, which check the CRC of whatever the device
 returns; data blocks then go through `sstable::read_data_block`.
 
 A table's `TableRef` carries `first_key` (its **live lower bound**),
 `last_key` (covering both sections, the greatest rdel end inclusively),
-`max_seq`/`min_seq` over both sections, `entry_count`, and `rdel_blocks`.
+`max_seq`/`min_seq` over both sections, `entry_count`, `rdel_blocks`,
+and the bloom section: `bloom_blocks`, `bloom_k` (the footer's `k`; 0
+means the record does not describe the filter and readers skip it) and
+`bloom_len`. With the table's block range that locates every section
+(data blocks number `block_count - rdel_blocks - bloom_blocks - 2`;
+the bloom section follows the rdel section; the index follows it), so
+`TableReader::from_ref` builds a reader with no I/O. It refuses a
+record whose counts do not fit its range or whose `bloom_len` does not
+fill exactly `bloom_blocks`.
 Entries and range-tombstone pieces below `first_key` are dead to every
 reader (a compaction narrowed the table past them).
 
@@ -194,13 +215,13 @@ shared by the levels. L0 holds at most `TABLES` refs, oldest first;
 deeper levels hold disjoint runs sorted by first key, in any share of
 the pool.
 
-Storage (format `hrtman07`, ADR-0011): two or more **copies**
+Storage (format `hrtman09`, ADR-0011): two or more **copies**
 (`ManifestLayout::pair` or `ManifestLayout::ring`), each
 `Manifest::max_blocks::<BLOCK>()` blocks long, the compile-time worst
 case. Block layout:
 
 ```
-magic: u64 = "hrtman07" | seq: u64 | index: u16 | count: u16 | len: u32
+magic: u64 = "hrtman09" | seq: u64 | index: u16 | count: u16 | len: u32
 | body chunk[len] | crc32: u32
 ```
 
@@ -233,7 +254,8 @@ map from the manifest and refuses a slot smaller than a full memtable's
 table (`BadConfig`). Flush and ingest claim a free slot after their
 manifest commit; a compaction job reserves its output slot for the job's
 life. Two slots are kept free for compaction; a tight job needs only
-one (§4.7). Every table writer is
+one (§4.7). A caller that steps two compaction lanes has two more kept,
+while the region has room for them (§4.7). Every table writer is
 capped at its slot (`TableTooLarge`). Allocation is next-fit, which
 spreads flash wear.
 
@@ -285,6 +307,41 @@ an open request has work.
   leaves the tree as of the last landed commit, and the next job merges
   on from the narrowed inputs. Crash tests enumerate every write of
   multi-output jobs.
+- **Detached merge** (ADR-0024): the merge between two commits needs
+  the device and the target level's table list, and nothing else of the
+  `Db`. After a `compact_step` that returned `More`,
+  `Compaction::merge_detached(device, manifest)` runs one merge quantum
+  over any handle to the device and a copy of `Db::manifest`, and
+  returns `Detached::More` or, when the output is full or the inputs
+  are exhausted, `Detached::NeedsDb`; the next `compact_step` with that
+  scratch seals and commits without repeating the quantum. A quantum
+  that fails loses the job (the next `compact_step` abandons it), and
+  `Compaction::abandon` does the same on the caller's word. Until that
+  next `compact_step`, the caller must not run `compact_step` with
+  another scratch, `request_compaction`, `ingest_table`,
+  `archive_commit` or `open` on the `Db`: they free the slot the merge
+  is writing. Everything that may run between two `compact_step`s may
+  run meanwhile. The result is the tree `compact_step` alone leaves,
+  block for block.
+- **Two jobs at a time** (ADR-0025): `compact_step_in(lane, scratch)`
+  steps the job of one of two lanes (`Lane`, `COMPACTION_LANES`), each
+  with a scratch of its own. A lane selects as `compact_step` does, and
+  beside a job in the other lane only a job that shares no table with
+  it (source or target) and writes to a different level; a tight job
+  and a requested job run alone. Level 0 drains oldest first, so it has
+  one job at a time. A lane that finds no such job returns `Done`;
+  `RegionFull` is returned only with no job in the other lane. A job is
+  admitted into the free slots the other job has not been admitted for.
+  `lane_target(lane)` is the level a lane's job writes to. Each lane's
+  merge may be detached.
+  For a caller that steps both lanes, two things differ. Flush keeps
+  the reserve for each lane (four slots) while the region has seven
+  slots or more above its bottom level, and otherwise for one job more
+  than is in flight. And under pressure level 0 is merged before a
+  table between level 0 and the bottom is pushed down.
+  `compact_step` is unchanged: one job, one reserve, deepest first.
+  When it selects a job it abandons every lane's, so a caller uses one
+  call or the other.
 
 ### 4.8 Read path
 
@@ -294,16 +351,45 @@ an open request has work.
   wins; a strictly newer covering range tombstone hides it; an expired
   winner reads as missing. Blocks are read through the `Db`'s shared
   buffers, so a second concurrent `get` on one handle is `Busy`.
+- **Detached point reads** (ADR-0018): the two phases of a point read
+  are also separate calls. `Db::probe_memtable` returns a `MemProbe`
+  (plain data: the key, the snapshot, what the memtable held), and
+  `TableView::resolve` finishes it over a copy of `Db::manifest`, any
+  handle to the device and a caller-owned `ReadScratch`, without the
+  `Db`. The answer is the store as of the probe. The caller must not
+  run `flush`, `compact_step`, `ingest_table` or `archive_commit`
+  between the probe and the end of `resolve`: they are what could
+  rewrite a table under the reader. Writes that reach only the WAL and
+  the memtable may run meanwhile. `Db::get` is the same two phases over
+  the `Db`'s own manifest, device, buffers and cache.
+  `Db::probe_memtable_into` writes the probe into one the caller keeps.
+  `MemProbe::set_absent` writes, without the `Db`, the probe of a key
+  the memtable holds nothing for (no version, no covering range
+  tombstone), for a caller that knows so by other means (ADR-0023); a
+  false claim answers from the tables alone.
 - **Scans** (`Scan`, `RevScan`): a merge over the memtable and one
   cursor per table in caller-owned state, same winner rule, skipping
-  hidden keys; `BufferTooSmall` never consumes an entry.
+  hidden keys; `BufferTooSmall` never consumes an entry. A scan holds
+  one decoded block of its own; `use_block_pool` lends it more, so a
+  table's block stays decoded while the merge is at another table. A
+  forward seek reads the tables whose range holds `start`; a table that
+  starts later is read when the scan reaches it, and an error in it is
+  reported by that `next` (ADR-0019).
+- **Detached scans** (ADR-0019): `Scan::detached` and
+  `RevScan::detached` merge a caller-owned `MemTable` with the tables
+  of a manifest copy, read through any device handle, without the
+  `Db`. `Db::copy_memtable_range` (and `_rev`) fills that `MemTable`
+  with the memtable's next `max_keys` keys and returns the horizon,
+  the first key it did not copy: a page scans up to the horizon and
+  the next page starts there. The caller's rule is the detached point
+  read's.
 - **Block cache:** `CACHE` slots of CLOCK-evicted physical block images
   keyed by `(table id, block id)`; scans insert cold (ADR-0007). Only
   blocks whose CRC matched are inserted. A hit is not CRC-checked
   again: each slot keeps a RAM checksum of its image in 16 chunks, and
   a hit must match it or it is dropped and read from the device again
-  (ADR-0016). A point read asks for byte ranges of the footer and bloom
-  blocks and pays for the chunks they touch. Above 8 slots a block's
+  (ADR-0016). A point read asks for one bloom bucket as a byte range
+  and pays for the chunk it lies in. Above 8 slots a block's
   slot is one of 8 chosen by hashing its key, so lookups do not grow
   with the cache.
 
@@ -344,6 +430,8 @@ impl Db<…> {
     pub async fn get_with_time(&self, key: &[u8], val_buf: &mut [u8], now: u64) -> Result<Option<usize>, …>;
     pub async fn flush(&mut self) -> Result<(), …>;
     pub async fn compact_step(&mut self, scratch: &mut Compaction<…>) -> Result<Progress, …>;
+    pub async fn compact_step_in(&mut self, lane: Lane, scratch: &mut Compaction<…>) -> Result<Progress, …>;
+    pub fn lane_target(&self, lane: Lane) -> Option<usize>;
     pub fn compaction_pending(&self) -> bool;
     pub fn request_compaction(&mut self, level: usize) -> Result<(), …>;
     pub const fn snapshot(&mut self) -> Result<u64, …>;

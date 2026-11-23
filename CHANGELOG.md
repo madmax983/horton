@@ -12,17 +12,100 @@ misread (SPEC §4.5).
 ## [Unreleased]
 
 The next release is 0.20.0. **The on-disk format changes** (manifest
-`hrtman07`, SSTable `hrtsst03`): v0.19 images, and archives exported by
-v0.19, are rejected, not misread.
+`hrtman09`, SSTable `hrtsst04`): v0.19 images, and archives exported by
+v0.19, are rejected, not misread. So are images written by a build
+from before this release (`hrtman07`, `hrtman08`, `hrtsst03`).
 
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
 key-value store against RocksDB on db_bench's workloads, before and
-after. Against 0.19, point reads are 5 to 7 times faster (8 to 16 for
-absent keys), scans 2 to 5 times, and unsynced writes 1.5 to 3 times;
-synced writes are unchanged.
+after. Against 0.19, one point read is 5 times cheaper (10 for an
+absent key), one thread's scan 9 times and its seek 7 times, and
+unsynced writes 2.5 to 2.9 times; synced writes are unchanged. With
+detached reads the host store's point reads, scans and seeks also run
+on every reader thread at once, and with bloom filters sized to their
+tables a read of an absent key stops at the filter, and takes no lock
+on the way: at 1 M keys on four threads, point reads are 26 times
+0.19's rate, reads of absent keys 620 times, seeks 60 times and scans
+39 times. Compaction's merge runs outside the host store's lock, so
+reads go on while it is written to, and two compaction jobs run at a
+time: random writes at 1 M keys are at 0.7 of RocksDB's rate given
+the same memory, from 0.37.
 
 ### Added
+
+- **Bloom filters that span blocks** (ADR-0020). `bloom_bytes` may now
+  exceed a block. It is the most filter a table can have: the table
+  writer builds the filter at that length and, when the table ends,
+  folds it down to the fewest blocks that give each entry 10 bits
+  (`BLOOM_BITS_PER_KEY`), so a small table still writes one bloom block
+  and a large one is no longer starved. `BloomShape` is the size rule;
+  `TableWriter::probes_for` picks the probe count for an expected entry
+  count; `TableWriter::restart` and `set_block_limit` start a writer
+  over in place. A configuration that fits one block behaves exactly as
+  before.
+- `TableRef::bloom_blocks`, `FinishedTable::bloom_blocks`,
+  `TableReader::bloom_blocks` and `bloom_len`.
+- **`TableReader::from_ref`** builds a reader from a table's manifest
+  record, with no I/O (ADR-0021). `TableRef` gains `bloom_k` and
+  `bloom_len`, and `bloom_first()` and `index_block()`;
+  `FinishedTable` gains `bloom_k` and `bloom_len`; `TableReader` gains
+  `bloom_k()`.
+- **Detached point reads** (ADR-0018). `Db::probe_memtable` runs the
+  memtable half of a point read and returns a `MemProbe`;
+  `TableView::resolve` finishes it over a copy of `Db::manifest`, any
+  handle to the device and a caller-owned `ReadScratch`, without the
+  `Db`. A host can run the table half of many reads at once on other
+  threads while one thread owns the `Db`; an async firmware can wait
+  for flash without holding a borrow of the `Db`. The caller must keep
+  `flush`, `compact_step`, `ingest_table` and `archive_commit` from
+  running while a detached read is in its tables. `db_types!` takes
+  `TableView`, `MemProbe` and `ReadScratch` aliases.
+- `MemProbe::new`, `Db::probe_memtable_into` and `MemProbe::set_absent`
+  (ADR-0023). A host keeps one probe per reader thread and has the
+  memtable's part of a read written into it. And a host that can tell
+  without the `Db` that the memtable holds nothing for a key (say,
+  from a filter of its own over the keys written since the last flush)
+  builds that probe itself with `set_absent`, so the read does not
+  wait for whoever has the `Db`. The claim is the caller's: a false
+  one answers from the tables alone.
+- **Detached compaction merges** (ADR-0024).
+  `Compaction::merge_detached` runs a job's merge quanta without the
+  `Db`, over any handle to the device and a copy of `Db::manifest`;
+  `Db::compact_step` selects the job, and seals and commits each
+  output the merge fills. `Compaction::wants_merge` says when a
+  quantum is next, `Detached` is what one returns, and
+  `Compaction::abandon` gives a job up. A host runs the merge outside
+  the lock that guards its `Db`. The caller must not run
+  `request_compaction`, `ingest_table`, `archive_commit`, `open` or
+  another scratch's `compact_step` while a merge is detached. The
+  result is the tree `compact_step` alone leaves, block for block;
+  firmware's `compact_step` loop is unchanged and the scratch is the
+  size it was.
+- **Two compaction jobs at a time** (ADR-0025).
+  `Db::compact_step_in(lane, scratch)` steps the job of one of two
+  lanes (`Lane`, `COMPACTION_LANES`), each with a scratch of its own;
+  `Db::lane_target` says what level a lane's job writes to. Two jobs
+  run side by side when they share no table and write to different
+  levels; tight and requested jobs run alone. For a caller that steps
+  both lanes, flush keeps a compaction reserve for each (four slots)
+  while the region has seven slots or more above its bottom level,
+  and under region pressure level 0 is merged before a deeper table is
+  pushed down. `compact_step` is unchanged: one job, one reserve,
+  deepest first, and when it selects a job it abandons every lane's.
+  The ESP32-S3 profile's `Db` is 40 bytes larger and its
+  `compact_step` future 160.
+- **Detached scans** (ADR-0019). `Scan::detached` and
+  `RevScan::detached` scan without the `Db`, over a copy of part of the
+  memtable made by `Db::copy_memtable_range` / `copy_memtable_range_rev`
+  (`MemTable::copy_range` / `copy_range_rev`), which return the horizon
+  a page must stop at.
+- **A block pool for scans** (ADR-0019). `Scan::use_block_pool` and
+  `RevScan::use_block_pool` lend a scan caller-owned `ScanBlock`
+  buffers, so a table's block stays decoded while the merge is at
+  another table. Without a pool a scan reloads a block each time it
+  comes back to a table, which was most of a scan's time over
+  overlapping tables.
 
 - `BlockCache::get_range_into` (and `CachePort::get_range_into`): copy a
   byte range of a cached block, checking only the chunks of the image
@@ -82,11 +165,103 @@ synced writes are unchanged.
   `CacheStats` a new field, `rejected`.
 - The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk
   sums); the RAM budget is unchanged.
+- **Reads, scans and compaction no longer read table footers**
+  (ADR-0021). The manifest record names every section of a table and
+  its filter's shape, so a point read that the filter turns away is
+  one read of one bloom bucket, and a seek reads one block fewer per
+  table. A damaged footer no longer fails a read; it fails a
+  re-attach (`ingest_table`), which is where a footer is still read.
+  A record whose filter length disagrees with its bloom blocks is
+  `CorruptManifest`. `sstable::footer_index_block` is gone.
+- **The table footer records the filter's length** (`bloom_len`), and
+  the manifest each table's bloom-block count. A reader takes the
+  filter's size from the table, not from its own `BLOOM_BYTES`, and
+  refuses a footer whose length and block ids disagree.
+  `TableRef::data_blocks` is `block_count - rdel_blocks - bloom_blocks
+  - 2`. A table reference is 7 bytes longer on the device and 8 in RAM.
+- `BLOOM_BYTES` is no longer limited to `BLOCK - 4`.
+- A bloom probe's bit positions in a whole bucket are reduced with a
+  mask where they took a 64-bit division each. The positions are the
+  same.
+- The kvstore's `stats` prints the bloom blocks its tables hold, and
+  its `bench` takes `--read-threads N`, so reads can be measured over
+  tables that fills on one thread always leave the same.
+- A compaction job reuses its table writer in place for each output.
+- **The kvstore's block cache is its own, and a hit in it takes no
+  lock and writes nothing shared** (`examples/kvstore/cache.rs`,
+  ADR-0022). Entries are immutable; each reader thread keeps a view of
+  the slots it uses and checks one atomic epoch per slot; the reference
+  bit is tested before it is set; counters are per thread. Hits are
+  still checked against a RAM checksum (ADR-0016), now kept per 256
+  bytes. It replaces the library's `BlockCache` in eight locked
+  shards.
+- The kvstore's `bench` has `readoutside`: reads of keys past every
+  table, which touch no table and no cache, to tell the store's own
+  cost per read from the tables'.
+- **kvstore point reads do not queue, and most take no lock**
+  (`examples/kvstore/gate.rs`, ADR-0023). A read takes the engine lock
+  itself for its memtable probe; the request queue carries only
+  writes. A read of a key the memtable cannot hold takes no lock at
+  all: a filter over the keys written since the last flush, the
+  manifest's published sequence number and a pin in the reader
+  thread's own slot tell it so, and it goes straight to the tables.
+  Flush and each compaction step shut that gate and wait for the pins.
+  A key written since the last flush, and every key after a
+  `delete_range` or a recovery until the next flush, still asks the
+  memtable under the lock. `stats` counts both kinds of read.
+- **kvstore compaction merges outside the engine lock**
+  (`examples/kvstore/handoff.rs`, ADR-0024). The compaction thread
+  has a handle of its own to the file. A step under the engine lock
+  selects a job, or seals and commits an output; the scratch is then
+  lent to the compaction thread, which merges with no lock and without
+  shutting the readers' gate, and gives it back. `stats` counts the
+  steps that ran outside the lock.
+- **A kvstore write that waits for compaction gives the engine lock
+  up.** When level 0 or the table region is full, the group at the
+  head of the queue is kept there and its thread lets go of the lock
+  until compaction has made room. Reads that need the memtable are no
+  longer held for the length of a compaction job.
+- **The kvstore runs two compaction jobs at a time** (ADR-0025): a
+  compaction thread, a scratch and a file handle for each of horton's
+  two lanes. The steps with the database are taken for both lanes by
+  whichever thread has the engine lock, and a lane that found no job
+  is not asked again until the tables or the other lane's job change.
+  `stats` counts the merges that began while another was running, and
+  `bench` reports them with each fill.
+- The kvstore's `bench` has db_bench's `readwhilewriting`: reader
+  threads read random keys while one more thread overwrites.
+- The kvstore's `bench` builds `readmissing`'s keys on the stack. The
+  allocation per key had become a third of the loop, and a lock that
+  four reader threads waited on.
+- **kvstore tables carry up to sixteen bloom blocks** (`bloom_bytes` is
+  255 KiB), and the store boxes its flush future, which holds the
+  writer and so the filter.
+- **A forward seek reads the tables that hold its key** (ADR-0019). A
+  table that starts after the seek key is read when the scan reaches
+  it. A seek followed by a few entries no longer reads a footer, an
+  index and a data block of every table in range. An error in a table
+  the scan has not reached is now reported by the `next` that gets
+  there, not by `seek`; it is still reported before anything of that
+  table is yielded.
+- `Db::node_id` is public.
+- `Db::get` and its variants run the same table phase as a detached
+  read; the `get()` future is 152 bytes larger (the ESP32-S3 peak is
+  unchanged).
+- A memtable counts its range tombstones, so a point read no longer
+  walks every slot to learn that none covers the key.
+- **kvstore point reads, scans and seeks run in parallel.** The
+  memtable's part (a probe, or a page's slice) is taken under the
+  engine lock; the caller then reads the tables on its own thread,
+  through a read-only handle to the file and a 16 MiB cache shared by
+  all readers. Scans
+  lend each page 32 block buffers. Flush and compaction wait for
+  readers in their table phase to leave. The `Db`'s own cache is off:
+  no read goes through the `Db` any more. `bench`'s `readseq` and
+  `readreverse` run one scan per client thread.
 - **kvstore** runs horton under one lock instead of on a store thread.
-  Point reads and writes are queued and served in order by whichever
-  thread holds the lock (flat combining; group commit is the write half
-  of it), waiters spin for 100 µs before they park, and the cache is
-  8 MiB (512 blocks). Dropping the `Store` closes it: surviving handles
+  Writes are queued and committed in order by whichever thread holds
+  the lock (flat combining, which gives group commit), and waiters
+  spin for 100 µs before they park. Dropping the `Store` closes it: surviving handles
   return `Closed`.
 - `compaction_pending()` is also true while a request has work.
 - `compact_step` can return `RegionFull` from a tight job that cannot

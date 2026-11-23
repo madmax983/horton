@@ -10,6 +10,7 @@
 //! on.
 
 use crate::error::Error;
+use crate::manifest::KeyBound;
 
 /// One entry. `key_off`/`val_off` are byte offsets into the arena.
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +134,9 @@ pub struct MemTable<
     arena: [u8; ARENA],
     arena_len: usize,
     max_seq: u64,
+    /// Range tombstones among the slots. Most memtables hold none, and
+    /// then a point read's covering-tombstone search has nothing to do.
+    range_dels: usize,
 }
 
 /// Insertion plan computed by [`MemTable::plan`].
@@ -196,6 +200,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             arena: [0u8; ARENA],
             arena_len: 0,
             max_seq: 0,
+            range_dels: 0,
         }
     }
 
@@ -239,6 +244,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         self.len = 0;
         self.arena_len = 0;
         self.max_seq = 0;
+        self.range_dels = 0;
     }
 
     fn slot_key(&self, slot: &Slot) -> &[u8] {
@@ -391,6 +397,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             expire_at: a.expire_at,
         };
         self.len += 1;
+        self.range_dels += usize::from(a.range_del);
         if a.seq > self.max_seq {
             self.max_seq = a.seq;
         }
@@ -554,6 +561,11 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     /// rare, and point lookups already paid the binary search.
     #[must_use]
     pub fn max_covering_rdel(&self, key: &[u8], max_seq: u64) -> Option<u64> {
+        // Every point read asks this. Without the count it walks every
+        // slot to learn that none is a range tombstone.
+        if self.range_dels == 0 {
+            return None;
+        }
         let mut best: Option<u64> = None;
         for slot in &self.slots[..self.len] {
             if !slot.range_del || slot.seq > max_seq {
@@ -616,6 +628,183 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
             Ok(start) => start,
             Err(pos) => pos,
         }
+    }
+
+    /// Appends a copy of `slot`, a slot of `src`, after every slot this
+    /// table holds. The caller copies slots in `src`'s order, so the
+    /// copy stays sorted without a search. `Err` when it does not fit.
+    fn push_copy<E, const C2: usize, const A2: usize>(
+        &mut self,
+        src: &MemTable<C2, A2, KEY_MAX, VAL_MAX>,
+        slot: &Slot,
+    ) -> Result<(), Error<E>> {
+        if self.len >= CAP {
+            return Err(Error::TableFull);
+        }
+        let (kl, vl) = (usize::from(slot.key_len), usize::from(slot.val_len));
+        let (koff, voff) = (slot.key_off as usize, slot.val_off as usize);
+        let at = self.arena_len;
+        let dst = self
+            .arena
+            .get_mut(at..at + kl + vl)
+            .ok_or(Error::ArenaFull)?;
+        dst[..kl].copy_from_slice(&src.arena[koff..koff + kl]);
+        dst[kl..].copy_from_slice(&src.arena[voff..voff + vl]);
+        let key_off = u32::try_from(at).map_err(|_| Error::ArenaFull)?;
+        self.slots[self.len] = Slot {
+            key_off,
+            val_off: key_off + u32::from(slot.key_len),
+            ..*slot
+        };
+        self.len += 1;
+        self.arena_len = at + kl + vl;
+        self.range_dels += usize::from(slot.range_del);
+        if slot.seq > self.max_seq {
+            self.max_seq = slot.seq;
+        }
+        Ok(())
+    }
+
+    /// Forgets every slot from index `len` on (the bytes from `arena_len`
+    /// on with them): undoes the [`push_copy`](Self::push_copy)s since
+    /// those marks were taken.
+    fn truncate_copy(&mut self, len: usize, arena_len: usize) {
+        let dropped = &self.slots[len..self.len];
+        self.range_dels -= dropped.iter().filter(|s| s.range_del).count();
+        self.len = len;
+        self.arena_len = arena_len;
+    }
+
+    /// Copies into `out` the part of this table that a forward scan of
+    /// `[start, end)` reads first: at most `max_keys` keys, in order from
+    /// `start`, each with all its versions, and every range tombstone
+    /// that can cover them. `out` is cleared first. This is how a
+    /// detached scan ([`Scan::detached`](crate::Scan::detached)) takes
+    /// its share of the memtable: a page at a time, so the copy made
+    /// while the owner waits stays small.
+    ///
+    /// Returns the **horizon**: the first key at or after `start` that
+    /// was *not* copied, or `None` when the copy reaches `end` (or the
+    /// end of the table). `out` is exact for keys below the horizon and
+    /// knows nothing at or above it, so a scan over `out` must stop
+    /// there: pass the horizon as the scan's `end`, and start the next
+    /// page from it.
+    ///
+    /// The copy stops early, at a key boundary, when `out` is full.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TableFull`] or [`Error::ArenaFull`] when `out` cannot
+    /// hold even the first key with the range tombstones before it: the
+    /// page could make no progress.
+    pub fn copy_range<E, const C2: usize, const A2: usize>(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        max_keys: usize,
+        out: &mut MemTable<C2, A2, KEY_MAX, VAL_MAX>,
+    ) -> Result<Option<KeyBound<KEY_MAX>>, Error<E>> {
+        out.clear();
+        let lo = self.lower_bound(start);
+        // A range tombstone that starts below `start` can still cover
+        // keys of the range.
+        for slot in self.slots[..lo].iter().filter(|s| s.range_del) {
+            out.push_copy(self, slot)?;
+        }
+        let mut keys = 0usize;
+        let mut run: Option<&[u8]> = None;
+        let mut mark = (out.len, out.arena_len);
+        for slot in &self.slots[lo..self.len] {
+            let key = self.slot_key(slot);
+            if end.is_some_and(|e| key >= e) {
+                break;
+            }
+            if run != Some(key) {
+                // A new key: the copy may stop here, never inside a key.
+                if keys >= max_keys.max(1) {
+                    return Ok(KeyBound::from_slice(key));
+                }
+                keys += 1;
+                run = Some(key);
+                mark = (out.len, out.arena_len);
+            }
+            if let Err(full) = out.push_copy(self, slot) {
+                // Give the whole key up, and stop before it.
+                out.truncate_copy(mark.0, mark.1);
+                return if keys <= 1 {
+                    Err(full)
+                } else {
+                    Ok(KeyBound::from_slice(key))
+                };
+            }
+        }
+        Ok(None)
+    }
+
+    /// The reverse of [`copy_range`](Self::copy_range), for a reverse
+    /// scan that starts at the greatest key at or below `from` (an empty
+    /// `from`: the last key) and stops above the exclusive bound
+    /// `lower`: copies the at most `max_keys` greatest keys of that
+    /// range, each with all its versions, and every range tombstone that
+    /// can cover them. `out` is cleared first.
+    ///
+    /// Returns the horizon: the greatest key of the range that was *not*
+    /// copied, or `None` when the copy reaches `lower` (or the start of
+    /// the table). `out` is exact for keys above the horizon: pass the
+    /// horizon as the reverse scan's `lower`, and start the next page
+    /// from it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TableFull`] or [`Error::ArenaFull`] when `out` cannot
+    /// hold the `max_keys` keys: unlike the forward copy, this one
+    /// cannot stop early, because the keys it would leave out are the
+    /// ones the scan reads first. Ask for fewer keys.
+    pub fn copy_range_rev<E, const C2: usize, const A2: usize>(
+        &self,
+        from: &[u8],
+        lower: Option<&[u8]>,
+        max_keys: usize,
+        out: &mut MemTable<C2, A2, KEY_MAX, VAL_MAX>,
+    ) -> Result<Option<KeyBound<KEY_MAX>>, Error<E>> {
+        out.clear();
+        // One past the last slot whose key is at or below `from`.
+        let mut hi = self.len;
+        if !from.is_empty() {
+            hi = self.lower_bound(from);
+            while hi < self.len && self.slot_key(&self.slots[hi]) == from {
+                hi += 1;
+            }
+        }
+        // Walk down over whole keys.
+        let mut lo = hi;
+        let mut keys = 0usize;
+        let mut run: Option<&[u8]> = None;
+        let mut horizon = None;
+        while lo > 0 {
+            let key = self.slot_key(&self.slots[lo - 1]);
+            if lower.is_some_and(|l| key <= l) {
+                break;
+            }
+            if run != Some(key) {
+                if keys >= max_keys.max(1) {
+                    horizon = KeyBound::from_slice(key);
+                    break;
+                }
+                keys += 1;
+                run = Some(key);
+            }
+            lo -= 1;
+        }
+        // Range tombstones that start below the copied keys can cover
+        // them; ones that start above `from` cannot.
+        for slot in self.slots[..lo].iter().filter(|s| s.range_del) {
+            out.push_copy(self, slot)?;
+        }
+        for slot in &self.slots[lo..hi] {
+            out.push_copy(self, slot)?;
+        }
+        Ok(horizon)
     }
 }
 

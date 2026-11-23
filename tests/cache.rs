@@ -250,7 +250,7 @@ fn repeat_point_read_is_served_from_cache() {
     assert!(first_get_reads > 0, "first get touches the device");
     let misses_after_first = db.cache_stats().misses;
 
-    // Second get of the same key: footer, bloom, index and data are all
+    // Second get of the same key: bloom, index and data are all
     // resident — zero table-region device reads, all hits.
     let n = block_on(db.get(b"hot", &mut buf)).unwrap().unwrap();
     assert_eq!(&buf[..n], b"value");
@@ -585,9 +585,10 @@ fn a_block_that_fails_its_crc_is_never_cached() {
         assert!(now > device_reads, "attempt {attempt}: served from cache");
         device_reads = now;
     }
-    // The footer, bloom and index of the table are cached; the damaged
-    // data block is not.
-    assert_eq!(db.cache_stats().len, 3);
+    // The bloom and index blocks of the table are cached; the damaged
+    // data block is not. (The footer is not read at all: the manifest
+    // describes the table.)
+    assert_eq!(db.cache_stats().len, 2);
     assert_eq!(db.cache_stats().rejected, 0, "no RAM damage happened");
 
     // The device recovers (a transient read fault): the very next read
@@ -597,27 +598,28 @@ fn a_block_that_fails_its_crc_is_never_cached() {
     let mut db = TestDb::new(dev, test_config());
     block_on(db.open()).unwrap();
     assert_eq!(get(&db, b"k"), Some(b"v".to_vec()));
-    assert_eq!(db.cache_stats().len, 4);
+    assert_eq!(db.cache_stats().len, 3);
 }
 
-/// A point read of a table that does not hold the key consults its
-/// footer and one bloom bucket. Once those blocks are cached the read
-/// costs no device I/O at all, and a key the filter rejects never
-/// reaches the index or a data block.
+/// A point read of a table that does not hold the key consults one
+/// bloom bucket and nothing else: the manifest says where the filter is
+/// and how to probe it, so the footer is never read. Once the bloom
+/// block is cached the read costs no device I/O at all, and a key the
+/// filter rejects never reaches the index or a data block.
 #[test]
-fn a_bloom_rejected_read_touches_only_the_footer_and_bloom_blocks() {
+fn a_bloom_rejected_read_touches_only_the_bloom_block() {
     let mut db = TestDb::new(CountingDevice::new(), test_config());
     block_on(db.open()).unwrap();
     put_keys(&mut db, &[(b"a", b"1"), (b"m", b"2"), (b"z", b"3")]);
 
-    // Cold: the footer and bloom blocks are read whole and cached.
+    // Cold: the bloom block is read whole and cached.
     let absent: Vec<Vec<u8>> = (0..50u32)
         .map(|i| format!("b{i:03}").into_bytes())
         .collect();
     assert_eq!(get(&db, &absent[0]), None);
     let cold_reads = db.device().reads();
-    assert_eq!(cold_reads, 2, "footer + bloom, never the index or data");
-    assert_eq!(db.cache_stats().len, 2);
+    assert_eq!(cold_reads, 1, "the bloom block: no footer, index or data");
+    assert_eq!(db.cache_stats().len, 1);
 
     // Warm: every further absent key is answered from the cache.
     let hits = db.cache_stats().hits;
@@ -629,13 +631,13 @@ fn a_bloom_rejected_read_touches_only_the_footer_and_bloom_blocks() {
         cold_reads,
         "warm misses did device I/O"
     );
-    assert_eq!(db.cache_stats().hits, hits + 2 * 49);
-    assert_eq!(db.cache_stats().len, 2, "no index or data block was read");
+    assert_eq!(db.cache_stats().hits, hits + 49, "one bucket a read");
+    assert_eq!(db.cache_stats().len, 1, "no index or data block was read");
 
     // A present key goes on to the index and its data block.
     assert_eq!(get(&db, b"m"), Some(b"2".to_vec()));
     assert_eq!(db.device().reads(), cold_reads + 2);
-    assert_eq!(db.cache_stats().len, 4);
+    assert_eq!(db.cache_stats().len, 3);
 }
 
 #[test]

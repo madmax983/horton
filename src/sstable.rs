@@ -3,7 +3,7 @@
 //! On-device layout (v0.17):
 //!
 //! ```text
-//! [data block]* [rdel block]* [bloom block] [index block] [footer block]
+//! [data block]* [rdel block]* [bloom block]+ [index block] [footer block]
 //! ```
 //!
 //! The range-tombstone (rdel) section follows the data so a writer can
@@ -17,26 +17,31 @@
 //!   key | val`, then restart offsets (`u16` each, one every 16 entries),
 //!   then the restart count (`u16`). Restart offsets make a block
 //!   binary-searchable without a full scan.
-//! - Bloom block: a `BLOOM_BYTES * 8`-bit array in 64-byte buckets. A key
-//!   hashes (hand-rolled splitmix64 over an Fx fold) to one bucket, and
-//!   its `k` probes (stored in the footer) are double-hashed inside those
-//!   512 bits, so a lookup reads 64 bytes of the block. A filter under
-//!   64 bytes is one bucket.
+//! - Bloom blocks: a bit array in 64-byte buckets, at most `BLOOM_BYTES`
+//!   long. A key hashes (hand-rolled splitmix64 over an Fx fold) to one
+//!   bucket, and its `k` probes (stored in the footer) are double-hashed
+//!   inside those 512 bits, so a lookup reads 64 bytes of one block. A
+//!   filter under 64 bytes is one bucket. A filter longer than a block
+//!   fills consecutive blocks, `(BLOCK - 4) / 64` buckets each; its
+//!   length is chosen per table from the entry count ([`BloomShape`]) and
+//!   stored in the footer.
 //! - Index block: one entry per data block,
 //!   `first_key_len u16 | first_key | block_id u64 | max_seq u64`.
 //! - Rdel block: range tombstones `start_len u16 | end_len u16 | seq u64 |
 //!   start | end`, sorted by `start` ascending (ties in any sequence
 //!   order: compaction clips pieces to its outputs' ranges), then
 //!   `count u16`.
-//! - Footer block: `magic u64 = "hrtsst03" | index_block u64 |
+//! - Footer block: `magic u64 = "hrtsst04" | index_block u64 |
 //!   bloom_block u64 | entry_count u64 | k u8 | rdel_blocks u32 |
-//!   min_seq u64`. The rdel section is `[bloom_block - rdel_blocks,
-//!   bloom_block)`.
+//!   min_seq u64 | bloom_len u32`. The rdel section is `[bloom_block -
+//!   rdel_blocks, bloom_block)`; the bloom section is `[bloom_block,
+//!   index_block)`.
 //!
 //! A failed CRC is [`Error::CorruptBlock`] for footer, index, data, and
 //! range-tombstone blocks: corruption is never silent, and never reads as
 //! "absent" (which would let an older version elsewhere win). Only the
-//! bloom block is advisory — a bad bloom CRC just disables the filter.
+//! bloom blocks are advisory — a bad bloom CRC just disables the filter
+//! for the keys whose bucket is in that block.
 //!
 //! Bounds: restart offsets are `u16`, so a data block effectively tops out
 //! at 64 KiB, and at most 2048 entries share one data block (restart offsets
@@ -50,22 +55,23 @@ use crate::compress::{CompressScratch, decompress};
 use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::KeyBound;
+use crate::manifest::{KeyBound, TableRef};
 use crate::wal::Op;
 
-/// Footer magic: ASCII "hrtsst03" as stored on device.
+/// Footer magic: ASCII "hrtsst04" as stored on device.
 ///
 /// Pre-1.0 format policy: the magic changes whenever the table layout
 /// does. "lsmtable" was the v0.2–v0.16 layout (rdel section first, no
 /// `min_seq`); "hrtsst02" is v0.17 (rdel section after the data, footer
-/// `min_seq`); "hrtsst03" is v0.20 (the bloom filter is bucketed: an
-/// older table's filter read by the new rule would answer "absent" for
-/// keys it holds). A foreign magic is [`Error::CorruptBlock`], never a
-/// misparse.
-pub const SSTABLE_MAGIC: u64 = u64::from_le_bytes(*b"hrtsst03");
+/// `min_seq`); "hrtsst03" was an unreleased v0.20 layout (the bloom
+/// filter bucketed: an older table's filter read by the new rule would
+/// answer "absent" for keys it holds); "hrtsst04" is v0.20 (the filter
+/// may span blocks, and the footer records its length). A foreign magic
+/// is [`Error::CorruptBlock`], never a misparse.
+pub const SSTABLE_MAGIC: u64 = u64::from_le_bytes(*b"hrtsst04");
 
 /// Bytes of a footer block that carry fields; the rest is zero padding.
-const FOOTER_LEN: usize = 45;
+const FOOTER_LEN: usize = 49;
 
 /// One sorted-run entry: exactly one per key (the memtable already keeps
 /// only the newest version of each key).
@@ -208,7 +214,8 @@ pub(crate) const fn packed_blocks_bound(
 
 /// Upper bound on the blocks one flush can occupy: a full memtable
 /// (`cap` entries over `arena` key and value bytes) packed into a data
-/// section and a range-tombstone section, plus bloom, index, and footer.
+/// section and a range-tombstone section, plus the bloom blocks a table of
+/// `cap` entries gets, the index, and the footer.
 /// Both sections are bounded as if the whole memtable went into each, so
 /// the bound holds for any mix. `Db::open` refuses a table-slot layout
 /// smaller than this: a memtable that could never flush would wedge the
@@ -219,6 +226,7 @@ pub(crate) const fn max_flush_blocks<const BLOCK: usize>(
     arena: usize,
     key_max: usize,
     val_max: usize,
+    bloom_bytes: usize,
 ) -> u64 {
     // Point entries: header, key, value, and an optional TTL expiry.
     let emax = ENTRY_HEADER + key_max + val_max + 8;
@@ -243,7 +251,10 @@ pub(crate) const fn max_flush_blocks<const BLOCK: usize>(
         BLOCK.saturating_sub(RDEL_TRAILER),
         usize::MAX,
     );
-    data + rdel + 3
+    // A flush holds at most `cap` entries, and a filter never shrinks as
+    // the entry count grows.
+    let bloom = BloomShape::for_entries(bloom_bytes, BLOCK, cap as u64).blocks as u64;
+    data + rdel + bloom + 2
 }
 
 /// Number of bloom probes for `entries` keys in a `bloom_bits`-bit filter.
@@ -289,6 +300,192 @@ const fn splitmix64(mut x: u64) -> u64 {
 
 /// Bytes in a bloom bucket: one cache line, 512 bits.
 pub const BLOOM_BUCKET_BYTES: usize = 64;
+
+/// Filter bits per entry that a filter of several blocks is sized for.
+///
+/// A table gets the fewest bloom blocks that still give each entry this
+/// many bits (see [`BloomShape::for_entries`]). Ten bits is about 1% of
+/// absent keys passing the filter.
+pub const BLOOM_BITS_PER_KEY: u64 = 10;
+
+/// The size a table's bloom filter is stored at: its length in bytes and
+/// the blocks that hold it.
+///
+/// `BLOOM_BYTES` is the most filter a table can have, and what the
+/// writer keeps in RAM. A configuration whose filter fits one block
+/// always stores all of it: the block is written anyway. One that spans
+/// blocks is built at full length and then *folded* down to the table's
+/// entry count when the table is finished, so a small table does not pay
+/// for a large table's filter. Folding by `f` ORs each run of `f`
+/// neighbouring buckets into one; because a key's bucket is its hash
+/// scaled to the bucket count, the folded filter is bit for bit the
+/// filter that would have been built at the smaller length.
+///
+/// Folding needs the full bucket count to be a multiple of the folded
+/// one. Configure a multi-block `bloom_bytes` as a number of whole blocks
+/// with many divisors, such as `16 * ((BLOCK - 4) / 64) * 64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomShape {
+    /// Filter bytes: whole 64-byte buckets, or under 64 bytes, which is
+    /// one short bucket.
+    pub len: usize,
+    /// Blocks the filter occupies: at least 1.
+    pub blocks: u32,
+}
+
+impl BloomShape {
+    /// Buckets one bloom block holds.
+    #[must_use]
+    pub const fn buckets_per_block(block: usize) -> usize {
+        block.saturating_sub(CRC_LEN) / BLOOM_BUCKET_BYTES
+    }
+
+    /// The largest filter a `max_len`-byte configuration stores: `max_len`
+    /// rounded down to whole buckets, or all of it when it is under one
+    /// bucket (and, for a block too small to hold a bucket, whatever of
+    /// it fits the block).
+    #[must_use]
+    pub const fn full(max_len: usize, block: usize) -> Self {
+        let per_block = Self::buckets_per_block(block);
+        let buckets = max_len / BLOOM_BUCKET_BYTES;
+        if buckets == 0 || per_block == 0 {
+            let room = block.saturating_sub(CRC_LEN);
+            let short = if max_len < BLOOM_BUCKET_BYTES {
+                max_len
+            } else {
+                BLOOM_BUCKET_BYTES - 1
+            };
+            return Self {
+                len: if short < room { short } else { room },
+                blocks: 1,
+            };
+        }
+        Self {
+            len: buckets * BLOOM_BUCKET_BYTES,
+            blocks: Self::blocks_for(buckets, per_block),
+        }
+    }
+
+    /// Blocks that hold `buckets` buckets, `per_block` to a block.
+    const fn blocks_for(buckets: usize, per_block: usize) -> u32 {
+        let blocks = buckets.div_ceil(per_block);
+        if blocks > u32::MAX as usize {
+            u32::MAX
+        } else {
+            // Checked just above.
+            #[allow(clippy::cast_possible_truncation)]
+            let narrowed = blocks as u32;
+            narrowed
+        }
+    }
+
+    /// The filter a table of `entries` entries stores, out of a
+    /// `max_len`-byte configuration: the fewest blocks that give every
+    /// entry [`BLOOM_BITS_PER_KEY`] bits, and the longest filter that
+    /// fits those blocks and that the full filter folds to. A table with
+    /// more entries than the full filter serves at that rate gets the
+    /// full filter.
+    ///
+    /// Never longer than [`full`](Self::full), and never shorter for more
+    /// entries.
+    #[must_use]
+    pub const fn for_entries(max_len: usize, block: usize, entries: u64) -> Self {
+        let full = Self::full(max_len, block);
+        if full.blocks <= 1 {
+            return full;
+        }
+        let per_block = Self::buckets_per_block(block);
+        let buckets = full.len / BLOOM_BUCKET_BYTES;
+        let bucket_bits = (BLOOM_BUCKET_BYTES * 8) as u64;
+        let need = entries
+            .saturating_mul(BLOOM_BITS_PER_KEY)
+            .div_ceil(bucket_bits);
+        let mut best = full;
+        let mut f = 2;
+        while f <= buckets {
+            if buckets.is_multiple_of(f) {
+                let folded = buckets / f;
+                // Larger folds only give fewer buckets.
+                if (folded as u64) < need {
+                    break;
+                }
+                let blocks = Self::blocks_for(folded, per_block);
+                // Only a fold that saves a block is taken, so within a
+                // block count the longest filter wins.
+                if blocks < best.blocks {
+                    best = Self {
+                        len: folded * BLOOM_BUCKET_BYTES,
+                        blocks,
+                    };
+                }
+            }
+            f += 1;
+        }
+        best
+    }
+
+    /// Where bytes `range` of the filter are stored: the block's index
+    /// within the bloom section and the range within that block. `range`
+    /// is one bucket (see [`BloomProbe::range`]), which never straddles
+    /// blocks.
+    #[must_use]
+    pub const fn locate(
+        block: usize,
+        range: &core::ops::Range<usize>,
+    ) -> (u64, core::ops::Range<usize>) {
+        let per_block = Self::buckets_per_block(block);
+        if per_block == 0 {
+            return (0, range.start..range.end);
+        }
+        let stride = per_block * BLOOM_BUCKET_BYTES;
+        let index = range.start / stride;
+        let base = index * stride;
+        (index as u64, range.start - base..range.end - base)
+    }
+}
+
+/// Blocks a stored filter of `len` bytes occupies: what the writer wrote
+/// for it, and what a reader requires of a footer.
+const fn bloom_section_blocks<const BLOCK: usize>(len: usize) -> u64 {
+    let per_block = BloomShape::buckets_per_block(BLOCK);
+    let buckets = len / BLOOM_BUCKET_BYTES;
+    if buckets == 0 || per_block == 0 {
+        1
+    } else {
+        buckets.div_ceil(per_block) as u64
+    }
+}
+
+/// Folds a filter of `full_len` bytes down to `len` bytes in place (see
+/// [`BloomShape`]): bucket `i` of the result is the OR of buckets
+/// `i * f .. (i + 1) * f` of the input, `f = full_len / len`. Lengths
+/// that are not whole buckets, or not a multiple of one another, leave
+/// the filter as it is.
+fn bloom_fold(bloom: &mut [u8], full_len: usize, len: usize) {
+    const B: usize = BLOOM_BUCKET_BYTES;
+    if len == 0
+        || len >= full_len
+        || full_len > bloom.len()
+        || !len.is_multiple_of(B)
+        || !full_len.is_multiple_of(len)
+    {
+        return;
+    }
+    let f = full_len / len;
+    for i in 0..len / B {
+        // Input bucket `i * f` is at or past output bucket `i`, and the
+        // input buckets before it were folded into earlier outputs.
+        bloom.copy_within(i * f * B..(i * f + 1) * B, i * B);
+        for j in 1..f {
+            let (out, src) = bloom.split_at_mut((i * f + j) * B);
+            if let (Some(out), Some(src)) = (out.get_mut(i * B..(i + 1) * B), src.get(..B)) {
+                for (o, s) in out.iter_mut().zip(src) {
+                    *o |= *s;
+                }
+            }
+        }
+    }
+}
 
 /// Where one key's bloom probes fall: every probe lies inside one bucket
 /// of the filter, so a reader needs only that bucket's bytes.
@@ -344,10 +541,20 @@ impl BloomProbe {
         let (first, stride) = (self.first, self.stride);
         // `len` is at most 64, so the bit count and every position fit.
         let bits = (self.len * 8) as u64;
+        // A whole bucket is 512 bits: the remainder is a mask, which
+        // matters when a key takes a dozen probes. A short filter's bit
+        // count is whatever it is, and takes the division.
+        let mask = if bits.is_power_of_two() {
+            Some(bits - 1)
+        } else {
+            None
+        };
         (0..u64::from(k)).filter_map(move |i| {
-            let p = first
-                .wrapping_add(i.wrapping_mul(stride))
-                .checked_rem(bits)?;
+            let at = first.wrapping_add(i.wrapping_mul(stride));
+            let p = match mask {
+                Some(mask) => at & mask,
+                None => at.checked_rem(bits)?,
+            };
             usize::try_from(p).ok()
         })
     }
@@ -397,9 +604,11 @@ pub fn bloom_maybe_contains(bloom: &[u8], key: &[u8], k: u8) -> bool {
         .is_none_or(|bucket| probe.matches(bucket, k))
 }
 
-/// Computes the table shape (pass 1, no I/O). Entries must arrive in
-/// key-ascending order; the caller pre-allocated `data_blocks + 3` blocks
-/// from this plan before calling [`write_table`].
+/// Computes the table shape (pass 1, no I/O).
+///
+/// Entries must arrive in key-ascending order; the caller pre-allocated
+/// `data_blocks + 2` blocks from this plan, plus the table's bloom
+/// blocks, before calling [`write_table`].
 ///
 /// # Errors
 ///
@@ -559,6 +768,12 @@ pub enum PushOutcome {
 pub struct FinishedTable<const KEY_MAX: usize> {
     /// Data blocks written.
     pub data_blocks: u64,
+    /// Bloom blocks written: at least 1 (see [`BloomShape`]).
+    pub bloom_blocks: u32,
+    /// Bytes of bloom filter in those blocks, as the footer records.
+    pub bloom_len: u32,
+    /// Bloom probes per key, as the footer records.
+    pub bloom_k: u8,
     /// Key/value entries written (including tombstones).
     pub entry_count: u64,
     /// Highest sequence number written.
@@ -582,6 +797,10 @@ pub struct FinishedTable<const KEY_MAX: usize> {
 /// blocks, then flushes the device, so the table is durable before the
 /// manifest commit that makes it visible.
 ///
+/// The writer holds the whole bloom filter, `BLOOM_BYTES` of it, while
+/// the table is written, and stores as much of it as the table's entry
+/// count calls for ([`BloomShape`]).
+///
 /// Entries must arrive in key-ascending order with at most one entry per
 /// key; keys are bounded by `KEY_MAX` (the table's [`KeyBound`] storage).
 /// The table occupies a contiguous run starting at `base`: the caller must
@@ -593,6 +812,12 @@ pub struct TableWriter<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_M
     data: [u8; BLOCK],
     index: [u8; BLOCK],
     bloom: [u8; BLOOM_BYTES],
+    /// Bytes of `bloom` the filter occupies now: the full length while
+    /// entries are pushed, the stored length once `finish_meta` has
+    /// folded it. A `finish_meta` that runs again (its future was
+    /// dropped at a device wait and the caller came back) must not fold
+    /// a second time: that would move bits to buckets no key hashes to.
+    bloom_now: usize,
     restarts: [u16; 128],
     payload: usize,
     n: u64,
@@ -618,6 +843,19 @@ pub struct TableWriter<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_M
 impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>
 {
+    /// Bloom probes per key for a table expected to hold `entries`
+    /// entries: [`bloom_k`] for the filter such a table stores. Pass the
+    /// result to [`new`](Self::new). An estimate that is off costs a few
+    /// false positives, never a wrong answer.
+    #[must_use]
+    pub fn probes_for(entries: u64) -> u8 {
+        let shape = BloomShape::for_entries(BLOOM_BYTES, BLOCK, entries);
+        bloom_k(shape.len.saturating_mul(8), entries)
+    }
+
+    /// The filter bytes the writer fills: the full shape's.
+    const FULL_BLOOM: usize = BloomShape::full(BLOOM_BYTES, BLOCK).len;
+
     /// Starts a table at `base` with `k` bloom probes per key.
     #[must_use]
     pub const fn new(base: u64, k: u8) -> Self {
@@ -627,6 +865,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             data: [0u8; BLOCK],
             index: [0u8; BLOCK],
             bloom: [0u8; BLOOM_BYTES],
+            bloom_now: Self::FULL_BLOOM,
             restarts: [0u16; 128],
             payload: 0,
             n: 0,
@@ -645,6 +884,37 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
             min_seq: u64::MAX,
             data_limit: u64::MAX,
         }
+    }
+
+    /// Starts the writer over on a new table at `base`, in place: what
+    /// [`new`](Self::new) builds, without a second writer on the stack
+    /// to move in. The writer holds `BLOOM_BYTES` of filter, which for a
+    /// filter of several blocks is more than a caller's stack should
+    /// carry twice. The block limit is cleared, as in a new writer.
+    pub fn restart(&mut self, base: u64, k: u8) {
+        self.base = base;
+        self.k = k;
+        self.bloom.fill(0);
+        self.bloom_now = Self::FULL_BLOOM;
+        self.payload = 0;
+        self.n = 0;
+        self.nrestarts = 0;
+        self.index_len = 0;
+        self.data_blocks = 0;
+        self.entry_count = 0;
+        self.block_first_len = 0;
+        self.block_max_seq = 0;
+        self.first_len = 0;
+        self.last_len = 0;
+        self.max_seq = 0;
+        self.min_seq = u64::MAX;
+        self.data_limit = u64::MAX;
+    }
+
+    /// Caps the data blocks this table may seal, on a writer already in
+    /// place (see [`with_block_limit`](Self::with_block_limit)).
+    pub const fn set_block_limit(&mut self, data_blocks: u64) {
+        self.data_limit = data_blocks;
     }
 
     /// Caps the data blocks this table may seal. The caller reserved a
@@ -783,7 +1053,11 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         if e.seq < self.min_seq {
             self.min_seq = e.seq;
         }
-        bloom_add(&mut self.bloom, e.key, self.k);
+        // `bloom_now` is the full length here: no entry is pushed after
+        // `seal_data`, and the filter is folded only after that.
+        if let Some(filter) = self.bloom.get_mut(..self.bloom_now) {
+            bloom_add(filter, e.key, self.k);
+        }
         self.payload += elen;
         self.n += 1;
         self.entry_count += 1;
@@ -863,7 +1137,10 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// Writes the bloom, index, and footer blocks after the data section
     /// and the `rdel_blocks`-block range-tombstone section the caller
     /// wrote at `base + data_blocks`, then flushes the device so the table
-    /// is durable before the manifest commit that makes it visible.
+    /// is durable before the manifest commit that makes it visible. The
+    /// bloom filter is folded to the entry count first
+    /// ([`BloomShape::for_entries`]); the blocks it took are in the
+    /// result. Calling it again writes the same blocks again.
     /// `rdel_min_seq` is the lowest range-tombstone sequence (`u64::MAX`
     /// when there are none). Call [`seal_data`](Self::seal_data) first.
     ///
@@ -879,26 +1156,45 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     ) -> Result<FinishedTable<KEY_MAX>, Error<D::Error>> {
         debug_assert_eq!(self.n, 0, "seal_data must run before finish_meta");
         let min_seq = self.min_seq.min(rdel_min_seq);
-        // Bloom block: reuse the data staging buffer (it is free now).
+        // Bloom blocks: the filter, folded to this table's entry count,
+        // a block's worth of buckets at a time through the data staging
+        // buffer (it is free now).
         let bloom_id = self
             .base
             .checked_add(self.data_blocks)
             .and_then(|b| b.checked_add(u64::from(rdel_blocks)))
             .ok_or(Error::TableTooLarge)?;
-        self.data.fill(0);
-        self.data[..self.bloom.len()].copy_from_slice(&self.bloom);
-        seal_block(
-            device,
-            bloom_id,
-            &mut self.data,
-            self.bloom.len(),
-            None,
-            None,
-        )
-        .await?;
+        let shape = BloomShape::for_entries(BLOOM_BYTES, BLOCK, self.entry_count);
+        // Once: a second `finish_meta` finds the filter at its stored
+        // length and writes the same blocks again.
+        if self.bloom_now != shape.len {
+            bloom_fold(&mut self.bloom, self.bloom_now, shape.len);
+            self.bloom_now = shape.len;
+        }
+        let bloom_len = u32::try_from(shape.len).map_err(|_| Error::TableTooLarge)?;
+        // A short filter (under one bucket) is one chunk.
+        let stride = BloomShape::buckets_per_block(BLOCK) * BLOOM_BUCKET_BYTES;
+        let per_block = if stride == 0 {
+            shape.len.max(1)
+        } else {
+            stride
+        };
+        let filter = self.bloom.get(..shape.len).unwrap_or(&[]);
+        let mut chunks = filter.chunks(per_block);
+        for i in 0..u64::from(shape.blocks) {
+            let chunk = chunks.next().unwrap_or(&[]);
+            let id = bloom_id.checked_add(i).ok_or(Error::TableTooLarge)?;
+            self.data.fill(0);
+            if let Some(dst) = self.data.get_mut(..chunk.len()) {
+                dst.copy_from_slice(chunk);
+            }
+            seal_block(device, id, &mut self.data, chunk.len(), None, None).await?;
+        }
 
         // Index block.
-        let index_id = bloom_id.checked_add(1).ok_or(Error::TableTooLarge)?;
+        let index_id = bloom_id
+            .checked_add(u64::from(shape.blocks))
+            .ok_or(Error::TableTooLarge)?;
         seal_block(
             device,
             index_id,
@@ -910,7 +1206,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         .await?;
 
         // Footer block: magic | index | bloom | entry_count | k |
-        // rdel_blocks | min_seq.
+        // rdel_blocks | min_seq | bloom_len.
         let footer_id = index_id.checked_add(1).ok_or(Error::TableTooLarge)?;
         self.data.fill(0);
         self.data[0..8].copy_from_slice(&SSTABLE_MAGIC.to_le_bytes());
@@ -919,7 +1215,8 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         self.data[24..32].copy_from_slice(&self.entry_count.to_le_bytes());
         self.data[32] = self.k;
         self.data[33..37].copy_from_slice(&rdel_blocks.to_le_bytes());
-        self.data[37..FOOTER_LEN].copy_from_slice(&min_seq.to_le_bytes());
+        self.data[37..45].copy_from_slice(&min_seq.to_le_bytes());
+        self.data[45..FOOTER_LEN].copy_from_slice(&bloom_len.to_le_bytes());
         seal_block(device, footer_id, &mut self.data, FOOTER_LEN, None, None).await?;
 
         // Table blocks are durable before the manifest commit makes them
@@ -940,6 +1237,9 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
         };
         Ok(FinishedTable {
             data_blocks: self.data_blocks,
+            bloom_blocks: shape.blocks,
+            bloom_len,
+            bloom_k: self.k,
             entry_count: self.entry_count,
             max_seq: self.max_seq,
             min_seq,
@@ -951,7 +1251,7 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
     /// Seals the trailing data block and writes the bloom, index, and
     /// footer blocks for a table with no range-tombstone section, then
     /// flushes the device. Reports the table's shape for the manifest's
-    /// [`TableRef`](crate::manifest::TableRef).
+    /// [`TableRef`].
     ///
     /// # Errors
     ///
@@ -975,9 +1275,11 @@ impl<const BLOCK: usize, const BLOOM_BYTES: usize, const KEY_MAX: usize>
 ///
 /// Entries must arrive in key-ascending order (the same order
 /// [`plan_table`] plans); `base` is a pre-allocated run of
-/// `plan.data_blocks + 3` blocks. Returns the blocks written.
+/// `plan.data_blocks + 2` blocks plus the table's bloom blocks
+/// ([`BloomShape::for_entries`]: one, unless `BLOOM_BYTES` spans blocks).
+/// Returns the blocks written.
 ///
-/// Block order on device: `[data]* [bloom] [index] [footer]`. The device is
+/// Block order on device: `[data]* [bloom]+ [index] [footer]`. The device is
 /// flushed at the end, so the table is durable before the manifest commit
 /// that makes it visible.
 ///
@@ -1013,7 +1315,7 @@ where
         w.push(device, e, cs.as_deref_mut()).await?;
     }
     let done = w.finish(device, cs).await?;
-    Ok(done.data_blocks + 3)
+    Ok(done.data_blocks + u64::from(done.bloom_blocks) + 2)
 }
 
 /// One range tombstone staged for a table's rdel section.
@@ -1470,13 +1772,15 @@ fn append_index<E, const BLOCK: usize>(
 /// Relocates a copied table to its destination block range.
 ///
 /// The table's blocks must already sit at `[dst_base, dst_base +
-/// block_count)` in writer order (data blocks, bloom, index, footer).
+/// block_count)` in writer order (data, rdel and bloom blocks, index,
+/// footer).
 /// Data and bloom block contents are position-independent, but index
 /// entries carry absolute data-block ids and the footer carries the
 /// absolute index/bloom ids of the table's *original* placement, so this
 /// rewrites those pointers to the destination layout and re-seals the
 /// touched blocks' CRCs. The original placement is derived from the
-/// footer's own pointers (old bloom id minus the data-block count) and
+/// footer's own pointers (old bloom id minus the data-block count; the
+/// bloom-block count is the gap between the footer's two pointers) and
 /// cross-checked for structural consistency — index entries that do not
 /// sit inside the derived original run are [`Error::CorruptBlock`], not
 /// silently mis-relocated.
@@ -1528,19 +1832,15 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
     scratch: &mut [u8; BLOCK],
 ) -> Result<(), Error<D::Error>> {
     let rdel = u64::from(rdel_blocks);
-    let data_blocks = u64::from(block_count)
-        .checked_sub(rdel)
-        .and_then(|n| n.checked_sub(3))
+    // Layout `[data]* [rdel]* [bloom]+ [index] [footer]`: the table ends
+    // with its index and footer.
+    let footer_id = dst_base
+        .checked_add(u64::from(block_count))
+        .and_then(|end| end.checked_sub(1))
         .ok_or(Error::CorruptBlock { id: dst_base })?;
-    // Layout `[data]* [rdel]* [bloom] [index] [footer]`: the index and
-    // footer follow both sections.
-    let index_id = dst_base
-        .checked_add(rdel)
-        .and_then(|b| b.checked_add(data_blocks))
-        .and_then(|b| b.checked_add(1))
-        .ok_or(Error::CorruptBlock { id: dst_base })?;
-    let footer_id = index_id
-        .checked_add(1)
+    let index_id = footer_id
+        .checked_sub(1)
+        .filter(|&i| i >= dst_base)
         .ok_or(Error::CorruptBlock { id: dst_base })?;
     let payload_len = BLOCK - CRC_LEN;
 
@@ -1568,16 +1868,26 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
             .try_into()
             .map_err(|_| Error::CorruptBlock { id: footer_id })?,
     );
-    // Structural check: bloom, index, footer are consecutive, so the
-    // original base is the bloom id minus the rdel-block and data-block
-    // counts.
-    if old_index
-        != old_bloom
-            .checked_add(1)
-            .ok_or(Error::CorruptBlock { id: footer_id })?
-    {
-        return Err(Error::CorruptBlock { id: footer_id });
-    }
+    // Structural check: the bloom blocks run up to the index, and the
+    // footer's filter length accounts for every one of them. What is
+    // left of the table before them is rdel blocks and data blocks, so
+    // the original base is the bloom id minus those two counts.
+    let bloom_len = u32::from_le_bytes(
+        scratch[45..FOOTER_LEN]
+            .try_into()
+            .map_err(|_| Error::CorruptBlock { id: footer_id })?,
+    );
+    let bloom_blocks = old_index
+        .checked_sub(old_bloom)
+        .filter(|&n| {
+            usize::try_from(bloom_len).is_ok_and(|len| n == bloom_section_blocks::<BLOCK>(len))
+        })
+        .ok_or(Error::CorruptBlock { id: footer_id })?;
+    let data_blocks = u64::from(block_count)
+        .checked_sub(rdel)
+        .and_then(|n| n.checked_sub(bloom_blocks))
+        .and_then(|n| n.checked_sub(2))
+        .ok_or(Error::CorruptBlock { id: footer_id })?;
     let old_base = old_bloom
         .checked_sub(data_blocks)
         .and_then(|b| b.checked_sub(rdel))
@@ -1613,7 +1923,8 @@ pub(crate) async fn relocate_table<D: BlockDevice, const BLOCK: usize>(
         .and_then(|b| b.checked_add(data_blocks))
         .ok_or(Error::CorruptBlock { id: footer_id })?;
     let dst_index = dst_bloom
-        .checked_add(1)
+        .checked_add(bloom_blocks)
+        .filter(|&i| i == index_id)
         .ok_or(Error::CorruptBlock { id: footer_id })?;
     scratch[8..16].copy_from_slice(&dst_index.to_le_bytes());
     scratch[16..24].copy_from_slice(&dst_bloom.to_le_bytes());
@@ -1822,47 +2133,6 @@ pub(crate) fn index_last_le_block<E>(
     index_id: u64,
 ) -> Result<Option<u64>, Error<E>> {
     Ok(index_partition(payload, index_id, |fkey| fkey <= key)?.last_matching)
-}
-
-/// Reads and verifies a table footer, returning its index block id.
-/// Used by the scan iterator to position cursors via the block index
-/// without opening a full [`TableReader`].
-///
-/// # Errors
-///
-/// [`Error::CorruptBlock`] when the footer is missing or fails
-/// verification, or [`Error::Device`] on I/O failure.
-pub(crate) async fn footer_index_block<D: BlockDevice, const BLOCK: usize>(
-    device: &D,
-    cache: Option<&dyn CachePort<BLOCK>>,
-    table_id: u32,
-    scratch: &mut [u8; BLOCK],
-    footer_block: u64,
-) -> Result<u64, Error<D::Error>> {
-    read_range_verified(
-        device,
-        cache,
-        table_id,
-        footer_block,
-        scratch,
-        0..FOOTER_LEN,
-        true,
-    )
-    .await?;
-    let magic = u64::from_le_bytes(
-        scratch[0..8]
-            .try_into()
-            .map_err(|_| Error::CorruptBlock { id: footer_block })?,
-    );
-    if magic != SSTABLE_MAGIC {
-        return Err(Error::CorruptBlock { id: footer_block });
-    }
-    let index_block = u64::from_le_bytes(
-        scratch[8..16]
-            .try_into()
-            .map_err(|_| Error::CorruptBlock { id: footer_block })?,
-    );
-    Ok(index_block)
 }
 
 /// One parsed data-block entry, borrowing the block.
@@ -2260,6 +2530,12 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
 
 /// Point-lookup reader over one table. Holds a shared device reference;
 /// every lookup reuses the caller's scratch block.
+///
+/// A `Db` builds one from the table's manifest record
+/// ([`from_ref`](Self::from_ref)), which costs no I/O: the record names
+/// every section of the table. [`open`](Self::open) reads the same facts
+/// from the table's footer, for a table no manifest describes yet (a
+/// copy being ingested) and for tools.
 pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize> {
     device: &'d D,
     /// Owning table's id: first half of the block-cache key. Table ids
@@ -2269,8 +2545,13 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
     /// Block cache, or `None` for standalone readers (tests, tooling).
     cache: Option<&'d dyn CachePort<BLOCK>>,
     index_block: u64,
+    /// First bloom block; the filter runs to `index_block`.
     bloom_block: u64,
+    /// Filter bytes, from the verified footer (see [`BloomShape`]).
+    bloom_len: usize,
     entry_count: u64,
+    /// Bloom probes per key; 0 when the reader was built from a record
+    /// that does not describe the filter, and the gate is then skipped.
     k: u8,
     /// First block of the range-tombstone section: `bloom_block -
     /// rdel_blocks` (the section follows the data blocks).
@@ -2284,6 +2565,54 @@ pub struct TableReader<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES
 impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     TableReader<'d, D, BLOCK, BLOOM_BYTES>
 {
+    /// A reader for the table `tref` describes, with no I/O: the manifest
+    /// record gives the table's sections, its entry count, and its bloom
+    /// filter's size and probe count, which is everything the footer
+    /// says. `Db` point reads use this, so a probe the filter turns away
+    /// costs one read of one bloom bucket.
+    ///
+    /// The record is trusted as far as the manifest is (its blocks are
+    /// CRC'd and its magic names this table format), and checked for
+    /// self-consistency: a filter length that does not fill exactly the
+    /// record's bloom blocks could send a probe into another section.
+    /// A record with `bloom_k == 0` does not describe the filter; the
+    /// reader then looks every key up in the index.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CorruptManifest`] when the record's counts do not fit
+    /// its block range or its filter length disagrees with its bloom
+    /// blocks.
+    pub fn from_ref<const KEY_MAX: usize>(
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        tref: &TableRef<KEY_MAX>,
+    ) -> Result<Self, Error<D::Error>> {
+        let rdel_first = tref.rdel_first().ok_or(Error::CorruptManifest)?;
+        let bloom_block = tref.bloom_first().ok_or(Error::CorruptManifest)?;
+        let index_block = tref.index_block().ok_or(Error::CorruptManifest)?;
+        let bloom_len = usize::try_from(tref.bloom_len).map_err(|_| Error::CorruptManifest)?;
+        if tref.bloom_blocks == 0
+            || (tref.bloom_k != 0
+                && bloom_section_blocks::<BLOCK>(bloom_len) != u64::from(tref.bloom_blocks))
+        {
+            return Err(Error::CorruptManifest);
+        }
+        Ok(Self {
+            device,
+            table_id: tref.id,
+            cache,
+            index_block,
+            bloom_block,
+            bloom_len,
+            entry_count: u64::from(tref.entry_count),
+            k: tref.bloom_k,
+            rdel_first,
+            rdel_blocks: tref.rdel_blocks,
+            min_seq: tref.min_seq,
+        })
+    }
+
     /// Opens the table ending at `footer_block` without a cache: reads and
     /// verifies the footer (magic + CRC); every block is read from the
     /// device. Used for pre-visibility reads (ingest validation) that must
@@ -2367,6 +2696,19 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
                 .try_into()
                 .map_err(|_| Error::CorruptBlock { id: footer_block })?,
         );
+        let bloom_len = u32::from_le_bytes(
+            scratch[45..FOOTER_LEN]
+                .try_into()
+                .map_err(|_| Error::CorruptBlock { id: footer_block })?,
+        );
+        let bloom_len =
+            usize::try_from(bloom_len).map_err(|_| Error::CorruptBlock { id: footer_block })?;
+        // The filter fills `[bloom_block, index_block)` exactly: a footer
+        // whose length and block ids disagree is corrupt, and a probe
+        // must never reach outside the section.
+        if index_block.checked_sub(bloom_block) != Some(bloom_section_blocks::<BLOCK>(bloom_len)) {
+            return Err(Error::CorruptBlock { id: footer_block });
+        }
         // The section sits right before the bloom block; a count reaching
         // past block 0 is a corrupt footer, never a wrapped read.
         let rdel_first = bloom_block
@@ -2378,6 +2720,7 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             cache,
             index_block,
             bloom_block,
+            bloom_len,
             entry_count,
             k,
             rdel_first,
@@ -2391,6 +2734,26 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     #[must_use]
     pub const fn rdel_blocks(&self) -> u32 {
         self.rdel_blocks
+    }
+
+    /// Bloom blocks in this table: at least 1.
+    #[must_use]
+    pub const fn bloom_blocks(&self) -> u64 {
+        self.index_block.saturating_sub(self.bloom_block)
+    }
+
+    /// Bytes of bloom filter in this table, as recorded in the verified
+    /// footer.
+    #[must_use]
+    pub const fn bloom_len(&self) -> usize {
+        self.bloom_len
+    }
+
+    /// Bloom probes per key in this table (0: the reader does not know
+    /// the filter and skips it; see [`from_ref`](Self::from_ref)).
+    #[must_use]
+    pub const fn bloom_k(&self) -> u8 {
+        self.k
     }
 
     /// Lowest sequence number in the table (entries and range
@@ -2544,29 +2907,40 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         // Bloom gate (advisory: a corrupt bloom block just disables the
         // optimization, never the lookup; a device error is still an
         // error). The key's probes all fall in one bucket of the filter,
-        // which starts the bloom block, so only that bucket is read.
-        let probe = BloomProbe::new(BLOOM_BYTES, key);
-        match read_range_verified(
-            device,
-            self.cache,
-            self.table_id,
-            self.bloom_block,
-            scratch,
-            probe.range(),
-            true,
-        )
-        .await
-        {
-            Ok(()) => {
-                if scratch
-                    .get(probe.range())
-                    .is_some_and(|bucket| !probe.matches(bucket, self.k))
-                {
-                    return Ok(Lookup::Missing);
+        // so only that bucket is read, from the one block that holds it.
+        // A reader that was not told the filter's shape skips the gate.
+        if self.k != 0 {
+            let probe = BloomProbe::new(self.bloom_len, key);
+            let (nth, range) = BloomShape::locate(BLOCK, &probe.range());
+            let bloom_block = self
+                .bloom_block
+                .checked_add(nth)
+                .filter(|&b| b < self.index_block)
+                .ok_or(Error::CorruptBlock {
+                    id: self.bloom_block,
+                })?;
+            match read_range_verified(
+                device,
+                self.cache,
+                self.table_id,
+                bloom_block,
+                scratch,
+                range.clone(),
+                true,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if scratch
+                        .get(range)
+                        .is_some_and(|bucket| !probe.matches(bucket, self.k))
+                    {
+                        return Ok(Lookup::Missing);
+                    }
                 }
+                Err(Error::CorruptBlock { .. }) => {}
+                Err(e) => return Err(e),
             }
-            Err(Error::CorruptBlock { .. }) => {}
-            Err(e) => return Err(e),
         }
         // Index: structural; corruption is an error, never a silent miss.
         read_block_verified(
@@ -2641,8 +3015,13 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
 mod tests {
     extern crate std;
 
-    use super::{CRC_LEN, INDEX_STRIDE, append_index, index_last_le_block, index_lookup};
+    use super::{
+        BLOOM_BITS_PER_KEY, BLOOM_BUCKET_BYTES, BloomShape, CRC_LEN, INDEX_STRIDE, append_index,
+        bloom_add, bloom_fold, bloom_maybe_contains, bloom_section_blocks, index_last_le_block,
+        index_lookup,
+    };
     use std::vec::Vec;
+    use std::{format, vec};
 
     const BLOCK: usize = 4096;
 
@@ -2755,5 +3134,215 @@ mod tests {
             assert!(index_lookup::<()>(payload, &k(probe), 9).is_err());
             assert!(index_last_le_block::<()>(payload, &k(probe), 9).is_err());
         }
+    }
+
+    /// The spine of the multi-block filter: folding a filter built at
+    /// full length gives, bit for bit, the filter built at the folded
+    /// length. So a reader that knows only the folded length probes it
+    /// exactly as it would any filter, and no inserted key is lost.
+    #[test]
+    fn a_folded_filter_is_the_filter_built_at_the_folded_length() {
+        const B: usize = BLOOM_BUCKET_BYTES;
+        let keys: Vec<Vec<u8>> = (0..3_000u32)
+            .map(|i| format!("fold-{:07}", i.wrapping_mul(2_654_435_761)).into_bytes())
+            .collect();
+        for (buckets, k) in [
+            (1usize, 3u8),
+            (2, 1),
+            (12, 7),
+            (48, 6),
+            (255, 30),
+            (4080, 7),
+        ] {
+            let full_len = buckets * B;
+            let mut full = vec![0u8; full_len];
+            for key in &keys {
+                bloom_add(&mut full, key, k);
+            }
+            for f in (1..=buckets).filter(|f| buckets.is_multiple_of(*f)) {
+                let len = full_len / f;
+                let mut direct = vec![0u8; len];
+                for key in &keys {
+                    bloom_add(&mut direct, key, k);
+                }
+                let mut folded = full.clone();
+                bloom_fold(&mut folded, full_len, len);
+                assert_eq!(
+                    &folded[..len],
+                    &direct[..],
+                    "{buckets} buckets folded by {f}"
+                );
+                for key in &keys {
+                    assert!(bloom_maybe_contains(&folded[..len], key, k));
+                }
+            }
+        }
+    }
+
+    /// A probe's bit positions are `first + i * stride` reduced modulo
+    /// the bucket's bit count. For a whole bucket that is computed with
+    /// a mask; it must be the same positions the division gives, or
+    /// tables written by one build would not be read by another.
+    #[test]
+    fn probe_positions_are_the_remainder_whatever_the_bucket_size() {
+        use super::BloomProbe;
+        for len in [1usize, 7, 32, 63, 64, 100, 128, 4032] {
+            for i in 0..200u32 {
+                let key = format!("bits-{i}").into_bytes();
+                let probe = BloomProbe::new(len, &key);
+                let bits = (probe.range().len() * 8) as u64;
+                let want: Vec<usize> = (0..30u64)
+                    .map(|n| {
+                        let at = probe.first.wrapping_add(n.wrapping_mul(probe.stride));
+                        usize::try_from(at % bits).unwrap()
+                    })
+                    .collect();
+                assert_eq!(
+                    probe.bits(30).collect::<Vec<_>>(),
+                    want,
+                    "{len}-byte filter"
+                );
+            }
+        }
+    }
+
+    /// A fold that cannot be exact (a length that is not whole buckets,
+    /// or that does not divide the full length) leaves the filter alone:
+    /// it must never produce a filter that loses a key.
+    #[test]
+    fn a_fold_that_cannot_be_exact_changes_nothing() {
+        let mut filter: Vec<u8> = (0..640u32).map(|i| (i * 7 + 1).to_le_bytes()[0]).collect();
+        let before = filter.clone();
+        for (full, len) in [
+            (640, 0),
+            (640, 640),
+            (640, 700),
+            (640, 100),
+            (640, 192),
+            (1280, 64),
+        ] {
+            bloom_fold(&mut filter, full, len);
+            assert_eq!(filter, before, "fold {full} -> {len}");
+        }
+    }
+
+    /// What `for_entries` promises, over a spread of block sizes, filter
+    /// sizes and entry counts.
+    #[test]
+    fn a_bloom_shape_fits_its_table() {
+        for block in [68usize, 128, 256, 4096, 16_384] {
+            let per_block = BloomShape::buckets_per_block(block);
+            for max_blocks in [1usize, 2, 3, 8, 12, 16] {
+                let max_len = max_blocks * per_block * BLOOM_BUCKET_BYTES;
+                let full = BloomShape::full(max_len, block);
+                assert_eq!(full.len, max_len);
+                assert_eq!(full.blocks as usize, max_blocks);
+                let mut last = BloomShape { len: 0, blocks: 0 };
+                let mut entries = 0u64;
+                while entries < 4 * (max_len as u64) {
+                    let shape = BloomShape::for_entries(max_len, block, entries);
+                    let buckets = shape.len / BLOOM_BUCKET_BYTES;
+                    // Whole buckets, a divisor of the full filter, in
+                    // exactly the blocks a reader will expect.
+                    assert_eq!(shape.len % BLOOM_BUCKET_BYTES, 0);
+                    assert_eq!(full.len % shape.len, 0);
+                    assert_eq!(
+                        u64::from(shape.blocks),
+                        bloom_section_blocks_of(block, shape.len)
+                    );
+                    assert_eq!(shape.blocks as usize, buckets.div_ceil(per_block));
+                    // Never more than the configuration, never smaller
+                    // for a larger table.
+                    assert!(shape.len <= full.len && shape.blocks >= 1);
+                    assert!(shape.len >= last.len && shape.blocks >= last.blocks);
+                    // The target is met unless the filter is already
+                    // as large as it gets.
+                    let bits = shape.len as u64 * 8;
+                    assert!(
+                        shape == full || bits >= entries * BLOOM_BITS_PER_KEY,
+                        "{entries} entries got {bits} bits"
+                    );
+                    // And no block is spent that a smaller legal filter
+                    // would have saved.
+                    for f in (1..=full.len / BLOOM_BUCKET_BYTES)
+                        .filter(|f| (full.len / B).is_multiple_of(*f))
+                    {
+                        let n = full.len / B / f;
+                        if (n * B * 8) as u64 >= entries * BLOOM_BITS_PER_KEY {
+                            assert!(n.div_ceil(per_block) >= shape.blocks as usize);
+                        }
+                        // Within the blocks it takes, it is the longest
+                        // filter the full one folds to.
+                        if n.div_ceil(per_block) == shape.blocks as usize {
+                            assert!(n * B <= shape.len, "{entries} entries: {n} buckets fit too");
+                        }
+                    }
+                    last = shape;
+                    entries = entries * 3 / 2 + 1;
+                }
+                // One block's worth of configuration never folds.
+                if max_blocks == 1 {
+                    assert_eq!(BloomShape::for_entries(max_len, block, 0), full);
+                }
+            }
+        }
+    }
+
+    const B: usize = BLOOM_BUCKET_BYTES;
+
+    fn bloom_section_blocks_of(block: usize, len: usize) -> u64 {
+        match block {
+            68 => bloom_section_blocks::<68>(len),
+            128 => bloom_section_blocks::<128>(len),
+            256 => bloom_section_blocks::<256>(len),
+            4096 => bloom_section_blocks::<4096>(len),
+            16_384 => bloom_section_blocks::<16_384>(len),
+            _ => unreachable!("add the block size above"),
+        }
+    }
+
+    /// Filters under one bucket, and sizes that are not whole buckets,
+    /// are one block and are stored as they always were.
+    #[test]
+    fn a_short_or_ragged_filter_is_one_block() {
+        for (max_len, block, len) in [
+            (1usize, 4096usize, 1usize),
+            (63, 4096, 63),
+            (64, 4096, 64),
+            (65, 4096, 64),
+            (100, 4096, 64),
+            (256, 4096, 256),
+            (4092, 4096, 4032),
+            // A block too small for a bucket holds what fits of the filter.
+            (40, 48, 40),
+            (60, 48, 44),
+            (200, 48, 44),
+        ] {
+            let full = BloomShape::full(max_len, block);
+            assert_eq!((full.len, full.blocks), (len, 1), "{max_len} in {block}");
+            for entries in [0, 1, 1_000, u64::MAX] {
+                assert_eq!(BloomShape::for_entries(max_len, block, entries), full);
+            }
+        }
+    }
+
+    /// A bucket lies inside one block, and `locate` names it: the block
+    /// index within the section and the bytes within that block.
+    #[test]
+    fn a_bucket_never_straddles_blocks() {
+        for block in [68usize, 256, 4096, 16_384] {
+            let per_block = BloomShape::buckets_per_block(block);
+            for bucket in 0..per_block * 5 {
+                let range = bucket * B..(bucket + 1) * B;
+                let (nth, within) = BloomShape::locate(block, &range);
+                assert_eq!(nth, (bucket / per_block) as u64);
+                assert_eq!(within.start, (bucket % per_block) * B);
+                assert_eq!(within.len(), B);
+                assert!(within.end <= block - CRC_LEN);
+            }
+        }
+        // A short filter is the head of the section's only block.
+        assert_eq!(BloomShape::locate(4096, &(0..7)), (0, 0..7));
+        assert_eq!(BloomShape::locate(48, &(0..40)), (0, 0..40));
     }
 }

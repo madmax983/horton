@@ -53,7 +53,7 @@ use crate::compress::CompressScratch;
 use crate::db::MAX_SNAPSHOTS;
 use crate::device::BlockDevice;
 use crate::error::Error;
-use crate::manifest::{KeyBound, TableRef};
+use crate::manifest::{KeyBound, Manifest, TableRef};
 use crate::slots::MAX_SLOTS;
 use crate::sstable::{self, PushOutcome, SstEntry, TableWriter};
 
@@ -77,6 +77,18 @@ pub enum Progress {
     Done,
     /// The job made bounded progress (one output block sealed); call again.
     More,
+}
+
+/// What [`Compaction::merge_detached`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detached {
+    /// One output block sealed and the merge has more to do without the
+    /// `Db`: call [`merge_detached`](Compaction::merge_detached) again.
+    More,
+    /// Nothing more can be done without the `Db`: the output is full, the
+    /// inputs are exhausted, or the scratch holds no job in its merge.
+    /// Call [`Db::compact_step`](crate::db::Db::compact_step).
+    NeedsDb,
 }
 
 /// Merge state of the key currently being compacted. A sealed output block
@@ -276,10 +288,24 @@ pub struct Compaction<
     pub(crate) n_inexact: usize,
 }
 
+/// Where a scratch's job stands. `Split`, `Exhausted` and `Failed` are
+/// left by a detached merge quantum
+/// ([`Compaction::merge_detached`]) for the next
+/// [`Db::compact_step`](crate::db::Db::compact_step) to act on: the `Db`
+/// is what seals an output, commits it and opens the next, and what
+/// abandons a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
+    /// No job.
     Idle,
+    /// A job is set up and its next step is a merge quantum.
     Merging,
+    /// A detached quantum found the output full at a key boundary.
+    Split,
+    /// A detached quantum exhausted every input.
+    Exhausted,
+    /// A detached quantum failed, and returned the error to its caller.
+    Failed,
 }
 
 /// Where the range-tombstone coverage stream stands.
@@ -470,6 +496,98 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         self.tight = false;
         self.manual = false;
         self.outputs = 0;
+    }
+
+    /// True when this scratch holds a job whose next step is a merge
+    /// quantum: the step [`merge_detached`](Self::merge_detached) can run
+    /// without the `Db`. True after a
+    /// [`compact_step`](crate::db::Db::compact_step) that returned
+    /// [`Progress::More`].
+    #[must_use]
+    pub const fn wants_merge(&self) -> bool {
+        matches!(self.state, State::Merging)
+    }
+
+    /// Runs one merge quantum of this scratch's job without the `Db`:
+    /// merged entries are read from the job's inputs and written to its
+    /// output through `device`, until one output block seals.
+    ///
+    /// This is the long part of a compaction job, and it needs nothing
+    /// from the `Db` but a way to read and write blocks and the target
+    /// level's table list. A host that shares a `Db` between threads
+    /// runs it outside the lock that guards the `Db`, on another thread,
+    /// while that `Db` goes on taking reads and writes (ADR-0024).
+    /// Selecting a job, sealing and committing an output, and opening
+    /// the next one stay with
+    /// [`compact_step`](crate::db::Db::compact_step): when this returns
+    /// [`Detached::NeedsDb`], the next `compact_step` with this scratch
+    /// does whichever of those is due, and does not repeat the quantum.
+    ///
+    /// `device` is any handle to the storage the `Db` is on. The quantum
+    /// reads the job's input tables and writes blocks of the slot the
+    /// `Db` reserved for the job's output; nothing else. Blocks written
+    /// through it must be durable by the `Db`'s next flush of its own
+    /// handle (sealing an output flushes before the commit): flush
+    /// `device` first if it buffers writes of its own. `manifest` is a
+    /// copy of [`Db::manifest`](crate::db::Db::manifest) taken after the
+    /// last `compact_step` with this scratch.
+    ///
+    /// **The caller keeps the job in place.** The `Db` cannot see a
+    /// merge that does not borrow it. From the `compact_step` that
+    /// returned [`Progress::More`] until the next `compact_step` with
+    /// this scratch, do not call on that `Db`: `compact_step` with
+    /// another scratch,
+    /// [`request_compaction`](crate::db::Db::request_compaction),
+    /// `ingest_table`, `archive_commit` or `open`. Each abandons the job
+    /// or changes its tables, and frees the slot this merge is writing.
+    /// Reads, scans, `put`, `delete`, `write`, `delete_range`, `flush`
+    /// and snapshots may all run meanwhile, as they may between two
+    /// `compact_step`s.
+    ///
+    /// # Errors
+    ///
+    /// As a merge step of `compact_step`: [`Error::CorruptBlock`] on a
+    /// torn input block, [`Error::TableTooLarge`], [`Error::Device`]. The
+    /// job is then lost: the next `compact_step` with this scratch
+    /// abandons it (what it committed stays) and returns
+    /// [`Progress::Done`], and the one after selects afresh.
+    pub async fn merge_detached<D: BlockDevice, const LEVELS: usize, const TABLES: usize>(
+        &mut self,
+        device: &mut D,
+        manifest: &Manifest<LEVELS, TABLES, KEY_MAX>,
+    ) -> Result<Detached, Error<D::Error>> {
+        if self.state != State::Merging {
+            return Ok(Detached::NeedsDb);
+        }
+        let tgt_level = manifest.level(self.target_level).unwrap_or(&[]);
+        match self.merge_step(device, tgt_level).await {
+            Ok(MergeOutcome::More) => Ok(Detached::More),
+            Ok(MergeOutcome::Split) => {
+                self.state = State::Split;
+                Ok(Detached::NeedsDb)
+            }
+            Ok(MergeOutcome::Exhausted) => {
+                self.state = State::Exhausted;
+                Ok(Detached::NeedsDb)
+            }
+            Err(e) => {
+                self.state = State::Failed;
+                Err(e)
+            }
+        }
+    }
+
+    /// Gives this scratch's job up, for a caller of
+    /// [`merge_detached`](Self::merge_detached) whose own part in the
+    /// merge failed outside a quantum (flushing its device handle, say):
+    /// the next [`compact_step`](crate::db::Db::compact_step) abandons
+    /// the job, as it does after a quantum that failed, and returns
+    /// [`Progress::Done`]. What the job committed stays. An idle scratch
+    /// is left idle.
+    pub const fn abandon(&mut self) {
+        if !matches!(self.state, State::Idle) {
+            self.state = State::Failed;
+        }
     }
 
     /// Starts the coverage stream over every input's range-tombstone
@@ -1827,8 +1945,8 @@ pub(crate) async fn init_cursor<
     }
     // The first data block whose key range can reach the bound.
     let floor = tref.first_key.as_slice();
-    let footer = tref.footer_block().ok_or(Error::CorruptManifest)?;
-    let index_id = sstable::footer_index_block(device, None, tref.id, raw, footer).await?;
+    // The manifest names the index block: no footer is read.
+    let index_id = tref.index_block().ok_or(Error::CorruptManifest)?;
     read_block_into(device, index_id, raw).await?;
     sstable::check_block_crc(raw, index_id)?;
     let payload_end = BLOCK - sstable::CRC_LEN;
@@ -2051,6 +2169,7 @@ mod tests {
         let mut t = TableRef::<256>::EMPTY;
         t.first_block = base;
         t.rdel_blocks = rdel_blocks;
+        t.bloom_blocks = 1;
         t.block_count = rdel_blocks + 3;
         t
     }

@@ -85,6 +85,7 @@ impl<
         id: u32,
         base: u64,
         total: u64,
+        (bloom, bloom_k): (sstable::BloomShape, u8),
         plan: &sstable::TablePlan<KEY_MAX>,
         rdel_plan: &sstable::RdelPlan<'_>,
     ) -> Result<TableRef<KEY_MAX>, Error<D::Error>> {
@@ -106,6 +107,11 @@ impl<
             min_seq: plan.min_seq.min(rdel_plan.min_seq),
             entry_count: u32::try_from(plan.entry_count).map_err(|_| Error::TableTooLarge)?,
             rdel_blocks: rdel_plan.blocks,
+            // What the writer put in the footer: readers take it from
+            // here.
+            bloom_blocks: u16::try_from(bloom.blocks).map_err(|_| Error::TableTooLarge)?,
+            bloom_k,
+            bloom_len: u32::try_from(bloom.len).map_err(|_| Error::TableTooLarge)?,
             // The memtable holds this handle's own mutations; the
             // wall-clock half of the origin arrives post-seal via
             // Db::stamp_table (horton is clock-free).
@@ -181,10 +187,14 @@ impl<
                     None
                 }
             }))?;
-        let k = sstable::bloom_k(BLOOM_BYTES * 8, plan.entry_count);
+        // The entry count is known, so the filter's size and its probe
+        // count are exact.
+        let k = sstable::TableWriter::<BLOCK, BLOOM_BYTES, KEY_MAX>::probes_for(plan.entry_count);
+        let bloom = sstable::BloomShape::for_entries(BLOOM_BYTES, BLOCK, plan.entry_count);
         let total = u64::from(rdel_plan.blocks)
             .checked_add(plan.data_blocks)
-            .and_then(|n| n.checked_add(3))
+            .and_then(|n| n.checked_add(u64::from(bloom.blocks)))
+            .and_then(|n| n.checked_add(2))
             .ok_or(Error::TableTooLarge)?;
         // Pick a free slot; it is claimed only once the manifest commit
         // below has landed.
@@ -218,8 +228,13 @@ impl<
             let rdel_written =
                 Self::write_flush_rdel(&mut *device, table, rdel_base, w.spare_block()).await?;
             debug_assert_eq!(rdel_written, rdel_plan.blocks);
-            w.finish_meta(&mut *device, rdel_written, rdel_plan.min_seq)
+            let done = w
+                .finish_meta(&mut *device, rdel_written, rdel_plan.min_seq)
                 .await?;
+            debug_assert_eq!(
+                (done.bloom_blocks, done.bloom_len as usize, done.bloom_k),
+                (bloom.blocks, bloom.len, k)
+            );
         }
         // The manifest commit is the atomic visibility point. Stage the
         // change as an edit, applied in memory only once the commit lands,
@@ -228,7 +243,15 @@ impl<
         let mut edit = ManifestEdit::new();
         let id = self.manifest.next_table_id();
         edit.advance_next_table_id(id.checked_add(1).ok_or(Error::CounterExhausted)?);
-        let tref = Self::flush_tref(self.cfg.node_id, id, base, total, &plan, &rdel_plan)?;
+        let tref = Self::flush_tref(
+            self.cfg.node_id,
+            id,
+            base,
+            total,
+            (bloom, k),
+            &plan,
+            &rdel_plan,
+        )?;
         edit.add::<D::Error>(0, tref)?;
         // Advance the WAL head past the flushed records; wrap the region
         // when it is exhausted. Folded into this same atomic commit, so no

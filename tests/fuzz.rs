@@ -279,6 +279,9 @@ fn tref(id: u32, first_block: u64) -> TableRef<256> {
         min_seq: 0,
         entry_count: 5,
         rdel_blocks: 0,
+        bloom_blocks: 1,
+        bloom_k: 0,
+        bloom_len: 0,
         node_id: 0,
         seal_wall: 0,
     }

@@ -7,11 +7,19 @@
 //! - **Every write is synced by default.** `db_bench`'s `fillseq` and
 //!   `fillrandom` do not sync (its `fillsync` does). Pass `--no-sync` for
 //!   the like-for-like run.
-//! - **Writers are threads, not one loop.** `--threads N` (default 4)
-//!   clients share the store, so group commit has something to group;
-//!   `--batch N` puts N writes in each client batch, like `fillbatch`.
+//! - **Clients are threads, not one loop.** `--threads N` (default 4)
+//!   clients share the store, so group commit has something to group
+//!   and reads, seeks and scans run side by side; `--batch N` puts N
+//!   writes in each client batch, like `fillbatch`.
+//! - **`--read-threads N` gives the read benchmarks their own thread
+//!   count.** What a read costs depends on how many level-0 tables the
+//!   fills leave, and with several writer threads that number changes
+//!   from run to run. Fills on one thread leave the same tables every
+//!   time, so `--threads 1 --read-threads 4` compares two builds'
+//!   reads on equal terms.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::store::{Batch, Handle, Store};
@@ -23,8 +31,23 @@ struct Params {
     num: u64,
     value_size: usize,
     threads: u64,
+    /// Client threads of the read benchmarks; `None`: as many as
+    /// `threads`.
+    read_threads: Option<u64>,
     batch: u64,
     benchmarks: Vec<String>,
+}
+
+impl Params {
+    /// The parameters a read benchmark runs with: `--read-threads`
+    /// clients when that was given.
+    fn readers(&self) -> Self {
+        Self {
+            threads: self.read_threads.unwrap_or(self.threads),
+            benchmarks: Vec::new(),
+            ..*self
+        }
+    }
 }
 
 fn parse(args: &[String]) -> Result<Params, String> {
@@ -32,6 +55,7 @@ fn parse(args: &[String]) -> Result<Params, String> {
         num: 100_000,
         value_size: 100,
         threads: 4,
+        read_threads: None,
         batch: 1,
         benchmarks: DEFAULT.split(',').map(String::from).collect(),
     };
@@ -46,6 +70,7 @@ fn parse(args: &[String]) -> Result<Params, String> {
             "--num" => p.num = num()?,
             "--value-size" => p.value_size = usize::try_from(num()?).map_err(|e| e.to_string())?,
             "--threads" => p.threads = num()?.max(1),
+            "--read-threads" => p.read_threads = Some(num()?.max(1)),
             "--batch" => p.batch = num()?.max(1),
             "--benchmarks" => {
                 p.benchmarks = it
@@ -174,11 +199,13 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
         let done = match name.as_str() {
             "fillseq" => fill(&store, &p, false),
             "fillrandom" | "overwrite" => fill(&store, &p, true),
-            "readrandom" => read_random(&store, &p, false),
-            "readmissing" => read_random(&store, &p, true),
-            "readseq" => read_seq(&store, false),
-            "readreverse" => read_seq(&store, true),
-            "seekrandom" => seek_random(&store, &p),
+            "readrandom" => read_random(&store, &p.readers(), false),
+            "readmissing" => read_random(&store, &p.readers(), true),
+            "readoutside" => read_outside(&store, &p.readers()),
+            "readwhilewriting" => read_while_writing(&store, &p),
+            "readseq" => read_seq(&store, &p.readers(), false),
+            "readreverse" => read_seq(&store, &p.readers(), true),
+            "seekrandom" => seek_random(&store, &p.readers()),
             "deleterandom" => delete_random(&store, &p),
             "compact" => store
                 .compact()
@@ -281,8 +308,10 @@ fn fill(store: &Store, p: &Params, random: bool) -> Result<Done, String> {
     let commits = after.groups - before.groups;
     let writes = after.grouped_writes - before.grouped_writes;
     done.note = format!(
-        "[{commits} commits, {:.1} client batches each]",
-        float(writes) / float(commits.max(1))
+        "[{commits} commits, {:.1} client batches each; {} compaction jobs, {} merges beside another]",
+        float(writes) / float(commits.max(1)),
+        after.compaction_jobs - before.compaction_jobs,
+        after.merges_side_by_side - before.merges_side_by_side,
     );
     Ok(done)
 }
@@ -295,8 +324,11 @@ fn read_random(store: &Store, p: &Params, missing: bool) -> Result<Done, String>
             let k = key(rng.below(p.num));
             let v = if missing {
                 // db_bench's readmissing: a key just past a real one.
-                let mut m = k.to_vec();
-                m.push(b'.');
+                // Built on the stack: at a few hundred nanoseconds a
+                // read, an allocation per key is a third of the loop,
+                // and four threads wait on the allocator's lock.
+                let mut m = [b'.'; 17];
+                m[..16].copy_from_slice(&k);
                 h.get(&m)
             } else {
                 h.get(&k)
@@ -317,26 +349,92 @@ fn read_random(store: &Store, p: &Params, missing: bool) -> Result<Done, String>
     Ok(done)
 }
 
-fn read_seq(store: &Store, reverse: bool) -> Result<Done, String> {
-    let mut d = Done::default();
-    let mut last: Option<Vec<u8>> = None;
-    for kv in store.range(b"", None, reverse).map_err(|e| e.to_string())? {
-        let (k, v) = kv.map_err(|e| e.to_string())?;
-        if let Some(prev) = &last {
-            let ordered = if reverse { *prev > k } else { *prev < k };
-            if !ordered {
-                return Err("keys out of order".into());
+/// `db_bench`'s `readwhilewriting`: the reader threads read random keys
+/// while one more thread overwrites random keys for as long as they
+/// run. The rate reported is the readers'. It is what a read costs
+/// while the store is flushing and compacting under it.
+fn read_while_writing(store: &Store, p: &Params) -> Result<Done, String> {
+    let stop = AtomicBool::new(false);
+    let (read, written) = std::thread::scope(|s| {
+        let h = store.handle();
+        let stop = &stop;
+        let writer = s.spawn(move || -> Result<u64, String> {
+            let mut rng = Rng::new(77);
+            let mut values = Values::new(p.value_size);
+            let mut written = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                h.put(&key(rng.below(p.num)), values.next(p.value_size))
+                    .map_err(|e| e.to_string())?;
+                written += 1;
             }
+            Ok(written)
+        });
+        let read = read_random(store, &p.readers(), false);
+        stop.store(true, Ordering::Relaxed);
+        let written = writer
+            .join()
+            .unwrap_or_else(|_| Err("the writer panicked".into()));
+        (read, written)
+    });
+    let (mut done, written) = (read?, written?);
+    done.note = format!(
+        "({} of {} found; {written} writes meanwhile)",
+        done.found, done.ops
+    );
+    Ok(done)
+}
+
+/// Reads of keys past every key in the store. No table's range covers
+/// them, so no table and no cache is consulted: what is left is what a
+/// read costs in the store itself, its queue and its memtable probe.
+/// `db_bench` has no such workload; it is here to tell that cost apart
+/// from the tables'. Not in the default list.
+fn read_outside(store: &Store, p: &Params) -> Result<Done, String> {
+    let mut done = clients(store, p, |h, t, share| {
+        let mut rng = Rng::new(3000 + t);
+        let mut d = Done::default();
+        for _ in 0..share {
+            // '~' sorts after every digit a key is made of.
+            let mut k = [b'~'; 17];
+            k[1..].copy_from_slice(&key(rng.below(p.num)));
+            d.found += u64::from(h.get(&k).map_err(|e| e.to_string())?.is_some());
         }
-        d.ops += 1;
-        d.bytes += (k.len() + v.len()) as u64;
-        last = Some(k);
+        d.ops = share;
+        Ok(d)
+    })?;
+    done.note = format!("({} of {} found)", done.found, done.ops);
+    if done.found != 0 {
+        return Err(format!("{} keys outside the store were found", done.found));
     }
-    Ok(d)
+    Ok(done)
+}
+
+/// Every client thread scans the whole store, as `db_bench`'s `readseq`
+/// does with `--threads`: the rate is entries per second over all of
+/// them.
+fn read_seq(store: &Store, p: &Params, reverse: bool) -> Result<Done, String> {
+    clients(store, p, |h, _, _| {
+        let mut d = Done::default();
+        let mut last: Option<Vec<u8>> = None;
+        for kv in h.range(b"", None, reverse).map_err(|e| e.to_string())? {
+            let (k, v) = kv.map_err(|e| e.to_string())?;
+            if let Some(prev) = &last {
+                let ordered = if reverse { *prev > k } else { *prev < k };
+                if !ordered {
+                    return Err("keys out of order".into());
+                }
+            }
+            d.ops += 1;
+            d.bytes += (k.len() + v.len()) as u64;
+            last = Some(k);
+        }
+        Ok(d)
+    })
 }
 
 fn seek_random(store: &Store, p: &Params) -> Result<Done, String> {
-    // A seek re-reads every table's index, so do a tenth as many.
+    // A seek reads an index and a data block of every table that could
+    // hold its key, so do a tenth as many.
     let p = Params {
         num: (p.num / 10).max(1),
         benchmarks: Vec::new(),
