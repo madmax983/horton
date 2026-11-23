@@ -410,6 +410,44 @@ impl<const BLOCK: usize, const SLOTS: usize> BlockCache<BLOCK, SLOTS> {
         self.settle(i, ok)
     }
 
+    /// Looks `(table_id, block_id)` up and hands bytes `from..to` of its
+    /// image to `read` where they lie, with no copy. Returns `false`,
+    /// without calling `read`, on a miss and when the range does not lie
+    /// inside a block.
+    ///
+    /// The chunks the range touches are checked against their sums
+    /// first, as [`get_range_into`](Self::get_range_into) checks them; a
+    /// chunk that fails drops the slot and `read` is not called. A
+    /// reader that parses a block once (an index search, an inflate)
+    /// saves the copy it would otherwise parse.
+    pub fn with_range(
+        &mut self,
+        table_id: u32,
+        block_id: u64,
+        from: usize,
+        to: usize,
+        read: &mut dyn FnMut(&[u8]),
+    ) -> bool {
+        if from > to || to > BLOCK {
+            return false;
+        }
+        let Some(i) = self.find(table_id, block_id) else {
+            return false;
+        };
+        let image = &self.images[i];
+        let mut ok = true;
+        if to > from {
+            for c in chunk_of(BLOCK, from)..=chunk_of(BLOCK, to - 1) {
+                let (lo, hi) = chunk_bounds(BLOCK, c);
+                ok &= image_sum(&image[lo..hi]) == self.sums[i][c];
+            }
+        }
+        if ok {
+            read(&image[from..to]);
+        }
+        self.settle(i, ok)
+    }
+
     /// The slot holding `(table_id, block_id)`. A lookup that finds none
     /// is counted as a miss here.
     fn find(&mut self, table_id: u32, block_id: u64) -> Option<usize> {
@@ -554,6 +592,28 @@ pub trait CachePort<const BLOCK: usize> {
     /// into `out`; `false` on a miss (see
     /// [`BlockCache::get_range_into`]).
     fn get_range_into(&self, table_id: u32, block_id: u64, offset: usize, out: &mut [u8]) -> bool;
+    /// Hand bytes `from..to` of the cached image, checked against its
+    /// RAM checksum, to `read` in place, with no copy (see
+    /// [`BlockCache::with_range`]). `Some(true)` on a hit, after `read`
+    /// has run; `Some(false)` on a miss, and `read` has not run.
+    ///
+    /// `None` means the cache does not lend images, and the caller
+    /// copies one out with [`get_into`](Self::get_into) or
+    /// [`get_range_into`](Self::get_range_into) instead. That is what
+    /// this provided method answers, so a cache written before it
+    /// existed keeps working unchanged. `read` must not call back into
+    /// the cache.
+    fn with_range(
+        &self,
+        table_id: u32,
+        block_id: u64,
+        from: usize,
+        to: usize,
+        read: &mut dyn FnMut(&[u8]),
+    ) -> Option<bool> {
+        let _ = (table_id, block_id, from, to, read);
+        None
+    }
     /// Insert a verified image; `hot` sets the CLOCK reference bit.
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool);
     /// Drop every entry for `table_id`.
@@ -573,6 +633,20 @@ impl<const BLOCK: usize, const SLOTS: usize> CachePort<BLOCK>
     fn get_range_into(&self, table_id: u32, block_id: u64, offset: usize, out: &mut [u8]) -> bool {
         self.try_borrow_mut()
             .is_ok_and(|mut c| c.get_range_into(table_id, block_id, offset, out))
+    }
+
+    fn with_range(
+        &self,
+        table_id: u32,
+        block_id: u64,
+        from: usize,
+        to: usize,
+        read: &mut dyn FnMut(&[u8]),
+    ) -> Option<bool> {
+        Some(
+            self.try_borrow_mut()
+                .is_ok_and(|mut c| c.with_range(table_id, block_id, from, to, read)),
+        )
     }
 
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool) {
@@ -845,6 +919,80 @@ mod tests {
                 assert_eq!((s.rejected, s.misses, s.len), (1, 1, 0));
             }
         }
+    }
+
+    /// A lent range is exactly the bytes of the range, `read` runs once
+    /// per hit and never on a miss, and a range outside the block is a
+    /// miss, never a panic.
+    #[test]
+    fn a_lent_range_is_the_bytes_of_the_range() {
+        let good = block::<4096>(71);
+        let mut c = BlockCache::<4096, 2>::new();
+        c.put(4, 2, &good, true);
+        for (from, to) in [
+            (0usize, 4096usize),
+            (0, 45),
+            (4032, 4096),
+            (255, 257),
+            (9, 9),
+        ] {
+            let mut seen = None;
+            assert!(c.with_range(4, 2, from, to, &mut |b| seen = Some(b.to_vec())));
+            assert_eq!(seen.as_deref(), Some(&good[from..to]), "{from}..{to}");
+        }
+        assert_eq!(c.stats().hits, 5);
+        let mut calls = 0;
+        assert!(!c.with_range(4, 3, 0, 64, &mut |_| calls += 1));
+        assert!(!c.with_range(4, 2, 4090, 4097, &mut |_| calls += 1));
+        assert!(!c.with_range(4, 2, 10, 9, &mut |_| calls += 1));
+        assert_eq!(calls, 0);
+        assert_eq!(c.stats().misses, 1, "only the absent block counts");
+    }
+
+    /// The lent form of ADR-0016's rule: a range over a flipped bit is
+    /// never lent; the slot is dropped and the lookup is a miss. A range
+    /// clear of the damaged chunk is still lent.
+    #[test]
+    fn a_flipped_bit_is_never_lent() {
+        let good = block::<4096>(81);
+        let flipped = 9 * 256 + 3;
+        for (from, to, touches) in [
+            (0usize, 4096usize, true),
+            (9 * 256, 10 * 256, true),
+            (flipped, flipped + 1, true),
+            (0, 9 * 256, false),
+            (10 * 256, 4096, false),
+        ] {
+            let mut c = BlockCache::<4096, 1>::new();
+            c.put(1, 1, &good, true);
+            c.images[0][flipped] ^= 0x80;
+            let mut lent = None;
+            let served = c.with_range(1, 1, from, to, &mut |b| lent = Some(b.to_vec()));
+            assert_eq!(served, !touches, "{from}..{to}");
+            if served {
+                assert_eq!(lent.as_deref(), Some(&good[from..to]));
+            } else {
+                assert!(lent.is_none(), "{from}..{to}: damaged bytes lent");
+                let s = c.stats();
+                assert_eq!((s.rejected, s.misses, s.len), (1, 1, 0));
+            }
+        }
+    }
+
+    /// Through the trait: a `RefCell` cache lends (never `None`), and a
+    /// cache that is already borrowed answers a miss, not a panic.
+    #[test]
+    fn the_refcell_port_lends_and_a_busy_one_misses() {
+        use super::CachePort;
+        let good = block::<4096>(91);
+        let c = core::cell::RefCell::new(BlockCache::<4096, 1>::new());
+        CachePort::put(&c, 7, 7, &good, true);
+        let mut n = 0;
+        assert_eq!(c.with_range(7, 7, 0, 16, &mut |b| n = b.len()), Some(true));
+        assert_eq!(n, 16);
+        let _busy = c.borrow_mut();
+        assert_eq!(c.with_range(7, 7, 0, 16, &mut |_| n = 0), Some(false));
+        assert_eq!(n, 16);
     }
 
     #[test]

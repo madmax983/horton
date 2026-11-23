@@ -2512,6 +2512,13 @@ async fn fetch_block<D: BlockDevice, const BLOCK: usize>(
 /// let an older version in a deeper table win (a silent stale read). A
 /// flag or decoding failure is `CorruptBlock` too.
 ///
+/// A cache hit on a compressed block copies and checks only what it
+/// inflates: the block's trailer, then its first `clen` bytes, each a
+/// ranged read ([`CachePort::get_range_into`]). Values that compress to
+/// half make that half the copying and half the summing of a whole
+/// image. When the inflate succeeds, `raw` holds only those bytes; no
+/// caller reads `raw` after a `true` return.
+///
 /// # Errors
 ///
 /// [`Error::CorruptBlock`] as above, or [`Error::Device`] on I/O failure.
@@ -2524,8 +2531,104 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
     logical: &mut [u8; BLOCK],
     hot: bool,
 ) -> Result<bool, Error<D::Error>> {
+    if let Some(c) = cache
+        && let Some(inflated) =
+            inflate_cached_prefix::<D::Error, BLOCK>(c, table_id, block_id, raw, logical)?
+    {
+        return Ok(inflated);
+    }
     read_block_verified(device, cache, table_id, block_id, raw, hot).await?;
     inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)
+}
+
+/// The hit path of [`read_data_block`] for a compressed block: reads the
+/// trailer, then the compressed prefix, from the cache, and inflates it.
+/// `Ok(None)` when the block is not cached whole for it (a miss on
+/// either range, or a block stored raw): the caller then reads the block
+/// whole as before.
+fn inflate_cached_prefix<E, const BLOCK: usize>(
+    cache: &dyn CachePort<BLOCK>,
+    table_id: u32,
+    block_id: u64,
+    raw: &mut [u8; BLOCK],
+    logical: &mut [u8; BLOCK],
+) -> Result<Option<bool>, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let Some(body_end) = BLOCK.checked_sub(CRC_LEN) else {
+        return Ok(None);
+    };
+    let mut flag = [0u8; 2];
+    if body_end < 2 || !cache.get_range_into(table_id, block_id, body_end - 2, &mut flag) {
+        return Ok(None);
+    }
+    let trailer = u16::from_le_bytes(flag);
+    if trailer & 0x8000 == 0 {
+        // Stored raw: the caller wants the whole image anyway.
+        return Ok(None);
+    }
+    let clen = usize::from(trailer & 0x7FFF);
+    if clen >= body_end {
+        return Err(corrupt());
+    }
+    // Inflated where it lies when the cache lends its images; copied
+    // out first when it does not.
+    let mut inflated = Ok(0);
+    let lent = cache.with_range(table_id, block_id, 0, clen, &mut |bytes| {
+        inflated = decompress(bytes, &mut logical[..body_end]);
+    });
+    match lent {
+        Some(true) => {}
+        // Evicted between the two reads.
+        Some(false) => return Ok(None),
+        None => {
+            if !cache.get_range_into(table_id, block_id, 0, &mut raw[..clen]) {
+                return Ok(None);
+            }
+            inflated = decompress(&raw[..clen], &mut logical[..body_end]);
+        }
+    }
+    inflated.map_err(|_| corrupt())?;
+    Ok(Some(true))
+}
+
+/// Runs `parse` over bytes `..len` of block `block_id`'s verified image,
+/// for a reader that parses a block once and keeps nothing of it (the
+/// index search). A cache that lends its images (see
+/// [`CachePort::with_range`]) has it parsed in place, with no copy;
+/// otherwise the block is read into `scratch` as
+/// [`read_block_verified`] reads it, and parsed there.
+///
+/// # Errors
+///
+/// As [`read_block_verified`].
+async fn parse_verified<D: BlockDevice, R, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    scratch: &mut [u8; BLOCK],
+    len: usize,
+    mut parse: impl FnMut(&[u8]) -> R,
+) -> Result<R, Error<D::Error>> {
+    let len = len.min(BLOCK);
+    if let Some(c) = cache {
+        let mut out = None;
+        let lent = c.with_range(table_id, block_id, 0, len, &mut |bytes| {
+            out = Some(parse(bytes));
+        });
+        match (lent, out) {
+            (Some(true), Some(r)) => return Ok(r),
+            (Some(false), _) => {
+                // A miss: straight to the device, without asking the
+                // cache a second time.
+                fetch_block(device, cache, table_id, block_id, scratch, true).await?;
+                return Ok(parse(&scratch[..len]));
+            }
+            _ => {}
+        }
+    }
+    read_block_verified(device, cache, table_id, block_id, scratch, true).await?;
+    Ok(parse(&scratch[..len]))
 }
 
 /// Point-lookup reader over one table. Holds a shared device reference;
@@ -2943,18 +3046,18 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
             }
         }
         // Index: structural; corruption is an error, never a silent miss.
-        read_block_verified(
+        // Searched where it lies in the cache when the cache lends it.
+        let index_block = self.index_block;
+        let Some((mut block_id, mut remaining)) = parse_verified(
             device,
             self.cache,
             self.table_id,
-            self.index_block,
+            index_block,
             scratch,
-            true,
+            BLOCK - CRC_LEN,
+            |payload| index_lookup::<D::Error>(payload, key, index_block),
         )
-        .await?;
-        let payload_end = BLOCK - CRC_LEN;
-        let Some((mut block_id, mut remaining)) =
-            index_lookup::<D::Error>(&scratch[..payload_end], key, self.index_block)?
+        .await??
         else {
             return Ok(Lookup::Missing);
         };

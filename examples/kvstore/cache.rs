@@ -514,6 +514,32 @@ impl CachePort<BLOCK> for SharedCache {
         })
     }
 
+    /// Lends the entry's bytes in place. An entry is immutable and this
+    /// thread holds a reference to it, so the bytes it sums are the
+    /// bytes `read` parses, as with a copy, without the copy.
+    fn with_range(
+        &self,
+        table_id: u32,
+        block_id: u64,
+        from: usize,
+        to: usize,
+        read: &mut dyn FnMut(&[u8]),
+    ) -> Option<bool> {
+        if from > to || to > BLOCK {
+            return Some(false);
+        }
+        Some(self.lookup(table_id, block_id, |entry| {
+            let Some(bytes) = entry.image.get(from..to) else {
+                return false;
+            };
+            if !entry.intact(&entry.image, from, to) {
+                return false;
+            }
+            read(bytes);
+            true
+        }))
+    }
+
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool) {
         self.insert(table_id, block_id, block, hot);
     }
@@ -896,6 +922,36 @@ mod tests {
         assert_eq!(cache.stats().rejected, 2);
         cache.put(4, 1, &img, true);
         assert_eq!(whole(&cache, 4, 1), Some(img));
+    }
+
+    /// A lent range is the entry's own bytes, checked: the bytes of the
+    /// range on a hit, `read` never called on a miss or on damage, and
+    /// a damaged entry dropped as a copying read drops it.
+    #[test]
+    fn a_lent_range_is_checked_like_a_copy() {
+        let cache = SharedCache::new();
+        let img = image(5, 2);
+        let lend = |b: u64, from, to| {
+            let mut got = None;
+            let hit = cache.with_range(5, b, from, to, &mut |b| got = Some(b.to_vec()));
+            assert_eq!(hit, Some(got.is_some()), "{from}..{to}: read iff hit");
+            got
+        };
+        assert!(lend(2, 0, BLOCK).is_none());
+        cache.put(5, 2, &img, true);
+        assert_eq!(lend(2, 0, BLOCK).as_deref(), Some(&img[..]));
+        assert_eq!(lend(2, 100, 300).as_deref(), Some(&img[100..300]));
+        assert!(lend(2, 10, BLOCK + 1).is_none(), "outside the block");
+        // A block no view holds yet, damaged in RAM.
+        cache.put_damaged(5, 3, &img, 1000);
+        assert_eq!(
+            lend(3, 0, 64).as_deref(),
+            Some(&img[..64]),
+            "clear of the damage"
+        );
+        assert!(lend(3, 990, 1010).is_none(), "the damaged chunk");
+        let s = cache.stats();
+        assert_eq!((s.rejected, s.len), (1, 1));
     }
 
     /// Two caches never answer for each other, even from one thread and

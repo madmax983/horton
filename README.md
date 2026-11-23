@@ -337,7 +337,7 @@ These are the limits it meets, and each is a property of the library:
 ```mermaid
 flowchart LR
     subgraph RAM["RAM (caller-owned, fixed size)"]
-        MT["MemTable<br/>sorted slots + bump arena"]
+        MT["MemTable<br/>sorted view + bump arena"]
         WS["WAL stage<br/>1 block"]
         MF["Manifest<br/>levels → TableRefs"]
         BC["BlockCache<br/>CLOCK, CACHE slots"]
@@ -582,7 +582,7 @@ What the suite covers:
 | `src/cache.rs` | CLOCK block cache |
 | `src/compress.rs` | LZ77 block codec |
 | `src/batch.rs` | `WriteBatch` |
-| `src/crc.rs` | Slicing-by-8 CRC-32 |
+| `src/crc.rs` | Slicing-by-8 CRC-32: three interleaved chains on 64-bit targets, zero runs carried across (ADR-0026) |
 | `src/model.rs` | Executable models used as test oracles |
 | `src/device.rs`, `src/flash.rs`, `src/esp32s3.rs` | `BlockDevice` trait, NOR flash adapter, ESP32-S3 SPI flash driver |
 | `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |

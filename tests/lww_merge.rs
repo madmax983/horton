@@ -169,6 +169,26 @@ fn lww_unstamped_sorts_below_stamped() {
     assert_eq!(get(&db, b"k"), Some(b"stamped".to_vec()));
 }
 
+/// A point read stages the first value it finds and lets a later table
+/// replace it only if that table's version wins (ADR-0026: the first
+/// value is looked up straight into the stage, later ones into a spare
+/// buffer). Here the winner changes twice, each time to a value of a
+/// different length, so a stale tail or a clobbered stage would show.
+#[test]
+fn lww_a_staged_winner_is_replaced_whole() {
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
+    block_on(db.open()).unwrap();
+    block_on(db.put(b"k", b"node-9-wall-200")).unwrap();
+    flush_stamp(&mut db, 9, 200);
+    block_on(db.put(b"k", b"node-7-wall-100-and-longer")).unwrap();
+    flush_stamp(&mut db, 7, 100);
+    block_on(db.put(b"k", b"u")).unwrap();
+    block_on(db.flush()).unwrap();
+    // Visited newest first: "u" (unstamped) is staged, (100, 7) beats
+    // it, (200, 9) beats that.
+    assert_eq!(get(&db, b"k"), Some(b"node-9-wall-200".to_vec()));
+}
+
 /// A foreign tombstone with an older wall does not shadow a value sealed
 /// later: (100, 7) beats (50, 9).
 #[test]

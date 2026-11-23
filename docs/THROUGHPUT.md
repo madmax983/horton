@@ -20,7 +20,12 @@ fifth took the footer and the cache's locks out of a reader's way. The
 sixth took point reads out of the store's request queue and, for
 nearly all of them, out of its lock. The seventh took compaction's
 merge out of that lock, and writers that wait for it. The eighth runs
-two compaction jobs at a time.
+two compaction jobs at a time. A ninth pass, after
+the release table below was measured, went back over the code a block
+passes through: CRC-32, the LZ77 codec, the cache's copies and the
+memtable's insert ([step 16](#then-the-hot-path-measured-again)).
+Against the build before it, writes are 1.3 to 1.4 times faster and
+point reads 1.6.
 
 | db_bench workload, 1 M keys, 4 threads, ops/s | horton 0.19 | horton 0.20 | against 0.19 | RocksDB, same memory | RocksDB, as shipped | 0.20 / RocksDB, same memory |
 |---|---:|---:|---:|---:|---:|---:|
@@ -824,6 +829,68 @@ sequenceDiagram
     are two compaction threads on the same four cores
     ([Reader threads](#reader-threads)).
 
+### Then: the hot path measured again
+
+Step 16 (ADR-0026). With the locks out of the way, a callgrind profile
+of the store put what was left in the code a block passes through:
+
+| | fill | reads |
+|---|---:|---:|
+| LZ77 compression | 38% | 5% |
+| CRC-32 (sealing, device reads, WAL records) | 18% | 4% |
+| LZ77 decompression and its `memcpy` calls | 3% | 22% |
+| 16 KiB images copied out of the cache | | 17% |
+| a 4 KiB value buffer zeroed per table a read probes | | 14% |
+| shifting the memtable's sorted slots | 4% | |
+
+None of it was design. Seven changes, no format change:
+
+- **CRC-32 in three chains**, joined with the CRC's own algebra, and
+  **carried across runs of zero bytes** by one multiplication instead
+  of computed through them: 3.6 GB/s on a 16 KiB block where it was
+  1.4, and 5.2 GB/s on a block that is half zeros, which most
+  compressed blocks are. No hardware CRC: `unsafe` is forbidden, and
+  rustc still asks for it to call a `#[target_feature]` function when
+  the build enables the feature.
+- **The encoder** counts matches a word at a time, loads a word with
+  one bounds check where it took four, stops indexing every byte of a
+  match, and steps faster over input with no match: 1.45 times faster,
+  and its output about 2% smaller. **The decoder** copies short runs
+  as one 16-byte chunk and fills one-byte runs: 1.4 times faster.
+- **A cache hit on a compressed block** reads the 2-byte flag, then
+  only the compressed prefix, and inflates it where it lies in the
+  cache (`CachePort::with_range`). **The index search** runs on the
+  cached image in place. No 16 KiB copies on a hit.
+- **A point read** writes the first value it finds straight into its
+  stage, and no longer zeroes a 4 KiB buffer for every table.
+- **The memtable** keeps entries in arrival order behind a sorted view
+  of positions: an insert into 4,096 entries is 0.34 µs, not 0.77.
+
+1 M keys, no fsync, four threads (the layout of the table at the top),
+two runs of each build, ops/s:
+
+| | before | after | after / before |
+|---|---:|---:|---:|
+| `fillseq` | 163,059 / 170,811 | 217,412 / 209,967 | 1.28× |
+| `fillrandom` | 97,512 / 96,867 | 126,758 / 133,969 | 1.34× |
+| `overwrite` | 90,722 / 88,020 | 124,302 / 128,466 | 1.41× |
+| `readrandom` | 134,243 / 136,173 | 215,763 / 223,744 | 1.63× |
+| `readmissing` | 3,073,581 / 3,444,969 | 4,427,257 / 4,737,398 | 1.41× |
+| `readseq` | 4,070,387 / 5,012,688 | 5,284,520 / 5,993,134 | 1.24× |
+| `readreverse` | 2,497,387 / 3,037,894 | 3,610,294 / 3,700,322 | 1.32× |
+| `seekrandom` | 52,629 / 69,867 | 117,201 / 109,993 | 1.85× |
+| `readwhilewriting` | 69,748 / 71,808 | 107,566 / 112,854 | 1.56× |
+| `deleterandom` | 132,201 / 131,720 | 169,545 / 167,678 | 1.28× |
+
+The runs left 6, 5, 4 and 2 tables in level 0, in that order, so the
+seek and scan rows carry the layout as well as the change. Fills on one
+thread and reads on four (four more runs) agree on the rows the layout
+does not decide: the three write rows gained 1.29 to 1.36 times and
+`readrandom` 1.55 times. This machine was slower than the one the
+table at the top was measured on (its "before" column is below that
+table's 0.20 column throughout), and `db_bench` was not installed, so
+the RocksDB columns were not run again.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
@@ -881,11 +948,12 @@ found by measuring the thing itself, and each time the profile of the
 whole had pointed somewhere else.
 
 **A point read that misses the cache is expensive.** It reads a 16 KiB
-block, CRCs it in software (8.3 µs; `unsafe` is forbidden, so no
-CRC instruction) and inflates it (3 µs). RocksDB reads 4 KiB, checks
-it with a hardware CRC32C or XXH3 and caches the block uncompressed.
-horton's cache holds the compressed image, so even a hit inflates the
-block again (3 µs) after summing it (1.4 µs), and the whole index
+block, CRCs it in software (8.3 µs before step 16, about 3 µs since;
+`unsafe` is forbidden, so no CRC instruction) and inflates it (3 µs
+before step 16, which made it 1.4 times faster). RocksDB reads 4 KiB, checks it with a
+hardware CRC32C or XXH3 and caches the block uncompressed. horton's
+cache holds the compressed image, so even a hit inflates the block
+again, after summing the compressed half of it, and the whole index
 block is summed for every lookup that passes the filter.
 
 **A scan's merge is linear in its cursors.** Each `next` compares the
@@ -896,9 +964,10 @@ forward scan, and a reverse seek still positions every table in range: the
 reverse cursor resolves version runs backwards across blocks and was
 left as it was.
 
-**Compression is 554 MB/s.** Sealing a 16 KiB table block costs 30 µs
-of LZ77, 8 µs of CRC and a write. It is the largest single item in
-`fillrandom` at 1 M keys, about a third of the engine's time.
+**Compression is about 600 MB/s.** Sealing a 16 KiB table block costs
+about 27 µs of LZ77 (40 before step 16), 3 µs of CRC (8 before) and a
+write. It is still the largest single item in `fillrandom` at 1 M
+keys.
 
 ## Levers not pulled
 
@@ -941,14 +1010,23 @@ Measured or scoped while doing this, and left:
 - **A heap or per-level iterators in the scan merge**, and lazy seeks
   for `RevScan`.
 - **Slicing-by-16 CRC-32**: 2.0 → 2.7 GB/s on this machine, for 8 KiB
-  more constant tables. It would take 2 µs off every cache miss and
-  every block written. A modest gain, and the firmware targets would
-  pay the table.
+  more constant tables. Superseded by step 16: three slicing-by-8
+  chains reach 3.6 GB/s with the tables there are.
+- **Group commit across WAL blocks.** A write group is one WAL block
+  and one `fdatasync`, at most about 120 puts of 100 bytes. With four
+  writers a synced group averages 2.6 client writes, so the block is
+  not what limits a group here. Covering several blocks with one sync
+  would also need `Db::write` split into a WAL append and a memtable
+  apply, so that no reader sees a write before it is durable.
+- **Inflating a data block only up to the key.** A point read inflates
+  all 16 KiB to search one key, because the restart offsets are at the
+  end of the block. A resumable decoder and a linear search could stop
+  at the key, about half the inflate on average.
 - **Index blocks verified by the entry.** Needs checksums inside the
   index block, which costs index capacity, and a table's index is one
   block (ADR-0017).
-- **LZ77 with skip acceleration and word-wide match counting.** The
-  stream format would not change; the compressed bytes would.
+- **LZ77 with skip acceleration and word-wide match counting.** Done
+  in step 16.
 - **A check that a detached reader's tables are still its own.** The
   rule that keeps compaction away from readers is the caller's to
   keep (ADR-0018). A table generation stamped in every block would let

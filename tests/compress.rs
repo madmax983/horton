@@ -552,3 +552,89 @@ fn archive_ingest_preserves_compressed_blocks() {
         "ingest must preserve compression flags"
     );
 }
+
+/// The decoder's copy paths (ADR-0026): a fixed 16-byte chunk for
+/// short runs, a fill for one-byte runs, doubling for other overlaps,
+/// and the plain copy when no whole chunk fits before the end of the
+/// output. Hand-built streams, decoded into junk-filled output and
+/// checked against a byte-at-a-time model of the format.
+#[test]
+fn decoder_copy_paths_match_the_byte_rule() {
+    /// One token: `lits` literal bytes, then a match of `mlen` bytes
+    /// (0: none) at `offset`.
+    fn token(out: &mut Vec<u8>, lits: &[u8], mlen: usize, offset: usize) {
+        fn ext(out: &mut Vec<u8>, mut n: usize) {
+            n -= 15;
+            while n >= 255 {
+                out.push(0xFF);
+                n -= 255;
+            }
+            out.push(u8::try_from(n).unwrap());
+        }
+        let l = lits.len().min(15);
+        let m = if mlen == 0 { 0 } else { (mlen - 4).min(15) };
+        out.push(u8::try_from(l << 4 | m).unwrap());
+        if lits.len() >= 15 {
+            ext(out, lits.len());
+        }
+        out.extend_from_slice(lits);
+        if mlen > 0 {
+            if mlen - 4 >= 15 {
+                ext(out, mlen - 4);
+            }
+            out.extend_from_slice(&u16::try_from(offset).unwrap().to_le_bytes());
+        }
+    }
+    /// The format's rule, a byte at a time.
+    fn model(stream: &[(Vec<u8>, usize, usize)]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for (lits, mlen, offset) in stream {
+            out.extend_from_slice(lits);
+            for _ in 0..*mlen {
+                out.push(out[out.len() - offset]);
+            }
+        }
+        out
+    }
+    fn check(stream: &[(Vec<u8>, usize, usize)], what: &str) {
+        let mut enc = Vec::new();
+        for (l, m, o) in stream {
+            token(&mut enc, l, *m, *o);
+        }
+        let want = model(stream);
+        assert_eq!(want.len(), BODY, "{what}: the stream fills the block");
+        let mut out = [0x5Au8; BODY];
+        assert_eq!(decompress(&enc, &mut out), Ok(BODY), "{what}");
+        assert_eq!(&out[..], &want[..], "{what}");
+    }
+    let mut rng = Lcg::new(0xC0DE);
+    let mut lits = |n: usize| -> Vec<u8> { (0..n).map(|_| rng.next().to_le_bytes()[0]).collect() };
+    for offset in 1..=40usize {
+        for mlen in [4usize, 5, 15, 16, 17, 19, 31, 32, 33, 100, 700] {
+            for lit in [0usize, 1, 7, 15, 16, 17, 40] {
+                // A first match far enough in that every offset reaches
+                // back inside the output, then the one under test; the
+                // last token's literals end exactly at the end of the
+                // output. (Only the last token may have no match.)
+                let used = 48 + 4 + lit + mlen;
+                let stream = [
+                    (lits(48), 4, 48),
+                    (lits(lit), mlen, offset),
+                    (lits(BODY - used), 0, 0),
+                ];
+                check(
+                    &stream,
+                    &format!("offset {offset}, match {mlen}, literals {lit}"),
+                );
+            }
+        }
+    }
+    // Short runs in the last 16 bytes of the output, where a whole
+    // chunk does not fit.
+    for tail in 4..=20usize {
+        let stream = [(lits(BODY - tail), tail, 9)];
+        check(&stream, &format!("match in the last {tail} bytes"));
+        let stream = [(lits(BODY - tail - 4), 4, 9), (lits(tail), 0, 0)];
+        check(&stream, &format!("literals in the last {tail} bytes"));
+    }
+}

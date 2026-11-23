@@ -2590,13 +2590,20 @@ mod tests {
     /// Runs `work` on its own thread and fails, instead of hanging, if
     /// it has not finished in a minute: a deadlock in the store shows up
     /// as a failed test.
+    ///
+    /// Five minutes in an unoptimized build. There the heaviest of these
+    /// tests takes most of a minute on its own (every CRC and every
+    /// block's compression runs unoptimized), and beside the rest of
+    /// `cargo test` it ran past one: a slow machine read as a deadlock.
+    /// A deadlock never finishes, so the longer bound still catches it.
     fn within_a_minute(work: impl FnOnce() + Send + 'static) {
+        let limit = if cfg!(debug_assertions) { 300 } else { 60 };
         let (done, finished) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             work();
             let _ = done.send(());
         });
-        match finished.recv_timeout(Duration::from_secs(60)) {
+        match finished.recv_timeout(Duration::from_secs(limit)) {
             Ok(()) => worker.join().expect("worker"),
             // The worker panicked: join to show its message.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

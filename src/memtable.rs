@@ -100,7 +100,7 @@ impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_M
     type Item = Entry<'a, CAP, ARENA, KEY_MAX, VAL_MAX>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let slot = self.table.slots[..self.table.len].get(self.idx)?;
+        let slot = self.table.sorted(self.idx)?;
         self.idx += 1;
         let koff = slot.key_off as usize;
         let kl = usize::from(slot.key_len);
@@ -129,7 +129,14 @@ pub struct MemTable<
     const KEY_MAX: usize,
     const VAL_MAX: usize,
 > {
+    /// Entries in the order they were added: an entry never moves once
+    /// written, so an insert writes one slot and moves none.
     slots: [Slot; CAP],
+    /// The sorted view: `order[i]` is the slot of the `i`th entry in
+    /// key-ascending, sequence-descending order. An insert into the
+    /// middle shifts these 4-byte positions, not the 32-byte slots, which
+    /// was the cost of a random insert into a large table (ADR-0026).
+    order: [u32; CAP],
     len: usize,
     arena: [u8; ARENA],
     arena_len: usize,
@@ -177,6 +184,8 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>
 {
     const ASSERT_CAP: () = assert!(CAP >= 1, "CAP must be at least 1");
+    // The sorted view holds slot positions as `u32`.
+    const ASSERT_CAP_U32: () = assert!(CAP <= u32::MAX as usize, "CAP must fit in u32");
     const ASSERT_ARENA_FITS: () =
         assert!(ARENA <= u32::MAX as usize, "ARENA must fit in u32 offsets");
     const ASSERT_KEY: () = assert!(
@@ -191,11 +200,13 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         // Associated consts are lazy: referencing them here forces the
         // parameter checks to be evaluated for every instantiation.
         let () = Self::ASSERT_CAP;
+        let () = Self::ASSERT_CAP_U32;
         let () = Self::ASSERT_ARENA_FITS;
         let () = Self::ASSERT_KEY;
         let () = Self::ASSERT_VAL;
         Self {
             slots: [Slot::EMPTY; CAP],
+            order: [0; CAP],
             len: 0,
             arena: [0u8; ARENA],
             arena_len: 0,
@@ -247,6 +258,19 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         self.range_dels = 0;
     }
 
+    /// The entry at sorted position `i`, or `None` past the end.
+    fn sorted(&self, i: usize) -> Option<&Slot> {
+        let at = *self.order[..self.len].get(i)?;
+        self.slots.get(at as usize)
+    }
+
+    /// The entries at sorted positions `range`, in order.
+    fn sorted_range(&self, range: core::ops::Range<usize>) -> impl Iterator<Item = &Slot> {
+        self.order[range]
+            .iter()
+            .filter_map(|&at| self.slots.get(at as usize))
+    }
+
     fn slot_key(&self, slot: &Slot) -> &[u8] {
         let off = slot.key_off as usize;
         let len = usize::from(slot.key_len);
@@ -257,9 +281,13 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     /// key is present, `Err(pos)` with the sorted insertion point when it
     /// is absent.
     fn find_run(&self, key: &[u8]) -> Result<usize, usize> {
-        let mut pos =
-            self.slots[..self.len].binary_search_by(|slot| self.slot_key(slot).cmp(key))?;
-        while pos > 0 && self.slot_key(&self.slots[pos - 1]) == key {
+        let mut pos = self.order[..self.len]
+            .binary_search_by(|&at| self.slot_key(&self.slots[at as usize]).cmp(key))?;
+        while pos > 0
+            && self
+                .sorted(pos - 1)
+                .is_some_and(|s| self.slot_key(s) == key)
+        {
             pos -= 1;
         }
         Ok(pos)
@@ -385,8 +413,15 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         self.arena[koff..koff + kl].copy_from_slice(&a.key[..kl]);
         self.arena[voff..voff + vl].copy_from_slice(&a.val[..vl]);
         self.arena_len = voff + vl;
-        self.slots.copy_within(pos..self.len, pos + 1);
-        self.slots[pos] = Slot {
+        // The new entry takes the next free slot; only the sorted view
+        // makes room at `pos`. `len < CAP` (checked by `plan`), and
+        // `ASSERT_CAP_U32` keeps `CAP` within `u32`: the cast is exact.
+        let at = self.len;
+        self.order.copy_within(pos..self.len, pos + 1);
+        #[allow(clippy::cast_possible_truncation)]
+        let at32 = at as u32;
+        self.order[pos] = at32;
+        self.slots[at] = Slot {
             key_off,
             key_len,
             val_off,
@@ -530,7 +565,9 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     pub fn get_at(&self, key: &[u8], max_seq: u64) -> Option<Lookup<'_>> {
         let mut idx = self.find_run(key).ok()?;
         while idx < self.len {
-            let slot = &self.slots[idx];
+            let Some(slot) = self.sorted(idx) else {
+                break;
+            };
             if self.slot_key(slot) != key {
                 break;
             }
@@ -605,7 +642,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     /// The entry at `idx`, or `None` for out-of-range indices.
     #[must_use]
     pub(crate) fn slot_view(&self, idx: usize) -> Option<SlotView<'_>> {
-        let slot = self.slots[..self.len].get(idx)?;
+        let slot = self.sorted(idx)?;
         let koff = slot.key_off as usize;
         let kl = usize::from(slot.key_len);
         let voff = slot.val_off as usize;
@@ -651,6 +688,11 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         dst[..kl].copy_from_slice(&src.arena[koff..koff + kl]);
         dst[kl..].copy_from_slice(&src.arena[voff..voff + vl]);
         let key_off = u32::try_from(at).map_err(|_| Error::ArenaFull)?;
+        // Appended at the end of the sorted view as well: the caller
+        // copies in order. `ASSERT_CAP_U32` keeps the cast exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let pos32 = self.len as u32;
+        self.order[self.len] = pos32;
         self.slots[self.len] = Slot {
             key_off,
             val_off: key_off + u32::from(slot.key_len),
@@ -669,8 +711,20 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
     /// on with them): undoes the [`push_copy`](Self::push_copy)s since
     /// those marks were taken.
     fn truncate_copy(&mut self, len: usize, arena_len: usize) {
-        let dropped = &self.slots[len..self.len];
-        self.range_dels -= dropped.iter().filter(|s| s.range_del).count();
+        // A table built by `push_copy` alone has its sorted view in slot
+        // order, so the dropped entries are the last slots as well, and
+        // the slots below `len` stay exactly the live ones.
+        debug_assert!(
+            self.order[..self.len]
+                .iter()
+                .enumerate()
+                .all(|(i, &at)| at as usize == i)
+        );
+        let dropped = self
+            .sorted_range(len..self.len)
+            .filter(|s| s.range_del)
+            .count();
+        self.range_dels -= dropped;
         self.len = len;
         self.arena_len = arena_len;
     }
@@ -708,13 +762,13 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         let lo = self.lower_bound(start);
         // A range tombstone that starts below `start` can still cover
         // keys of the range.
-        for slot in self.slots[..lo].iter().filter(|s| s.range_del) {
+        for slot in self.sorted_range(0..lo).filter(|s| s.range_del) {
             out.push_copy(self, slot)?;
         }
         let mut keys = 0usize;
         let mut run: Option<&[u8]> = None;
         let mut mark = (out.len, out.arena_len);
-        for slot in &self.slots[lo..self.len] {
+        for slot in self.sorted_range(lo..self.len) {
             let key = self.slot_key(slot);
             if end.is_some_and(|e| key >= e) {
                 break;
@@ -772,7 +826,7 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         let mut hi = self.len;
         if !from.is_empty() {
             hi = self.lower_bound(from);
-            while hi < self.len && self.slot_key(&self.slots[hi]) == from {
+            while self.sorted(hi).is_some_and(|s| self.slot_key(s) == from) {
                 hi += 1;
             }
         }
@@ -782,7 +836,10 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         let mut run: Option<&[u8]> = None;
         let mut horizon = None;
         while lo > 0 {
-            let key = self.slot_key(&self.slots[lo - 1]);
+            let Some(slot) = self.sorted(lo - 1) else {
+                break;
+            };
+            let key = self.slot_key(slot);
             if lower.is_some_and(|l| key <= l) {
                 break;
             }
@@ -798,10 +855,10 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         }
         // Range tombstones that start below the copied keys can cover
         // them; ones that start above `from` cannot.
-        for slot in self.slots[..lo].iter().filter(|s| s.range_del) {
+        for slot in self.sorted_range(0..lo).filter(|s| s.range_del) {
             out.push_copy(self, slot)?;
         }
-        for slot in &self.slots[lo..hi] {
+        for slot in self.sorted_range(lo..hi) {
             out.push_copy(self, slot)?;
         }
         Ok(horizon)

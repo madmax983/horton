@@ -398,35 +398,45 @@ impl<
         // the record does not.
         let reader =
             sstable::TableReader::<R, BLOCK, BLOOM_BYTES>::from_ref(self.device, self.cache, tref)?;
-        // `tmp` (not `acc.stage`) receives the value: only a winning hit is
-        // promoted, so a losing hit cannot clobber the staged winner.
-        let mut tmp = [0u8; VAL_MAX];
-        match reader
-            .lookup_at(scratch, decomp, key, &mut tmp, max_seq)
-            .await?
-        {
+        // A hit wins if it is visible at `max_seq` and newer than the
+        // best so far.
+        let wins = |seq: u64, best: Version| {
+            seq <= max_seq && version_gt(Version::table(tref.node_id, tref.seal_wall, seq), best)
+        };
+        // Only a winning hit may replace a staged winner, so while one is
+        // staged the value goes to a spare buffer and is promoted if it
+        // wins. With nothing staged (no table has given a value yet: the
+        // common case, and nearly every table a read looks into),
+        // `acc.stage` holds nothing to protect and the value goes straight
+        // there. That spares a `VAL_MAX` buffer zeroed per table, and the
+        // second copy.
+        let found = if matches!(acc.best, Best::Value(_)) {
+            let mut spare = [0u8; VAL_MAX];
+            let found = reader
+                .lookup_at(scratch, decomp, key, &mut spare, max_seq)
+                .await?;
+            if let sstable::Lookup::Value { len, seq, .. } = found
+                && wins(seq, acc.best_ver)
+            {
+                acc.stage[..len].copy_from_slice(&spare[..len]);
+            }
+            found
+        } else {
+            reader
+                .lookup_at(scratch, decomp, key, &mut acc.stage, max_seq)
+                .await?
+        };
+        match found {
             sstable::Lookup::Value {
                 len,
                 seq,
                 expire_at,
-            } if seq <= max_seq
-                && version_gt(
-                    Version::table(tref.node_id, tref.seal_wall, seq),
-                    acc.best_ver,
-                ) =>
-            {
+            } if wins(seq, acc.best_ver) => {
                 acc.best_ver = Version::table(tref.node_id, tref.seal_wall, seq);
-                acc.stage[..len].copy_from_slice(&tmp[..len]);
                 acc.best = Best::Value(len);
                 acc.best_expire_at = expire_at;
             }
-            sstable::Lookup::Tombstone { seq }
-                if seq <= max_seq
-                    && version_gt(
-                        Version::table(tref.node_id, tref.seal_wall, seq),
-                        acc.best_ver,
-                    ) =>
-            {
+            sstable::Lookup::Tombstone { seq } if wins(seq, acc.best_ver) => {
                 acc.best_ver = Version::table(tref.node_id, tref.seal_wall, seq);
                 acc.best = Best::Tombstone;
             }

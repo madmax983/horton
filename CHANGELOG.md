@@ -137,8 +137,43 @@ the same memory, from 0.37.
 - `model_tight_commit_ok`, `model_tight_job` and `TightJob` in
   `horton::model`.
 - The kvstore `compact` command uses `request_compaction(0)`.
+- **`CachePort::with_range`** and `BlockCache::with_range` lend a
+  checked range of a cached image to a closure in place, with no copy
+  (ADR-0026). The index search and the inflate of a compressed data
+  block run that way. It is a provided method whose default (`None`:
+  "I do not lend") keeps the copying path, so existing `CachePort`
+  implementations work unchanged. The kvstore's `SharedCache` lends.
 
 ### Changed
+
+- **The hot path, measured again** (ADR-0026). No format change: every
+  CRC is the same value, and the LZ77 stream format is unchanged (images
+  written now decode on older versions and the other way round).
+  - CRC-32 runs as three interleaved chains on 64-bit targets, and
+    carries its register across runs of zero bytes with one
+    multiplication instead of computing through them: 2.6 times faster
+    on a 16 KiB block, 3.7 on a block that is half zeros (most
+    compressed blocks). A hardware CRC is not possible under
+    `#![forbid(unsafe_code)]`.
+  - The LZ77 encoder is 1.45 times faster (a match is counted 8 bytes
+    at a time, a long match is no longer indexed byte by byte, and runs
+    with no match are stepped over faster) and its output about 2%
+    smaller. The decoder is 1.4 times faster (short runs copied as one
+    16-byte chunk, one-byte runs filled, overlapping matches doubled).
+  - A cache hit on a compressed data block reads its flag and then only
+    the compressed prefix, inflated in place: about half the bytes
+    checked, none copied.
+  - A point read no longer zeroes a `VAL_MAX` buffer for every table it
+    looks into.
+  - The memtable keeps slots in arrival order behind a sorted view of
+    4-byte positions: a random insert into a 4,096-entry memtable takes
+    0.34 µs, where shifting the 32-byte slots took 0.77. The view costs
+    4 bytes an entry (64 bytes on the ESP32-S3 profile; BUDGET.md).
+  - kvstore at 1 M keys, four threads, against the build before (mean
+    of two pairs): `fillseq` 1.28×, `fillrandom` 1.34×, `overwrite`
+    1.41×, `readrandom` 1.63×, `readmissing` 1.41×, `readseq` 1.24×,
+    `readreverse` 1.32×, `readwhilewriting` 1.56×, `deleterandom`
+    1.28× (`docs/THROUGHPUT.md`, step 16).
 
 - **Block-cache hits no longer re-run CRC-32** (ADR-0016, superseding
   ADR-0014). Only blocks whose CRC matched are cached, and a hit is
@@ -269,6 +304,9 @@ the same memory, from 0.37.
 
 ### Fixed
 
+- The kvstore's deadlock guard in its tests allows five minutes in an
+  unoptimized build. One test took 52 s of its one-minute limit alone,
+  and timed out beside the rest of `cargo test`.
 - A full table region no longer stops all writes. When no job fits its slot
   estimate, a *tight* job runs with one free slot and never grows the
   region. A region full of expired or deleted data now gives its space

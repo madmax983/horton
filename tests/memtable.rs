@@ -198,3 +198,67 @@ fn range_tombstones_are_tracked_across_inserts_and_clear() {
     assert_eq!(t.max_covering_rdel(b"m", u64::MAX), Some(5));
     assert_eq!(t.max_covering_rdel(b"a", u64::MAX), None);
 }
+
+/// Entries are kept in the order they arrive and found through a sorted
+/// view (ADR-0026). Inserts in a scrambled order, with repeated keys and
+/// a range tombstone, must still iterate key-ascending and
+/// sequence-descending, answer every lookup with the newest version, and
+/// copy any page of the range exactly as the full iteration orders it.
+#[test]
+fn scrambled_inserts_iterate_and_copy_in_order() {
+    type Big = MemTable<512, 32768, 16, 16>;
+    let mut t = Big::new();
+    let mut model: Vec<(Vec<u8>, u64, Vec<u8>)> = Vec::new();
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for seq in 1..=400u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let key = format!("k{:03}", x % 150).into_bytes();
+        let val = format!("v{seq}").into_bytes();
+        t.insert::<Infallible>(&key, &val, seq, false).unwrap();
+        model.push((key, seq, val));
+    }
+    t.insert_range_del::<Infallible>(b"k050", b"k060", 401)
+        .unwrap();
+    model.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let points: Vec<_> = t
+        .iter()
+        .filter(|e| !e.range_del)
+        .map(|e| (e.key.to_vec(), e.seq, e.val.to_vec()))
+        .collect();
+    assert_eq!(points, model, "iteration order");
+
+    for (key, seq, val) in &model {
+        let newest = model.iter().find(|m| &m.0 == key).unwrap();
+        let got = t.get(key).unwrap();
+        assert_eq!((got.seq, got.val), (newest.1, newest.2.as_slice()));
+        let at = t.get_at(key, *seq).unwrap();
+        assert_eq!((at.seq, at.val), (*seq, val.as_slice()));
+    }
+    assert_eq!(t.max_covering_rdel(b"k055", u64::MAX), Some(401));
+    assert_eq!(t.max_covering_rdel(b"k060", u64::MAX), None);
+
+    // Pages of the range, forward: each page is the next run of keys
+    // in iteration order, plus the range tombstone before it.
+    let mut page = Big::new();
+    let mut from = b"k000".to_vec();
+    let mut copied = Vec::new();
+    loop {
+        let horizon = t
+            .copy_range::<Infallible, 512, 32768>(&from, None, 7, &mut page)
+            .unwrap();
+        copied.extend(
+            page.iter()
+                .filter(|e| !e.range_del && e.key >= from.as_slice())
+                .filter(|e| horizon.as_ref().is_none_or(|h| e.key < h.as_slice()))
+                .map(|e| (e.key.to_vec(), e.seq, e.val.to_vec())),
+        );
+        match horizon {
+            Some(h) => from = h.as_slice().to_vec(),
+            None => break,
+        }
+    }
+    assert_eq!(copied, model, "paged copy");
+}

@@ -48,6 +48,10 @@ const MIN_MATCH: usize = 4;
 /// which bounds encode time and keeps the table small.
 const HASH_BITS: u32 = 10;
 const HASH_SIZE: usize = 1 << HASH_BITS;
+/// Consecutive positions without a match before the encoder steps over
+/// more than one byte: after `2^SKIP_TRIGGER` misses the step is 2,
+/// after twice that 3, and so on. LZ4 uses the same trigger.
+const SKIP_TRIGGER: u32 = 6;
 /// Longest match the encoder will emit for one token pair; the
 /// extension bytes could describe more, but one 64 KiB cap keeps the
 /// per-token work bounded.
@@ -134,56 +138,68 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
 
         let mut ip = 0usize; // input position
         let mut anchor = 0usize; // start of pending literals
-        while ip < body {
-            let (mpos, mlen, h) = self.find_match(src, ip, body);
-            if mlen >= MIN_MATCH {
-                let lit_len = ip - anchor;
-                // Encoded match length E = mlen - MIN_MATCH; the nibble
-                // carries min(E, 15) and the extension the rest.
-                let e = mlen - MIN_MATCH;
-                if !self.emit_token(lit_len, e.min(15)) {
-                    return None;
-                }
-                // Token order: literal extension, literals, match
-                // extension, offset (the decoder reads them in this
-                // order, and stops after the literals when the output
-                // is full — so the trailing all-literal token needs no
-                // match part at all).
-                if !self.emit_ext(lit_len) {
-                    return None;
-                }
-                if !self.emit_literals(src, anchor, ip) {
-                    return None;
-                }
-                if !self.emit_ext(e) {
-                    return None;
-                }
-                // Offset: distance back from the current output position
-                // to the match start.
-                let offset = ip - mpos;
-                if !self.emit_u16(offset) {
-                    return None;
-                }
-                // Index the bytes the match skipped so later positions
-                // can match into them (one pass, no re-scan).
-                let end = (ip + mlen).min(body);
-                let mut p = ip + 1;
-                while p + MIN_MATCH <= end {
-                    self.insert(src, p);
-                    p += 1;
-                }
-                ip = end;
-                anchor = ip;
-            } else {
-                // `find_match` already hashed `ip` to probe the table; on
-                // this miss, record `ip` there without hashing it again.
-                // `h == HASH_SIZE` marks the near-tail case where it
-                // couldn't hash at all (mirrors `insert`'s own no-op).
-                if h != HASH_SIZE {
-                    self.insert_at(h, ip);
-                }
-                ip += 1;
+        // Positions since the last match. Past `1 << SKIP_TRIGGER` of
+        // them the input looks incompressible, and the encoder steps over
+        // more than one byte at a time (LZ4's acceleration): a block of
+        // random bytes costs a fraction of the hashing it would.
+        let mut misses = 0usize;
+        while ip + MIN_MATCH <= body {
+            let word = load_u32(src, ip);
+            let h = hash(word);
+            let cand = self.head[h] as usize;
+            self.insert_at(h, ip);
+            // `u32::MAX` (an empty bucket) is never below `ip`.
+            if cand >= ip || ip - cand > 32768 || load_u32(src, cand) != word {
+                ip += 1 + (misses >> SKIP_TRIGGER);
+                misses += 1;
+                continue;
             }
+            misses = 0;
+            // Four bytes match; count the rest, capped so one token pair
+            // stays sane.
+            let cap = (body - ip).min(MAX_MATCH);
+            let mlen = MIN_MATCH
+                + common_prefix(
+                    &src[cand + MIN_MATCH..cand + cap],
+                    &src[ip + MIN_MATCH..ip + cap],
+                );
+            let lit_len = ip - anchor;
+            // Encoded match length E = mlen - MIN_MATCH; the nibble
+            // carries min(E, 15) and the extension the rest.
+            let e = mlen - MIN_MATCH;
+            if !self.emit_token(lit_len, e.min(15)) {
+                return None;
+            }
+            // Token order: literal extension, literals, match extension,
+            // offset (the decoder reads them in this order, and stops
+            // after the literals when the output is full — so the
+            // trailing all-literal token needs no match part at all).
+            if !self.emit_ext(lit_len) {
+                return None;
+            }
+            if !self.emit_literals(src, anchor, ip) {
+                return None;
+            }
+            if !self.emit_ext(e) {
+                return None;
+            }
+            // Offset: distance back from the current output position to
+            // the match start.
+            if !self.emit_u16(ip - cand) {
+                return None;
+            }
+            // Index some of the bytes the match skipped so later
+            // positions can match into them. Not every one: a long match
+            // would cost a hash per byte it covers, more than finding it
+            // did. The first two and the last two are where the next
+            // match most likely begins (LZ4 indexes one).
+            let end = ip + mlen;
+            self.insert(src, ip + 1);
+            self.insert(src, ip + 2);
+            self.insert(src, end - 2);
+            self.insert(src, end - 1);
+            ip = end;
+            anchor = ip;
         }
         // Trailing literals.
         let lit_len = body - anchor;
@@ -212,19 +228,16 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
     /// Hashes 4 bytes at `p` into a bucket.
     ///
     /// `#[inline(always)]` is measured, not decorative — same story as
-    /// `crc32` (`src/crc.rs`): LLVM declines to inline this on its own at
-    /// either of its two call sites (`find_match`, `insert`), which leaves
-    /// each 4-byte little-endian load as four separate bounds-checked
-    /// slice indexes instead of one checked against the caller's
-    /// already-proven length. Confirmed with `callgrind` on
-    /// `benches/compaction.rs`: forcing the inline drops it from
-    /// 463,462,751 to 386,303,098 Ir (-16.65%). See the PR for the full
-    /// before/after.
+    /// `crc32` (`src/crc.rs`): LLVM declined to inline the hash on its
+    /// own, which left each 4-byte little-endian load as four separate
+    /// bounds-checked slice indexes instead of one checked against the
+    /// caller's already-proven length. Confirmed with `callgrind` on
+    /// `benches/compaction.rs`: forcing the inline dropped it from
+    /// 463,462,751 to 386,303,098 Ir (-16.65%).
     #[allow(clippy::inline_always)] // measured with callgrind (see above), not decorative
     #[inline(always)]
-    const fn hash(src: &[u8], p: usize) -> usize {
-        let v = u32::from_le_bytes([src[p], src[p + 1], src[p + 2], src[p + 3]]);
-        (v.wrapping_mul(0x9E37_79B9) >> (32 - HASH_BITS)) as usize
+    const fn hash_at(src: &[u8], p: usize) -> usize {
+        hash(load_u32(src, p))
     }
 
     /// Records `p` in bucket `h`, which the caller has already hashed.
@@ -239,44 +252,9 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
     /// Records position `p` in the hash table. No-op near the tail.
     const fn insert(&mut self, src: &[u8], p: usize) {
         if p + MIN_MATCH <= src.len() {
-            let h = Self::hash(src, p);
+            let h = Self::hash_at(src, p);
             self.insert_at(h, p);
         }
-    }
-
-    /// Finds the longest match at `ip`: the most recent position with the
-    /// same 4-byte hash, within a 32 KiB window. Single probe — bounded
-    /// and simple; the table always holds the freshest candidate.
-    ///
-    /// Also returns the bucket `ip` hashed to, or `HASH_SIZE` on the
-    /// early-return path (too close to the tail to hash at all) — so a
-    /// caller that misses can record `ip` via [`insert_at`](Self::insert_at)
-    /// without hashing the same 4 bytes a second time.
-    fn find_match(&self, src: &[u8], ip: usize, body: usize) -> (usize, usize, usize) {
-        if ip + MIN_MATCH > body {
-            return (0, 0, HASH_SIZE);
-        }
-        let h = Self::hash(src, ip);
-        let cand = self.head[h];
-        if cand == u32::MAX {
-            return (0, 0, h);
-        }
-        let pos = cand as usize;
-        if pos >= ip || ip - pos > 32768 {
-            return (0, 0, h);
-        }
-        // Count the match, capped so one token pair stays sane. Slicing
-        // both windows to exactly `cap` first proves the range once,
-        // instead of bounds-checking each indexed access against the
-        // much larger `src` on every iteration.
-        let cap = (body - ip).min(MAX_MATCH);
-        let a = &src[pos..pos + cap];
-        let b = &src[ip..ip + cap];
-        let mut len = 0usize;
-        while len < cap && a[len] == b[len] {
-            len += 1;
-        }
-        (pos, len, h)
     }
 
     /// Appends one byte; `false` when the staging buffer is full.
@@ -347,6 +325,52 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
     }
 }
 
+/// The 4 bytes at `p`, little-endian: one bounds check and one load,
+/// where indexing the four bytes costs four of each. Every caller has
+/// already checked `p + 4 <= src.len()`; past the end it reads as 0,
+/// which can only cost a match, never produce a wrong one (a match is
+/// counted again from the bytes themselves).
+#[allow(clippy::inline_always)] // see `hash_at`
+#[inline(always)]
+const fn load_u32(src: &[u8], p: usize) -> u32 {
+    match src.split_at_checked(p) {
+        Some((_, rest)) => match rest.first_chunk::<4>() {
+            Some(word) => u32::from_le_bytes(*word),
+            None => 0,
+        },
+        None => 0,
+    }
+}
+
+/// Multiplicative hash of a 4-byte word into a bucket.
+#[allow(clippy::inline_always)] // see `hash_at`
+#[inline(always)]
+const fn hash(word: u32) -> usize {
+    (word.wrapping_mul(0x9E37_79B9) >> (32 - HASH_BITS)) as usize
+}
+
+/// Length of the common prefix of `a` and `b`, which have equal
+/// length: eight bytes a step, and the first differing byte of a word
+/// from its lowest set bit.
+fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let (aw, _) = a.as_chunks::<8>();
+    let (bw, _) = b.as_chunks::<8>();
+    let mut len = 0usize;
+    for (x, y) in aw.iter().zip(bw) {
+        let diff = u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y);
+        if diff != 0 {
+            // At most 7: the cast is exact.
+            return len + (diff.trailing_zeros() / 8) as usize;
+        }
+        len += 8;
+    }
+    let n = a.len().min(b.len());
+    while len < n && a[len] == b[len] {
+        len += 1;
+    }
+    len
+}
+
 /// Decompresses `src` into `dst`, which must be exactly the decompressed
 /// block size (`BLOCK - 4`).
 ///
@@ -390,7 +414,7 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
         if sp + lit_len > src.len() {
             return Err(DecompressError::Truncated);
         }
-        dst[dp..dp + lit_len].copy_from_slice(&src[sp..sp + lit_len]);
+        copy_literals(dst, dp, src, sp, lit_len);
         sp += lit_len;
         dp += lit_len;
         if dp == out_len {
@@ -418,24 +442,68 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
         if offset >= match_len {
             // Source and destination ranges are disjoint (source ends at
             // or before `dp`): a single bulk copy is equivalent to the
-            // byte-by-byte loop below, since no destination byte is read
-            // as a source byte.
-            dst.copy_within(mp..mp + match_len, dp);
+            // byte-by-byte rule, since no destination byte is read as a
+            // source byte.
+            copy_match(dst, mp, dp, match_len);
+        } else if offset == 1 {
+            // A run of one byte: the zero fill at the end of every block.
+            let b = dst[mp];
+            dst[dp..end].fill(b);
         } else {
-            // Overlapping (e.g. run-length patterns like offset == 1):
-            // must go byte-by-byte so each newly written byte becomes
-            // visible as a source byte for the bytes after it.
-            let mut mp = mp;
-            let mut dp = dp;
-            while dp < end {
-                dst[dp] = dst[mp];
-                dp += 1;
-                mp += 1;
+            // Overlapping: each output byte repeats the one `offset`
+            // back, so the output is periodic from `mp`. Copying
+            // `dst[mp..mp + n]` to `d` with `n <= d - mp` reads only
+            // bytes already final, and doubles the distance each round:
+            // a few bulk copies where a byte loop takes `match_len`
+            // steps.
+            let mut d = dp;
+            while d < end {
+                let n = (d - mp).min(end - d);
+                dst.copy_within(mp..mp + n, d);
+                d += n;
             }
         }
         dp = end;
     }
     Ok(out_len)
+}
+
+/// Bytes the decoder copies as one fixed-size chunk when it may.
+const SHORT: usize = 16;
+
+/// Copies `src[sp..sp + n]` to `dst[dp..]`. The caller has checked both
+/// ranges. A run of up to [`SHORT`] bytes, with room for a whole chunk
+/// on both sides, is one fixed 16-byte copy: two loads and two stores
+/// where a copy of `n` bytes is a call. The bytes past `n` it writes lie
+/// ahead of the output position, and the tokens that follow write them
+/// again before anything reads them. (Copying longer runs chunk by
+/// chunk measured no faster than the call.)
+#[allow(clippy::inline_always)] // the decoder's inner copy: a call here is the cost being removed
+#[inline(always)]
+fn copy_literals(dst: &mut [u8], dp: usize, src: &[u8], sp: usize, n: usize) {
+    if n <= SHORT
+        && let Some(to) = dst.get_mut(dp..dp + SHORT)
+        && let Some(from) = src.get(sp..sp + SHORT)
+    {
+        to.copy_from_slice(from);
+    } else {
+        dst[dp..dp + n].copy_from_slice(&src[sp..sp + n]);
+    }
+}
+
+/// Copies the match `dst[mp..mp + n]` to `dst[dp..]`, where the two do
+/// not overlap (`mp + n <= dp`). A match of up to [`SHORT`] bytes, with
+/// room for a whole chunk, is one fixed 16-byte copy: two loads and two
+/// stores where a copy of `n` bytes is a call. The bytes it writes past
+/// `dp + n` are written again later, as in [`copy_literals`].
+#[allow(clippy::inline_always)] // as `copy_literals`
+#[inline(always)]
+fn copy_match(dst: &mut [u8], mp: usize, dp: usize, n: usize) {
+    if n <= SHORT && dp + SHORT <= dst.len() {
+        dst.copy_within(mp..mp + SHORT, dp);
+    } else {
+        dst.copy_within(mp..mp + n, dp);
+    }
 }
 
 /// Reads LZ4-style extension bytes: `0xFF` adds 255 each, the first
