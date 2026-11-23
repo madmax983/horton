@@ -383,89 +383,153 @@ fn common_prefix(a: &[u8], b: &[u8]) -> usize {
 /// length, or match offset. The decoder never panics, whatever bytes it
 /// is handed.
 pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> {
-    let mut sp = 0usize; // stream position
-    let mut dp = 0usize; // output position
-    let out_len = dst.len();
+    let mut inflate = Inflate::new();
+    inflate.run(src, dst, dst.len())?;
+    Ok(dst.len())
+}
 
-    // Reads one stream byte.
-    macro_rules! take {
-        () => {{
-            if sp >= src.len() {
+/// A decode that can stop part way and go on later: [`decompress`] in
+/// steps. A point lookup inflates a data block only as far as the entry
+/// that answers it (ADR-0027); [`run`](Self::run) is called again, with
+/// the same `src` and `dst`, each time the lookup needs more.
+///
+/// Bytes of `dst` below [`done`](Self::done) are final. Bytes at or past
+/// it are not: the decoder copies short runs as whole 16-byte chunks,
+/// which write a little past the run, and later tokens write those bytes
+/// again.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Inflate {
+    /// Stream position: the next token starts here.
+    sp: usize,
+    /// Output position: `dst[..dp]` is final.
+    dp: usize,
+}
+
+impl Inflate {
+    /// A decode at the start of the stream.
+    pub(crate) const fn new() -> Self {
+        Self { sp: 0, dp: 0 }
+    }
+
+    /// Bytes of output that are final.
+    pub(crate) const fn done(&self) -> usize {
+        self.dp
+    }
+
+    /// Decodes whole tokens until at least `until` bytes of `dst` are
+    /// final (or `dst` is full). `src` and `dst` must be the ones of
+    /// every earlier call. The rules, and the errors, are
+    /// [`decompress`]'s. After an error the decode must not be resumed.
+    ///
+    /// # Errors
+    ///
+    /// As [`decompress`].
+    pub(crate) fn run(
+        &mut self,
+        src: &[u8],
+        dst: &mut [u8],
+        until: usize,
+    ) -> Result<(), DecompressError> {
+        let out_len = dst.len();
+        let until = until.min(out_len);
+        let (sp, dp) = self.decode(src, dst, out_len, until)?;
+        self.sp = sp;
+        self.dp = dp;
+        Ok(())
+    }
+
+    /// The decode loop: tokens from `self.sp` while the output is below
+    /// `until`. Returns the new stream and output positions.
+    fn decode(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        out_len: usize,
+        until: usize,
+    ) -> Result<(usize, usize), DecompressError> {
+        let mut sp = self.sp; // stream position
+        let mut dp = self.dp; // output position
+
+        // Reads one stream byte.
+        macro_rules! take {
+            () => {{
+                if sp >= src.len() {
+                    return Err(DecompressError::Truncated);
+                }
+                let b = src[sp];
+                sp += 1;
+                b
+            }};
+        }
+
+        while dp < until {
+            let tag = take!();
+            let mut lit_len = usize::from(tag >> 4);
+            let mut match_len = usize::from(tag & 0x0F);
+
+            if lit_len == 15 {
+                lit_len += read_ext(src, &mut sp)?;
+            }
+            // Copy literals.
+            if lit_len > out_len - dp {
+                return Err(DecompressError::Invalid);
+            }
+            if sp + lit_len > src.len() {
                 return Err(DecompressError::Truncated);
             }
-            let b = src[sp];
-            sp += 1;
-            b
-        }};
-    }
-
-    while dp < out_len {
-        let tag = take!();
-        let mut lit_len = usize::from(tag >> 4);
-        let mut match_len = usize::from(tag & 0x0F);
-
-        if lit_len == 15 {
-            lit_len += read_ext(src, &mut sp)?;
-        }
-        // Copy literals.
-        if lit_len > out_len - dp {
-            return Err(DecompressError::Invalid);
-        }
-        if sp + lit_len > src.len() {
-            return Err(DecompressError::Truncated);
-        }
-        copy_literals(dst, dp, src, sp, lit_len);
-        sp += lit_len;
-        dp += lit_len;
-        if dp == out_len {
-            break;
-        }
-
-        if match_len == 15 {
-            match_len += read_ext(src, &mut sp)?;
-        }
-        match_len += MIN_MATCH;
-        // Offset: 2 bytes, little-endian, 1-based distance back.
-        if sp + 2 > src.len() {
-            return Err(DecompressError::Truncated);
-        }
-        let offset = usize::from(src[sp]) | (usize::from(src[sp + 1]) << 8);
-        sp += 2;
-        if offset == 0 || offset > dp {
-            return Err(DecompressError::Invalid);
-        }
-        if match_len > out_len - dp {
-            return Err(DecompressError::Invalid);
-        }
-        let mp = dp - offset;
-        let end = dp + match_len;
-        if offset >= match_len {
-            // Source and destination ranges are disjoint (source ends at
-            // or before `dp`): a single bulk copy is equivalent to the
-            // byte-by-byte rule, since no destination byte is read as a
-            // source byte.
-            copy_match(dst, mp, dp, match_len);
-        } else if offset == 1 {
-            // A run of one byte: the zero fill at the end of every block.
-            let b = dst[mp];
-            dst[dp..end].fill(b);
-        } else {
-            // Overlapping: each output byte repeats the one `offset`
-            // back, so the output is periodic from `mp`. Copying
-            // `dst[mp..mp + n]` to `d` with `n <= d - mp` reads only
-            // bytes already final, and doubles the distance each round:
-            // a few bulk copies where a byte loop takes `match_len`
-            // steps.
-            let mut d = dp;
-            while d < end {
-                let n = (d - mp).min(end - d);
-                dst.copy_within(mp..mp + n, d);
-                d += n;
+            copy_literals(dst, dp, src, sp, lit_len);
+            sp += lit_len;
+            dp += lit_len;
+            if dp == out_len {
+                break;
             }
+
+            if match_len == 15 {
+                match_len += read_ext(src, &mut sp)?;
+            }
+            match_len += MIN_MATCH;
+            // Offset: 2 bytes, little-endian, 1-based distance back.
+            if sp + 2 > src.len() {
+                return Err(DecompressError::Truncated);
+            }
+            let offset = usize::from(src[sp]) | (usize::from(src[sp + 1]) << 8);
+            sp += 2;
+            if offset == 0 || offset > dp {
+                return Err(DecompressError::Invalid);
+            }
+            if match_len > out_len - dp {
+                return Err(DecompressError::Invalid);
+            }
+            let mp = dp - offset;
+            let end = dp + match_len;
+            if offset >= match_len {
+                // Source and destination ranges are disjoint (source ends at
+                // or before `dp`): a single bulk copy is equivalent to the
+                // byte-by-byte rule, since no destination byte is read as a
+                // source byte.
+                copy_match(dst, mp, dp, match_len);
+            } else if offset == 1 {
+                // A run of one byte: the zero fill at the end of every block.
+                let b = dst[mp];
+                dst[dp..end].fill(b);
+            } else {
+                // Overlapping: each output byte repeats the one `offset`
+                // back, so the output is periodic from `mp`. Copying
+                // `dst[mp..mp + n]` to `d` with `n <= d - mp` reads only
+                // bytes already final, and doubles the distance each round:
+                // a few bulk copies where a byte loop takes `match_len`
+                // steps.
+                let mut d = dp;
+                while d < end {
+                    let n = (d - mp).min(end - d);
+                    dst.copy_within(mp..mp + n, d);
+                    d += n;
+                }
+            }
+            dp = end;
         }
-        dp = end;
+        Ok((sp, dp))
     }
-    Ok(out_len)
 }
 
 /// Bytes the decoder copies as one fixed-size chunk when it may.

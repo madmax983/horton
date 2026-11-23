@@ -890,6 +890,27 @@ table at the top was measured on (its "before" column is below that
 table's 0.20 column throughout), and `db_bench` was not installed, so
 the RocksDB columns were not run again.
 
+### Then: point reads that inflate only to their key
+
+Step 17 (ADR-0027). A point read inflated the whole 16 KiB of the data
+block it searched, because the restart offsets it binary-searches are
+at the end of the block. The decoder can now stop and resume, and a
+point lookup scans a compressed block's entries as it inflates them,
+stopping at the answer: about half the block inflated on average.
+What the scan cannot decide (the end of the entries, where a version
+run may go on in the next block) is left to the whole-block search.
+
+300 K keys, fills on one thread, reads on one, two runs of each build,
+ops/s:
+
+| | before | after |
+|---|---:|---:|
+| `readrandom` | 78,891 / 77,010 | 86,248 / 86,065 |
+| `readrandom` (again) | 79,832 / 75,545 | 84,667 / 83,844 |
+
+About 9% on point reads. Scans, seeks and compaction read whole blocks
+and do not change.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
@@ -1017,10 +1038,8 @@ Measured or scoped while doing this, and left:
   not what limits a group here. Covering several blocks with one sync
   would also need `Db::write` split into a WAL append and a memtable
   apply, so that no reader sees a write before it is durable.
-- **Inflating a data block only up to the key.** A point read inflates
-  all 16 KiB to search one key, because the restart offsets are at the
-  end of the block. A resumable decoder and a linear search could stop
-  at the key, about half the inflate on average.
+- **Inflating a data block only up to the key.** Done in step 17
+  (ADR-0027).
 - **Index blocks verified by the entry.** Needs checksums inside the
   index block, which costs index capacity, and a table's index is one
   block (ADR-0017).

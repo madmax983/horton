@@ -146,6 +146,13 @@ the same memory, from 0.37.
 
 ### Changed
 
+- **A point read inflates a data block only as far as its key**
+  (ADR-0027). The LZ77 decoder can stop and resume; a point lookup
+  scans a compressed block's entries as it inflates them and stops at
+  the answer, leaving what the scan cannot decide (the end of the
+  entries) to the whole-block search. Same answers, about half the
+  inflating; `readrandom` on one thread 9% faster. A raw block is
+  searched where it lies in the cache.
 - **The hot path, measured again** (ADR-0026). No format change: every
   CRC is the same value, and the LZ77 stream format is unchanged (images
   written now decode on older versions and the other way round).

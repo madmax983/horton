@@ -51,7 +51,7 @@
 use core::future::poll_fn;
 
 use crate::cache::CachePort;
-use crate::compress::{CompressScratch, decompress};
+use crate::compress::{CompressScratch, Inflate, decompress};
 use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -2297,20 +2297,7 @@ fn data_lookup<E>(
                 let (mut entry, mut next) = (entry, next);
                 loop {
                     if entry.seq <= max_seq {
-                        if entry.op == Op::Delete {
-                            return Ok(BlockOutcome::Hit(DataHit::Tombstone(entry.seq)));
-                        }
-                        if entry.val.len() > val_buf.len() {
-                            return Err(Error::BufferTooSmall {
-                                need: entry.val.len(),
-                            });
-                        }
-                        val_buf[..entry.val.len()].copy_from_slice(entry.val);
-                        return Ok(BlockOutcome::Hit(DataHit::Value {
-                            len: entry.val.len(),
-                            seq: entry.seq,
-                            expire_at: entry.expire_at,
-                        }));
+                        return data_hit(&entry, val_buf);
                     }
                     off = next;
                     if off >= rstart {
@@ -2333,6 +2320,173 @@ fn data_lookup<E>(
         }
     }
     Ok(BlockOutcome::Truncated)
+}
+
+/// The outcome [`data_lookup`] gives once it has found the newest version
+/// of `key` visible at `max_seq`: its value copied out, or a tombstone.
+fn data_hit<E>(entry: &ParsedEntry<'_>, val_buf: &mut [u8]) -> Result<BlockOutcome, Error<E>> {
+    if entry.op == Op::Delete {
+        return Ok(BlockOutcome::Hit(DataHit::Tombstone(entry.seq)));
+    }
+    let len = entry.val.len();
+    let dst = val_buf
+        .get_mut(..len)
+        .ok_or(Error::BufferTooSmall { need: len })?;
+    dst.copy_from_slice(entry.val);
+    Ok(BlockOutcome::Hit(DataHit::Value {
+        len,
+        seq: entry.seq,
+        expire_at: entry.expire_at,
+    }))
+}
+
+/// Output a partial inflate decodes past what the scan needs, so that the
+/// decoder is called once per few entries rather than once per entry.
+const INFLATE_STEP: usize = 1024;
+
+/// [`data_lookup`] over a compressed data block, inflating `stream` into
+/// `logical` only as far as the answer needs (ADR-0027).
+///
+/// The restart offsets that let [`data_lookup`] binary-search a block sit
+/// at its end, so it needs the whole block inflated. Here the entries are
+/// scanned from the first, with the decode kept just ahead of the scan,
+/// and the scan stops where the answer is decided: at the newest visible
+/// version of `key` (a value or a tombstone), or at a larger key. A point
+/// read whose key lies halfway through the block inflates half of it.
+///
+/// What the scan does not decide is left to [`data_lookup`] itself, after
+/// inflating the rest: the end of the entries (zero padding, or the
+/// restart offsets, whose first is always 0 and so reads as an empty key:
+/// the run may go on in the next block), and anything that does not
+/// parse. Those answers, and the corruption they report, are exactly the
+/// whole-block search's. The answers the scan gives itself are the ones
+/// the whole-block search gives for every block the writer produces: its
+/// binary search only chooses where to start the same linear scan.
+fn data_lookup_inflating<E, const BLOCK: usize>(
+    stream: &[u8],
+    logical: &mut [u8; BLOCK],
+    key: &[u8],
+    val_buf: &mut [u8],
+    block_id: u64,
+    max_seq: u64,
+) -> Result<BlockOutcome, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
+    let out = &mut logical[..body_end];
+    let mut inflate = Inflate::new();
+    // Decodes until `need` bytes are final; `false` when the block holds
+    // fewer.
+    let ready = |inflate: &mut Inflate, out: &mut [u8], need: usize| {
+        if need > out.len() {
+            return Ok(false);
+        }
+        if inflate.done() < need {
+            let until = need.max(inflate.done() + INFLATE_STEP);
+            inflate.run(stream, out, until).map_err(|_| corrupt())?;
+        }
+        Ok::<bool, Error<E>>(inflate.done() >= need)
+    };
+    let mut off = 0usize;
+    loop {
+        if !ready(&mut inflate, out, off + ENTRY_HEADER)? {
+            break;
+        }
+        let head = &out[off..off + ENTRY_HEADER];
+        let kl = usize::from(u16::from_le_bytes([head[0], head[1]]));
+        let vl = usize::from(u16::from_le_bytes([head[2], head[3]]));
+        if kl == 0 {
+            // The end of the entries: padding or the restart offsets.
+            break;
+        }
+        let ttl = if head[12] == Op::PutTtl.to_u8() { 8 } else { 0 };
+        if !ready(&mut inflate, out, off + ENTRY_HEADER + kl + vl + ttl)? {
+            break;
+        }
+        let Ok((entry, next)) = data_entry_parse(&out[..inflate.done()], off) else {
+            break;
+        };
+        match entry.key.cmp(key) {
+            core::cmp::Ordering::Greater => return Ok(BlockOutcome::Absent),
+            core::cmp::Ordering::Equal if entry.seq <= max_seq => {
+                return data_hit(&entry, val_buf);
+            }
+            // A smaller key, or a version newer than the snapshot (the
+            // run goes on): the next entry.
+            core::cmp::Ordering::Less | core::cmp::Ordering::Equal => off = next,
+        }
+    }
+    // Not decided by the scan: the whole block, and the whole-block rules.
+    if !ready(&mut inflate, out, body_end)? {
+        return Err(corrupt());
+    }
+    data_lookup(out, key, val_buf, block_id, max_seq)
+}
+
+/// [`data_lookup`] over a verified block image as stored: in place when
+/// it is raw, inflating only as far as needed when it is compressed.
+fn lookup_image<E, const BLOCK: usize>(
+    image: &[u8],
+    logical: &mut [u8; BLOCK],
+    key: &[u8],
+    val_buf: &mut [u8],
+    block_id: u64,
+    max_seq: u64,
+) -> Result<BlockOutcome, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
+    let body = image
+        .get(..body_end)
+        .filter(|_| image.len() == BLOCK && body_end >= 2)
+        .ok_or_else(corrupt)?;
+    let flag = u16::from_le_bytes([body[body_end - 2], body[body_end - 1]]);
+    if flag & 0x8000 == 0 {
+        return data_lookup(body, key, val_buf, block_id, max_seq);
+    }
+    let clen = usize::from(flag & 0x7FFF);
+    let stream = body
+        .get(..clen)
+        .filter(|_| clen < body_end)
+        .ok_or_else(corrupt)?;
+    data_lookup_inflating(stream, logical, key, val_buf, block_id, max_seq)
+}
+
+/// One data block of a point lookup: [`data_lookup`]'s answer for block
+/// `block_id`. A cache that lends its images has the block searched
+/// where it lies (one lookup, counted once); otherwise the block is read
+/// into `raw` as [`read_block_verified`] reads it. Either way a
+/// compressed block is inflated into `logical` only as far as the answer
+/// needs.
+#[allow(clippy::too_many_arguments)] // one call site; a struct would only rename them
+async fn lookup_data_block<D: BlockDevice, const BLOCK: usize>(
+    device: &D,
+    cache: Option<&dyn CachePort<BLOCK>>,
+    table_id: u32,
+    block_id: u64,
+    raw: &mut [u8; BLOCK],
+    logical: &mut [u8; BLOCK],
+    key: &[u8],
+    val_buf: &mut [u8],
+    max_seq: u64,
+) -> Result<BlockOutcome, Error<D::Error>> {
+    if let Some(c) = cache {
+        let mut found = None;
+        let lent = c.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
+            found = Some(lookup_image::<D::Error, BLOCK>(
+                image, logical, key, val_buf, block_id, max_seq,
+            ));
+        });
+        match (lent, found) {
+            (Some(true), Some(outcome)) => return outcome,
+            (Some(_), _) => {
+                // A miss: to the device, without asking the cache again.
+                fetch_block(device, cache, table_id, block_id, raw, true).await?;
+                return lookup_image(raw, logical, key, val_buf, block_id, max_seq);
+            }
+            (None, _) => {}
+        }
+    }
+    read_block_verified(device, cache, table_id, block_id, raw, true).await?;
+    lookup_image(raw, logical, key, val_buf, block_id, max_seq)
 }
 
 /// Result of a point lookup in one table, carrying the entry's sequence
@@ -3086,25 +3240,21 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
         // forward, and `remaining` keeps it inside the table's data blocks.
         loop {
             // A bad CRC is an error, never a miss (see `read_data_block`).
-            // A flagged block inflates into `decomp`; a raw block parses
-            // in place from `scratch`.
-            let inflated = read_data_block(
+            // A compressed block inflates into `decomp` only as far as the
+            // answer needs; a raw block parses where it lies.
+            let outcome = lookup_data_block(
                 device,
                 self.cache,
                 self.table_id,
                 block_id,
                 scratch,
                 decomp,
-                true,
+                key,
+                val_buf,
+                max_seq,
             )
             .await?;
-            let body_end = BLOCK - CRC_LEN;
-            let body: &[u8] = if inflated {
-                &decomp[..body_end]
-            } else {
-                &scratch[..body_end]
-            };
-            match data_lookup::<D::Error>(body, key, val_buf, block_id, max_seq)? {
+            match outcome {
                 BlockOutcome::Hit(DataHit::Value {
                     len,
                     seq,
@@ -3468,5 +3618,215 @@ mod tests {
         // A short filter is the head of the section's only block.
         assert_eq!(BloomShape::locate(4096, &(0..7)), (0, 0..7));
         assert_eq!(BloomShape::locate(48, &(0..40)), (0, 0..40));
+    }
+}
+
+/// The partial inflate (ADR-0027) against the whole-block search: the
+/// same answer for every key, snapshot and buffer size, on every data
+/// block of compressed and raw tables.
+#[cfg(test)]
+mod partial_inflate_tests {
+    extern crate std;
+
+    use super::{
+        BlockOutcome, CRC_LEN, DataHit, SstEntry, TableWriter, data_lookup, inflate_data_block,
+        lookup_image,
+    };
+    use crate::compress::CompressScratch;
+    use crate::device::BlockDevice;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use std::format;
+    use std::vec::Vec;
+
+    const BLOCK: usize = 4096;
+
+    struct Ram(Vec<[u8; BLOCK]>);
+
+    impl BlockDevice for Ram {
+        type Error = ();
+        const BLOCK: usize = BLOCK;
+        fn poll_read_block(
+            &self,
+            _: &mut Context<'_>,
+            id: u64,
+            buf: &mut [u8],
+        ) -> Poll<Result<(), ()>> {
+            buf.copy_from_slice(&self.0[usize::try_from(id).unwrap()]);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_write_block(
+            &mut self,
+            _: &mut Context<'_>,
+            id: u64,
+            buf: &[u8],
+        ) -> Poll<Result<(), ()>> {
+            self.0[usize::try_from(id).unwrap()].copy_from_slice(buf);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_flush(&mut self, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn block_on<F: Future>(f: F) -> F::Output {
+        let mut f = pin!(f);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    /// An outcome as comparable data, with the value bytes of a hit.
+    fn shape(r: &Result<BlockOutcome, crate::Error<()>>, val: &[u8]) -> std::string::String {
+        match r {
+            Ok(BlockOutcome::Hit(DataHit::Value {
+                len,
+                seq,
+                expire_at,
+            })) => format!("value {seq} {expire_at} {:?}", &val[..*len]),
+            Ok(BlockOutcome::Hit(DataHit::Tombstone(seq))) => format!("tombstone {seq}"),
+            Ok(BlockOutcome::Absent) => "absent".into(),
+            Ok(BlockOutcome::Truncated) => "truncated".into(),
+            Err(e) => format!("error {e:?}"),
+        }
+    }
+
+    /// A table of `keys` keys, each with 1 to 4 versions (newest first),
+    /// some of them tombstones and some with an expiry; written with
+    /// compression (`compressible`) or with every block raw.
+    fn table(keys: u32, compressible: bool) -> (Ram, u64) {
+        // Key, value, sequence number, tombstone, expiry.
+        type Row = (Vec<u8>, Vec<u8>, u64, bool, u64);
+        let mut entries: Vec<Row> = Vec::new();
+        let mut seq = 10_000u64;
+        let mut x = 0x9E37_79B9u32;
+        for k in 0..keys {
+            // Every third key leaves a gap, so absent keys fall between.
+            let key = format!("key{:05}", k * 3).into_bytes();
+            for v in 0..=(k % 4) {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let len = 20 + usize::try_from(x % 180).unwrap();
+                let fill = b'a' + k.to_le_bytes()[0] % 26;
+                let val: Vec<u8> = if compressible {
+                    std::iter::repeat_n(fill, len).collect()
+                } else {
+                    let mut y = x;
+                    (0..len)
+                        .map(|_| {
+                            y = y.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                            y.to_le_bytes()[2]
+                        })
+                        .collect()
+                };
+                let tomb = (k + v) % 7 == 0;
+                let expire = if (k + v) % 5 == 0 {
+                    1_000 + u64::from(k)
+                } else {
+                    0
+                };
+                entries.push((key.clone(), val, seq - u64::from(v), tomb, expire));
+            }
+            seq -= 10;
+        }
+        let mut dev = Ram(std::vec![[0u8; BLOCK]; 512]);
+        let mut w = TableWriter::<BLOCK, 64, 32>::new(0, 3);
+        let mut cs = CompressScratch::<BLOCK>::new();
+        for (key, val, seq, tomb, expire) in &entries {
+            let e = SstEntry {
+                key,
+                val: if *tomb { &[] } else { val },
+                seq: *seq,
+                tombstone: *tomb,
+                expire_at: *expire,
+            };
+            let cs = compressible.then_some(&mut cs);
+            block_on(w.push(&mut dev, e, cs)).unwrap();
+        }
+        let done = block_on(w.finish(&mut dev, compressible.then_some(&mut cs))).unwrap();
+        (dev, done.data_blocks)
+    }
+
+    #[test]
+    fn partial_inflate_answers_as_the_whole_block_does() {
+        for compressible in [true, false] {
+            let (dev, blocks) = table(700, compressible);
+            assert!(blocks > 4, "the table spans blocks");
+            let mut compressed = 0;
+            for b in 0..usize::try_from(blocks).unwrap() {
+                let image = dev.0[b];
+                let mut whole = [0u8; BLOCK];
+                let inflated =
+                    inflate_data_block::<(), BLOCK>(&image, &mut whole, b as u64).unwrap();
+                compressed += usize::from(inflated);
+                let body: &[u8] = if inflated {
+                    &whole[..BLOCK - CRC_LEN]
+                } else {
+                    &image[..BLOCK - CRC_LEN]
+                };
+                for k in 0..(700 * 3 + 5) {
+                    let key = format!("key{k:05}").into_bytes();
+                    for max_seq in [u64::MAX, 10_000 - 3_000 - 1, 10_000 - 3_000 - 2, 5_000, 0] {
+                        for cap in [4096usize, 30] {
+                            let mut want_val = std::vec![0u8; cap];
+                            let want =
+                                data_lookup::<()>(body, &key, &mut want_val, b as u64, max_seq);
+                            let mut got_val = std::vec![0u8; cap];
+                            let mut scratch = [0xEEu8; BLOCK];
+                            let got = lookup_image::<(), BLOCK>(
+                                &image,
+                                &mut scratch,
+                                &key,
+                                &mut got_val,
+                                b as u64,
+                                max_seq,
+                            );
+                            assert_eq!(
+                                shape(&got, &got_val),
+                                shape(&want, &want_val),
+                                "block {b}, key {k}, max_seq {max_seq}, buffer {cap}, compressible {compressible}"
+                            );
+                        }
+                    }
+                }
+            }
+            // The point of it: a hit on a block's first key inflates the
+            // first step of the block, not the block. Past that the
+            // output buffer is as the caller left it.
+            for b in 0..usize::try_from(blocks).unwrap() {
+                let image = dev.0[b];
+                let mut whole = [0u8; BLOCK];
+                if !inflate_data_block::<(), BLOCK>(&image, &mut whole, b as u64).unwrap() {
+                    continue;
+                }
+                let kl = usize::from(u16::from_le_bytes([whole[0], whole[1]]));
+                let first = whole[13..13 + kl].to_vec();
+                let mut scratch = [0xEEu8; BLOCK];
+                let mut val = [0u8; 4096];
+                let got = lookup_image::<(), BLOCK>(
+                    &image,
+                    &mut scratch,
+                    &first,
+                    &mut val,
+                    b as u64,
+                    u64::MAX,
+                );
+                assert!(matches!(got, Ok(BlockOutcome::Hit(_))), "block {b}");
+                assert!(
+                    scratch[2048..BLOCK - CRC_LEN].iter().all(|&x| x == 0xEE),
+                    "block {b}: a hit on the first key inflated the whole block"
+                );
+            }
+            if compressible {
+                assert!(compressed > 4, "most blocks are compressed");
+            } else {
+                assert_eq!(compressed, 0, "written without compression");
+            }
+        }
     }
 }
