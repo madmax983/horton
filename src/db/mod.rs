@@ -396,8 +396,8 @@ pub struct Db<
     /// a fallback buffer in every `get` future. `&mut self` operations
     /// reach it with `get_mut`, which no read can contend with.
     get_scratch: RefCell<[u8; BLOCK]>,
-    /// Decompression buffer for point reads: data blocks flagged
-    /// compressed inflate into here before parsing (see
+    /// Decompression buffer for point reads: a data block flagged
+    /// compressed inflates into here as far as the lookup needs (see
     /// [`sstable::TableReader::lookup_at`](crate::sstable::TableReader::lookup_at)).
     /// Same borrow discipline as `get_scratch`.
     decomp_scratch: RefCell<[u8; BLOCK]>,

@@ -1658,8 +1658,10 @@ pub(crate) fn rdel_parse_at(block: &[u8], off: usize) -> Result<(RdelEntry<'_>, 
 /// A set flag with an impossible length, or a decoder rejection, is
 /// [`Error::CorruptBlock`]: the CRC already passed, so this is a format
 /// violation rather than a torn write — but it is still an error, never
-/// a panic. Used by every data-block read path (point lookups, scans,
-/// compaction cursors, entry streams).
+/// a panic. Used by every data-block read path that needs the whole
+/// block (scans, compaction cursors, entry streams). A point lookup
+/// inflates only as far as its answer instead (`data_lookup_inflating`,
+/// ADR-0027), and uses this only to test it.
 pub(crate) fn inflate_data_block<E, const BLOCK: usize>(
     raw: &[u8; BLOCK],
     decomp: &mut [u8; BLOCK],
@@ -2652,8 +2654,10 @@ async fn fetch_block<D: BlockDevice, const BLOCK: usize>(
     Ok(())
 }
 
-/// The single funnel for data-block reads, shared by point lookups, both
-/// scan directions, and compaction: reads block `block_id` into `raw`
+/// The funnel for whole data-block reads, shared by both scan directions
+/// and compaction (a point lookup has its own, `lookup_data_block`, which
+/// inflates only as far as its answer: ADR-0027): reads block `block_id`
+/// into `raw`
 /// (through the cache when given; `hot` inserts it as a point read
 /// would), verifies its CRC, and inflates it into `logical` when its
 /// compression flag is set. Returns `true` when `logical` holds the
@@ -3143,9 +3147,10 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     /// [`Error::CorruptBlock`] when the index block fails verification, or
     /// [`Error::Device`] on I/O failure.
     ///
-    /// `decomp` is the caller's decompression buffer: data blocks flagged
-    /// compressed are inflated into it before parsing; raw blocks are
-    /// parsed in place from `scratch` with no copy.
+    /// `decomp` is the caller's decompression buffer: a data block flagged
+    /// compressed is inflated into it as far as the answer needs
+    /// (ADR-0027); a raw block is parsed where it lies, in the cache when
+    /// the cache lends its images, otherwise in `scratch`.
     pub async fn lookup(
         &self,
         scratch: &mut [u8; BLOCK],
@@ -3170,9 +3175,10 @@ impl<'d, D: BlockDevice, const BLOCK: usize, const BLOOM_BYTES: usize>
     /// [`Error::CorruptBlock`] when the index block fails verification, or
     /// [`Error::Device`] on I/O failure.
     ///
-    /// `decomp` is the caller's decompression buffer: data blocks flagged
-    /// compressed are inflated into it before parsing; raw blocks are
-    /// parsed in place from `scratch` with no copy.
+    /// `decomp` is the caller's decompression buffer: a data block flagged
+    /// compressed is inflated into it as far as the answer needs
+    /// (ADR-0027); a raw block is parsed where it lies, in the cache when
+    /// the cache lends its images, otherwise in `scratch`.
     pub async fn lookup_at(
         &self,
         scratch: &mut [u8; BLOCK],
