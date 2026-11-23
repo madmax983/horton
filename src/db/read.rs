@@ -42,9 +42,11 @@ enum Best {
 
 /// Accumulator for [`Db::get_at`]'s multi-table read: the winning staged
 /// value bytes plus the version that won them. Bundled into one struct so
-/// `consider_table` stays under the argument-count lint; table lookups
-/// copy into a per-table buffer first, and only a winning hit is promoted
-/// into `stage`, so a losing hit can never clobber the winner.
+/// `consider_table` stays under the argument-count lint. While a value is
+/// staged, a table lookup copies into a spare buffer and only a winning
+/// hit is promoted into `stage`, so a losing hit can never clobber the
+/// winner. With nothing staged, a lookup writes `stage` directly: its
+/// bytes are read only once a hit has won (`best` says how many).
 #[derive(Debug, Clone, Copy)]
 struct ReadAcc<const VAL_MAX: usize> {
     stage: [u8; VAL_MAX],
@@ -685,10 +687,11 @@ impl<
     /// only as far as the winning value goes (nothing past that length
     /// is ever read).
     fn fill_memtable_acc(&self, key: &[u8], max_seq: u64, acc: &mut ReadAcc<VAL_MAX>) {
-        // The winning value's bytes are staged here; table lookups copy
-        // into a per-table buffer first so a losing hit can never clobber
-        // the winner. Values are at most VAL_MAX bytes (enforced on the
-        // write path), so the staging always fits.
+        // The winning value's bytes are staged here; a table lookup made
+        // while a value is staged copies into a spare buffer first, so a
+        // losing hit can never clobber the winner (see `consider_table`).
+        // Values are at most VAL_MAX bytes (enforced on the write path),
+        // so the staging always fits.
         acc.clear();
         if let Some(entry) = self.table.get_at(key, max_seq) {
             // The memtable holds the newest mutations; `get_at` already

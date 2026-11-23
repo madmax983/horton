@@ -2512,12 +2512,13 @@ async fn fetch_block<D: BlockDevice, const BLOCK: usize>(
 /// let an older version in a deeper table win (a silent stale read). A
 /// flag or decoding failure is `CorruptBlock` too.
 ///
-/// A cache hit on a compressed block copies and checks only what it
-/// inflates: the block's trailer, then its first `clen` bytes, each a
-/// ranged read ([`CachePort::get_range_into`]). Values that compress to
-/// half make that half the copying and half the summing of a whole
-/// image. When the inflate succeeds, `raw` holds only those bytes; no
-/// caller reads `raw` after a `true` return.
+/// A cache that lends its images ([`CachePort::with_range`]) is asked
+/// once: the block is checked whole against its RAM checksums and, if
+/// compressed, inflated where it lies, with no copy; a block stored raw
+/// is copied into `raw`. A miss goes straight to the device. Either way
+/// one block read is one lookup, so [`CacheStats`](crate::CacheStats)
+/// counts it once. When the inflate succeeds, `raw` holds nothing of the
+/// block; no caller reads `raw` after a `true` return.
 ///
 /// # Errors
 ///
@@ -2531,64 +2532,84 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
     logical: &mut [u8; BLOCK],
     hot: bool,
 ) -> Result<bool, Error<D::Error>> {
-    if let Some(c) = cache
-        && let Some(inflated) =
-            inflate_cached_prefix::<D::Error, BLOCK>(c, table_id, block_id, raw, logical)?
-    {
-        return Ok(inflated);
+    if let Some(c) = cache {
+        match inflate_lent::<D::Error, BLOCK>(c, table_id, block_id, raw, logical) {
+            Lent::Done(inflated) => return inflated,
+            Lent::Miss => {
+                // Not cached: to the device, without asking the cache a
+                // second time.
+                fetch_block(device, cache, table_id, block_id, raw, hot).await?;
+                return inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id);
+            }
+            Lent::Copy => {}
+        }
     }
     read_block_verified(device, cache, table_id, block_id, raw, hot).await?;
     inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)
 }
 
-/// The hit path of [`read_data_block`] for a compressed block: reads the
-/// trailer, then the compressed prefix, from the cache, and inflates it.
-/// `Ok(None)` when the block is not cached whole for it (a miss on
-/// either range, or a block stored raw): the caller then reads the block
-/// whole as before.
-fn inflate_cached_prefix<E, const BLOCK: usize>(
+/// What [`inflate_lent`] made of one lookup.
+enum Lent<E> {
+    /// A hit: the block was inflated into `logical` (`Ok(true)`), copied
+    /// into `raw` as stored (`Ok(false)`), or failed to decode.
+    Done(Result<bool, Error<E>>),
+    /// Not cached, or rejected by its checksums: read the device.
+    Miss,
+    /// The cache does not lend its images: copy one out instead.
+    Copy,
+}
+
+/// The hit path of [`read_data_block`] for a cache that lends: one
+/// lookup of the whole image, which is inflated where it lies (or, when
+/// stored raw, copied into `raw`).
+fn inflate_lent<E, const BLOCK: usize>(
     cache: &dyn CachePort<BLOCK>,
     table_id: u32,
     block_id: u64,
     raw: &mut [u8; BLOCK],
     logical: &mut [u8; BLOCK],
-) -> Result<Option<bool>, Error<E>> {
-    let corrupt = || Error::CorruptBlock { id: block_id };
-    let Some(body_end) = BLOCK.checked_sub(CRC_LEN) else {
-        return Ok(None);
-    };
-    let mut flag = [0u8; 2];
-    if body_end < 2 || !cache.get_range_into(table_id, block_id, body_end - 2, &mut flag) {
-        return Ok(None);
-    }
-    let trailer = u16::from_le_bytes(flag);
-    if trailer & 0x8000 == 0 {
-        // Stored raw: the caller wants the whole image anyway.
-        return Ok(None);
-    }
-    let clen = usize::from(trailer & 0x7FFF);
-    if clen >= body_end {
-        return Err(corrupt());
-    }
-    // Inflated where it lies when the cache lends its images; copied
-    // out first when it does not.
-    let mut inflated = Ok(0);
-    let lent = cache.with_range(table_id, block_id, 0, clen, &mut |bytes| {
-        inflated = decompress(bytes, &mut logical[..body_end]);
+) -> Lent<E> {
+    let mut done = None;
+    let lent = cache.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
+        done = Some(inflate_image::<E, BLOCK>(image, raw, logical, block_id));
     });
-    match lent {
-        Some(true) => {}
-        // Evicted between the two reads.
-        Some(false) => return Ok(None),
-        None => {
-            if !cache.get_range_into(table_id, block_id, 0, &mut raw[..clen]) {
-                return Ok(None);
-            }
-            inflated = decompress(&raw[..clen], &mut logical[..body_end]);
-        }
+    match (lent, done) {
+        (Some(true), Some(result)) => Lent::Done(result),
+        (Some(_), _) => Lent::Miss,
+        (None, _) => Lent::Copy,
     }
-    inflated.map_err(|_| corrupt())?;
-    Ok(Some(true))
+}
+
+/// [`inflate_data_block`] over a lent image: a compressed block inflates
+/// from `image` into `logical` (`true`); a raw one is copied into `raw`
+/// (`false`).
+fn inflate_image<E, const BLOCK: usize>(
+    image: &[u8],
+    raw: &mut [u8; BLOCK],
+    logical: &mut [u8; BLOCK],
+    block_id: u64,
+) -> Result<bool, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
+    let flag = image
+        .get(body_end.wrapping_sub(2)..body_end)
+        .and_then(|b| b.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(corrupt)?;
+    if flag & 0x8000 == 0 {
+        if image.len() != BLOCK {
+            return Err(corrupt());
+        }
+        raw.copy_from_slice(image);
+        return Ok(false);
+    }
+    let clen = usize::from(flag & 0x7FFF);
+    let stream = image
+        .get(..clen)
+        .filter(|_| clen < body_end)
+        .ok_or_else(corrupt)?;
+    decompress(stream, &mut logical[..body_end]).map_err(|_| corrupt())?;
+    Ok(true)
 }
 
 /// Runs `parse` over bytes `..len` of block `block_id`'s verified image,

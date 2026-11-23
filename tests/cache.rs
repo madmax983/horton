@@ -265,6 +265,55 @@ fn repeat_point_read_is_served_from_cache() {
     assert!(s.len > 0);
 }
 
+/// One block read is one cache lookup (ADR-0026 review): a cold point
+/// read counts exactly one miss per block it reads from the device, and
+/// the same read warm counts exactly one hit per block. Both for a
+/// compressed data block (inflated where it lies in the cache) and for a
+/// data block stored raw.
+#[test]
+fn a_block_read_is_counted_once() {
+    for (what, value) in [
+        ("compressed", vec![b'a'; 600]),
+        (
+            "raw",
+            (0u32..600)
+                .map(|i| i.wrapping_mul(2_654_435_761).to_le_bytes()[3])
+                .collect::<Vec<u8>>(),
+        ),
+    ] {
+        let mut db = TestDb::new(CountingDevice::new(), test_config());
+        block_on(db.open()).unwrap();
+        for i in 0u8..5 {
+            block_on(db.put(&[b'k', i], &value)).unwrap();
+        }
+        block_on(db.flush()).unwrap();
+
+        let mut buf = [0u8; 1024];
+        let (reads, before) = (db.device().reads(), db.cache_stats());
+        let n = block_on(db.get(b"k\x02", &mut buf)).unwrap().unwrap();
+        assert_eq!(&buf[..n], &value[..]);
+        let device = db.device().reads() - reads;
+        let cold = db.cache_stats();
+        assert!(device > 0, "{what}: the cold read touches the device");
+        assert_eq!(
+            cold.misses - before.misses,
+            device,
+            "{what}: one miss per block read from the device"
+        );
+        assert_eq!(cold.hits, before.hits, "{what}: nothing was cached yet");
+
+        let n = block_on(db.get(b"k\x02", &mut buf)).unwrap().unwrap();
+        assert_eq!(&buf[..n], &value[..]);
+        let warm = db.cache_stats();
+        assert_eq!(warm.misses, cold.misses, "{what}: no misses warm");
+        assert_eq!(
+            warm.hits - cold.hits,
+            device,
+            "{what}: one hit per block, the same blocks"
+        );
+    }
+}
+
 #[test]
 fn cached_values_match_uncached_values() {
     let pairs: Vec<(Vec<u8>, Vec<u8>)> =

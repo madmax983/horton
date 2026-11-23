@@ -61,6 +61,8 @@ or the same answers, as before.
    zero (in 256-byte steps) are carried. Damage where zeros belong is
    run through the tables and changes the result as it must. This
    covers every CRC the library computes, on write and on device read.
+   The operator table has an entry per bit of `usize`, so any length
+   has one (review found a 32-entry table panicking at 4 GiB).
 3. **The LZ77 encoder** counts a match eight bytes at a time, loads its
    4-byte words with one bounds check, indexes four positions of a
    match where it indexed every one, and, like LZ4, lengthens its step
@@ -79,14 +81,17 @@ or the same answers, as before.
    provided method). The cache checks the chunks a range touches
    against their RAM checksums, as `get_range_into` does, then hands
    the bytes where they lie to a closure. The index search runs that
-   way, as does the inflate of a compressed data block. A data-block
-   hit reads the 2-byte compression flag first and then only the
-   compressed prefix (about half the block), where it copied and summed
-   all 16 KiB. The default answers `None` ("I do not lend"), and the
-   reader copies as before, so a `CachePort` written before this keeps
-   working. The library's `RefCell<BlockCache>` and the host store's
-   `SharedCache` both lend. ADR-0016's rule is untouched: a damaged
-   chunk is never handed out, lent or copied.
+   way, and a compressed data block is inflated straight from the
+   cache, where 16 KiB were copied out first. Each block read is one
+   lookup, so `CacheStats` counts a block once: a miss still means the
+   device did the work. (A first version probed the compression flag
+   and then lent only the compressed prefix, half the summing, but that
+   was two lookups and counted every block twice; review caught it.)
+   The default answers `None` ("I do not lend"), and the reader copies
+   as before, so a `CachePort` written before this keeps working. The
+   library's `RefCell<BlockCache>` and the host store's `SharedCache`
+   both lend. ADR-0016's rule is untouched: a damaged chunk is never
+   handed out, lent or copied.
 6. **Point reads no longer zero a `VAL_MAX` buffer per table.** While
    no table has produced a value yet, the lookup writes straight into
    the accumulator's stage, which has nothing to protect. A spare
@@ -136,6 +141,6 @@ or the same answers, as before.
   [ADR-0008](0008-hand-rolled-lz77-block-compression.md) (the codec)
 - `src/crc.rs` (`update_streams`, `zeros_op`, `crc32`),
   `src/compress.rs`, `src/cache.rs` (`with_range`),
-  `src/sstable.rs` (`inflate_cached_prefix`, `parse_verified`),
+  `src/sstable.rs` (`read_data_block`, `inflate_lent`, `parse_verified`),
   `src/db/read.rs` (`consider_table`), `src/memtable.rs` (`order`)
 - [`docs/THROUGHPUT.md`](../THROUGHPUT.md), [BUDGET.md](../../BUDGET.md)

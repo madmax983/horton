@@ -85,13 +85,14 @@ pub const STREAMS_MIN: usize = 768;
 /// `X8N[k]` is `x^(8 * 2^k)` modulo the polynomial, in the reflected
 /// representation: the operator that carries a register across `2^k`
 /// zero bytes. [`zeros_op`] multiplies together the entries for the bits
-/// of a length.
-const X8N: [u32; 32] = {
-    let mut t = [0u32; 32];
+/// of a length. One entry per bit of `usize`, so every length has its
+/// entries (a 32-entry table panicked at 4 GiB on 64-bit hosts).
+const X8N: [u32; usize::BITS as usize] = {
+    let mut t = [0u32; usize::BITS as usize];
     // x^8: bit 31 is x^0 in the reflected form, so x^8 is bit 23.
     let mut p = 1u32 << 23;
     let mut k = 0;
-    while k < 32 {
+    while k < t.len() {
         t[k] = p;
         p = mulmod(p, p);
         k += 1;
@@ -413,6 +414,23 @@ mod tests {
             let reg = 0x1234_5678;
             assert_eq!(mulmod(zeros_op(n), reg), update_serial(reg, &zeros[..n]));
         }
+    }
+
+    /// Every bit of a `usize` length has its operator: a length of 4 GiB
+    /// or more (a run of zeros that long, or a segment of a 13 GB input)
+    /// used to index past a 32-entry table and panic.
+    #[test]
+    fn zeros_op_covers_every_length() {
+        assert_eq!(X8N.len(), usize::BITS as usize);
+        for k in 1..X8N.len() {
+            assert_eq!(X8N[k], mulmod(X8N[k - 1], X8N[k - 1]), "entry {k}");
+        }
+        // No panic for any length; the top bit's operator is the last
+        // entry.
+        let _ = zeros_op(usize::MAX);
+        assert_eq!(zeros_op(1 << (usize::BITS - 1)), X8N[X8N.len() - 1]);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(zeros_op(1 << 32), mulmod(X8N[31], X8N[31]));
     }
 
     /// `crc32` is usable in constant evaluation.

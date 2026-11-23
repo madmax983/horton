@@ -857,10 +857,9 @@ None of it was design. Seven changes, no format change:
   match, and steps faster over input with no match: 1.45 times faster,
   and its output about 2% smaller. **The decoder** copies short runs
   as one 16-byte chunk and fills one-byte runs: 1.4 times faster.
-- **A cache hit on a compressed block** reads the 2-byte flag, then
-  only the compressed prefix, and inflates it where it lies in the
-  cache (`CachePort::with_range`). **The index search** runs on the
-  cached image in place. No 16 KiB copies on a hit.
+- **A cache hit on a compressed block** is inflated where it lies in
+  the cache (`CachePort::with_range`), and **the index search** runs on
+  the cached image in place. No 16 KiB copies on a hit.
 - **A point read** writes the first value it finds straight into its
   stage, and no longer zeroes a 4 KiB buffer for every table.
 - **The memtable** keeps entries in arrival order behind a sorted view
@@ -953,7 +952,7 @@ block, CRCs it in software (8.3 µs before step 16, about 3 µs since;
 before step 16, which made it 1.4 times faster). RocksDB reads 4 KiB, checks it with a
 hardware CRC32C or XXH3 and caches the block uncompressed. horton's
 cache holds the compressed image, so even a hit inflates the block
-again, after summing the compressed half of it, and the whole index
+again, after summing it (no longer copying it), and the whole index
 block is summed for every lookup that passes the filter.
 
 **A scan's merge is linear in its cursors.** Each `next` compares the

@@ -160,9 +160,9 @@ the same memory, from 0.37.
     with no match are stepped over faster) and its output about 2%
     smaller. The decoder is 1.4 times faster (short runs copied as one
     16-byte chunk, one-byte runs filled, overlapping matches doubled).
-  - A cache hit on a compressed data block reads its flag and then only
-    the compressed prefix, inflated in place: about half the bytes
-    checked, none copied.
+  - A cache hit on a compressed data block is inflated where it lies in
+    the cache, and the index is searched there: no 16 KiB copy per hit.
+    One block read is still one cache lookup, counted once.
   - A point read no longer zeroes a `VAL_MAX` buffer for every table it
     looks into.
   - The memtable keeps slots in arrival order behind a sorted view of

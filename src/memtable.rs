@@ -1,8 +1,10 @@
 //! Fixed-capacity sorted memtable over a bump arena.
 //!
-//! Slots are kept sorted by key bytes, with sequence numbers descending
-//! within each key's run. Key/value bytes live in a single bump-allocated
-//! arena. Every mutation appends a fresh slot — nothing is ever replaced
+//! Entries are kept in arrival order, and a sorted view of their
+//! positions orders them by key bytes, with sequence numbers descending
+//! within each key's run (ADR-0026: an insert shifts 4-byte positions,
+//! not the entries). Key/value bytes live in a single bump-allocated
+//! arena. Every mutation adds a fresh entry — nothing is ever replaced
 //! in place — so a key's run holds its full version history newest-first.
 //! Snapshot reads need those older versions; the live view simply takes
 //! the run's first entry. Flush drains the runs into an `SSTable` in
@@ -117,8 +119,9 @@ impl<'a, const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_M
     }
 }
 
-/// Sorted in-memory table. Every mutation appends a new slot at its key's
-/// run start, so each key's versions are ordered newest-first.
+/// Sorted in-memory table. Every mutation adds a new entry, placed in the
+/// sorted view at its key's run start, so each key's versions are
+/// ordered newest-first.
 ///
 /// Sequence numbers are assigned in increasing order by the owner, which
 /// is what keeps the runs descending.
@@ -631,7 +634,8 @@ impl<const CAP: usize, const ARENA: usize, const KEY_MAX: usize, const VAL_MAX: 
         }
     }
 
-    /// Number of slots. The scan iterator walks slots by index; the borrow
+    /// Number of slots. The scan iterator walks them by sorted position
+    /// ([`slot_view`](Self::slot_view)); the borrow
     /// on the database (not documentation) is what keeps those indices
     /// valid for the scan's lifetime.
     #[must_use]
