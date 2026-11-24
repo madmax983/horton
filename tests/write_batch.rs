@@ -76,21 +76,60 @@ fn write_batch_empty_is_seq_conserving_noop() {
     assert_eq!(s, 1, "no seq was consumed by the empty batch");
 }
 
+/// Ops in [`spanning_batch`].
+const SPAN_OPS: u8 = 62;
+
+/// 62 ops of a 2-byte key and a 60-byte value: 85 bytes of WAL each,
+/// 5,270 in all, so the batch spans two 4 KiB WAL blocks; 3,844 arena
+/// bytes and 62 of `TestDb`'s 64 memtable slots.
+fn spanning_batch(tag: u8) -> Batch<64> {
+    let mut b = Batch::<64>::new();
+    for i in 0..SPAN_OPS {
+        b.put(&[tag, i], &[i; 60]).unwrap();
+    }
+    b
+}
+
+/// A batch larger than a WAL block spans blocks and commits whole
+/// (ADR-0029), and reads back after a reopen.
 #[test]
-fn write_batch_rejects_over_block_with_no_trace() {
+fn write_batch_spans_blocks() {
     let mut db = open_db();
-    // One max-size record is 23 + 256 + 1024 = 1303 bytes; four exceed one
-    // 4096-byte WAL block, so the batch cannot commit atomically.
+    let before = block_on(db.put(b"a", b"1")).unwrap();
+    let base = block_on(db.write(&spanning_batch(b'b'))).unwrap();
+    assert_eq!(base, before + 1);
+    let after = block_on(db.put(b"c", b"3")).unwrap();
+    assert_eq!(after, base + 62, "the batch took 62 sequence numbers");
+    for i in 0..SPAN_OPS {
+        assert_eq!(get(&db, &[b'b', i]), Some(vec![i; 60]));
+    }
+    let dev = db.into_device();
+    let mut db = TestDb::new(dev, test_config());
+    let rep = block_on(db.open()).unwrap();
+    assert_eq!(rep.recovered_records, 64);
+    for i in 0..SPAN_OPS {
+        assert_eq!(get(&db, &[b'b', i]), Some(vec![i; 60]));
+    }
+    assert_eq!(get(&db, b"c"), Some(b"3".to_vec()));
+}
+
+/// A batch even an empty memtable cannot hold is `BatchTooLarge`, not
+/// `ArenaFull` (a flush would not make room), and leaves no trace.
+#[test]
+fn write_batch_beyond_an_empty_memtable_is_too_large() {
+    let mut db = open_db();
+    // Four max-size records: 4 * (256 + 1024) arena bytes, over 4096.
     let mut b = Batch::<4>::new();
-    let big_k = [b'x'; KEY_MAX];
     let big_v = [b'y'; VAL_MAX];
-    for _ in 0..4 {
-        b.put(&big_k, &big_v).unwrap();
+    for i in 0..4u8 {
+        let mut k = [b'x'; KEY_MAX];
+        k[0] = i;
+        b.put(&k, &big_v).unwrap();
     }
     match block_on(db.write(&b)) {
         Err(Error::BatchTooLarge { bytes, max }) => {
-            assert_eq!(bytes, 4 * (23 + KEY_MAX + VAL_MAX));
-            assert_eq!(max, BLOCK);
+            assert_eq!(bytes, 4 * (KEY_MAX + VAL_MAX));
+            assert_eq!(max, 4096, "the arena");
         }
         other => panic!("expected BatchTooLarge, got {other:?}"),
     }
@@ -98,6 +137,22 @@ fn write_batch_rejects_over_block_with_no_trace() {
     let s = block_on(db.put(b"k", b"v")).unwrap();
     assert_eq!(s, 1);
     assert_eq!(get(&db, b"k"), Some(b"v".to_vec()));
+}
+
+/// A spanning batch the memtable cannot take beside what it holds is
+/// `TableFull`, before any block is written; a flush makes room.
+#[test]
+fn write_batch_spanning_waits_for_room_with_no_trace() {
+    let mut db = open_db();
+    for k in [b"a", b"b", b"c"] {
+        block_on(db.put(k, b"1")).unwrap();
+    }
+    let b = spanning_batch(b'b');
+    assert_eq!(block_on(db.write(&b)), Err(Error::TableFull));
+    assert_eq!(block_on(db.put(b"d", b"4")).unwrap(), 4, "no seq consumed");
+    block_on(db.flush()).unwrap();
+    block_on(db.write(&b)).unwrap();
+    assert_eq!(get(&db, &[b'b', 61]), Some(vec![61; 60]));
 }
 
 #[test]
@@ -281,6 +336,85 @@ fn write_batch_crash_is_atomic() {
 /// A batch's device-free errors flow into any device's result type
 /// through `Error::widen` (architecture review: `WriteBatch` returned a
 /// different error type from `Db`).
+/// A device that drops the writes whose numbers are in `lost` (a cache
+/// that lost power before they reached the medium, in any order).
+struct DropDevice {
+    inner: MemDevice<BLOCK>,
+    lost: Vec<usize>,
+    writes: usize,
+}
+
+impl BlockDevice for DropDevice {
+    type Error = <MemDevice<BLOCK> as BlockDevice>::Error;
+    const BLOCK: usize = BLOCK;
+
+    fn poll_read_block(
+        &self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_read_block(cx, id, buf)
+    }
+
+    fn poll_write_block(
+        &mut self,
+        cx: &mut Context<'_>,
+        id: u64,
+        buf: &[u8],
+    ) -> Poll<Result<(), Self::Error>> {
+        let n = self.writes;
+        self.writes += 1;
+        if self.lost.contains(&n) {
+            return Poll::Ready(Ok(()));
+        }
+        self.inner.poll_write_block(cx, id, buf)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_flush(cx)
+    }
+}
+
+/// Exhaustive over a batch spanning two WAL blocks: put(a) is write #0,
+/// the batch's blocks #1 and #2, put(c) after it #3. Whichever of the
+/// batch's blocks a crash keeps, recovery replays all of it or none of
+/// it, keeps `a`, and reads `c` only when the batch is there too (a write
+/// lost before it ends the log).
+#[test]
+fn write_batch_spanning_crash_is_atomic() {
+    for mask in 0..4usize {
+        let lost: Vec<usize> = [1, 2]
+            .into_iter()
+            .filter(|&w| mask & (1 << (w - 1)) == 0)
+            .collect();
+        let dev = DropDevice {
+            inner: MemDevice::<BLOCK>::new(),
+            lost: lost.clone(),
+            writes: 0,
+        };
+        let mut db = TestDb::new(dev, test_config());
+        block_on(db.open()).unwrap();
+        block_on(db.put(b"a", b"1")).unwrap();
+        block_on(db.write(&spanning_batch(b'b'))).unwrap();
+        block_on(db.put(b"c", b"3")).unwrap();
+        assert_eq!(db.device().writes, 4, "write count changed");
+        let dev = db.into_device().inner;
+        let mut db = TestDb::new(dev, test_config());
+        block_on(db.open()).unwrap();
+        assert_eq!(get(&db, b"a"), Some(b"1".to_vec()), "lost {lost:?}");
+        let present: Vec<bool> = (0..SPAN_OPS)
+            .map(|i| get(&db, &[b'b', i]) == Some(vec![i; 60]))
+            .collect();
+        let whole = lost.is_empty();
+        assert!(
+            present.iter().all(|&p| p == whole),
+            "lost {lost:?}: batch {present:?}"
+        );
+        assert_eq!(get(&db, b"c").is_some(), whole, "lost {lost:?}");
+    }
+}
+
 #[test]
 fn batch_errors_widen_into_device_results() {
     fn stage(batch: &mut WriteBatch<256, 1024, 1>) -> Result<(), Error<std::io::ErrorKind>> {

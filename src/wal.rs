@@ -8,8 +8,8 @@
 //! ```
 //!
 //! `len` covers everything from `seq` through `crc32` inclusive, and `crc32`
-//! covers everything after `magic` except itself. Records never span blocks
-//! in v0.1. Recovery replays records in order and stops at the first
+//! covers everything after `magic` except itself. Records never span
+//! blocks. Recovery replays records in order and stops at the first
 //! corrupt/truncated record — the torn tail is the expected crash boundary,
 //! not an error.
 //!
@@ -17,10 +17,18 @@
 //! is followed by more records of the same atomic group, and the group ends
 //! at the first record without it. Recovery replays a group only once its
 //! closing record is intact, so a torn block write can never replay part of
-//! a [`WriteBatch`](crate::WriteBatch). A group is committed in one block.
+//! a [`WriteBatch`](crate::WriteBatch).
+//!
+//! A group may span blocks (ADR-0029): the last record of a block whose
+//! group goes on carries [`SPAN`], and the next block's first record
+//! [`CONT`]. A group spans blocks only from the start of a block, over at
+//! most [`GROUP_BLOCKS_MAX`] blocks; recovery
+//! replays it only when every one of them is intact, and drops all of it
+//! otherwise. The op kind is the byte's low five bits.
 
 use core::future::poll_fn;
 
+use crate::GROUP_BLOCKS_MAX;
 use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -32,6 +40,15 @@ pub const WAL_MAGIC: u16 = 0x6C73;
 /// The `op` byte's group flag: more records of this record's atomic group
 /// follow it. See the module docs.
 pub const MORE: u8 = 0x80;
+/// The `op` byte's span flag, on the last record of a block (with
+/// [`MORE`]): the record's group continues in the next block, which
+/// begins with a [`CONT`] record (ADR-0029).
+pub const SPAN: u8 = 0x40;
+/// The `op` byte's continuation flag, on the first record of a block: it
+/// continues the group the previous block's [`SPAN`] record left open.
+pub const CONT: u8 = 0x20;
+/// The op byte's flag bits; the low bits are the [`Op`].
+const FLAGS: u8 = MORE | SPAN | CONT;
 /// Fixed header bytes before the key: magic + len + seq + op + `key_len` + `val_len`.
 pub const WAL_HEADER_LEN: usize = 19;
 /// Trailing CRC32 bytes.
@@ -100,7 +117,7 @@ fn encode_record(
     out: &mut [u8],
     seq: u64,
     op: Op,
-    more: bool,
+    flags: u8,
     key: &[u8],
     key_len: u16,
     val: &[u8],
@@ -123,7 +140,7 @@ fn encode_record(
     out[0..2].copy_from_slice(&WAL_MAGIC.to_le_bytes());
     out[2..6].copy_from_slice(&len.to_le_bytes());
     out[6..14].copy_from_slice(&seq.to_le_bytes());
-    out[14] = op.to_u8() | if more { MORE } else { 0 };
+    out[14] = op.to_u8() | flags;
     out[15..17].copy_from_slice(&key_len.to_le_bytes());
     out[17..19].copy_from_slice(&val_len.to_le_bytes());
     out[19..19 + kl].copy_from_slice(&key[..kl]);
@@ -141,6 +158,10 @@ struct Decoded<'a> {
     op: Op,
     /// More records of this record's atomic group follow ([`MORE`]).
     more: bool,
+    /// The group continues in the next block ([`SPAN`]).
+    span: bool,
+    /// The record continues a group from the previous block ([`CONT`]).
+    cont: bool,
     key: &'a [u8],
     val: &'a [u8],
     /// For [`Op::PutTtl`]: the absolute expiry tick; 0 otherwise.
@@ -214,8 +235,15 @@ fn decode_record(buf: &[u8]) -> Option<Decoded<'_>> {
     let seq = u64::from_le_bytes([
         buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13],
     ]);
-    let op = Op::from_u8(buf[14] & !MORE)?;
+    let op = Op::from_u8(buf[14] & !FLAGS)?;
     let more = buf[14] & MORE != 0;
+    let span = buf[14] & SPAN != 0;
+    let cont = buf[14] & CONT != 0;
+    // A span continues an open group, and a continuation follows one:
+    // anything else is not a record this writer wrote.
+    if span && !more {
+        return None;
+    }
     let kl = usize::from(u16::from_le_bytes([buf[15], buf[16]]));
     let vl = usize::from(u16::from_le_bytes([buf[17], buf[18]]));
     // A PutTtl record carries 8 expiry bytes after the value.
@@ -240,6 +268,8 @@ fn decode_record(buf: &[u8]) -> Option<Decoded<'_>> {
         seq,
         op,
         more,
+        span,
+        cont,
         key,
         val,
         expire_at,
@@ -256,6 +286,11 @@ pub struct RecoverState {
     pub max_seq: u64,
     /// WAL blocks consumed (first unwritten block is `wal_start + blocks_used`).
     pub blocks_used: u64,
+    /// WAL blocks read up to the one recovery stopped at, from where it
+    /// began. At least `blocks_used`; more when a group that spanned
+    /// blocks broke off, since writing resumes at its first block
+    /// (ADR-0029).
+    pub blocks_read: u64,
 }
 
 /// One record in a WAL batch: the drainer sweep's unit of work.
@@ -317,8 +352,21 @@ pub struct WalWriter<D: BlockDevice, const BLOCK: usize> {
     next_block: u64,
     max_seq: u64,
     /// The last staged record opened a group (its [`MORE`] flag is set), so
-    /// the stage must not be written until the group closes.
+    /// the stage must not be written until the group closes, or is sealed
+    /// with [`SPAN`] to go on in the next block.
     group_open: bool,
+    /// Offset in the stage of the last record staged: the one a seal marks
+    /// with [`SPAN`].
+    last_record: usize,
+    /// The stage was sealed inside a group: the next record continues it
+    /// and carries [`CONT`].
+    continues: bool,
+    /// Where the open group began in the stage: only a group that began
+    /// at offset 0 may go on in the next block (ADR-0029).
+    group_start: usize,
+    /// Blocks of the open group already written: a group spans at most
+    /// [`GROUP_BLOCKS_MAX`] blocks.
+    group_blocks: usize,
 }
 
 impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
@@ -344,6 +392,10 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             next_block: wal_start,
             max_seq: 0,
             group_open: false,
+            last_record: 0,
+            continues: false,
+            group_start: 0,
+            group_blocks: 0,
         }
     }
 
@@ -396,6 +448,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.stage_len = len;
         // Whatever group was open is discarded with its records.
         self.group_open = false;
+        self.continues = false;
     }
 
     /// Repositions the append pointer to `block` (the WAL wrap).
@@ -419,7 +472,8 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
 
     /// Writes the stage out as a block of its own, without a flush, when
     /// `bytes` more would not fit it: the atomic group about to be
-    /// appended then starts a fresh block and stays inside one. The
+    /// appended then starts a fresh block, and stays inside it or spans
+    /// blocks from its start (ADR-0029). The
     /// group commit ([`Db::write_group`](crate::Db::write_group)) seals
     /// blocks this way and flushes once at the end.
     ///
@@ -436,12 +490,25 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     }
 
     /// After recovery: makes what lies just past the recovered log
-    /// harmless (ADR-0028). Reads the block recovery stopped at and the
-    /// `span - 1` after it; zeroes (then flushes) each of the later ones
-    /// that holds a record newer than `newer_than` (the newest sequence
-    /// number recovery saw, or the flush floor if higher); and returns the
-    /// highest sequence number of any record found in them, at any
-    /// offset, so the caller can resume numbering above it.
+    /// harmless (ADR-0028). Reads the block writing resumes at and every
+    /// one after it before block `until`; zeroes (then flushes) each one
+    /// from `stop` on (the block recovery stopped reading at; never the
+    /// first) that holds a record newer than `newer_than` (the newest
+    /// sequence number recovery saw, or the flush floor if higher); and
+    /// returns the highest sequence number of any record found in them,
+    /// at any offset, so the caller can resume numbering above it. `Db`
+    /// passes `until` = `stop` plus [`GROUP_BLOCKS_MAX`].
+    ///
+    /// The blocks between where writing resumes and `stop` are those of
+    /// groups that spanned blocks and broke off (ADR-0029): each continues
+    /// one ([`CONT`] first, which ends the log while no span is open) or
+    /// begins a later one that broke off too. They are left as they are:
+    /// none of those groups can close (the numbers that would close them
+    /// were consumed, never written), and new writes are numbered above
+    /// their records, so none can join them. Zeroing them would let a crash
+    /// during the scrub move the next recovery's stop back, and its
+    /// window short of blocks this one had still to zero (review
+    /// finding).
     ///
     /// A group commit writes up to `span` blocks before its one flush,
     /// and a device may reach the medium in any order before a flush, so
@@ -451,9 +518,9 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// - **A stranded block.** Recovery stopped at a gap, and writing
     ///   resumes there; once the gap is filled the next recovery reads on
     ///   into a later block of the group. Zeroing it prevents that. Only
-    ///   the `span - 1` blocks after the stop can hold such records, and
-    ///   only records newer than everything recovered: older ones are
-    ///   stale, and every recovery stops at them as before.
+    ///   blocks before `until` can hold such records, and only records
+    ///   newer than everything recovered: older ones are stale, and every
+    ///   recovery stops at them as before.
     /// - **Bytes left behind a torn write.** A block written again in
     ///   place can tear, keeping its old bytes past the tear. Recovery
     ///   takes records in a block only while their sequence numbers rise,
@@ -474,11 +541,16 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     pub(crate) async fn scrub_stranded(
         &mut self,
         newer_than: u64,
-        span: u64,
+        stop: u64,
+        until: u64,
     ) -> Result<(u64, u64), Error<D::Error>> {
         debug_assert_eq!(self.stage_len, 0, "scrub with records staged");
         let first = self.next_block;
-        let end = self.next_block.saturating_add(span).min(self.wal_end);
+        let end = until.min(self.wal_end);
+        // Blocks before `stop` are a broken span's: never zeroed (see
+        // above), so a crash during this scrub cannot move the next
+        // recovery's stop, and with it this window, back.
+        let zero_from = stop.max(first + 1);
         let mut scrubbed = 0;
         let mut highest = 0u64;
         for id in first..end {
@@ -489,7 +561,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
                 .map_err(Error::Device)?;
             let seen = highest_seq_anywhere(&self.stage);
             highest = highest.max(seen.unwrap_or(0));
-            if id > first && seen.is_some_and(|seq| seq > newer_than) {
+            if id >= zero_from && seen.is_some_and(|seq| seq > newer_than) {
                 self.stage.fill(0);
                 let device = &mut self.device;
                 let block = &self.stage;
@@ -542,14 +614,27 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
 
     /// Appends one record of an atomic group: pass `more = true` for every
     /// record but the last. Recovery replays the group only if its last
-    /// record is intact, so a torn write never replays part of it. The
-    /// whole group must fit the staging block ([`Db::write`](crate::Db::write)
-    /// drains the stage and checks the size first).
+    /// record is intact, so a torn write never replays part of it.
+    ///
+    /// A group that does not fit what is left of the stage goes on into
+    /// the next block (ADR-0029): the stage is written out (no flush) with
+    /// its last record marked [`SPAN`], and this record starts the next
+    /// block marked [`CONT`]. Only a group that began at the start of a
+    /// block may do that, over at most
+    /// [`GROUP_BLOCKS_MAX`] blocks; start a large
+    /// group on an empty stage ([`commit`](WalWriter::commit) first, as
+    /// [`Db::write`](crate::Db::write) does). Until the closing record is
+    /// committed, a crash drops the whole group.
     ///
     /// # Errors
     ///
     /// Same as [`append`](WalWriter::append), plus [`Error::BatchTooLarge`]
-    /// when the group would not fit one block.
+    /// when the group would have to go on into the next block but began
+    /// part way into this one, or would span more than
+    /// [`GROUP_BLOCKS_MAX`] blocks. That error,
+    /// and a failed block write inside the group, drop the group's
+    /// records from the stage (none of it is replayed); appending goes on
+    /// with a new group.
     pub async fn append_grouped(
         &mut self,
         seq: u64,
@@ -635,22 +720,25 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             });
         }
         if self.stage_len + rlen > BLOCK {
-            // A group commits in one block: never write part of one.
             if self.group_open {
-                return Err(Error::BatchTooLarge {
-                    bytes: self.stage_len + rlen,
-                    max: BLOCK,
-                });
+                self.seal_span().await?;
+            } else {
+                self.write_stage().await?;
             }
-            self.write_stage().await?;
+        }
+        if !self.group_open {
+            // This record begins a group (or is one by itself).
+            self.group_start = self.stage_len;
+            self.group_blocks = 0;
         }
         let expiry = expire_at.to_le_bytes();
         let extra = if op == Op::PutTtl { &expiry[..] } else { &[] };
+        let flags = if more { MORE } else { 0 } | if self.continues { CONT } else { 0 };
         let n = encode_record(
             &mut self.stage[self.stage_len..],
             seq,
             op,
-            more,
+            flags,
             key,
             key_len,
             &val[..vlen],
@@ -658,12 +746,71 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             extra,
         );
         debug_assert_eq!(n, rlen);
+        self.last_record = self.stage_len;
         self.stage_len += n;
         self.group_open = more;
+        self.continues = false;
         if seq > self.max_seq {
             self.max_seq = seq;
         }
         Ok(())
+    }
+
+    /// The open group does not fit what is left of the stage: writes the
+    /// stage out with the group's last record here marked [`SPAN`], and
+    /// the next record continues the group, carrying [`CONT`] (ADR-0029).
+    ///
+    /// Only a group that began at the start of a block may span blocks,
+    /// and over at most [`GROUP_BLOCKS_MAX`] of them: recovery needs the
+    /// first, and open's scrub the second. A group that cannot go on is
+    /// refused with [`Error::BatchTooLarge`], and so is one whose block
+    /// write fails; either way the group is dropped from the stage, so no
+    /// later commit writes any of it. A block of it already written is
+    /// never closed, and recovery drops the whole group.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BatchTooLarge`], [`Error::WalFull`] or [`Error::Device`].
+    async fn seal_span(&mut self) -> Result<(), Error<D::Error>> {
+        if self.group_start != 0 || self.group_blocks + 2 > GROUP_BLOCKS_MAX {
+            let bytes = self.stage_len - self.group_start;
+            let start = self.group_start;
+            self.truncate_stage(start);
+            return Err(Error::BatchTooLarge {
+                bytes,
+                max: if start == 0 {
+                    GROUP_BLOCKS_MAX * BLOCK
+                } else {
+                    BLOCK - start
+                },
+            });
+        }
+        self.mark_span();
+        if let Err(e) = self.write_stage().await {
+            self.truncate_stage(0);
+            return Err(e);
+        }
+        self.group_blocks += 1;
+        self.continues = true;
+        Ok(())
+    }
+
+    /// Marks the last staged record with [`SPAN`] and re-seals its CRC.
+    /// It belongs to the open group, so it carries [`MORE`].
+    fn mark_span(&mut self) {
+        let at = self.last_record;
+        debug_assert!(self.stage[at + 14] & MORE != 0, "span without MORE");
+        self.stage[at + 14] |= SPAN;
+        let len = u32::from_le_bytes([
+            self.stage[at + 2],
+            self.stage[at + 3],
+            self.stage[at + 4],
+            self.stage[at + 5],
+        ]) as usize;
+        // The CRC covers `len` and everything after it but itself.
+        let crc_at = at + 6 + len - WAL_TRAILER_LEN;
+        let crc = crc32(&self.stage[at + 2..crc_at]);
+        self.stage[crc_at..crc_at + WAL_TRAILER_LEN].copy_from_slice(&crc.to_le_bytes());
     }
 
     /// Writes the staging buffer (zero-padded to a full block) and flushes
@@ -697,7 +844,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// Several blocks are written before the one flush, and a device may
     /// persist them in any order, so a crash can keep a later block
     /// without an earlier one. [`Db::open`](crate::Db::open) zeroes such
-    /// stranded blocks within [`GROUP_BLOCKS_MAX`](crate::GROUP_BLOCKS_MAX)
+    /// stranded blocks within [`GROUP_BLOCKS_MAX`]
     /// blocks of where recovery stopped (ADR-0028); keep a batch to that
     /// many blocks, as [`Db::write_group`](crate::Db::write_group) does,
     /// for the guarantee that a later recovery never brings back a record
@@ -877,13 +1024,21 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             records: 0,
             max_seq: 0,
             blocks_used: 0,
+            blocks_read: 0,
         };
-        // Set after a torn block that still held complete groups: the log
-        // goes on only if the next block holds newer records (writes made
-        // after an earlier recovery resumed past the torn block).
+        // Set after a torn block that still held complete groups, and after
+        // a group that spanned blocks broke off: the log goes on only if the
+        // next block holds newer records (writes made after an earlier
+        // recovery resumed past it).
         let mut newer_than: Option<u64> = None;
+        // A group that began in an earlier block and goes on (ADR-0029).
+        let mut span: Option<OpenSpan> = None;
+        // Blocks read so far. `state.blocks_used` is where writing resumes:
+        // past the last block that held a complete group, which the blocks
+        // of a group that never closed do not.
+        let mut cursor = 0u64;
         loop {
-            let id = from + state.blocks_used;
+            let id = from + cursor;
             if id >= self.wal_end {
                 break; // Region exhausted: nothing beyond wal_end was written.
             }
@@ -892,105 +1047,92 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
             poll_fn(|cx| device.poll_read_block(cx, id, block))
                 .await
                 .map_err(Error::Device)?;
-            // Pass 1: find where the block's last complete group ends. A
-            // group whose closing record never landed is torn, even when
-            // what did land reads as clean padding.
-            let mut off = 0usize;
-            let mut complete = 0usize;
-            let mut torn = false;
-            let mut first_seq = None;
-            let mut last_seq = None;
-            while off < BLOCK {
-                match scan_record(&block[off..]) {
-                    // A block's records carry strictly increasing sequence
-                    // numbers, and sequence numbers are never reused, so a
-                    // record no newer than the one before it is a previous
-                    // write's bytes left behind a torn in-place write (a
-                    // file or disk keeps them; NOR flash erases first).
-                    // Taking it would let an old group's closing record
-                    // close a new, torn group (F21).
-                    Scan::Record(rec) if last_seq.is_some_and(|last| rec.seq <= last) => {
-                        torn = true;
-                        break;
+            let seen = scan_block(&self.stage, span.map(|s| s.last_seq), seq_floor);
+            if span.is_some() && !seen.joined {
+                // The next block does not continue the open group: it
+                // never finished. Drop all of it. This block (never the
+                // one after it) goes on with the log only if it is newer
+                // than everything taken, the flush floor included: a
+                // failed commit can leave a dead span behind live writes.
+                span = None;
+                newer_than = Some(state.max_seq.max(seq_floor));
+            }
+            if let Some(floor) = newer_than.take()
+                && seen.first_seq.is_none_or(|seq| seq <= floor)
+            {
+                break; // The tear, or the broken group, was the tail after all.
+            }
+            if seen.joined {
+                let Some(open) = span else {
+                    return Err(Error::CorruptWal { offset: id });
+                };
+                if id - open.start_block >= GROUP_BLOCKS_MAX as u64 {
+                    // Longer than any group a writer makes: not one.
+                    break;
+                }
+                match seen.closes_span {
+                    Some(end) => {
+                        // The group is whole: replay it from where it began.
+                        self.replay_span(table, open, id, end, seq_floor, &mut state)
+                            .await?;
+                        span = None;
+                        state.blocks_used = cursor + 1;
                     }
-                    Scan::Record(rec) => {
-                        first_seq.get_or_insert(rec.seq);
-                        last_seq = Some(rec.seq);
-                        off += rec.total_len;
-                        if !rec.more {
-                            complete = off;
-                        }
+                    None if seen.opens_span.is_some() => {
+                        // The whole block goes on with the group.
+                        span = Some(OpenSpan {
+                            last_seq: seen.last_seq.unwrap_or(open.last_seq),
+                            ..open
+                        });
+                        cursor += 1;
+                        continue;
                     }
-                    // Clean zero padding: this block is done; the log may
-                    // continue in the next block.
-                    Scan::CleanEnd => break,
-                    // Non-zero data that is not a valid record: torn.
-                    Scan::Corrupt => {
-                        torn = true;
+                    None => {
+                        // Torn inside the group, or the group's records
+                        // end without closing it: it never finished, and
+                        // nothing was written after it.
                         break;
                     }
                 }
             }
-            torn |= complete < off;
-            if let Some(floor) = newer_than.take()
-                && first_seq.is_none_or(|seq| seq <= floor)
-            {
-                break; // The torn block was the tail after all.
+            if !seen.joined && !seen.live && !seen.torn && seen.first_seq.is_some() {
+                // Only stale (already flushed) records: the live log ended
+                // at the previous block. Resume appending here.
+                break;
             }
-            if complete == 0 {
+            if !seen.joined && seen.complete == 0 && seen.opens_span.is_none() {
                 // Unwritten, or torn before any group completed: the log
                 // ends here, and the writer resumes on this block, so no
                 // write ever lands behind a torn block without a group.
                 break;
             }
-            // Pass 2: replay the complete groups.
-            let mut at = 0usize;
-            let mut live = 0u64;
-            while at < complete {
-                let Scan::Record(rec) = scan_record(&block[at..]) else {
-                    return Err(Error::CorruptWal { offset: id });
-                };
-                if rec.seq > state.max_seq {
-                    state.max_seq = rec.seq;
-                }
-                // Stale pre-wrap records: already in a table, never
-                // replayed (see the `seq_floor` docs above).
-                if rec.seq > seq_floor {
-                    match rec.op {
-                        Op::RangeDelete => {
-                            table
-                                .insert_range_del::<D::Error>(rec.key, rec.val, rec.seq)
-                                .map_err(|_| Error::CorruptWal { offset: id })?;
-                        }
-                        Op::PutTtl => {
-                            table
-                                .insert_ttl::<D::Error>(rec.key, rec.val, rec.seq, rec.expire_at)
-                                .map_err(|_| Error::CorruptWal { offset: id })?;
-                        }
-                        _ => {
-                            let tombstone = rec.op == Op::Delete;
-                            table
-                                .insert::<D::Error>(rec.key, rec.val, rec.seq, tombstone)
-                                .map_err(|_| Error::CorruptWal { offset: id })?;
-                        }
-                    }
-                    state.records += 1;
-                    live += 1;
-                }
-                at += rec.total_len;
+            // Replay the complete groups after whatever the span took.
+            let replayed = self.replay_range(
+                table,
+                id,
+                seen.closes_span.unwrap_or(0),
+                seen.complete,
+                seq_floor,
+                &mut state,
+            )?;
+            if replayed || seen.complete > seen.closes_span.unwrap_or(0) {
+                state.blocks_used = cursor + 1;
             }
-            if live == 0 && !torn {
-                // Only stale (already flushed) records: the live log ended
-                // at the previous block. Resume appending here.
-                break;
-            }
-            state.blocks_used += 1;
-            if torn {
+            if let Some(start) = seen.opens_span {
+                // A group begins here and goes on in the next block.
+                span = Some(OpenSpan {
+                    start_block: id,
+                    start_off: start,
+                    last_seq: seen.last_seq.unwrap_or(0),
+                });
+            } else if seen.torn {
                 // A torn tail after complete groups: the crash boundary,
                 // unless newer writes follow (see `newer_than`).
                 newer_than = Some(state.max_seq);
             }
+            cursor += 1;
         }
+        state.blocks_read = cursor;
         self.next_block = from + state.blocks_used;
         self.stage_len = 0;
         // Recovery read blocks into `stage`: none of it is known to be zero
@@ -998,6 +1140,240 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.dirty_to = BLOCK;
         self.max_seq = state.max_seq;
         self.group_open = false;
+        self.continues = false;
         Ok(state)
     }
+
+    /// Replays the records of the block in the stage (block `id`) from
+    /// offset `from` up to `to`: complete groups, as [`scan_block`] found
+    /// them. Records at or below `seq_floor` are stale and skipped.
+    /// Returns whether any record was replayed.
+    fn replay_range<
+        const CAP: usize,
+        const ARENA: usize,
+        const KEY_MAX: usize,
+        const VAL_MAX: usize,
+    >(
+        &self,
+        table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        id: u64,
+        from: usize,
+        to: usize,
+        seq_floor: u64,
+        state: &mut RecoverState,
+    ) -> Result<bool, Error<D::Error>> {
+        let mut at = from;
+        let mut live = false;
+        while at < to {
+            let Scan::Record(rec) = scan_record(&self.stage[at..]) else {
+                return Err(Error::CorruptWal { offset: id });
+            };
+            live |= replay_record(table, &rec, id, seq_floor, state)?;
+            at += rec.total_len;
+        }
+        Ok(live)
+    }
+
+    /// Replays a group that spanned blocks, now that its closing record
+    /// (ending at `end` in block `close`) has been found intact: re-reads
+    /// each of its blocks from where it began, so no record of it is held
+    /// in RAM before the group is known to be whole. Leaves block `close`
+    /// in the stage.
+    async fn replay_span<
+        const CAP: usize,
+        const ARENA: usize,
+        const KEY_MAX: usize,
+        const VAL_MAX: usize,
+    >(
+        &mut self,
+        table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        open: OpenSpan,
+        close: u64,
+        end: usize,
+        seq_floor: u64,
+        state: &mut RecoverState,
+    ) -> Result<(), Error<D::Error>> {
+        let mut id = open.start_block;
+        let mut from = open.start_off;
+        loop {
+            let device = &mut self.device;
+            let block = &mut self.stage;
+            poll_fn(|cx| device.poll_read_block(cx, id, block))
+                .await
+                .map_err(Error::Device)?;
+            let to = if id == close {
+                end
+            } else {
+                // Up to and including the block's `SPAN` record.
+                span_end(&self.stage, from).ok_or(Error::CorruptWal { offset: id })?
+            };
+            self.replay_range(table, id, from, to, seq_floor, state)?;
+            if id == close {
+                return Ok(());
+            }
+            id += 1;
+            from = 0;
+        }
+    }
+}
+
+/// A group open across blocks during recovery (ADR-0029).
+#[derive(Debug, Clone, Copy)]
+struct OpenSpan {
+    /// The block and offset of the group's first record.
+    start_block: u64,
+    start_off: usize,
+    /// The sequence number of its last record so far: the next block must
+    /// continue with the one after.
+    last_seq: u64,
+}
+
+/// What one block holds, as recovery reads it.
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockScan {
+    /// The block begins by continuing the open group (its first record
+    /// carries [`CONT`] and the next sequence number).
+    joined: bool,
+    /// End of the record that closes the open group, when the block does.
+    closes_span: Option<usize>,
+    /// End of the block's last complete group (0: none).
+    complete: usize,
+    /// Start of a group that goes on in the next block ([`SPAN`]).
+    opens_span: Option<usize>,
+    /// Anything that is not a record, or a group cut short, before the
+    /// block's clean zero padding.
+    torn: bool,
+    /// Some record is newer than the flush floor.
+    live: bool,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+}
+
+/// Reads the records of `block`. `continuing` is the last sequence number
+/// of the group open from the block before, if any; `seq_floor` marks
+/// records already flushed.
+///
+/// A block's records carry strictly increasing sequence numbers, and
+/// sequence numbers are never reused, so a record no newer than the one
+/// before it is a previous write's bytes left behind a torn in-place
+/// write (a file or disk keeps them; NOR flash erases first). Taking it
+/// would let an old group's closing record close a new, torn group (F21).
+/// A [`CONT`] record anywhere but first, or first without the group it
+/// continues, and a [`SPAN`] record not followed by clean padding, are
+/// such bytes as well.
+fn scan_block(block: &[u8], continuing: Option<u64>, seq_floor: u64) -> BlockScan {
+    let mut scan = BlockScan::default();
+    let mut off = 0usize;
+    // Start of the group being read; `None` while still inside the group
+    // continued from the block before.
+    let mut group_start = None;
+    while off < block.len() {
+        match scan_record(&block[off..]) {
+            Scan::Record(rec) => {
+                if scan.last_seq.is_some_and(|last| rec.seq <= last) {
+                    scan.torn = true;
+                    break;
+                }
+                if off == 0 {
+                    scan.joined = rec.cont
+                        && continuing.is_some_and(|last| last.checked_add(1) == Some(rec.seq));
+                    if rec.cont != scan.joined {
+                        scan.torn = true;
+                        break;
+                    }
+                    if !scan.joined {
+                        group_start = Some(0);
+                    }
+                } else if rec.cont {
+                    scan.torn = true;
+                    break;
+                }
+                scan.first_seq.get_or_insert(rec.seq);
+                scan.last_seq = Some(rec.seq);
+                scan.live |= rec.seq > seq_floor;
+                off += rec.total_len;
+                if rec.span {
+                    // A group goes on in the next block only from the start
+                    // of this one: it continues one (no group start of its
+                    // own here), or began at offset 0 (ADR-0029).
+                    if group_start.is_none_or(|g| g == 0) && all_zero(&block[off..]) {
+                        scan.opens_span = Some(0);
+                    } else {
+                        scan.torn = true;
+                    }
+                    break;
+                }
+                if !rec.more {
+                    if group_start.is_none() {
+                        scan.closes_span = Some(off);
+                    }
+                    scan.complete = off;
+                    group_start = Some(off);
+                }
+            }
+            // Clean zero padding: this block is done.
+            Scan::CleanEnd => break,
+            // Non-zero data that is not a valid record: torn.
+            Scan::Corrupt => {
+                scan.torn = true;
+                break;
+            }
+        }
+    }
+    // A group whose closing record never landed is torn, even when what
+    // did land reads as clean padding; one that goes on in the next block
+    // is not.
+    if scan.opens_span.is_none() && scan.complete < off {
+        scan.torn = true;
+    }
+    scan
+}
+
+/// The end of the [`SPAN`] record that ends a group's part of `block`,
+/// reading from `from`.
+fn span_end(block: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    while at < block.len() {
+        let Scan::Record(rec) = scan_record(&block[at..]) else {
+            return None;
+        };
+        at += rec.total_len;
+        if rec.span {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// Applies one recovered record to `table` unless it is stale (at or
+/// below `seq_floor`), and counts it. Returns whether it was applied.
+fn replay_record<
+    const CAP: usize,
+    const ARENA: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    E,
+>(
+    table: &mut MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+    rec: &Decoded<'_>,
+    id: u64,
+    seq_floor: u64,
+    state: &mut RecoverState,
+) -> Result<bool, Error<E>> {
+    if rec.seq > state.max_seq {
+        state.max_seq = rec.seq;
+    }
+    // Stale pre-wrap records: already in a table, never replayed (see the
+    // `seq_floor` docs on `recover_from`).
+    if rec.seq <= seq_floor {
+        return Ok(false);
+    }
+    let applied = match rec.op {
+        Op::RangeDelete => table.insert_range_del::<E>(rec.key, rec.val, rec.seq),
+        Op::PutTtl => table.insert_ttl::<E>(rec.key, rec.val, rec.seq, rec.expire_at),
+        _ => table.insert::<E>(rec.key, rec.val, rec.seq, rec.op == Op::Delete),
+    };
+    applied.map_err(|_| Error::CorruptWal { offset: id })?;
+    state.records += 1;
+    Ok(true)
 }

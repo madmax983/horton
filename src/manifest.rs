@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman09" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman10" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -40,7 +40,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman09".
+/// Manifest block magic: ASCII "hrtman10".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -56,11 +56,17 @@ use crate::error::Error;
 /// section in full (`bloom_blocks`, `bloom_k`, `bloom_len`), so a reader
 /// needs nothing from a table's footer, and names tables in the
 /// `hrtsst04` format, so an image whose tables carry an older bloom
-/// filter is rejected when it is opened, not at its first read. A
-/// foreign magic decodes
+/// filter is rejected when it is opened, not at its first read.
+/// "hrtman10" (v0.20) is the same layout over a WAL whose atomic groups
+/// may span blocks ([`SPAN`](crate::wal::SPAN), ADR-0029): an older
+/// reader takes a `SPAN` or `CONT` record for a torn tail, so it would
+/// drop a spanning group and every write after it and write over them;
+/// it must not open the image, and this one must not open an older
+/// image's. A foreign
+/// magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman09");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman10");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.
@@ -1064,10 +1070,15 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// replays everything — no data loss, the orphaned blocks are simply
     /// never referenced.
     ///
+    /// An intact copy of another format version (`hrtman` and other
+    /// digits) rejects the whole image; a copy torn inside its magic is
+    /// merely corrupt.
+    ///
     /// # Errors
     ///
-    /// [`Error::CorruptManifest`] when no copy is intact or blank, or
-    /// [`Error::Device`] on I/O failure.
+    /// [`Error::CorruptManifest`] when no copy is intact or blank, or a
+    /// copy is another format version's, or [`Error::Device`] on I/O
+    /// failure.
     pub async fn recover_from<D: BlockDevice, const BLOCK: usize>(
         device: &mut D,
         scratch: &mut [u8; BLOCK],
@@ -1086,6 +1097,10 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 }
                 Probe::Blank => blank = true,
                 Probe::Corrupt => {}
+                // Another version's image: rejected, never read as a
+                // fresh device beside a blank copy (its WAL would replay
+                // over tables this version cannot see).
+                Probe::Foreign => return Err(Error::CorruptManifest),
             }
         }
         let Some((seq, start, count)) = best else {
@@ -1123,6 +1138,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         read_block(device, start, scratch).await?;
         if scratch.iter().all(|&b| b == 0) || scratch.iter().all(|&b| b == 0xFF) {
             return Ok(Probe::Blank);
+        }
+        if is_foreign::<BLOCK>(scratch) {
+            return Ok(Probe::Foreign);
         }
         let Some(head) = check_block::<BLOCK>(scratch) else {
             return Ok(Probe::Corrupt);
@@ -1546,6 +1564,9 @@ enum Probe {
     Blank,
     /// Written but not intact (torn or damaged).
     Corrupt,
+    /// An intact manifest block of another format version (see
+    /// [`is_foreign`]).
+    Foreign,
 }
 
 /// A manifest block's parsed header.
@@ -1559,12 +1580,64 @@ struct BlockHead {
 /// Validates one manifest block — magic, chunk length, CRC — and returns
 /// its header.
 fn check_block<const BLOCK: usize>(buf: &[u8; BLOCK]) -> Option<BlockHead> {
+    check_block_of::<BLOCK>(buf, MANIFEST_MAGIC)
+}
+
+/// A manifest block of another format version: "hrtman" and two ASCII
+/// digits other than this version's, over a block intact under that
+/// version's header (its CRC computed with its own magic): the one every
+/// version since "hrtman05" shares, or the single-block layout before it
+/// (`magic | len: u32 | payload | crc32`). A copy of this version torn
+/// or partly erased inside its magic is never that, so it stays a corrupt
+/// copy that loses to an intact one (review findings, ADR-0029).
+fn is_foreign<const BLOCK: usize>(buf: &[u8; BLOCK]) -> bool {
+    let Some(magic) = buf.get(..8) else {
+        return false;
+    };
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(magic);
+    bytes[..6] == *b"hrtman"
+        && bytes[6].is_ascii_digit()
+        && bytes[7].is_ascii_digit()
+        && bytes != MANIFEST_MAGIC.to_le_bytes()
+        && (check_block_of::<BLOCK>(buf, u64::from_le_bytes(bytes)).is_some()
+            || single_block_intact::<BLOCK>(buf))
+}
+
+/// A block intact under the single-block manifest layout of "hrtman01"
+/// to "hrtman04": `magic | len: u32 | payload | crc32`, the CRC over
+/// everything before it.
+fn single_block_intact<const BLOCK: usize>(buf: &[u8; BLOCK]) -> bool {
+    let Some(len) = buf
+        .get(8..12)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)
+        .and_then(|l| usize::try_from(l).ok())
+    else {
+        return false;
+    };
+    let Some(end) = len.checked_add(12) else {
+        return false;
+    };
+    let Some(stored) = end
+        .checked_add(4)
+        .and_then(|crc_end| buf.get(end..crc_end))
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return false;
+    };
+    crc32(&buf[..end]) == stored
+}
+
+/// [`check_block`] against `magic`.
+fn check_block_of<const BLOCK: usize>(buf: &[u8; BLOCK], magic: u64) -> Option<BlockHead> {
     let u64_at = |o: usize| {
         buf.get(o..o + 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
     };
-    if u64_at(0)? != MANIFEST_MAGIC {
+    if u64_at(0)? != magic {
         return None;
     }
     let seq = u64_at(8)?;

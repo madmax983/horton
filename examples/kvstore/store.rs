@@ -119,7 +119,7 @@ use crate::gate::{Gate, Pin, Slot};
 use crate::handoff::{Handoff, Next};
 use crate::{
     BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
-    KvScan, KvTables, LEVELS, VAL_MAX, block_on,
+    KvScan, KvTables, LEVELS, MEMTABLE_ARENA, MEMTABLE_ENTRIES, VAL_MAX, block_on,
 };
 
 /// horton's error, with this store's device error.
@@ -239,9 +239,10 @@ pub enum BatchOp {
 }
 
 /// Writes applied together or not at all, like `leveldb::WriteBatch`.
-/// Its encoded size must fit one WAL block ([`BLOCK`] bytes, each op
-/// costing its key and value plus 23 bytes); a larger batch is refused
-/// with `BatchTooLarge` rather than split.
+/// Each op costs its key and value plus 23 bytes of WAL; a batch may
+/// span WAL blocks, up to `GROUP_BLOCKS_MAX` of them ([`BLOCK`] bytes
+/// each, ADR-0029). A larger batch is refused with `BatchTooLarge`
+/// rather than split.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Batch {
     ops: Vec<BatchOp>,
@@ -266,18 +267,20 @@ impl Batch {
         &self.ops
     }
 
-    /// Bytes this batch takes in a WAL block.
+    /// Bytes each op's WAL record takes.
+    fn records(&self) -> impl Iterator<Item = usize> + '_ {
+        self.ops.iter().map(|op| {
+            WAL_RECORD_OVERHEAD
+                + match op {
+                    BatchOp::Put(k, v) => k.len() + v.len(),
+                    BatchOp::Delete(k) => k.len(),
+                }
+        })
+    }
+
+    /// Bytes this batch takes in the WAL.
     fn wal_bytes(&self) -> usize {
-        self.ops
-            .iter()
-            .map(|op| {
-                WAL_RECORD_OVERHEAD
-                    + match op {
-                        BatchOp::Put(k, v) => k.len() + v.len(),
-                        BatchOp::Delete(k) => k.len(),
-                    }
-            })
-            .sum()
+        self.records().sum()
     }
 
     /// The error horton would return for this batch's first bad op.
@@ -295,11 +298,74 @@ impl Batch {
                 });
             }
         }
-        let bytes = self.wal_bytes();
-        if bytes > BLOCK {
-            return Err(Error::BatchTooLarge { bytes, max: BLOCK });
+        let mut alone = Placement::default();
+        alone.unit(self);
+        if alone.blocks() > GROUP_BLOCKS_MAX {
+            return Err(Error::BatchTooLarge {
+                bytes: self.wal_bytes(),
+                max: GROUP_BLOCKS_MAX * BLOCK,
+            });
+        }
+        // Nor may it outgrow an empty memtable, which horton refuses
+        // as well: refused here, it never joins other clients' writes.
+        if self.ops.len() > MEMTABLE_ENTRIES {
+            return Err(Error::BatchTooLarge {
+                bytes: self.ops.len(),
+                max: MEMTABLE_ENTRIES,
+            });
+        }
+        let arena: usize = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put(k, v) => k.len() + v.len(),
+                BatchOp::Delete(k) => k.len(),
+            })
+            .sum();
+        if arena > MEMTABLE_ARENA {
+            return Err(Error::BatchTooLarge {
+                bytes: arena,
+                max: MEMTABLE_ARENA,
+            });
         }
         Ok(())
+    }
+}
+
+/// Where horton places a group's batches in WAL blocks (ADR-0028,
+/// ADR-0029): a batch that does not fit what is left of a block starts a
+/// fresh one; inside a batch, a record that does not fit starts the next
+/// block.
+#[derive(Debug, Clone, Copy, Default)]
+struct Placement {
+    /// Blocks written out so far.
+    sealed: usize,
+    /// Bytes in the block being filled.
+    filling: usize,
+}
+
+impl Placement {
+    fn unit(&mut self, batch: &Batch) {
+        let wal = batch.wal_bytes();
+        if wal == 0 {
+            return;
+        }
+        if self.filling > 0 && self.filling + wal > BLOCK {
+            self.sealed += 1;
+            self.filling = 0;
+        }
+        for rlen in batch.records() {
+            if self.filling + rlen > BLOCK {
+                self.sealed += 1;
+                self.filling = rlen;
+            } else {
+                self.filling += rlen;
+            }
+        }
+    }
+
+    const fn blocks(&self) -> usize {
+        self.sealed + if self.filling > 0 { 1 } else { 0 }
     }
 }
 
@@ -1834,23 +1900,20 @@ impl Engine {
             return false;
         };
         self.group.clear();
-        // The head always goes: `Handle::write` checked that it fits a
-        // block by itself. Behind it, as many writes as fill
-        // `GROUP_BLOCKS_MAX` WAL blocks, each whole inside one, as horton
-        // places them (ADR-0028): one `fdatasync` for all of them.
-        let (mut blocks, mut filling) = (1usize, head.batch.wal_bytes());
+        // The head always goes: `Handle::write` checked that it fits
+        // `GROUP_BLOCKS_MAX` blocks by itself. Behind it, as many writes as
+        // fill those blocks, placed as horton places them (ADR-0028,
+        // ADR-0029): one `fdatasync` for all of them.
+        let mut place = Placement::default();
+        place.unit(&head.batch);
         self.group.push(head);
         while let Some(next) = queue.front() {
-            let bytes = next.batch.wal_bytes();
-            let (b, f) = if filling + bytes > BLOCK {
-                (blocks + 1, bytes)
-            } else {
-                (blocks, filling + bytes)
-            };
-            if b > GROUP_BLOCKS_MAX {
+            let mut then = place;
+            then.unit(&next.batch);
+            if then.blocks() > GROUP_BLOCKS_MAX {
                 break;
             }
-            (blocks, filling) = (b, f);
+            place = then;
             self.group.extend(queue.pop_front());
         }
         shared.queued.store(queue.len(), Ordering::Relaxed);
@@ -1930,7 +1993,7 @@ impl Engine {
                     unit
                 })
                 .collect();
-            let done = room.with_room(db, stall, |db| {
+            let done = match room.with_room(db, stall, |db| {
                 // The filter first, then the memtable: a read that
                 // starts after this write returns must find the bits.
                 // And before each try: making room flushes, and a flush
@@ -1942,14 +2005,29 @@ impl Engine {
                     }
                 }
                 block_on(db.write_group(&units))
-            })?;
+            }) {
+                // The head can never commit, alone or not (`Handle::write`
+                // checks for that first, so this is a backstop): it fails
+                // by itself, and the writes behind it go on.
+                Err(
+                    e @ (Error::BatchTooLarge { .. }
+                    | Error::EmptyKey
+                    | Error::KeyTooLarge { .. }
+                    | Error::ValueTooLarge { .. }),
+                ) => {
+                    let head = self.group.remove(0);
+                    head.finish(Err(StoreError::Db(e)));
+                    continue;
+                }
+                other => other?,
+            };
             if done.units == 0 {
-                // Unreachable: the head fits a block by itself, and a
+                // Unreachable: the head fits the blocks by itself, and a
                 // refusal for want of room is an error, not an empty
                 // prefix.
                 return Err(Error::BatchTooLarge {
                     bytes: self.group.first().map_or(0, |p| p.batch.wal_bytes()),
-                    max: BLOCK,
+                    max: GROUP_BLOCKS_MAX * BLOCK,
                 });
             }
             self.groups += 1;
@@ -2414,6 +2492,41 @@ mod tests {
     }
 
     #[test]
+    fn an_oversized_batch_does_not_fail_the_writes_grouped_with_it() {
+        let store = TempStore::new("oversized-neighbour");
+        // Review finding: 4,097 deletes of a one-byte key fit seven 16 KiB
+        // WAL blocks, but not the memtable's 4,096 slots, which horton
+        // refuses (BatchTooLarge). `Batch::check` let it through on blocks
+        // alone, and its refusal failed every write grouped with it. Now
+        // it is refused before it queues.
+        let mut big = Batch::new();
+        for _ in 0..=crate::MEMTABLE_ENTRIES {
+            big.delete(b"a");
+        }
+        let shared = Arc::clone(&store.handle.shared);
+        // With the engine held, the batch is refused without queueing
+        // (nothing could commit it otherwise), and a write queued after
+        // it commits once the engine is free.
+        let held = shared.engine().expect("engine");
+        let refused = store.handle().write(big);
+        assert!(
+            matches!(refused, Err(StoreError::Db(Error::BatchTooLarge { .. }))),
+            "{refused:?}"
+        );
+        assert_eq!(shared.queued.load(Ordering::Relaxed), 0, "it never queued");
+        std::thread::scope(|s| {
+            let h = store.handle();
+            let b = s.spawn(move || h.put(b"innocent", b"v"));
+            while shared.queued.load(Ordering::Relaxed) < 1 {
+                std::thread::yield_now();
+            }
+            drop(held);
+            assert_eq!(b.join().expect("put"), Ok(()));
+        });
+        assert_eq!(store.get(b"innocent"), Ok(Some(b"v".to_vec())));
+    }
+
+    #[test]
     fn bad_writes_fail_alone() {
         let store = TempStore::new("bad-writes");
         assert_eq!(store.put(b"", b"v"), Err(StoreError::Db(Error::EmptyKey)));
@@ -2425,8 +2538,10 @@ mod tests {
             store.put(b"k", &[0; VAL_MAX + 1]),
             Err(StoreError::Db(Error::ValueTooLarge { .. }))
         ));
+        // Three maximal records to a 16 KiB WAL block: 64 of them need 22
+        // blocks, more than one commit writes.
         let mut big = Batch::new();
-        for i in 0..8 {
+        for i in 0..64 {
             big.put(&key(i), &[b'v'; VAL_MAX]);
         }
         assert!(matches!(
@@ -2435,6 +2550,15 @@ mod tests {
         ));
         // Nothing of the refused batch landed, and the store still works.
         assert_eq!(store.get(&key(0)), Ok(None));
+        // Twenty of them span seven blocks: one atomic batch (ADR-0029).
+        let mut spanning = Batch::new();
+        for i in 100..120 {
+            spanning.put(&key(i), &[b'w'; VAL_MAX]);
+        }
+        store
+            .write(spanning)
+            .expect("a batch over several WAL blocks");
+        assert_eq!(store.get(&key(119)), Ok(Some(vec![b'w'; VAL_MAX])));
         store.put(b"k", &[b'v'; VAL_MAX]).expect("a maximal value");
         assert_eq!(store.get(b"k"), Ok(Some(vec![b'v'; VAL_MAX])));
     }

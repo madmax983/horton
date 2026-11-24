@@ -94,13 +94,24 @@ pub enum Error<E> {
     },
     /// A [`WriteBatch`](crate::WriteBatch) already holds `OPS` operations.
     BatchFull,
-    /// A [`WriteBatch`](crate::WriteBatch), or a single WAL record, does
-    /// not fit one WAL block, so it cannot commit atomically. Split it into
-    /// smaller batches.
+    /// An atomic batch ([`WriteBatch`](crate::WriteBatch), a
+    /// [`write_group`](crate::Db::write_group) unit) or a single WAL record
+    /// is larger than one commit can ever hold, so it cannot commit
+    /// atomically: split it. `bytes` and `max` are what it exceeded:
+    ///
+    /// - a record's bytes, and the WAL block size (a record never spans
+    ///   blocks);
+    /// - the batch's WAL bytes, and what
+    ///   [`GROUP_BLOCKS_MAX`](crate::GROUP_BLOCKS_MAX) blocks hold (records
+    ///   are not split, so a batch can need more blocks than its bytes
+    ///   suggest, ADR-0029);
+    /// - its key and value bytes, and the memtable arena (`ARENA`), or its
+    ///   op count and the memtable's slots (`CAP`): it would not fit even
+    ///   an empty memtable, so a flush would not help.
     BatchTooLarge {
-        /// Total encoded size of the batch or record in bytes.
+        /// The batch's or record's size, in the measure it exceeded.
         bytes: usize,
-        /// The WAL block size: the atomicity ceiling.
+        /// The limit it exceeded.
         max: usize,
     },
     /// Archiving a table was refused: removing it would resurrect a value
@@ -220,7 +231,10 @@ impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
             Self::BadLevel { level } => write!(f, "level {level} is out of range"),
             Self::BatchFull => f.write_str("write batch is full"),
             Self::BatchTooLarge { bytes, max } => {
-                write!(f, "batch is {bytes} bytes; one WAL block holds {max}")
+                write!(
+                    f,
+                    "batch too large for one commit: {bytes} over a limit of {max}"
+                )
             }
             Self::WouldResurrect { table } => {
                 write!(f, "archiving table {table} would bring deleted data back")

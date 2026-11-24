@@ -1464,3 +1464,156 @@ fn f22_dominated_range_tombstones_are_collected() {
     assert_eq!(rdel_blocks(&db), 0, "every tombstone was collected");
     assert!(scan_all(&db, false).is_empty());
 }
+
+/// ADR-0029 review — findings on atomic batches across WAL blocks. The
+/// scrub-window findings need the fault-injecting device of
+/// `tests/group_commit.rs` and live there
+/// (`a_broken_span_does_not_hide_a_later_group_from_the_scrub`,
+/// `a_crash_during_the_scrub_keeps_its_window`).
+mod adr_0029 {
+    use std::task::{Context, Poll};
+
+    use super::common::{MemDevice, TestDb, TornDevice, block_on, test_config};
+    use horton::BlockDevice;
+    use horton::memtable::MemTable;
+    use horton::wal::{Op, WalWriter};
+
+    const BLOCK: usize = 4096;
+
+    /// Counts block writes.
+    struct Count<D> {
+        inner: D,
+        writes: usize,
+    }
+
+    impl<D: BlockDevice> BlockDevice for Count<D> {
+        type Error = D::Error;
+        const BLOCK: usize = D::BLOCK;
+        fn poll_read_block(
+            &self,
+            cx: &mut Context<'_>,
+            id: u64,
+            buf: &mut [u8],
+        ) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_read_block(cx, id, buf)
+        }
+        fn poll_write_block(
+            &mut self,
+            cx: &mut Context<'_>,
+            id: u64,
+            buf: &[u8],
+        ) -> Poll<Result<(), Self::Error>> {
+            self.writes += 1;
+            self.inner.poll_write_block(cx, id, buf)
+        }
+        fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.inner.poll_flush(cx)
+        }
+    }
+
+    fn get<D: BlockDevice>(db: &TestDb<D>, key: &[u8]) -> Option<Vec<u8>>
+    where
+        D::Error: std::fmt::Debug,
+    {
+        let mut buf = [0u8; 2048];
+        block_on(db.get(key, &mut buf))
+            .unwrap()
+            .map(|n| buf[..n].to_vec())
+    }
+
+    /// Two puts and a flush (the first manifest commit); with `two`, a
+    /// third put and a second flush (the first commit to the other copy).
+    fn script<D: BlockDevice>(db: &mut TestDb<D>, two: bool)
+    where
+        D::Error: std::fmt::Debug,
+    {
+        block_on(db.open()).unwrap();
+        block_on(db.put(b"a", b"1")).unwrap();
+        block_on(db.put(b"b", b"2")).unwrap();
+        block_on(db.flush()).unwrap();
+        if two {
+            block_on(db.put(b"c", b"3")).unwrap();
+            block_on(db.flush()).unwrap();
+        }
+    }
+
+    fn writes(two: bool) -> usize {
+        let dev = Count {
+            inner: MemDevice::<BLOCK>::new(),
+            writes: 0,
+        };
+        let mut db = TestDb::new(dev, test_config());
+        script(&mut db, two);
+        db.into_device().writes
+    }
+
+    fn check(db: &TestDb<MemDevice<BLOCK>>, two: bool, what: &str) {
+        assert_eq!(get(db, b"a"), Some(b"1".to_vec()), "{what}");
+        assert_eq!(get(db, b"b"), Some(b"2".to_vec()), "{what}");
+        if two {
+            assert_eq!(get(db, b"c"), Some(b"3".to_vec()), "{what}");
+        }
+    }
+
+    /// A manifest commit torn inside its magic ("hrtman" and zeros, or
+    /// "hrtman1" and a zero) over a blank copy read as another version's
+    /// manifest, and the image no longer opened. It is a torn copy: it
+    /// loses to the intact one, or the device reads as fresh and the WAL
+    /// replays, as before.
+    #[test]
+    fn a_manifest_torn_inside_its_magic_is_not_another_version() {
+        for two in [false, true] {
+            let w = writes(two);
+            for torn_len in [6usize, 7] {
+                let dev: TornDevice<_, BLOCK> =
+                    TornDevice::new(MemDevice::<BLOCK>::new(), w - 1, torn_len);
+                let mut db = TestDb::new(dev, test_config());
+                script(&mut db, two);
+                let mut db = TestDb::new(db.into_device().into_inner(), test_config());
+                let what = format!("two flushes: {two}, torn after {torn_len} bytes");
+                block_on(db.open()).unwrap_or_else(|e| panic!("{what}: open failed: {e:?}"));
+                check(&db, two, &what);
+            }
+        }
+    }
+
+    /// The same on erased NOR flash: the bytes after the tear read 0xFF.
+    #[test]
+    fn a_manifest_torn_inside_its_magic_on_nor_is_not_another_version() {
+        let w = writes(true);
+        for torn_len in [6usize, 7] {
+            let mut base = MemDevice::<BLOCK>::new();
+            // Both manifest copies (blocks 0..8) erased.
+            base.blocks_mut().resize(8, [0xFF; BLOCK]);
+            let dev: TornDevice<_, BLOCK> = TornDevice::in_place(base, w - 1, torn_len);
+            let mut db = TestDb::new(dev, test_config());
+            script(&mut db, true);
+            let mut db = TestDb::new(db.into_device().into_inner(), test_config());
+            let what = format!("NOR, torn after {torn_len} bytes");
+            block_on(db.open()).unwrap_or_else(|e| panic!("{what}: open failed: {e:?}"));
+            check(&db, true, &what);
+        }
+    }
+
+    /// A spanning group whose `SPAN` record carries `u64::MAX`: recovery
+    /// computed `last + 1` and panicked on overflow in a debug build. The
+    /// next block cannot continue it; recovery drops it.
+    #[test]
+    fn a_span_at_the_top_of_the_counter_does_not_panic_recovery() {
+        type W512 = WalWriter<MemDevice<512>, 512>;
+        let mut w = W512::new(MemDevice::new(), 0, 32);
+        // 57-byte records, eight to a 512-byte block: MAX-7..=MAX fill
+        // block 0, and a ninth spans into block 1.
+        let first = u64::MAX - 7;
+        for i in 0..8u32 {
+            let seq = first + u64::from(i);
+            block_on(w.append_grouped(seq, Op::Put, &i.to_be_bytes(), &[b'.'; 30], true)).unwrap();
+        }
+        block_on(w.append_grouped(1, Op::Put, &9u32.to_be_bytes(), &[b'.'; 30], false)).unwrap();
+        block_on(w.commit()).unwrap();
+        let mut w = W512::new(w.into_device(), 0, 32);
+        let mut t = MemTable::<64, 8192, 16, 32>::new();
+        let state = block_on(w.recover(&mut t)).expect("recover");
+        assert_eq!(state.records, 0, "the group never closed");
+    }
+}

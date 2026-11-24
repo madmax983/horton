@@ -380,6 +380,10 @@ pub struct Db<
     /// so capacity checks count them, and the next write flushes the
     /// device before adding blocks of its own.
     unapplied: Unapplied,
+    /// WAL blocks the last commit refused with `WalFull` needed: the next
+    /// flush wraps the region when fewer are left (a batch may span
+    /// blocks, ADR-0029). 1 otherwise: wrap when none is left.
+    wal_wanted: u64,
     /// Live snapshot watermarks (sequence numbers). A snapshot pins reads
     /// to mutations with `seq <= watermark`; while any snapshot is live,
     /// compaction must not drop a tombstone at or above the oldest
@@ -637,6 +641,7 @@ impl<
             cfg: config,
             next_seq: 0,
             unapplied: Unapplied::NONE,
+            wal_wanted: 1,
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
             opened: false,
@@ -1071,12 +1076,15 @@ impl<
         // recovered, so the next recovery cannot read them once the gap
         // is filled; and number new writes above every record left there,
         // so bytes a torn rewrite leaves behind always read as older than
-        // what was written over them (ADR-0028).
+        // what was written over them (ADR-0028). The unflushed blocks lie
+        // within `GROUP_BLOCKS_MAX` of where recovery stopped reading,
+        // which is past where writing resumes when a group that spanned
+        // blocks broke off: scrub from the one to beyond the other
+        // (ADR-0029).
         let newest = state.max_seq.max(self.manifest.flushed_seq());
-        let (_, left_behind) = self
-            .wal
-            .scrub_stranded(newest, GROUP_BLOCKS_MAX as u64)
-            .await?;
+        let stop = self.manifest.wal_head().saturating_add(state.blocks_read);
+        let until = stop.saturating_add(GROUP_BLOCKS_MAX as u64);
+        let (_, left_behind) = self.wal.scrub_stranded(newest, stop, until).await?;
         // Resume above every sequence ever issued: the WAL's newest record,
         // the persisted high-water mark, and any live table (an ingested
         // table can carry sequences from another history).
@@ -1093,6 +1101,91 @@ impl<
         })
     }
 
+    /// The most WAL blocks one atomic batch may span: [`GROUP_BLOCKS_MAX`],
+    /// or the whole WAL region when that is smaller (a batch larger than
+    /// the region is `BatchTooLarge`, not a `WalFull` no flush answers).
+    fn span_blocks_max(&self) -> usize {
+        let region = self.cfg.wal_end.saturating_sub(self.cfg.wal_start);
+        usize::try_from(region).map_or(GROUP_BLOCKS_MAX, |r| r.min(GROUP_BLOCKS_MAX))
+    }
+
+    /// Checks that a batch of `ops` can commit, before any I/O, and
+    /// returns the memtable arena bytes it takes: each record fits a
+    /// block; the batch, one atomic group from a fresh block that may span
+    /// blocks (ADR-0029), fits [`GROUP_BLOCKS_MAX`] blocks and an empty
+    /// memtable (`BatchTooLarge`), the memtable as it is (`TableFull` /
+    /// `ArenaFull`), and the WAL blocks left (`WalFull`).
+    fn plan_write(
+        &mut self,
+        ops: &[crate::batch::BatchOp<KEY_MAX, VAL_MAX>],
+    ) -> Result<usize, Error<D::Error>> {
+        let n = ops.len();
+        // Total capacity for the whole batch, up front: sizes were
+        // validated when the batch was built.
+        let mut need_arena = 0usize;
+        let mut need_wal = 0usize;
+        // A TTL record carries its 8-byte expiry after the value.
+        let record = |op: &crate::batch::BatchOp<KEY_MAX, VAL_MAX>| {
+            WAL_RECORD_OVERHEAD
+                + op.key().len()
+                + op.val().len()
+                + if op.kind() == Op::PutTtl { 8 } else { 0 }
+        };
+        for op in ops {
+            need_arena = need_arena
+                .checked_add(op.key().len() + op.val().len())
+                .ok_or(Error::ArenaFull)?;
+            if record(op) > BLOCK {
+                return Err(Error::BatchTooLarge {
+                    bytes: record(op),
+                    max: BLOCK,
+                });
+            }
+            need_wal = need_wal.saturating_add(record(op));
+        }
+        // Where its records land, as the writer places them.
+        let mut place = group::Placement::<BLOCK> {
+            sealed: 0,
+            filling: 0,
+        };
+        place.unit(need_wal, ops.iter().map(record));
+        let most = self.span_blocks_max();
+        if place.blocks() > most {
+            return Err(Error::BatchTooLarge {
+                bytes: need_wal,
+                max: most.saturating_mul(BLOCK),
+            });
+        }
+        // A batch even an empty memtable cannot hold: a flush would not
+        // help, so it is not `TableFull` / `ArenaFull`.
+        if n > CAP {
+            return Err(Error::BatchTooLarge { bytes: n, max: CAP });
+        }
+        if need_arena > ARENA {
+            return Err(Error::BatchTooLarge {
+                bytes: need_arena,
+                max: ARENA,
+            });
+        }
+        let (slots, arena) = self.memtable_taken();
+        if slots.saturating_add(n) > CAP {
+            return Err(Error::TableFull);
+        }
+        if arena.saturating_add(need_arena) > ARENA {
+            return Err(Error::ArenaFull);
+        }
+        // Every block the batch takes must be there before the first is
+        // written: a batch cut short by the region's end would leave a
+        // group that never closes.
+        let blocks = u64::try_from(place.blocks()).unwrap_or(u64::MAX);
+        if blocks > self.wal.blocks_left() {
+            // The flush that answers it wraps the region now.
+            self.wal_wanted = blocks;
+            return Err(Error::WalFull);
+        }
+        Ok(need_arena)
+    }
+
     /// Captures the WAL staging state before a mutation, for rollback.
     const fn stage_mark(&self) -> StageMark {
         StageMark {
@@ -1101,26 +1194,29 @@ impl<
         }
     }
 
-    /// Undoes a failed commit. If no block landed (`next_block`
-    /// unchanged), the staged records never became durable and are
-    /// truncated away. If a block landed but the device flush failed —
-    /// the device lied, indistinguishable from a crash at that instant —
-    /// the records may replay on recovery, so `seqs` sequence numbers are
-    /// consumed now and never reused.
+    /// Undoes a failed commit. Records still staged never became durable
+    /// and are truncated away. If a block may have reached the device
+    /// (see [`may_have_landed`](Self::may_have_landed)), its records may
+    /// replay on recovery, so `seqs` sequence numbers are consumed now and
+    /// never reused.
     ///
     /// `slots` and `arena` are what the records would take in the
-    /// memtable: when a block landed they are counted as taken until a
-    /// flush moves `wal_head` past them (see [`Unapplied`]).
+    /// memtable: when a block may have landed they are counted as taken
+    /// until a flush moves `wal_head` past them (see [`Unapplied`]).
     fn rollback_commit(
         &mut self,
         mark: StageMark,
+        landed: bool,
         seqs: u64,
         slots: usize,
         arena: usize,
     ) -> Result<(), Error<D::Error>> {
-        if self.wal.next_block() == mark.next_block {
-            self.wal.truncate_stage(mark.stage_len);
-        } else {
+        // Records still staged never reached the device: drop them, so no
+        // later commit writes them (a group that spans blocks can fail
+        // with part of it written and the rest staged).
+        self.wal
+            .truncate_stage(mark.stage_len.min(self.wal.staged_bytes()));
+        if landed {
             self.note_unapplied(slots, arena);
             self.next_seq = self
                 .next_seq
@@ -1132,6 +1228,18 @@ impl<
 
     /// Counts records a failed commit left on the device (see
     /// [`Unapplied`]).
+    /// Whether a commit that failed with `e` may have put a block on the
+    /// device since `mark`: one was written (the flush then failed: the
+    /// device lied, indistinguishable from a crash at that instant), or a
+    /// block write failed. A write that reports an error may still have
+    /// reached the medium (EIO after a partial write, a NOR program that
+    /// failed part way), so its numbers are never reused: a later batch
+    /// numbered the same could otherwise continue its span (review
+    /// finding, ADR-0029).
+    const fn may_have_landed(&self, mark: StageMark, e: &Error<D::Error>) -> bool {
+        self.wal.next_block() != mark.next_block || matches!(e, Error::Device(_))
+    }
+
     const fn note_unapplied(&mut self, slots: usize, arena: usize) {
         self.unapplied.slots = self.unapplied.slots.saturating_add(slots);
         self.unapplied.arena = self.unapplied.arena.saturating_add(arena);
@@ -1210,12 +1318,13 @@ impl<
             }
         };
         if let Err(e) = appended {
-            self.rollback_commit(mark, 0, 1, arena)?;
+            let landed = self.may_have_landed(mark, &e);
+            self.rollback_commit(mark, landed, u64::from(landed), 1, arena)?;
             return Err(e);
         }
         if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed), 1, arena)?;
+            let landed = self.may_have_landed(mark, &e);
+            self.rollback_commit(mark, landed, u64::from(landed), 1, arena)?;
             return Err(e);
         }
         self.next_seq = seq;
@@ -1309,24 +1418,34 @@ impl<
     /// honored — puts, deletes, range deletes, and TTL puts (whose
     /// records carry the 8-byte expiry inside the same atomic group).
     ///
-    /// Atomicity rides on a single WAL commit: the batch is staged into
-    /// the WAL's RAM buffer and made durable by one block write, so the
-    /// torn-tail rule yields all-or-nothing for free. A batch whose
-    /// encoded size exceeds one block cannot commit atomically and is
-    /// rejected with [`Error::BatchTooLarge`] — never silently split.
-    /// An empty batch is a no-op returning the current sequence number.
+    /// Atomicity rides on one WAL group under one device flush: the batch
+    /// starts a fresh WAL block, and recovery replays its records only
+    /// when its closing record is intact. A batch larger than a block
+    /// spans consecutive blocks (ADR-0029), up to
+    /// [`GROUP_BLOCKS_MAX`] of them; recovery replays it only when every
+    /// one of them is intact. A batch that does not fit those blocks, or
+    /// even an empty memtable, is rejected with [`Error::BatchTooLarge`] —
+    /// never silently split. An empty batch is a no-op returning the
+    /// current sequence number.
     ///
     /// This is also horton's **group commit**: every single-op write
     /// (`put`, `delete`, …) costs one WAL block write — one sector erase on
-    /// NOR flash — while a batch pays that once for all its ops. Batch
-    /// writes that arrive together to save both time and flash wear.
+    /// NOR flash — while a batch pays that once a block for all its ops.
+    /// Batch writes that arrive together to save both time and flash wear.
+    /// A batch of many blocks keeps the caller waiting for all of them
+    /// before its one flush: on NOR flash, an erase each.
     ///
     /// # Errors
     ///
     /// [`Error::BatchTooLarge`], [`Error::TableFull`],
     /// [`Error::ArenaFull`], [`Error::WalFull`], [`Error::CounterExhausted`],
-    /// or [`Error::Device`]. A rejected batch leaves no trace: no WAL records, no staged bytes,
-    /// no consumed sequence numbers.
+    /// or [`Error::Device`]. A batch rejected before any I/O leaves no
+    /// trace: no WAL records, no staged bytes, no consumed sequence
+    /// numbers. A device error once a block of it was written, or from a
+    /// block write itself (it may have reached the medium all the same),
+    /// fails the batch, unapplied; its sequence numbers are consumed, and
+    /// the next open may replay it whole (never in part), as after a
+    /// crash.
     pub async fn write<const OPS: usize>(
         &mut self,
         batch: &WriteBatch<KEY_MAX, VAL_MAX, OPS>,
@@ -1337,40 +1456,11 @@ impl<
         if n == 0 {
             return Ok(self.next_seq);
         }
-        // Total capacity for the whole batch, up front: sizes were
-        // validated when the batch was built.
-        let mut need_arena = 0usize;
-        let mut need_wal = 0usize;
-        for op in ops {
-            // A TTL record carries its 8-byte expiry after the value.
-            let ttl_extra = if op.kind() == Op::PutTtl { 8 } else { 0 };
-            need_arena = need_arena
-                .checked_add(op.key().len() + op.val().len())
-                .ok_or(Error::ArenaFull)?;
-            need_wal = need_wal
-                .checked_add(WAL_RECORD_OVERHEAD + op.key().len() + op.val().len() + ttl_extra)
-                .ok_or(Error::BatchTooLarge {
-                    bytes: usize::MAX,
-                    max: BLOCK,
-                })?;
-        }
-        if need_wal > BLOCK {
-            return Err(Error::BatchTooLarge {
-                bytes: need_wal,
-                max: BLOCK,
-            });
-        }
-        let (slots, arena) = self.memtable_taken();
-        if slots.saturating_add(n) > CAP {
-            return Err(Error::TableFull);
-        }
-        if arena.saturating_add(need_arena) > ARENA {
-            return Err(Error::ArenaFull);
-        }
+        let need_arena = self.plan_write(ops)?;
         self.sync_unapplied().await?;
-        // Drain any previously staged data so the batch still commits as
-        // one block write. (In practice the stage is always empty between
-        // Db calls — every mutation commits immediately.)
+        // Drain any previously staged data so the batch starts on a fresh
+        // block. (In practice the stage is always empty between Db calls —
+        // every mutation commits immediately.)
         if self.wal.staged_bytes() > 0 {
             self.wal.commit().await?;
         }
@@ -1403,13 +1493,17 @@ impl<
                     .await
             };
             if let Err(e) = appended {
-                self.rollback_commit(mark, 0, n, need_arena)?;
+                // A group that spans blocks may have written some already.
+                let landed = self.may_have_landed(mark, &e);
+                let seqs = if landed { nu64 } else { 0 };
+                self.rollback_commit(mark, landed, seqs, n, need_arena)?;
                 return Err(e);
             }
         }
         if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, if landed { nu64 } else { 0 }, n, need_arena)?;
+            let landed = self.may_have_landed(mark, &e);
+            let seqs = if landed { nu64 } else { 0 };
+            self.rollback_commit(mark, landed, seqs, n, need_arena)?;
             return Err(e);
         }
         self.next_seq = last;

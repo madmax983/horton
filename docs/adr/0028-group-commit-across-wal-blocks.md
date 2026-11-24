@@ -124,10 +124,11 @@ for the group is gone: units borrow the clients' own batches.
   the reviewers' randomized crash model (dropped, torn and torn-in-place
   writes at every point, crashes during open) over 1,500 seeds in
   release builds, 150 in debug.
-- **Not done:** a group's units are still at most one block each. A
-  single batch larger than a block stays `BatchTooLarge`: making one
-  batch span blocks atomically needs a record that closes a group
-  across blocks, a format change.
+- **Not done here:** a group's units were still at most one block
+  each, and a batch larger than a block stayed `BatchTooLarge`. Done in
+  [ADR-0029](0029-atomic-batches-across-wal-blocks.md), with a format
+  change; it also widens this ADR's scrub window (from where writing
+  resumes to 16 blocks past where recovery stopped reading).
 
 ## References
 
