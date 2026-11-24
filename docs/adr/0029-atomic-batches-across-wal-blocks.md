@@ -60,10 +60,14 @@ records of 60% of a block take three blocks. The checks, in order:
   region when fewer are left than that (before, a flush wrapped only an
   exhausted region, which a commit of one block was enough for).
 
-A device error after a block of the batch landed fails it, unapplied:
-its sequence numbers are consumed, the rest of it is dropped from the
-stage, and its memtable cost counts as taken until a flush moves past
-it (`Unapplied`, ADR-0028).
+A device error after a block of the batch landed, or from a block write
+itself, fails it, unapplied: its sequence numbers are consumed, the rest
+of it is dropped from the stage, and its memtable cost counts as taken
+until a flush moves past it (`Unapplied`, ADR-0028). A block write that
+reports an error may still reach the medium (EIO after a partial write,
+a NOR program cut short); if its numbers were reused, a later batch's
+`CONT` block could continue the failed batch's span, and recovery would
+replay half of each.
 
 **Recovery** reads each block once and carries an open span: the block
 and sequence number where a spanning group began, and the last sequence
@@ -102,10 +106,12 @@ It zeroes only blocks from the stop on, never the broken span's own
 blocks before it. Zeroing those would move the next recovery's stop
 back if power failed during the scrub with some of its zeroes landed,
 and that recovery's window would end short of blocks this one had still
-to zero. The span's blocks are harmless as they are: each begins with
-`CONT`, which ends the log while no span is open, and new writes are
-numbered above their records (the scrub reads them), so none can join
-them, and bytes they leave behind a torn rewrite read as older.
+to zero. The span's blocks are harmless as they are: each continues it
+(`CONT` first, which ends the log while no span is open) or begins a
+later span that broke off too; none of them can close, since the
+numbers that would close them were consumed and never written; and new
+writes are numbered above their records (the scrub reads them), so none
+can join them, and bytes they leave behind a torn rewrite read as older.
 
 **The manifest magic is `hrtman10`.** An older build reads a flagged
 record as an unknown op, a tear: it would drop a spanning group and
@@ -164,7 +170,15 @@ subset of the new format, and reads correctly.
   refusal then failed every write grouped with it
   (`tests/review_findings.rs`, `tests/group_commit.rs`, the kvstore's
   tests). It found planner and writer in agreement over 1,200 random
-  workloads, and no other panic under fuzzed WAL blocks.
+  workloads, and no other panic under fuzzed WAL blocks. A round
+  verifying those fixes found two more, each reproduced and fixed with
+  a test: a block write that failed but reached the medium let a later
+  batch continue the failed one's span (`tests/write_error_landed.rs`),
+  and the intact-copy check for another version's manifest knew only
+  the layout since `hrtman05`, so a v0.16 image beside a blank copy
+  opened as a fresh device (`tests/manifest.rs`). It ran the crash model
+  with chained failed spans and crashes during open over 80,000 more
+  seeds, and found the scrub fix sound.
 
 ## References
 

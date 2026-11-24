@@ -1071,8 +1071,8 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// never referenced.
     ///
     /// An intact copy of another format version (`hrtman` and other
-    /// digits, since "hrtman05") rejects the whole image; a copy torn
-    /// inside its magic is merely corrupt.
+    /// digits) rejects the whole image; a copy torn inside its magic is
+    /// merely corrupt.
     ///
     /// # Errors
     ///
@@ -1584,11 +1584,12 @@ fn check_block<const BLOCK: usize>(buf: &[u8; BLOCK]) -> Option<BlockHead> {
 }
 
 /// A manifest block of another format version: "hrtman" and two ASCII
-/// digits other than this version's, over a block intact under the
-/// header every version since "hrtman05" shares (its CRC computed with
-/// its own magic). A copy of this version torn or partly erased inside
-/// its magic is never that, so it stays a corrupt copy that loses to an
-/// intact one (review finding, ADR-0029).
+/// digits other than this version's, over a block intact under that
+/// version's header (its CRC computed with its own magic): the one every
+/// version since "hrtman05" shares, or the single-block layout before it
+/// (`magic | len: u32 | payload | crc32`). A copy of this version torn
+/// or partly erased inside its magic is never that, so it stays a corrupt
+/// copy that loses to an intact one (review findings, ADR-0029).
 fn is_foreign<const BLOCK: usize>(buf: &[u8; BLOCK]) -> bool {
     let Some(magic) = buf.get(..8) else {
         return false;
@@ -1599,7 +1600,34 @@ fn is_foreign<const BLOCK: usize>(buf: &[u8; BLOCK]) -> bool {
         && bytes[6].is_ascii_digit()
         && bytes[7].is_ascii_digit()
         && bytes != MANIFEST_MAGIC.to_le_bytes()
-        && check_block_of::<BLOCK>(buf, u64::from_le_bytes(bytes)).is_some()
+        && (check_block_of::<BLOCK>(buf, u64::from_le_bytes(bytes)).is_some()
+            || single_block_intact::<BLOCK>(buf))
+}
+
+/// A block intact under the single-block manifest layout of "hrtman01"
+/// to "hrtman04": `magic | len: u32 | payload | crc32`, the CRC over
+/// everything before it.
+fn single_block_intact<const BLOCK: usize>(buf: &[u8; BLOCK]) -> bool {
+    let Some(len) = buf
+        .get(8..12)
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)
+        .and_then(|l| usize::try_from(l).ok())
+    else {
+        return false;
+    };
+    let Some(end) = len.checked_add(12) else {
+        return false;
+    };
+    let Some(stored) = end
+        .checked_add(4)
+        .and_then(|crc_end| buf.get(end..crc_end))
+        .and_then(|b| b.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return false;
+    };
+    crc32(&buf[..end]) == stored
 }
 
 /// [`check_block`] against `magic`.

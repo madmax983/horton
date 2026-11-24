@@ -450,8 +450,10 @@ impl<
 
     /// Undoes a group that failed after `appended` records were staged:
     /// the records still in the stage never reached the device and are
-    /// dropped, so no later commit writes them. If any block reached the
-    /// device, its records may replay after a crash: every sequence
+    /// dropped, so no later commit writes them. If any block may have
+    /// reached the device (one was written, or a block write failed: it
+    /// may have landed all the same), its records may replay after a
+    /// crash: every sequence
     /// number the group used is consumed and never reused, and the
     /// group's memtable cost is counted as taken until a flush moves
     /// `wal_head` past it (see `Unapplied`). Returns `e`.
@@ -462,7 +464,7 @@ impl<
         plan: &GroupPlan,
         e: Error<D::Error>,
     ) -> Error<D::Error> {
-        let landed = self.wal.next_block() != mark.next_block;
+        let landed = self.may_have_landed(mark, &e);
         self.wal
             .truncate_stage(mark.stage_len.min(self.wal.staged_bytes()));
         if landed {

@@ -1194,19 +1194,19 @@ impl<
         }
     }
 
-    /// Undoes a failed commit. If no block landed (`next_block`
-    /// unchanged), the staged records never became durable and are
-    /// truncated away. If a block landed but the device flush failed —
-    /// the device lied, indistinguishable from a crash at that instant —
-    /// the records may replay on recovery, so `seqs` sequence numbers are
-    /// consumed now and never reused.
+    /// Undoes a failed commit. Records still staged never became durable
+    /// and are truncated away. If a block may have reached the device
+    /// (see [`may_have_landed`](Self::may_have_landed)), its records may
+    /// replay on recovery, so `seqs` sequence numbers are consumed now and
+    /// never reused.
     ///
     /// `slots` and `arena` are what the records would take in the
-    /// memtable: when a block landed they are counted as taken until a
-    /// flush moves `wal_head` past them (see [`Unapplied`]).
+    /// memtable: when a block may have landed they are counted as taken
+    /// until a flush moves `wal_head` past them (see [`Unapplied`]).
     fn rollback_commit(
         &mut self,
         mark: StageMark,
+        landed: bool,
         seqs: u64,
         slots: usize,
         arena: usize,
@@ -1216,7 +1216,7 @@ impl<
         // with part of it written and the rest staged).
         self.wal
             .truncate_stage(mark.stage_len.min(self.wal.staged_bytes()));
-        if self.wal.next_block() != mark.next_block {
+        if landed {
             self.note_unapplied(slots, arena);
             self.next_seq = self
                 .next_seq
@@ -1228,6 +1228,18 @@ impl<
 
     /// Counts records a failed commit left on the device (see
     /// [`Unapplied`]).
+    /// Whether a commit that failed with `e` may have put a block on the
+    /// device since `mark`: one was written (the flush then failed: the
+    /// device lied, indistinguishable from a crash at that instant), or a
+    /// block write failed. A write that reports an error may still have
+    /// reached the medium (EIO after a partial write, a NOR program that
+    /// failed part way), so its numbers are never reused: a later batch
+    /// numbered the same could otherwise continue its span (review
+    /// finding, ADR-0029).
+    const fn may_have_landed(&self, mark: StageMark, e: &Error<D::Error>) -> bool {
+        self.wal.next_block() != mark.next_block || matches!(e, Error::Device(_))
+    }
+
     const fn note_unapplied(&mut self, slots: usize, arena: usize) {
         self.unapplied.slots = self.unapplied.slots.saturating_add(slots);
         self.unapplied.arena = self.unapplied.arena.saturating_add(arena);
@@ -1306,12 +1318,13 @@ impl<
             }
         };
         if let Err(e) = appended {
-            self.rollback_commit(mark, 0, 1, arena)?;
+            let landed = self.may_have_landed(mark, &e);
+            self.rollback_commit(mark, landed, u64::from(landed), 1, arena)?;
             return Err(e);
         }
         if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed), 1, arena)?;
+            let landed = self.may_have_landed(mark, &e);
+            self.rollback_commit(mark, landed, u64::from(landed), 1, arena)?;
             return Err(e);
         }
         self.next_seq = seq;
@@ -1428,9 +1441,11 @@ impl<
     /// [`Error::ArenaFull`], [`Error::WalFull`], [`Error::CounterExhausted`],
     /// or [`Error::Device`]. A batch rejected before any I/O leaves no
     /// trace: no WAL records, no staged bytes, no consumed sequence
-    /// numbers. A device error after a block of it was written fails the
-    /// batch, unapplied; its sequence numbers are consumed, and the next
-    /// open may replay it whole (never in part), as after a crash.
+    /// numbers. A device error once a block of it was written, or from a
+    /// block write itself (it may have reached the medium all the same),
+    /// fails the batch, unapplied; its sequence numbers are consumed, and
+    /// the next open may replay it whole (never in part), as after a
+    /// crash.
     pub async fn write<const OPS: usize>(
         &mut self,
         batch: &WriteBatch<KEY_MAX, VAL_MAX, OPS>,
@@ -1479,14 +1494,16 @@ impl<
             };
             if let Err(e) = appended {
                 // A group that spans blocks may have written some already.
-                let landed = self.wal.next_block() != mark.next_block;
-                self.rollback_commit(mark, if landed { nu64 } else { 0 }, n, need_arena)?;
+                let landed = self.may_have_landed(mark, &e);
+                let seqs = if landed { nu64 } else { 0 };
+                self.rollback_commit(mark, landed, seqs, n, need_arena)?;
                 return Err(e);
             }
         }
         if let Err(e) = self.wal.commit().await {
-            let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, if landed { nu64 } else { 0 }, n, need_arena)?;
+            let landed = self.may_have_landed(mark, &e);
+            let seqs = if landed { nu64 } else { 0 };
+            self.rollback_commit(mark, landed, seqs, n, need_arena)?;
             return Err(e);
         }
         self.next_seq = last;

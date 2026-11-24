@@ -182,9 +182,11 @@ included. A record never spans blocks; a group may.
   rewrite leaves behind read as older and are rejected. In-flight units
   survive a crash whole or not at all, in any combination; what one
   recovery decides, later ones keep.
-- A commit that fails after a block of it reached the device is not
-  applied, but its records may replay: until a flush moves `wal_head`
-  past them, capacity checks count them as taken, and the next write
+- A commit that fails after a block of it reached the device, or whose
+  block write failed (a write that reports an error may still reach the
+  medium), is not applied, but its records may replay: its sequence
+  numbers are consumed, never reused; until a flush moves `wal_head`
+  past them, capacity checks count them as taken; and the next write
   flushes the device before adding blocks.
 - When the region is exhausted (see `WalFull` above) the next flush
   wraps it: `wal_head` returns to `wal_start` in the same manifest

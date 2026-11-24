@@ -277,6 +277,37 @@ fn an_older_image_with_one_copy_is_rejected_not_taken_for_fresh() {
     }
 }
 
+/// Review finding: images of v0.4.1 to v0.16 keep each manifest copy in
+/// one block of another layout (`magic | len: u32 | payload | crc32`). An
+/// intact such copy beside a blank one is another version's image too,
+/// not a torn copy of this one, and is rejected.
+#[test]
+fn a_single_block_manifest_of_an_old_layout_is_rejected() {
+    for old in [b"hrtman02", b"hrtman03", b"hrtman04"] {
+        let mut dev = MemDevice::<BLOCK>::new();
+        let mut block = [0u8; BLOCK];
+        block[0..8].copy_from_slice(old);
+        let payload = [7u8; 40];
+        block[8..12].copy_from_slice(&40u32.to_le_bytes());
+        block[12..52].copy_from_slice(&payload);
+        let crc = horton::crc32(&block[..52]);
+        block[52..56].copy_from_slice(&crc.to_le_bytes());
+        write_block(&mut dev, SLOT_B, &block);
+        let mut scratch = [0u8; BLOCK];
+        let res = block_on(TestManifest::recover(
+            &mut dev,
+            &mut scratch,
+            SLOT_A,
+            SLOT_B,
+        ));
+        assert!(
+            matches!(res, Err(Error::CorruptManifest)),
+            "{old:?}: an older image must be rejected, got {:?}",
+            res.map(|(_, fresh)| fresh)
+        );
+    }
+}
+
 #[test]
 fn encode_crc_tail_is_bounds_checked() {
     // Regression: the trailing CRC write was not bounds-checked. A payload

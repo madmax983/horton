@@ -499,11 +499,13 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// at any offset, so the caller can resume numbering above it. `Db`
     /// passes `until` = `stop` plus [`GROUP_BLOCKS_MAX`].
     ///
-    /// The blocks between where writing resumes and `stop` are those of a
-    /// group that spanned blocks and broke off (ADR-0029). They are left
-    /// as they are: each begins with a [`CONT`] record, which ends the log
-    /// while no span is open, and new writes are numbered above their
-    /// records, so none can join them. Zeroing them would let a crash
+    /// The blocks between where writing resumes and `stop` are those of
+    /// groups that spanned blocks and broke off (ADR-0029): each continues
+    /// one ([`CONT`] first, which ends the log while no span is open) or
+    /// begins a later one that broke off too. They are left as they are:
+    /// none of those groups can close (the numbers that would close them
+    /// were consumed, never written), and new writes are numbered above
+    /// their records, so none can join them. Zeroing them would let a crash
     /// during the scrub move the next recovery's stop back, and its
     /// window short of blocks this one had still to zero (review
     /// finding).
