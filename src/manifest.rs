@@ -59,8 +59,10 @@ use crate::error::Error;
 /// filter is rejected when it is opened, not at its first read.
 /// "hrtman10" (v0.20) is the same layout over a WAL whose atomic groups
 /// may span blocks ([`SPAN`](crate::wal::SPAN), ADR-0029): an older
-/// reader would replay part of such a group, so it must not open the
-/// image, and this one must not open an older image's WAL. A foreign
+/// reader takes a `SPAN` or `CONT` record for a torn tail, so it would
+/// drop a spanning group and every write after it and write over them;
+/// it must not open the image, and this one must not open an older
+/// image's. A foreign
 /// magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
@@ -1068,8 +1070,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// replays everything — no data loss, the orphaned blocks are simply
     /// never referenced.
     ///
-    /// A copy that begins with another version's magic (`hrtman` and other
-    /// digits) rejects the whole image.
+    /// An intact copy of another format version (`hrtman` and other
+    /// digits, since "hrtman05") rejects the whole image; a copy torn
+    /// inside its magic is merely corrupt.
     ///
     /// # Errors
     ///
@@ -1136,7 +1139,7 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         if scratch.iter().all(|&b| b == 0) || scratch.iter().all(|&b| b == 0xFF) {
             return Ok(Probe::Blank);
         }
-        if scratch[..6] == *b"hrtman" && scratch[..8] != MANIFEST_MAGIC.to_le_bytes() {
+        if is_foreign::<BLOCK>(scratch) {
             return Ok(Probe::Foreign);
         }
         let Some(head) = check_block::<BLOCK>(scratch) else {
@@ -1561,7 +1564,8 @@ enum Probe {
     Blank,
     /// Written but not intact (torn or damaged).
     Corrupt,
-    /// A manifest of another format version ("hrtman" with other digits).
+    /// An intact manifest block of another format version (see
+    /// [`is_foreign`]).
     Foreign,
 }
 
@@ -1576,12 +1580,36 @@ struct BlockHead {
 /// Validates one manifest block — magic, chunk length, CRC — and returns
 /// its header.
 fn check_block<const BLOCK: usize>(buf: &[u8; BLOCK]) -> Option<BlockHead> {
+    check_block_of::<BLOCK>(buf, MANIFEST_MAGIC)
+}
+
+/// A manifest block of another format version: "hrtman" and two ASCII
+/// digits other than this version's, over a block intact under the
+/// header every version since "hrtman05" shares (its CRC computed with
+/// its own magic). A copy of this version torn or partly erased inside
+/// its magic is never that, so it stays a corrupt copy that loses to an
+/// intact one (review finding, ADR-0029).
+fn is_foreign<const BLOCK: usize>(buf: &[u8; BLOCK]) -> bool {
+    let Some(magic) = buf.get(..8) else {
+        return false;
+    };
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(magic);
+    bytes[..6] == *b"hrtman"
+        && bytes[6].is_ascii_digit()
+        && bytes[7].is_ascii_digit()
+        && bytes != MANIFEST_MAGIC.to_le_bytes()
+        && check_block_of::<BLOCK>(buf, u64::from_le_bytes(bytes)).is_some()
+}
+
+/// [`check_block`] against `magic`.
+fn check_block_of<const BLOCK: usize>(buf: &[u8; BLOCK], magic: u64) -> Option<BlockHead> {
     let u64_at = |o: usize| {
         buf.get(o..o + 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
     };
-    if u64_at(0)? != MANIFEST_MAGIC {
+    if u64_at(0)? != magic {
         return None;
     }
     let seq = u64_at(8)?;

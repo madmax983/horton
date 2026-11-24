@@ -119,7 +119,7 @@ use crate::gate::{Gate, Pin, Slot};
 use crate::handoff::{Handoff, Next};
 use crate::{
     BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
-    KvScan, KvTables, LEVELS, VAL_MAX, block_on,
+    KvScan, KvTables, LEVELS, MEMTABLE_ARENA, MEMTABLE_ENTRIES, VAL_MAX, block_on,
 };
 
 /// horton's error, with this store's device error.
@@ -304,6 +304,28 @@ impl Batch {
             return Err(Error::BatchTooLarge {
                 bytes: self.wal_bytes(),
                 max: GROUP_BLOCKS_MAX * BLOCK,
+            });
+        }
+        // Nor may it outgrow an empty memtable, which horton refuses
+        // as well: refused here, it never joins other clients' writes.
+        if self.ops.len() > MEMTABLE_ENTRIES {
+            return Err(Error::BatchTooLarge {
+                bytes: self.ops.len(),
+                max: MEMTABLE_ENTRIES,
+            });
+        }
+        let arena: usize = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                BatchOp::Put(k, v) => k.len() + v.len(),
+                BatchOp::Delete(k) => k.len(),
+            })
+            .sum();
+        if arena > MEMTABLE_ARENA {
+            return Err(Error::BatchTooLarge {
+                bytes: arena,
+                max: MEMTABLE_ARENA,
             });
         }
         Ok(())
@@ -1971,7 +1993,7 @@ impl Engine {
                     unit
                 })
                 .collect();
-            let done = room.with_room(db, stall, |db| {
+            let done = match room.with_room(db, stall, |db| {
                 // The filter first, then the memtable: a read that
                 // starts after this write returns must find the bits.
                 // And before each try: making room flushes, and a flush
@@ -1983,7 +2005,22 @@ impl Engine {
                     }
                 }
                 block_on(db.write_group(&units))
-            })?;
+            }) {
+                // The head can never commit, alone or not (`Handle::write`
+                // checks for that first, so this is a backstop): it fails
+                // by itself, and the writes behind it go on.
+                Err(
+                    e @ (Error::BatchTooLarge { .. }
+                    | Error::EmptyKey
+                    | Error::KeyTooLarge { .. }
+                    | Error::ValueTooLarge { .. }),
+                ) => {
+                    let head = self.group.remove(0);
+                    head.finish(Err(StoreError::Db(e)));
+                    continue;
+                }
+                other => other?,
+            };
             if done.units == 0 {
                 // Unreachable: the head fits the blocks by itself, and a
                 // refusal for want of room is an error, not an empty
@@ -2452,6 +2489,41 @@ mod tests {
         ));
         drop(held);
         store.snapshot().expect("released slots are free again");
+    }
+
+    #[test]
+    fn an_oversized_batch_does_not_fail_the_writes_grouped_with_it() {
+        let store = TempStore::new("oversized-neighbour");
+        // Review finding: 4,097 deletes of a one-byte key fit seven 16 KiB
+        // WAL blocks, but not the memtable's 4,096 slots, which horton
+        // refuses (BatchTooLarge). `Batch::check` let it through on blocks
+        // alone, and its refusal failed every write grouped with it. Now
+        // it is refused before it queues.
+        let mut big = Batch::new();
+        for _ in 0..=crate::MEMTABLE_ENTRIES {
+            big.delete(b"a");
+        }
+        let shared = Arc::clone(&store.handle.shared);
+        // With the engine held, the batch is refused without queueing
+        // (nothing could commit it otherwise), and a write queued after
+        // it commits once the engine is free.
+        let held = shared.engine().expect("engine");
+        let refused = store.handle().write(big);
+        assert!(
+            matches!(refused, Err(StoreError::Db(Error::BatchTooLarge { .. }))),
+            "{refused:?}"
+        );
+        assert_eq!(shared.queued.load(Ordering::Relaxed), 0, "it never queued");
+        std::thread::scope(|s| {
+            let h = store.handle();
+            let b = s.spawn(move || h.put(b"innocent", b"v"));
+            while shared.queued.load(Ordering::Relaxed) < 1 {
+                std::thread::yield_now();
+            }
+            drop(held);
+            assert_eq!(b.join().expect("put"), Ok(()));
+        });
+        assert_eq!(store.get(b"innocent"), Ok(Some(b"v".to_vec())));
     }
 
     #[test]

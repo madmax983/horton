@@ -491,13 +491,22 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
 
     /// After recovery: makes what lies just past the recovered log
     /// harmless (ADR-0028). Reads the block writing resumes at and every
-    /// one after it before block `until`; zeroes (then flushes) each of
-    /// the later ones that holds a record newer than `newer_than` (the
-    /// newest sequence number recovery saw, or the flush floor if
-    /// higher); and returns the highest sequence number of any record
-    /// found in them, at any offset, so the caller can resume numbering
-    /// above it. `Db` passes `until` = where recovery stopped reading plus
-    /// [`GROUP_BLOCKS_MAX`].
+    /// one after it before block `until`; zeroes (then flushes) each one
+    /// from `stop` on (the block recovery stopped reading at; never the
+    /// first) that holds a record newer than `newer_than` (the newest
+    /// sequence number recovery saw, or the flush floor if higher); and
+    /// returns the highest sequence number of any record found in them,
+    /// at any offset, so the caller can resume numbering above it. `Db`
+    /// passes `until` = `stop` plus [`GROUP_BLOCKS_MAX`].
+    ///
+    /// The blocks between where writing resumes and `stop` are those of a
+    /// group that spanned blocks and broke off (ADR-0029). They are left
+    /// as they are: each begins with a [`CONT`] record, which ends the log
+    /// while no span is open, and new writes are numbered above their
+    /// records, so none can join them. Zeroing them would let a crash
+    /// during the scrub move the next recovery's stop back, and its
+    /// window short of blocks this one had still to zero (review
+    /// finding).
     ///
     /// A group commit writes up to `span` blocks before its one flush,
     /// and a device may reach the medium in any order before a flush, so
@@ -509,9 +518,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     ///   into a later block of the group. Zeroing it prevents that. Only
     ///   blocks before `until` can hold such records, and only records
     ///   newer than everything recovered: older ones are stale, and every
-    ///   recovery stops at them as before. The blocks of a group that
-    ///   spanned blocks and broke off, between where writing resumes and
-    ///   where recovery stopped, hold such records too (ADR-0029).
+    ///   recovery stops at them as before.
     /// - **Bytes left behind a torn write.** A block written again in
     ///   place can tear, keeping its old bytes past the tear. Recovery
     ///   takes records in a block only while their sequence numbers rise,
@@ -532,11 +539,16 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     pub(crate) async fn scrub_stranded(
         &mut self,
         newer_than: u64,
+        stop: u64,
         until: u64,
     ) -> Result<(u64, u64), Error<D::Error>> {
         debug_assert_eq!(self.stage_len, 0, "scrub with records staged");
         let first = self.next_block;
         let end = until.min(self.wal_end);
+        // Blocks before `stop` are a broken span's: never zeroed (see
+        // above), so a crash during this scrub cannot move the next
+        // recovery's stop, and with it this window, back.
+        let zero_from = stop.max(first + 1);
         let mut scrubbed = 0;
         let mut highest = 0u64;
         for id in first..end {
@@ -547,7 +559,7 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
                 .map_err(Error::Device)?;
             let seen = highest_seq_anywhere(&self.stage);
             highest = highest.max(seen.unwrap_or(0));
-            if id > first && seen.is_some_and(|seq| seq > newer_than) {
+            if id >= zero_from && seen.is_some_and(|seq| seq > newer_than) {
                 self.stage.fill(0);
                 let device = &mut self.device;
                 let block = &self.stage;
@@ -1261,7 +1273,8 @@ fn scan_block(block: &[u8], continuing: Option<u64>, seq_floor: u64) -> BlockSca
                     break;
                 }
                 if off == 0 {
-                    scan.joined = rec.cont && continuing.is_some_and(|last| rec.seq == last + 1);
+                    scan.joined = rec.cont
+                        && continuing.is_some_and(|last| last.checked_add(1) == Some(rec.seq));
                     if rec.cont != scan.joined {
                         scan.torn = true;
                         break;

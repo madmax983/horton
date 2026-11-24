@@ -333,8 +333,9 @@ the same memory, from 0.37.
 - **An image of another format version is rejected even when one of its
   manifest copies is blank.** Such a copy read as damaged, and beside a
   blank one the device read as fresh: the WAL replayed over tables the
-  build could not see. A copy that starts with `hrtman` and another
-  version now rejects the image (ADR-0029).
+  build could not see. An intact copy of another version (`hrtman`, other
+  digits, a valid CRC) now rejects the image; a copy torn inside its
+  magic still loses to the other copy (ADR-0029).
 - **A crash can no longer bring back a write that recovery dropped.**
   A group of WAL blocks written before one flush (`write_group`, and
   `WalWriter::append_batch`) can be left with a later block on the

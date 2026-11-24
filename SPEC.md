@@ -166,11 +166,14 @@ included. A record never spans blocks; a group may.
   landed after it); otherwise it ends. A block that begins with `CONT`
   while no span is open, a `CONT` record anywhere but first, and a
   `SPAN` record not followed by clean zero padding are torn bytes.
-- After recovery, open zeroes any block after the one writing resumes at,
-  up to `GROUP_BLOCKS_MAX` blocks past the one recovery stopped reading
-  at, that holds a record newer than every record it recovered (and than
-  `flushed_seq`), and flushes. (The two differ when a spanning group
-  broke off: writing resumes at its first block.) A device may persist
+- After recovery, open reads from the block writing resumes at to
+  `GROUP_BLOCKS_MAX` blocks past the one recovery stopped reading at,
+  and zeroes any block from the stop on (never the first) that holds a
+  record newer than every record it recovered (and than `flushed_seq`),
+  and flushes. (The two differ when a spanning group broke off: writing
+  resumes at its first block, and the group's blocks before the stop are
+  left as they are, so a crash during the scrub cannot move the next
+  stop back.) A device may persist
   a group's blocks in any order before the flush, so a later block can
   outlive an earlier one; without this, the next recovery would read it
   once the gap is written over, and bring back a write this recovery
@@ -302,9 +305,10 @@ and its table refs.
   SSTables and the manifest carry a magic that changes with the layout;
   a foreign magic is rejected, never misread. The WAL's layout is
   versioned by the manifest's magic (its record magic stays `0x6C73`, and
-  a foreign one reads as a torn tail): a manifest copy that starts with
-  `hrtman` and another version rejects the whole image, even beside a
-  blank copy, rather than reading as a fresh device. A WAL with no
+  a foreign one reads as a torn tail): an intact manifest copy of another
+  version (`hrtman`, two other digits, a valid CRC) rejects the whole
+  image, even beside a blank copy, rather than reading as a fresh
+  device; a copy torn inside its magic is merely torn. A WAL with no
   manifest yet (never flushed) written by an older build holds only
   records the current format reads the same way.
 

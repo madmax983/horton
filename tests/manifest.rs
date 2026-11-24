@@ -258,6 +258,10 @@ fn an_older_image_with_one_copy_is_rejected_not_taken_for_fresh() {
             .expect("one copy written");
         let mut block = read_block(&dev, slot);
         block[0..8].copy_from_slice(old);
+        // A real older block carries a CRC over its own magic.
+        let len = u32::from_le_bytes(block[20..24].try_into().unwrap()) as usize;
+        let crc = horton::crc32(&block[..24 + len]);
+        block[24 + len..28 + len].copy_from_slice(&crc.to_le_bytes());
         write_block(&mut dev, slot, &block);
         let res = block_on(TestManifest::recover(
             &mut dev,

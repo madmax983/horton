@@ -1082,12 +1082,9 @@ impl<
         // blocks broke off: scrub from the one to beyond the other
         // (ADR-0029).
         let newest = state.max_seq.max(self.manifest.flushed_seq());
-        let until = self
-            .manifest
-            .wal_head()
-            .saturating_add(state.blocks_read)
-            .saturating_add(GROUP_BLOCKS_MAX as u64);
-        let (_, left_behind) = self.wal.scrub_stranded(newest, until).await?;
+        let stop = self.manifest.wal_head().saturating_add(state.blocks_read);
+        let until = stop.saturating_add(GROUP_BLOCKS_MAX as u64);
+        let (_, left_behind) = self.wal.scrub_stranded(newest, stop, until).await?;
         // Resume above every sequence ever issued: the WAL's newest record,
         // the persisted high-water mark, and any live table (an ingested
         // table can carry sequences from another history).

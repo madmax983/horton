@@ -789,3 +789,73 @@ fn new_writes_are_numbered_above_records_left_past_the_log() {
         done.base + 5
     );
 }
+
+/// Review finding: open's scrub zeroed the blocks of a broken span too,
+/// between where writing resumes and where recovery stopped. Power
+/// failing during the scrub, with the zero over a span block landed and
+/// the one over the group's last block not, moved the next recovery's
+/// stop back a block, and its scrub window with it: the group's last
+/// block was never zeroed, new writes reused its numbers, and once they
+/// filled the gap the next recovery replayed a unit the first dropped.
+/// The scrub leaves a broken span's blocks alone (each begins with
+/// `CONT`, which ends the log while no span is open).
+#[test]
+fn a_crash_during_the_scrub_keeps_its_window() {
+    let mut db = open(Lab::default());
+    block_on(db.put(b"acked", b"1")).expect("put");
+    let first = db.device().wal_writes.last().copied().expect("a WAL write") + 1;
+    db.device().fail_write.set(Some(db.device().writes + 2));
+    let broken = spanning_unit(0);
+    assert_eq!(
+        write_group(&mut db, &broken).map(|d| d.units),
+        Err(Error::Device(Fault))
+    );
+    db.device().lose.borrow_mut().insert(first + 2);
+    db.device().fail_flush.set(true);
+    db.device().pass_flushes.set(1);
+    let later = units(100, GROUP_BLOCKS_MAX, 3, 1000);
+    assert_eq!(
+        write_group(&mut db, &later).map(|d| d.units),
+        Err(Error::Device(Fault))
+    );
+    let last = first + 2 + GROUP_BLOCKS_MAX as u64 - 1;
+    assert_eq!(db.device().wal_writes.last().copied(), Some(last));
+    // Power cycle; the first open fails in its scrub: the zero over the
+    // group's last block never lands (the scrub's flush fails), every
+    // other write does.
+    let dev = db.into_device();
+    dev.lose.borrow_mut().clear();
+    dev.lose.borrow_mut().insert(last);
+    dev.fail_flush.set(true);
+    dev.pass_flushes.set(0);
+    let mut db = GroupDb::new(dev, test_config());
+    assert_eq!(block_on(db.open()).map(|_| ()), Err(Error::Device(Fault)));
+    let dev = db.into_device();
+    dev.lose.borrow_mut().clear();
+    dev.fail_flush.set(false);
+    let mut db = open(dev);
+    for (u, unit) in later.iter().enumerate() {
+        for (k, _) in unit {
+            assert!(
+                get(&db, k).is_none(),
+                "unit {u} visible after the second open"
+            );
+        }
+    }
+    // Fill from where writing resumes up to just before the group's last
+    // block, then reopen.
+    for i in 0..=GROUP_BLOCKS_MAX {
+        block_on(db.put(format!("fill{i}").as_bytes(), b"f")).expect("put");
+    }
+    assert_eq!(db.device().wal_writes.last().copied(), Some(last - 1));
+    let db = open(db.into_device());
+    assert_eq!(get(&db, b"fill16").as_deref(), Some(&b"f"[..]));
+    for (u, unit) in later.iter().enumerate() {
+        for (k, _) in unit {
+            assert!(get(&db, k).is_none(), "unit {u} came back");
+        }
+    }
+    for (k, _) in broken.iter().flatten() {
+        assert!(get(&db, k).is_none(), "the broken unit came back");
+    }
+}

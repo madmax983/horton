@@ -98,14 +98,26 @@ beyond such a window: recovery dropped them, writes filled the gap, and
 the next recovery replayed them. The scrub now reads from where writing
 resumes to `GROUP_BLOCKS_MAX` blocks past where recovery stopped
 (`RecoverState::blocks_read`). Every unflushed block lies inside that.
+It zeroes only blocks from the stop on, never the broken span's own
+blocks before it. Zeroing those would move the next recovery's stop
+back if power failed during the scrub with some of its zeroes landed,
+and that recovery's window would end short of blocks this one had still
+to zero. The span's blocks are harmless as they are: each begins with
+`CONT`, which ends the log while no span is open, and new writes are
+numbered above their records (the scrub reads them), so none can join
+them, and bytes they leave behind a torn rewrite read as older.
 
 **The manifest magic is `hrtman10`.** An older build reads a flagged
 record as an unknown op, a tear: it would drop a spanning group and
 every write after it, and write over them. The magic keeps the two
-apart. Images written by older builds are rejected. A manifest copy that starts with `hrtman` and another version
-now rejects the image (`CorruptManifest`). Before, such a copy beside a
+apart. Images written by older builds are rejected. An intact manifest
+copy of another version (`hrtman`, two other digits, and a block whose
+CRC checks under the header every version since `hrtman05` shares) now
+rejects the image (`CorruptManifest`). Before, such a copy beside a
 blank one read as a fresh device: the old WAL was replayed over tables
-this build could not see. The WAL record magic is unchanged: a
+this build could not see. A copy of this version torn inside its magic
+(`hrtman` and zeros, or `0xFF` on erased NOR flash) is not such a copy:
+it is torn, and loses to the other copy as before. The WAL record magic is unchanged: a
 never-flushed old image (no manifest) is a WAL of records that are a
 subset of the new format, and reads correctly.
 
@@ -143,7 +155,16 @@ subset of the new format, and reads correctly.
   `tests/write_batch.rs` (failures part way, the scrub window, `WalFull`,
   crashes at every point), `tests/manifest.rs`, and the randomized crash
   model in `tests/group_commit_crash.rs`, now with spanning units and
-  failed spanning batches followed by writes.
+  failed spanning batches followed by writes. An adversarial review of
+  the code found four more, each reproduced and fixed with a test: the
+  scrub zeroing a broken span's blocks (above), a manifest copy torn
+  inside its magic taken for another version (the database would not
+  open), recovery overflowing on a span at `u64::MAX` (a panic), and the
+  host store letting through a batch larger than its memtable, whose
+  refusal then failed every write grouped with it
+  (`tests/review_findings.rs`, `tests/group_commit.rs`, the kvstore's
+  tests). It found planner and writer in agreement over 1,200 random
+  workloads, and no other panic under fuzzed WAL blocks.
 
 ## References
 
