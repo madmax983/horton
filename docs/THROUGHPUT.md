@@ -20,32 +20,44 @@ fifth took the footer and the cache's locks out of a reader's way. The
 sixth took point reads out of the store's request queue and, for
 nearly all of them, out of its lock. The seventh took compaction's
 merge out of that lock, and writers that wait for it. The eighth runs
-two compaction jobs at a time. A ninth pass, after
-the release table below was measured, went back over the code a block
-passes through: CRC-32, the LZ77 codec, the cache's copies and the
-memtable's insert ([step 16](#then-the-hot-path-measured-again)).
+two compaction jobs at a time. A ninth pass went back over the code a
+block passes through: CRC-32, the LZ77 codec, the cache's copies and
+the memtable's insert ([step 16](#then-the-hot-path-measured-again)).
 Against the build before it, writes are 1.3 to 1.4 times faster and
-point reads 1.6.
+point reads 1.6. The last steps let one `fdatasync` cover many WAL
+blocks of writes, and one atomic batch span them
+([steps 18 and 19](#then-one-fdatasync-for-more-than-a-block-of-writes)).
+
+The table was measured again after step 19 (commit `dc6affa`), with
+RocksDB run beside it on the same machine.
 
 | db_bench workload, 1 M keys, 4 threads, ops/s | horton 0.19 | horton 0.20 | against 0.19 | RocksDB, same memory | RocksDB, as shipped | 0.20 / RocksDB, same memory |
 |---|---:|---:|---:|---:|---:|---:|
-| `fillseq` | 90,389 | 222,118 | 2.5× | 241,835 | 408,901 | 0.92× |
-| `fillrandom` | 47,054 | 133,455 | 2.8× | 189,794 | 330,383 | 0.70× |
-| `overwrite` | 44,143 | 128,749 | 2.9× | 133,682 | 336,217 | 0.96× |
-| `readrandom` | 7,190 | 190,269 | 26× | 356,681 | 626,371 | 0.53× |
-| `readmissing` | 7,995 | 4,958,200 | 620× | 4,761,060 | 1,505,577 | 1.04× |
-| `readseq` | 209,822 | 8,148,692 | 39× | 16,118,609 | 7,860,138 | 0.51× |
-| `readreverse` | 186,400 | 4,839,314 | 26× | 16,524,470 | 4,419,448 | 0.29× |
-| `seekrandom` | 1,964 | 117,645 | 60× | 301,626 | 221,475 | 0.39× |
-| `readwhilewriting` | not measured | 101,688 | | 191,614 | 419,316 | 0.53× |
-| `deleterandom` | 55,882 | 196,918 | 3.5× | 362,007 | 347,232 | 0.54× |
+| `fillseq` | 90,389 | 195,867 | 2.2× | 233,083 | 413,909 | 0.84× |
+| `fillrandom` | 47,054 | 153,071 | 3.3× | 162,708 | 277,394 | 0.94× |
+| `overwrite` | 44,143 | 131,696 | 3.0× | 123,516 | 263,636 | 1.07× |
+| `readrandom` | 7,190 | 248,889 | 35× | 327,333 | 433,491 | 0.76× |
+| `readmissing` | 7,995 | 5,719,763 | 715× | 3,778,521 | 1,727,075 | 1.51× |
+| `readseq` | 209,822 | 5,971,168 | 28× | 15,974,687 | 8,616,526 | 0.37× |
+| `readreverse` | 186,400 | 3,025,237 | 16× | 14,920,127 | 7,418,412 | 0.20× |
+| `seekrandom` | 1,964 | 84,351 | 43× | 296,408 | 219,061 | 0.28× |
+| `readwhilewriting` | not measured | 125,104 | | 167,913 | 360,847 | 0.75× |
+| `deleterandom` | 55,882 | 186,935 | 3.3× | 340,090 | 322,541 | 0.55× |
+| `fillrandom`, every write synced (100 K keys) | | 15,492 | | 12,511 | 12,238 | 1.24× |
+| `fillrandom`, 100 writes a batch | | 281,720 | | 175,113 | 530,186 | 1.61× |
+| `fillrandom`, 1,000 writes a batch, synced | | 196,397 | | 232,630 | 592,451 | 0.84× |
 
 Every column but the first is one run. The 0.19 column is from an
 earlier run on the same kind of machine. **The read rows move from run
 to run** (see [Run to run](#run-to-run)): what a read costs depends on
 how many level-0 tables the fills happened to leave, between none and
 five, and `seekrandom` has been anywhere from 45 K to 120 K for that
-reason alone. The comparisons between builds in
+reason alone. In the same run the build before step 19, whose reads
+are the same code, got 108,759 `seekrandom`, 7.1 M `readseq` and
+4.1 M `readreverse` ([Results](#results)). The scan rows were also
+higher in the release table (8.1 M and 4.8 M), measured on a faster
+machine of the same kind: every column of step 16's table is below
+it. The comparisons between builds in
 [What changed in v0.20](#what-changed-in-v020) are made on identical
 tables instead. The `readseq` and `readreverse` figures for 0.19 are
 one thread scanning (that benchmark ignored the thread count); in 0.20
@@ -69,17 +81,17 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
   got through the queue more slowly than one. A read of a key the
   memtable cannot hold now takes no lock at all. Against RocksDB with
   the same memory that row went from 0.05× to 0.17× (the filters) to
-  about 1× (the lock). The two engines are level there, give or take
-  the spread of single runs.
+  about 1× (the lock), and was 1.5× in the latest run. The two engines
+  are about level there, give or take the spread of single runs.
 - **Reads no longer stop for writes.** While one thread overwrote the
   store, a reader got a sixth of its quiet rate: the few reads that
   needed the engine lock waited behind a writer that held it for the
   length of a compaction job. Compaction's merge now runs on its own
   thread outside the lock, and a write that waits for it waits without
   the lock. Four readers went from 17 K reads a second to 135 K while
-  a fifth thread wrote. They get 102 K now that the writer writes
-  twice as fast (the eighth pass); RocksDB with the same memory gets
-  192 K.
+  a fifth thread wrote. They got 102 K once the writer wrote twice as
+  fast (the eighth pass), and 125 K in the latest run; RocksDB with the
+  same memory got 168 K beside it.
 - **Scans and seeks were three costs, one of them threads.** A scan
   re-decoded a block every time its merge changed table, a seek read
   every table in range before yielding anything, and both held the
@@ -88,15 +100,25 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
 - **Unsynced writes were bound by thread hand-offs**, two per
   operation, and then by compaction: first on the writers' own time,
   then as one merge on one thread, and at this size in a region with
-  no slot for a second. Sequential fills are 2.5 times faster and
-  within 10% of RocksDB given the same memory. Random fills are 2.8
-  times faster, at 0.7 of RocksDB's rate, and overwrites are level
-  with it. Half of that came last: two compaction jobs at a time, with
+  no slot for a second. Sequential fills are 2.2 times faster, at 0.84
+  of RocksDB's rate given the same memory. Random fills are 3.3 times
+  faster, at 0.94 of it, and overwrites are level with it (1.07). Half of that came last: two compaction jobs at a time, with
   a slot reserve for each, took random fills from 66 K to 133 K a
   second. Less than half of *that* is the second thread; the rest is
   that the jobs now rewrite less (step 15).
-- **Synced writes did not change**, and all three engines are within
-  a quarter of each other there: each waits for the same `fdatasync`.
+- **Synced single writes are a quarter faster than RocksDB's**, 15.5 K
+  a second against 12.5 K: each engine waits for the same `fdatasync`,
+  and horton's writer queue puts 2.5 client writes behind each.
+- **Batches.** With 100 writes a batch and no `fdatasync`, horton
+  writes 1.6 to 2.1 times as fast as RocksDB with the same memory
+  (RocksDB as shipped, with a 64 MiB memtable, is faster still). A
+  batch may now be larger than a 16 KiB WAL block and stay atomic (step
+  19), up to 16 blocks, about 1,800 of these writes; a build before it
+  refused one. horton gains nothing from batches past 100, synced or
+  not, where RocksDB with the same memory keeps gaining: at 1,000
+  writes a batch horton is 1.1 to 1.4 times RocksDB's rate without
+  `fdatasync` and 0.84 to 1.22 with it, and at 1,800, synced, 0.66 to
+  1.03 ([Batches](#batches-and-batches-larger-than-a-wal-block)).
 - **What remains.** One thread at a time writes, flushes run on the
   writers' time, and level 0 drains as one merge on one thread, which
   is nearly all the compaction a store with slots to spare has. A
@@ -112,11 +134,17 @@ thread alone scans at 1.9 M entries/s forwards and 1.1 M backwards.
 apt install rocksdb-tools                 # db_bench 8.9.1
 examples/kvstore/vs-rocksdb.sh 1000000    # the table above
 examples/kvstore/vs-rocksdb.sh 100000 --sync
+examples/kvstore/vs-rocksdb.sh 1000000 --batch 1000          # 1,000 writes a client batch
+examples/kvstore/vs-rocksdb.sh 1000000 --sync --batch 1000
 KVSTORE_BASELINE=path/to/an/older/kvstore examples/kvstore/vs-rocksdb.sh   # adds a "before" column
 ```
 
 [`vs-rocksdb.sh`](../examples/kvstore/vs-rocksdb.sh) runs the same
-benchmark list on three configurations and prints ops/s side by side:
+benchmark list on three configurations and prints ops/s side by side.
+`--batch N` puts N writes in each client batch on both (db_bench's
+`--batch_size`, the kvstore's `--batch`) and runs only the write
+benchmarks; both then count entries, not batches, a second. A build
+that refuses the batch size shows `-`.
 
 | | memtable | block cache | block | flush and compaction |
 |---|---|---|---|---|
@@ -154,9 +182,13 @@ Read the numbers with these in mind:
 
 ## Results
 
-"horton (before)" in these tables is v0.20 with one compaction job at
-a time (commit `3b3583e`); "horton" is v0.20. For the earlier steps
-see [What changed in v0.20](#what-changed-in-v020).
+"horton (before)" in these tables is v0.20 before step 19 (commit
+`9398c60`, where a batch must fit one WAL block); "horton" is v0.20
+after it (commit `dc6affa`). Every table here was measured on
+2026-11-24, one run after another on an otherwise idle machine. Step
+19 changes nothing for a batch that fits a block, and the two columns
+differ only by the spread of single runs. For the earlier steps see
+[What changed in v0.20](#what-changed-in-v020).
 
 ### No fsync (`--no-sync`; db_bench's default)
 
@@ -164,26 +196,26 @@ see [What changed in v0.20](#what-changed-in-v020).
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                              408901           241835           211344           222118                     0.92x
-fillrandom                           330383           189794            65959           133455                     0.70x
-overwrite                            336217           133682            61733           128749                     0.96x
-readrandom                           626371           356681           205233           190269                     0.53x
-readmissing                         1505577          4761060          5996121          4958200                     1.04x
-readseq                             7860138         16118609          8213468          8148692                     0.51x
-readreverse                         4419448         16524470          4684071          4839314                     0.29x
-seekrandom                           221475           301626           113878           117645                     0.39x
-readwhilewriting                     419316           191614           146314           101688                     0.53x
-deleterandom                         347232           362007            79775           196918                     0.54x
-readrandom (after compact)         11958646         13065277           319013           419701                     0.03x
+fillseq                              413909           233083           203390           195867                     0.84x
+fillrandom                           277394           162708           151596           153071                     0.94x
+overwrite                            263636           123516           136862           131696                     1.07x
+readrandom                           433491           327333           256470           248889                     0.76x
+readmissing                         1727075          3778521          4438673          5719763                     1.51x
+readseq                             8616526         15974687          7132232          5971168                     0.37x
+readreverse                         7418412         14920127          4101865          3025237                     0.20x
+seekrandom                           219061           296408           108759            84351                     0.28x
+readwhilewriting                     360847           167913           132045           125104                     0.75x
+deleterandom                         322541           340090           200643           186935                     0.55x
+readrandom (after compact)          9755788         10001075           625802           576931                     0.06x
 ```
 
-The three write rows and `deleterandom` are this step: two compaction
-jobs at a time (step 15 of [What changed](#what-changed-in-v020)).
-`readwhilewriting` fell with it: its writer now does twice the writes
-in the same time, on the same four cores (see
-[Reader threads](#reader-threads)). The read rows of a quiet store are
-not a like-for-like pair (each column fills its own store and they end
-with different tables), and pairs show none of them slower.
+The write rows of the two horton columns are within 4% of each
+other. Their scans and seeks are not: the fills left each column its
+own tables, and the reads that follow are decided by them
+([Run to run](#run-to-run)). Against the run of step 15 (on a faster
+machine of the same kind) RocksDB with the same memory is 4% to 14%
+slower on every write row here; horton is 15% faster on `fillrandom`
+and 2% on `overwrite` (step 16), and 12% slower on `fillseq`.
 
 100 K keys (11 MB: RocksDB as shipped never leaves its memtable):
 
@@ -257,13 +289,77 @@ disk, so the engines converge: each is waiting for the same device.
 
 ```text
 benchmark                           rocksdb  rocksdb (small)  horton (before)           horton  horton / rocksdb (small)
-fillseq                               14570            16606            16025            15580                     0.94x
-fillrandom                            15204            16020            16642            16429                     1.03x
-overwrite                             14662            15492            16544            16994                     1.10x
+fillseq                               12204            12782            14990            16016                     1.25x
+fillrandom                            12238            12511            15709            15492                     1.24x
+overwrite                             11528            11989            15102            15235                     1.27x
 ```
 
-Both group commits. horton averaged 2.6 client writes per
-`fdatasync` with 4 writers.
+Both group commits. horton's writer queue put 2.5 client writes behind
+each `fdatasync` with 4 writers (1 M synced random writes: 395,404
+commits, 397,445 syncs, 15,456 writes a second; 15,618 for the build
+before step 19). RocksDB's was 14,570 to 16,606 in step 15's run, and
+is a fifth to a quarter below that here.
+
+### Batches, and batches larger than a WAL block
+
+1 M keys, 4 client threads, each writing N entries a client batch;
+entries a second. A 16 KiB WAL block holds about 117 of these writes,
+so a batch of 1,000 spans nine blocks and one of 1,800 sixteen, the
+most one commit writes. The build before step 19 refuses a batch
+larger than a block (`-`).
+
+No `fdatasync`, two runs of each:
+
+```text
+benchmark, writes a batch          rocksdb      rocksdb (small)    horton (before)             horton   horton / rocksdb (small)
+fillseq, 100                 897951/1033554        262278/264270      455305/549212      537135/516602                1.95/2.05x
+fillrandom, 100               530186/487757        175113/177773      286656/301893      281720/293180                1.61/1.65x
+overwrite, 100                478708/484051        139212/137403      249258/251357      257875/264738                1.85/1.93x
+fillseq, 1000               1252648/1074799        372453/409568                  -      524322/445607                1.41/1.09x
+fillrandom, 1000              645788/553002        234769/239861                  -      280226/282224                1.19/1.18x
+overwrite, 1000               567172/575569        177676/186989                  -      235926/259203                1.33/1.39x
+```
+
+Every write synced, one run of each:
+
+```text
+benchmark, writes a batch          rocksdb      rocksdb (small)    horton (before)             horton   horton / rocksdb (small)
+fillseq, 100                         561913               250216             347878             347866                      1.39x
+fillrandom, 100                      394924               170158             186125             189102                      1.11x
+overwrite, 100                       343127               135462             196185             200086                      1.48x
+fillseq, 1000                       1077812               349904                  -             427488                      1.22x
+fillrandom, 1000                     592451               232630                  -             196397                      0.84x
+overwrite, 1000                      508581               169677                  -             187854                      1.11x
+fillseq, 1800                       1056649               442812                  -             456281                      1.03x
+fillrandom, 1800                     622746               298931                  -             196444                      0.66x
+overwrite, 1800                      551134               235068                  -             168959                      0.72x
+```
+
+What horton's writer queue did, one synced `fillrandom` of 1 M keys
+into an empty store, 4 threads:
+
+| writes a batch | commits | `fdatasync`s | client batches a commit | entries/s | build before step 19 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 395,404 | 397,445 | 2.5 | 15,456 | 15,618 |
+| 100 | 4,322 | 5,862 | 2.3 | 137,696 | 137,372 |
+| 1,000 | 1,000 | 2,514 | 1.0 | 137,290 | refused |
+| 1,800 | 556 | 2,249 | 1.0 | 132,699 | refused |
+
+(Flushes and compaction add about 1,500 syncs of their own.) From 100
+writes a batch up, `fdatasync` is not what horton waits on: the syncs
+fall by 2.6 times and the rate does not move. A commit of 1,000 writes
+takes a batch alone, since two would not fit 16 blocks.
+
+RocksDB with the same memory gains a quarter to a half from 100 to
+1,000 writes a batch, and three quarters from 100 to 1,800 synced.
+horton gains a fifth to a third on sequential keys synced and nothing
+on random keys, synced or not. So the lead it has at 100 writes a
+batch shrinks with the batch: at 1,000 it is 1.1 to 1.4 times
+RocksDB's rate without `fdatasync`, and at 1,800, synced, level on
+sequential keys and two thirds on random ones.
+
+100 K keys runs, synced, were too short to read (a fifth of a second
+a benchmark); they agree on the direction.
 
 ### Reader threads
 
@@ -930,20 +1026,45 @@ Every write synced, `fillrandom` at 200 K keys, two runs of each build:
 Where the block was the limit, half the syncs and a fifth more writes.
 Four writers of single puts never filled a block, and do not change.
 
+### Then: batches larger than a WAL block
+
+Step 19 (ADR-0029). A batch had to fit one WAL block to be atomic: in
+the kvstore about 117 writes of 100 bytes, and on firmware with 4 KiB
+blocks some 30. It may now span up to 16 blocks: two flags in the
+record's op byte, `SPAN` and `CONT`, tie its blocks together, and
+recovery replays it only when every block of it is intact. The format
+changed (manifest `hrtman10`).
+
+Nothing changes for a batch that fits a block: at 1 M keys the write
+rows of the build before and after are within 4% of each other, and
+synced single puts within 7% ([Results](#results)), as close as single
+runs come. What it adds is
+batches of 1,000 and 1,800 writes that the build before refused, at
+horton's batched rate: 0.45 to 0.52 M sequential and 0.28 M random
+entries a second without `fdatasync`, 0.43 to 0.46 M and 0.20 M synced
+([Batches](#batches-and-batches-larger-than-a-wal-block)). It does not
+make batched writes faster: past 100 writes a batch `fdatasync` is not
+what they wait on.
+
 ## What the remaining gap is made of
+
+Ratios from the run at the top (commit `dc6affa`); the read rows carry
+the tables the fills left, as [Run to run](#run-to-run) says.
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
 |---|---:|---|
-| `fillseq` | 0.92× | one writer at a time commits in about 4 µs; little to compact when keys arrive in order |
-| `fillrandom` | 0.70× | each 16 KiB block compaction writes is about 80 µs of one core, and it writes some twenty times what the writers do; two jobs run at once, where RocksDB's cost less each |
-| `overwrite` | 0.96× | the same work; RocksDB's own rate falls by a third from `fillrandom` to here, and horton's does not |
-| `readrandom` | 0.53× | a read is 19 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
-| `readmissing` | 1.04× | no gap: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
-| `readseq` | 0.51× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
-| `readreverse` | 0.29× | the same, and stepping backwards through a block's version runs costs more than forwards |
-| `seekrandom` | 0.39× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
-| `readwhilewriting` | 0.53× | `readrandom`'s 19 µs, on four cores shared with a writer and two merges; and every table compaction writes is new to the cache |
-| `deleterandom` | 0.54× | as `fillrandom` |
+| `fillseq` | 0.84× | one writer at a time commits in about 4 µs; little to compact when keys arrive in order |
+| `fillrandom` | 0.94× | each 16 KiB block compaction writes is about 80 µs of one core, and it writes some twenty times what the writers do; two jobs run at once, where RocksDB's cost less each |
+| `overwrite` | 1.07× | the same work; RocksDB's own rate falls by a quarter from `fillrandom` to here, and horton's by a seventh |
+| `readrandom` | 0.76× | a read is 19 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
+| `readmissing` | 1.51× | no gap: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
+| `readseq` | 0.37× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
+| `readreverse` | 0.20× | the same, and stepping backwards through a block's version runs costs more than forwards |
+| `seekrandom` | 0.28× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
+| `readwhilewriting` | 0.75× | `readrandom`'s 19 µs, on four cores shared with a writer and two merges; and every table compaction writes is new to the cache |
+| `deleterandom` | 0.55× | as `fillrandom` |
+| `fillrandom`, every write synced (100 K keys) | 1.24× | no gap: both wait for the same `fdatasync`, and horton's queue puts 2.5 writes behind each |
+| `fillrandom`, 1,000 writes a batch, synced | 0.84× | not the syncs: from 100 writes a batch up, horton's rate stays put while its `fdatasync`s fall by 2.6 times; one writer thread at a time does each entry's work, where RocksDB's gains from larger batches |
 
 **One thread at a time writes, and level 0 drains as one job.** `Db`
 is a single-owner value with `&mut self` writes; that is ADR-0002's
@@ -1052,6 +1173,7 @@ Measured or scoped while doing this, and left:
   more constant tables. Superseded by step 16: three slicing-by-8
   chains reach 3.6 GB/s with the tables there are.
 - **Group commit across WAL blocks.** Done in step 18 (ADR-0028).
+- **Batches larger than a WAL block.** Done in step 19 (ADR-0029).
 - **Inflating a data block only up to the key.** Done in step 17
   (ADR-0027).
 - **Index blocks verified by the entry.** Needs checksums inside the
