@@ -24,11 +24,13 @@
 //!   is megabytes of state that would otherwise move between CPU caches
 //!   on every call: four threads taking turns at the lock write slower
 //!   than one thread alone.
-//! - **Group commit** falls out of it: consecutive writes in the queue
-//!   that fit one WAL block are committed as one [`WriteBatch`], one
-//!   block write and one `fdatasync` for all of them. This is `LevelDB`'s
-//!   writer queue. Each client's batch stays atomic (the group is all or
-//!   nothing).
+//! - **Group commit** falls out of it: consecutive writes in the queue,
+//!   up to `GROUP_BLOCKS_MAX` WAL blocks of them, are committed with
+//!   horton's `Db::write_group` (ADR-0028): one `fdatasync` for all of
+//!   them, and visible only once it has returned. This is `LevelDB`'s
+//!   writer queue. Each client's batch stays atomic, inside one WAL
+//!   block; a write is acknowledged when the prefix of the group it is in
+//!   is durable.
 //! - **Waiters spin before they sleep.** An operation takes microseconds,
 //!   so a waiting thread polls for its result and for the lock for up to
 //!   [`SPIN`] before parking, as `RocksDB`'s write thread does. Parking
@@ -107,8 +109,8 @@ use std::time::{Duration, Instant};
 
 use horton::wal::WAL_RECORD_OVERHEAD;
 use horton::{
-    BlockDevice, COMPACTION_LANES, CachePort, Detached, Error, Lane, OpenReport, Progress,
-    ScanBlock, SlotStats, WriteBatch,
+    BlockDevice, COMPACTION_LANES, CachePort, Detached, Error, GROUP_BLOCKS_MAX, GroupOp, Lane,
+    OpenReport, Progress, ScanBlock, SlotStats,
 };
 
 use crate::cache::SharedCache;
@@ -122,13 +124,6 @@ use crate::{
 
 /// horton's error, with this store's device error.
 pub type DbError = Error<IoError>;
-
-/// Most ops one WAL block can hold: every op costs at least its record
-/// overhead plus a one-byte key.
-const GROUP_OPS: usize = BLOCK / (WAL_RECORD_OVERHEAD + 1);
-
-/// The group-commit batch: one WAL block's worth of ops.
-type GroupBatch = WriteBatch<KEY_MAX, VAL_MAX, GROUP_OPS>;
 
 /// How many times one write retries after making room. Each retry follows
 /// a flush or a whole compaction job, so a write that still does not fit
@@ -336,7 +331,8 @@ pub struct Stats {
     pub io: IoStats,
     pub cache_hits: u64,
     pub cache_misses: u64,
-    /// Write groups committed, and the client writes they carried.
+    /// Write groups committed (each one `fdatasync` when syncing), and
+    /// the client writes they carried.
     pub groups: u64,
     pub grouped_writes: u64,
     pub flushes: u64,
@@ -1628,7 +1624,6 @@ struct Engine {
     /// The readers' gate (the room has it too, and [`Shared`]). The
     /// engine's part is to tell it what the memtable is about to hold.
     gate: Arc<Gate>,
-    batch: Box<GroupBatch>,
     /// The writes of the group being committed (kept to reuse its
     /// allocation).
     group: Vec<Arc<Pending>>,
@@ -1685,7 +1680,6 @@ impl Engine {
                 steps: 0,
             },
             gate,
-            batch: Box::new(GroupBatch::new()),
             group: Vec::new(),
             tables,
             compaction_stuck: None,
@@ -1827,7 +1821,8 @@ impl Engine {
     }
 
     /// Moves the write at the head of the queue, and every write queued
-    /// directly behind it that fits the same WAL block, into
+    /// directly behind it that fits the same `GROUP_BLOCKS_MAX` WAL
+    /// blocks, into
     /// `self.group`. False when there is nothing to take, or when
     /// `leave` asks for the queue to be left as it is.
     fn take_group(&mut self, shared: &Shared, leave: bool) -> bool {
@@ -1840,15 +1835,22 @@ impl Engine {
         };
         self.group.clear();
         // The head always goes: `Handle::write` checked that it fits a
-        // block by itself.
-        let (mut bytes, mut ops) = (head.batch.wal_bytes(), head.batch.ops.len());
+        // block by itself. Behind it, as many writes as fill
+        // `GROUP_BLOCKS_MAX` WAL blocks, each whole inside one, as horton
+        // places them (ADR-0028): one `fdatasync` for all of them.
+        let (mut blocks, mut filling) = (1usize, head.batch.wal_bytes());
         self.group.push(head);
         while let Some(next) = queue.front() {
-            bytes += next.batch.wal_bytes();
-            ops += next.batch.ops.len();
-            if bytes > BLOCK || ops > GROUP_OPS {
+            let bytes = next.batch.wal_bytes();
+            let (b, f) = if filling + bytes > BLOCK {
+                (blocks + 1, bytes)
+            } else {
+                (blocks, filling + bytes)
+            };
+            if b > GROUP_BLOCKS_MAX {
                 break;
             }
+            (blocks, filling) = (b, f);
             self.group.extend(queue.pop_front());
         }
         shared.queued.store(queue.len(), Ordering::Relaxed);
@@ -1856,9 +1858,10 @@ impl Engine {
         true
     }
 
-    /// Commits the writes in `self.group` as one batch and tells each of
-    /// them the result. Returns false, with the group kept, when the
-    /// batch has to wait for compaction to make room.
+    /// Commits the writes in `self.group` as one group commit and tells
+    /// each of them the result. Returns false, with the writes not yet
+    /// committed kept, when they have to wait for compaction to make
+    /// room.
     ///
     /// A write that finds the memtable full flushes it here, under the
     /// engine lock. When the flush is refused because level 0 or the
@@ -1874,21 +1877,7 @@ impl Engine {
             return false;
         }
         self.stalled = None;
-        self.batch.clear();
-        let mut result = Ok(());
-        for op in self.group.iter().flat_map(|p| &p.batch.ops) {
-            let r = match op {
-                BatchOp::Put(k, v) => self.batch.put(k, v),
-                BatchOp::Delete(k) => self.batch.delete(k),
-            };
-            // Unreachable: `Handle::write` checked every op, and the
-            // group fits one block.
-            if let Err(e) = r {
-                result = Err(e.widen());
-                break;
-            }
-        }
-        let mut result = result.and_then(|()| self.write_group(Stall::Report));
+        let mut result = self.write_group(Stall::Report);
         if result == Err(Error::NeedsCompaction) {
             if self.background_pending() {
                 self.stalled = Some(self.db.manifest().seq());
@@ -1903,31 +1892,73 @@ impl Engine {
             result = self.write_group(Stall::Wait);
         }
         let result = result.map_err(StoreError::Db);
-        self.groups += 1;
-        self.grouped_writes += self.group.len() as u64;
         for p in self.group.drain(..) {
             p.finish(result.clone());
         }
         true
     }
 
-    /// Writes `self.batch`, the writes of `self.group`, making room as
-    /// `stall` says.
+    /// Commits the writes of `self.group` with horton's group commit
+    /// (`Db::write_group`, ADR-0028): each client's batch one atomic
+    /// unit, the group one `fdatasync`. Makes room as `stall` says, and
+    /// finishes each write as soon as the prefix it is in is durable.
+    /// Returns once all are committed, or with the error that stopped
+    /// the rest, which stay in `self.group`.
+    ///
+    /// horton commits the longest prefix that fits the memtable and the
+    /// WAL. When that is not all of them, the rest go round again, and
+    /// the room logic flushes first if the memtable or the WAL was full.
     fn write_group(&mut self, stall: Stall) -> Result<(), DbError> {
-        let (batch, group, gate) = (&*self.batch, &self.group, &self.gate);
-        self.room
-            .with_room(&mut self.db, stall, |db| {
+        while !self.group.is_empty() {
+            let (room, db, group, gate) = (&mut self.room, &mut self.db, &self.group, &self.gate);
+            // Each client's batch is one unit, its ops borrowed.
+            let mut ops = Vec::new();
+            let mut ends = Vec::with_capacity(group.len());
+            for p in group {
+                ops.extend(p.batch.ops.iter().map(|op| match op {
+                    BatchOp::Put(k, v) => GroupOp::put(k, v),
+                    BatchOp::Delete(k) => GroupOp::delete(k),
+                }));
+                ends.push(ops.len());
+            }
+            let mut start = 0;
+            let units: Vec<&[GroupOp<'_>]> = ends
+                .iter()
+                .map(|&end| {
+                    let unit = &ops[start..end];
+                    start = end;
+                    unit
+                })
+                .collect();
+            let done = room.with_room(db, stall, |db| {
                 // The filter first, then the memtable: a read that
                 // starts after this write returns must find the bits.
                 // And before each try: making room flushes, and a flush
                 // empties the filter.
-                for op in group.iter().flat_map(|p| &p.batch.ops) {
-                    let (BatchOp::Put(key, _) | BatchOp::Delete(key)) = op;
-                    gate.note(key);
+                for p in group {
+                    for op in &p.batch.ops {
+                        let (BatchOp::Put(key, _) | BatchOp::Delete(key)) = op;
+                        gate.note(key);
+                    }
                 }
-                block_on(db.write(batch))
-            })
-            .map(drop)
+                block_on(db.write_group(&units))
+            })?;
+            if done.units == 0 {
+                // Unreachable: the head fits a block by itself, and a
+                // refusal for want of room is an error, not an empty
+                // prefix.
+                return Err(Error::BatchTooLarge {
+                    bytes: self.group.first().map_or(0, |p| p.batch.wal_bytes()),
+                    max: BLOCK,
+                });
+            }
+            self.groups += 1;
+            self.grouped_writes += done.units as u64;
+            for p in self.group.drain(..done.units) {
+                p.finish(Ok(()));
+            }
+        }
+        Ok(())
     }
 
     fn stats(&self) -> Stats {

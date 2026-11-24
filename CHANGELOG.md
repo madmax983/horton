@@ -34,6 +34,14 @@ the same memory, from 0.37.
 
 ### Added
 
+- **Group commit across WAL blocks** (ADR-0028). `Db::write_group`
+  commits many atomic units (`GroupOp` slices: each a client's batch,
+  borrowed) under one device flush, each unit inside one WAL block, at
+  most `GROUP_BLOCKS_MAX` blocks; nothing is visible before the flush
+  returns. It commits the longest prefix that fits the memtable and the
+  WAL and says how many (`GroupCommit`). The kvstore's writer queue
+  commits through it: synced writes from 8 threads in batches of 50 take
+  half the `fdatasync`s and run 22 to 26% faster.
 - **Bloom filters that span blocks** (ADR-0020). `bloom_bytes` may now
   exceed a block. It is the most filter a table can have: the table
   writer builds the filter at that length and, when the table ends,
@@ -146,6 +154,13 @@ the same memory, from 0.37.
 
 ### Changed
 
+- **A point read inflates a data block only as far as its key**
+  (ADR-0027). The LZ77 decoder can stop and resume; a point lookup
+  scans a compressed block's entries as it inflates them and stops at
+  the answer, leaving what the scan cannot decide (the end of the
+  entries) to the whole-block search. Same answers, about half the
+  inflating; `readrandom` on one thread 9% faster. A raw block is
+  searched where it lies in the cache.
 - **The hot path, measured again** (ADR-0026). No format change: every
   CRC is the same value, and the LZ77 stream format is unchanged (images
   written now decode on older versions and the other way round).
@@ -304,6 +319,23 @@ the same memory, from 0.37.
 
 ### Fixed
 
+- **A crash can no longer bring back a write that recovery dropped.**
+  A group of WAL blocks written before one flush (`write_group`, and
+  `WalWriter::append_batch`) can be left with a later block on the
+  medium and an earlier one not. Recovery stopped at the earlier one,
+  but once the next write filled it, a following recovery would read
+  on into the later block. Open now zeroes such stranded blocks
+  (ADR-0028).
+- **A failed write can no longer make the database unopenable.** A
+  commit that failed after its block reached the device (a put whose
+  flush failed) left a record the memtable did not count; enough writes
+  after it, and the next open replayed more than the memtable holds and
+  failed with `CorruptWal` every time. Capacity checks now count such
+  records until a flush moves past them, and the next write flushes the
+  device before adding blocks (ADR-0028).
+- New writes after a recovery are numbered above every record left past
+  the recovered log, so bytes a torn rewrite leaves behind can never
+  replay as a newer write (ADR-0028).
 - The kvstore's deadlock guard in its tests allows five minutes in an
   unoptimized build. One test took 52 s of its one-minute limit alone,
   and timed out beside the rest of `cargo test`.

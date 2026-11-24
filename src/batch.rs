@@ -48,6 +48,52 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize> BatchOp<KEY_MAX, VAL_MAX> {
     }
 }
 
+/// Checks one op as a batch queues it, and returns its key and value
+/// lengths as stored (a delete stores no value). Shared by
+/// [`WriteBatch`] and [`Db::write_group`](crate::Db::write_group), so the
+/// two accept exactly the same ops. An inverted or empty range delete is
+/// a no-op that the callers skip before checking.
+///
+/// For [`Op::RangeDelete`], `key` is the inclusive start and `val` the
+/// exclusive end; the end must fit `KEY_MAX` as well as `VAL_MAX`.
+pub(crate) fn check_op<const KEY_MAX: usize, const VAL_MAX: usize>(
+    kind: Op,
+    key: &[u8],
+    val: &[u8],
+) -> Result<(u16, u16), Error<Infallible>> {
+    if kind == Op::RangeDelete && val.len() > KEY_MAX {
+        return Err(Error::KeyTooLarge {
+            len: val.len(),
+            max: KEY_MAX,
+        });
+    }
+    if key.is_empty() {
+        return Err(Error::EmptyKey);
+    }
+    let key_len = u16::try_from(key.len()).map_err(|_| Error::KeyTooLarge {
+        len: key.len(),
+        max: usize::from(u16::MAX),
+    })?;
+    if key.len() > KEY_MAX {
+        return Err(Error::KeyTooLarge {
+            len: key.len(),
+            max: KEY_MAX,
+        });
+    }
+    let vlen = if kind == Op::Delete { 0 } else { val.len() };
+    let val_len = u16::try_from(vlen).map_err(|_| Error::ValueTooLarge {
+        len: vlen,
+        max: usize::from(u16::MAX),
+    })?;
+    if vlen > VAL_MAX {
+        return Err(Error::ValueTooLarge {
+            len: vlen,
+            max: VAL_MAX,
+        });
+    }
+    Ok((key_len, val_len))
+}
+
 /// A fixed-capacity batch of mutations, owned by the caller.
 ///
 /// Created empty with [`new`](WriteBatch::new); ops are queued with
@@ -176,15 +222,6 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const OPS: usize>
     /// [`Error::ValueTooLarge`] (the end bound must fit the value
     /// storage).
     pub fn range_delete(&mut self, start: &[u8], end: &[u8]) -> Result<(), Error<Infallible>> {
-        if start >= end {
-            return Ok(());
-        }
-        if end.len() > KEY_MAX {
-            return Err(Error::KeyTooLarge {
-                len: end.len(),
-                max: KEY_MAX,
-            });
-        }
         self.push(Op::RangeDelete, start, end, 0)
     }
 
@@ -200,33 +237,23 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const OPS: usize>
         val: &[u8],
         expire_at: u64,
     ) -> Result<(), Error<Infallible>> {
-        if self.len >= OPS {
-            return Err(Error::BatchFull);
+        // An empty range shadows nothing: a no-op, before any check.
+        if kind == Op::RangeDelete && key >= val {
+            return Ok(());
         }
-        if key.is_empty() {
-            return Err(Error::EmptyKey);
-        }
-        let key_len = u16::try_from(key.len()).map_err(|_| Error::KeyTooLarge {
-            len: key.len(),
-            max: usize::from(u16::MAX),
-        })?;
-        if key.len() > KEY_MAX {
+        // A range end too long for a key is reported first, as it always
+        // was, even by a full batch.
+        if kind == Op::RangeDelete && val.len() > KEY_MAX {
             return Err(Error::KeyTooLarge {
-                len: key.len(),
+                len: val.len(),
                 max: KEY_MAX,
             });
         }
-        let vlen = if kind == Op::Delete { 0 } else { val.len() };
-        let val_len = u16::try_from(vlen).map_err(|_| Error::ValueTooLarge {
-            len: vlen,
-            max: usize::from(u16::MAX),
-        })?;
-        if vlen > VAL_MAX {
-            return Err(Error::ValueTooLarge {
-                len: vlen,
-                max: VAL_MAX,
-            });
+        if self.len >= OPS {
+            return Err(Error::BatchFull);
         }
+        let (key_len, val_len) = check_op::<KEY_MAX, VAL_MAX>(kind, key, val)?;
+        let vlen = usize::from(val_len);
         let slot = &mut self.ops[self.len];
         slot.kind = kind;
         slot.key_len = key_len;

@@ -117,6 +117,11 @@ everything after `magic`. Records never span blocks.
   a block holding acknowledged records is never rewritten. A
   `WriteBatch` stages all its ops into one block (group commit); a batch
   larger than a block is `BatchTooLarge`, never split.
+- `Db::write_group` commits many such units under one flush (ADR-0028):
+  each unit stays inside one block, a block is written without a flush
+  when the next unit does not fit it, at most `GROUP_BLOCKS_MAX` blocks
+  are written, and the device is flushed once before any unit is applied
+  to the memtable. Units take consecutive sequence numbers in order.
 - Recovery replays `[wal_head, …)` in order and stops at the first
   corrupt or truncated record: the torn tail is the crash boundary, not an
   error. Records at or below the manifest's `flushed_seq` are stale
@@ -128,6 +133,21 @@ everything after `magic`. Records never span blocks.
   resumes on it. A block torn after complete groups ends the log unless
   the next block starts with a newer sequence number: an earlier recovery
   resumed past the tear, and the writes after it are live.
+- After recovery, open zeroes any of the `GROUP_BLOCKS_MAX - 1` blocks
+  after the one it stopped at that hold a record newer than every record
+  it recovered (and than `flushed_seq`), and flushes. A device may persist
+  a group's blocks in any order before the flush, so a later block can
+  outlive an earlier one; without this, the next recovery would read it
+  once the gap is written over, and bring back a write this recovery
+  dropped. It also numbers new writes above every record it finds in
+  those blocks and the one it stopped at, at any offset, so bytes a torn
+  rewrite leaves behind read as older and are rejected. In-flight units
+  survive a crash whole or not at all, in any combination; what one
+  recovery decides, later ones keep.
+- A commit that fails after a block of it reached the device is not
+  applied, but its records may replay: until a flush moves `wal_head`
+  past them, capacity checks count them as taken, and the next write
+  flushes the device before adding blocks.
 - When the region is exhausted the next flush wraps it: `wal_head`
   returns to `wal_start` in the same manifest commit.
 

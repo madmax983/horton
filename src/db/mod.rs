@@ -31,10 +31,12 @@ use crate::wal::{Op, RecoverState, WAL_RECORD_OVERHEAD, WalWriter};
 mod archive;
 mod compaction;
 mod flush;
+mod group;
 mod invariants;
 mod read;
 
 pub use archive::{ArchivePlan, SealedTable};
+pub use group::{GROUP_BLOCKS_MAX, GroupCommit, GroupOp};
 pub use read::{MemProbe, ReadScratch, TableView};
 
 /// Where the database lives on the device, in block ids.
@@ -373,6 +375,11 @@ pub struct Db<
     manual_skip: u64,
     cfg: Config,
     next_seq: u64,
+    /// WAL records a failed commit may have left on the device that the
+    /// memtable does not hold (ADR-0028). They replay at the next open,
+    /// so capacity checks count them, and the next write flushes the
+    /// device before adding blocks of its own.
+    unapplied: Unapplied,
     /// Live snapshot watermarks (sequence numbers). A snapshot pins reads
     /// to mutations with `seq <= watermark`; while any snapshot is live,
     /// compaction must not drop a tombstone at or above the oldest
@@ -396,8 +403,8 @@ pub struct Db<
     /// a fallback buffer in every `get` future. `&mut self` operations
     /// reach it with `get_mut`, which no read can contend with.
     get_scratch: RefCell<[u8; BLOCK]>,
-    /// Decompression buffer for point reads: data blocks flagged
-    /// compressed inflate into here before parsing (see
+    /// Decompression buffer for point reads: a data block flagged
+    /// compressed inflates into here as far as the lookup needs (see
     /// [`sstable::TableReader::lookup_at`](crate::sstable::TableReader::lookup_at)).
     /// Same borrow discipline as `get_scratch`.
     decomp_scratch: RefCell<[u8; BLOCK]>,
@@ -408,6 +415,45 @@ pub struct Db<
     /// silent bypass, never a panic. Count `CACHE * (BLOCK + tag)` bytes
     /// of permanent RAM against SPEC.md's RAM budget.
     cache: RefCell<BlockCache<BLOCK, CACHE>>,
+}
+
+/// WAL records a failed commit left behind (ADR-0028).
+///
+/// A commit that fails after a block of it reached the device (a later
+/// block write failed, or the flush did) is reported as failed, and its
+/// records are not applied to the memtable; but the device may keep
+/// them, and the next open replays every record past `wal_head`. Two
+/// things keep that safe:
+///
+/// - **Capacity.** Recovery must fit those records in the memtable next
+///   to the ones it does hold, or open fails with `CorruptWal`. So every
+///   capacity check counts `slots` and `arena` as already taken, and a
+///   writer is told `TableFull` / `ArenaFull` in time; the flush that
+///   follows moves `wal_head` past the records and clears the count
+///   (even a flush of an empty memtable). The count is the whole failed
+///   commit's, an upper bound of what landed: exact enough for an error
+///   path, and it costs at most an early flush.
+/// - **Order.** A crash can strand a later block of an unflushed run
+///   without an earlier one, and open's scrub looks only
+///   [`GROUP_BLOCKS_MAX`] blocks ahead. So the next write first flushes
+///   the device (`unsynced`): an unflushed run is never longer than one
+///   commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unapplied {
+    /// Memtable slots the records would take on replay.
+    slots: usize,
+    /// Memtable arena bytes the records would take on replay.
+    arena: usize,
+    /// The device has not been flushed since they were written.
+    unsynced: bool,
+}
+
+impl Unapplied {
+    const NONE: Self = Self {
+        slots: 0,
+        arena: 0,
+        unsynced: false,
+    };
 }
 
 /// WAL staging snapshot, taken before a mutation stages its records.
@@ -590,6 +636,7 @@ impl<
             manual_skip: 0,
             cfg: config,
             next_seq: 0,
+            unapplied: Unapplied::NONE,
             snapshots: [0u64; MAX_SNAPSHOTS],
             n_snapshots: 0,
             opened: false,
@@ -1018,13 +1065,26 @@ impl<
                 self.manifest.flushed_seq(),
             )
             .await?;
+        // A group commit writes several blocks before its flush, and a
+        // crash can leave records of it past where recovery stopped. Zero
+        // the blocks after the stop that hold records newer than what was
+        // recovered, so the next recovery cannot read them once the gap
+        // is filled; and number new writes above every record left there,
+        // so bytes a torn rewrite leaves behind always read as older than
+        // what was written over them (ADR-0028).
+        let newest = state.max_seq.max(self.manifest.flushed_seq());
+        let (_, left_behind) = self
+            .wal
+            .scrub_stranded(newest, GROUP_BLOCKS_MAX as u64)
+            .await?;
         // Resume above every sequence ever issued: the WAL's newest record,
         // the persisted high-water mark, and any live table (an ingested
         // table can carry sequences from another history).
         self.next_seq = state
             .max_seq
             .max(self.manifest.seq_high())
-            .max(self.manifest.max_seq());
+            .max(self.manifest.max_seq())
+            .max(left_behind);
         self.opened = true;
         Ok(OpenReport {
             recovered_records: state.records,
@@ -1047,14 +1107,51 @@ impl<
     /// the device lied, indistinguishable from a crash at that instant —
     /// the records may replay on recovery, so `seqs` sequence numbers are
     /// consumed now and never reused.
-    fn rollback_commit(&mut self, mark: StageMark, seqs: u64) -> Result<(), Error<D::Error>> {
+    ///
+    /// `slots` and `arena` are what the records would take in the
+    /// memtable: when a block landed they are counted as taken until a
+    /// flush moves `wal_head` past them (see [`Unapplied`]).
+    fn rollback_commit(
+        &mut self,
+        mark: StageMark,
+        seqs: u64,
+        slots: usize,
+        arena: usize,
+    ) -> Result<(), Error<D::Error>> {
         if self.wal.next_block() == mark.next_block {
             self.wal.truncate_stage(mark.stage_len);
         } else {
+            self.note_unapplied(slots, arena);
             self.next_seq = self
                 .next_seq
                 .checked_add(seqs)
                 .ok_or(Error::CounterExhausted)?;
+        }
+        Ok(())
+    }
+
+    /// Counts records a failed commit left on the device (see
+    /// [`Unapplied`]).
+    const fn note_unapplied(&mut self, slots: usize, arena: usize) {
+        self.unapplied.slots = self.unapplied.slots.saturating_add(slots);
+        self.unapplied.arena = self.unapplied.arena.saturating_add(arena);
+        self.unapplied.unsynced = true;
+    }
+
+    /// Memtable slots and arena bytes taken, counting records a failed
+    /// commit left in the WAL (see [`Unapplied`]).
+    const fn memtable_taken(&self) -> (usize, usize) {
+        (
+            self.table.len().saturating_add(self.unapplied.slots),
+            self.table.arena_len().saturating_add(self.unapplied.arena),
+        )
+    }
+
+    /// Flushes the device before a write adds WAL blocks, when a failed
+    /// commit left blocks that were never flushed (see [`Unapplied`]).
+    async fn sync_unapplied(&mut self) -> Result<(), Error<D::Error>> {
+        if self.unapplied.unsynced {
+            self.sync_wal().await?;
         }
         Ok(())
     }
@@ -1078,10 +1175,27 @@ impl<
                 self.table.check_insert_range_del::<D::Error>(start, end)?;
             }
         }
+        // What the record takes in the memtable, for the capacity check
+        // and for the count of a failed commit's records.
+        let arena = match m {
+            Mutation::Put { key, val } | Mutation::PutTtl { key, val, .. } => key.len() + val.len(),
+            Mutation::Delete { key } => key.len(),
+            Mutation::RangeDelete { start, end } => start.len() + end.len(),
+        };
+        if self.unapplied != Unapplied::NONE {
+            let (slots, used) = self.memtable_taken();
+            if slots >= CAP {
+                return Err(Error::TableFull);
+            }
+            if used.saturating_add(arena) > ARENA {
+                return Err(Error::ArenaFull);
+            }
+        }
         let seq = self
             .next_seq
             .checked_add(1)
             .ok_or(Error::CounterExhausted)?;
+        self.sync_unapplied().await?;
         let mark = self.stage_mark();
         let appended = match m {
             Mutation::Put { key, val } => self.wal.append(seq, Op::Put, key, val).await,
@@ -1096,12 +1210,12 @@ impl<
             }
         };
         if let Err(e) = appended {
-            self.rollback_commit(mark, 0)?;
+            self.rollback_commit(mark, 0, 1, arena)?;
             return Err(e);
         }
         if let Err(e) = self.wal.commit().await {
             let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, u64::from(landed))?;
+            self.rollback_commit(mark, u64::from(landed), 1, arena)?;
             return Err(e);
         }
         self.next_seq = seq;
@@ -1246,12 +1360,14 @@ impl<
                 max: BLOCK,
             });
         }
-        if self.table.len() + n > CAP {
+        let (slots, arena) = self.memtable_taken();
+        if slots.saturating_add(n) > CAP {
             return Err(Error::TableFull);
         }
-        if self.table.arena_len() + need_arena > ARENA {
+        if arena.saturating_add(need_arena) > ARENA {
             return Err(Error::ArenaFull);
         }
+        self.sync_unapplied().await?;
         // Drain any previously staged data so the batch still commits as
         // one block write. (In practice the stage is always empty between
         // Db calls — every mutation commits immediately.)
@@ -1287,13 +1403,13 @@ impl<
                     .await
             };
             if let Err(e) = appended {
-                self.rollback_commit(mark, 0)?;
+                self.rollback_commit(mark, 0, n, need_arena)?;
                 return Err(e);
             }
         }
         if let Err(e) = self.wal.commit().await {
             let landed = self.wal.next_block() != mark.next_block;
-            self.rollback_commit(mark, if landed { nu64 } else { 0 })?;
+            self.rollback_commit(mark, if landed { nu64 } else { 0 }, n, need_arena)?;
             return Err(e);
         }
         self.next_seq = last;

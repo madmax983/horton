@@ -124,9 +124,9 @@ or the same answers, as before.
 - **Not done:** a hardware CRC (needs `unsafe`, see Context), and
   group commit across WAL blocks (does not limit any measured workload,
   and needs the write path split first).
-- **Not done:** a point read still inflates a whole 16 KiB data block
-  to find one key: the restart offsets that let it binary-search are
-  at the end of the block. Inflating only up to the key would need a
+- **Not done here:** a point read still inflated a whole 16 KiB data
+  block to find one key: the restart offsets that let it binary-search
+  are at the end of the block. (Done since: ADR-0027.) Inflating only up to the key would need a
   resumable decoder and a linear search. The index search still parses
   every entry of the index, which the walk bound and the check for
   structural corruption both use.

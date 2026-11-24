@@ -890,6 +890,46 @@ table at the top was measured on (its "before" column is below that
 table's 0.20 column throughout), and `db_bench` was not installed, so
 the RocksDB columns were not run again.
 
+### Then: point reads that inflate only to their key
+
+Step 17 (ADR-0027). A point read inflated the whole 16 KiB of the data
+block it searched, because the restart offsets it binary-searches are
+at the end of the block. The decoder can now stop and resume, and a
+point lookup scans a compressed block's entries as it inflates them,
+stopping at the answer: about half the block inflated on average.
+What the scan cannot decide (the end of the entries, where a version
+run may go on in the next block) is left to the whole-block search.
+
+300 K keys, fills on one thread, reads on one, two runs of each build,
+ops/s:
+
+| | before | after |
+|---|---:|---:|
+| `readrandom` | 78,891 / 77,010 | 86,248 / 86,065 |
+| `readrandom` (again) | 79,832 / 75,545 | 84,667 / 83,844 |
+
+About 9% on point reads. Scans, seeks and compaction read whole blocks
+and do not change.
+
+### Then: one `fdatasync` for more than a block of writes
+
+Step 18 (ADR-0028). The writer queue committed what fitted one 16 KiB
+WAL block per `fdatasync`: about 120 puts of 100 bytes, or two batches
+of 50. horton's `Db::write_group` now places each client's batch inside
+a block, writes up to 16 blocks, flushes once, and only then makes them
+visible; the queue commits through it.
+
+Every write synced, `fillrandom` at 200 K keys, two runs of each build:
+
+| writers, batch | syncs before → after | batches per sync | ops/s before | ops/s after |
+|---|---|---:|---:|---:|
+| 8 threads, 50 puts | 2,001 → 933 / 936 | 2.0 → 4.3 | 147,970 / 137,755 | 180,503 / 173,998 |
+| 16 threads, 20 puts | 2,015 / 2,005 → 1,112 / 1,120 | 5.0 → 9.0 | 135,157 / 140,050 | 157,498 / 167,361 |
+| 4 threads, 1 put (40 K keys) | about 15,700 either way | 2.5 | 12,834 / 12,905 | 13,135 / 12,185 |
+
+Where the block was the limit, half the syncs and a fifth more writes.
+Four writers of single puts never filled a block, and do not change.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
@@ -1011,16 +1051,9 @@ Measured or scoped while doing this, and left:
 - **Slicing-by-16 CRC-32**: 2.0 → 2.7 GB/s on this machine, for 8 KiB
   more constant tables. Superseded by step 16: three slicing-by-8
   chains reach 3.6 GB/s with the tables there are.
-- **Group commit across WAL blocks.** A write group is one WAL block
-  and one `fdatasync`, at most about 120 puts of 100 bytes. With four
-  writers a synced group averages 2.6 client writes, so the block is
-  not what limits a group here. Covering several blocks with one sync
-  would also need `Db::write` split into a WAL append and a memtable
-  apply, so that no reader sees a write before it is durable.
-- **Inflating a data block only up to the key.** A point read inflates
-  all 16 KiB to search one key, because the restart offsets are at the
-  end of the block. A resumable decoder and a linear search could stop
-  at the key, about half the inflate on average.
+- **Group commit across WAL blocks.** Done in step 18 (ADR-0028).
+- **Inflating a data block only up to the key.** Done in step 17
+  (ADR-0027).
 - **Index blocks verified by the entry.** Needs checksums inside the
   index block, which costs index capacity, and a table's index is one
   block (ADR-0017).
