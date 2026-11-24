@@ -1,6 +1,6 @@
 //! Flush: the memtable becomes one `SSTable` in a free table slot.
 
-use super::Db;
+use super::{Db, Unapplied};
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, ManifestEdit, TableRef};
@@ -19,13 +19,17 @@ impl<
     const CACHE: usize,
 > Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>
 {
-    /// Wraps the WAL when the region is exhausted and nothing is unflushed.
+    /// With nothing unflushed: wraps the WAL when the region is
+    /// exhausted, and moves `wal_head` past the records a failed commit
+    /// left in the WAL (see [`Unapplied`]), so they no longer count
+    /// against the memtable. Otherwise a no-op.
     ///
     /// The `wal_head` move rides a manifest commit, so it stays atomic with
     /// the flush; stale pre-wrap blocks are skipped at recovery by the
     /// sequence floor (see `WalWriter::recover_from`).
-    async fn wrap_wal_if_full(&mut self) -> Result<(), Error<D::Error>> {
-        if self.wal.next_block() < self.cfg.wal_end {
+    async fn retire_wal(&mut self) -> Result<(), Error<D::Error>> {
+        let full = self.wal.next_block() >= self.cfg.wal_end;
+        if !full && self.unapplied == Unapplied::NONE {
             return Ok(());
         }
         // Safe: the memtable is empty, and every WAL record not yet flushed
@@ -34,8 +38,13 @@ impl<
         // `wal_head` and the append position; the sequence floor skips them
         // at recovery.)
         let mut edit = ManifestEdit::new();
-        edit.set_wal_head(self.cfg.wal_start);
-        // Every issued mutation has left the WAL: the memtable is empty.
+        edit.set_wal_head(if full {
+            self.cfg.wal_start
+        } else {
+            self.wal.next_block()
+        });
+        // Every issued mutation has left the WAL: the memtable is empty,
+        // and a failed commit's records were never acknowledged.
         edit.note_flushed(self.next_seq);
         let layout = self.manifest_layout();
         self.manifest
@@ -46,7 +55,26 @@ impl<
                 layout,
             )
             .await?;
-        self.wal.reset_to(self.cfg.wal_start);
+        self.wal_head_moved(full);
+        Ok(())
+    }
+
+    /// After a manifest commit moved `wal_head` to the append position
+    /// (or, when `wrapped`, back to `wal_start`): appending restarts at
+    /// `wal_start` if wrapped, and no record a failed commit left behind
+    /// lies past `wal_head` any more (see [`Unapplied`]).
+    fn wal_head_moved(&mut self, wrapped: bool) {
+        if wrapped {
+            self.wal.reset_to(self.cfg.wal_start);
+        }
+        self.unapplied = Unapplied::NONE;
+    }
+
+    /// Writes out what is staged and flushes the device, which also makes
+    /// durable any blocks a failed commit left unflushed.
+    pub(super) async fn sync_wal(&mut self) -> Result<(), Error<D::Error>> {
+        self.wal.commit().await?;
+        self.unapplied.unsynced = false;
         Ok(())
     }
 
@@ -154,11 +182,11 @@ impl<
     pub async fn flush(&mut self) -> Result<(), Error<D::Error>> {
         self.ensure_open()?;
         // Every acked mutation must be durable in the WAL or the new table.
-        self.wal.commit().await?;
+        self.sync_wal().await?;
         if self.table.is_empty() {
-            // Still a no-op for the table region, but the WAL may need
-            // wrapping after earlier flushes filled it.
-            self.wrap_wal_if_full().await?;
+            // No table to write, but the WAL may need wrapping, or moving
+            // past a failed commit's records.
+            self.retire_wal().await?;
             return Ok(());
         }
         // Fail before doing I/O when level 0 cannot take another table;
@@ -278,9 +306,7 @@ impl<
         self.slots.claim(slot);
         // The flushed contents now live in the table; drop the memtable.
         self.table.clear();
-        if wrap {
-            self.wal.reset_to(self.cfg.wal_start);
-        }
+        self.wal_head_moved(wrap);
         Ok(())
     }
 }

@@ -911,6 +911,25 @@ ops/s:
 About 9% on point reads. Scans, seeks and compaction read whole blocks
 and do not change.
 
+### Then: one `fdatasync` for more than a block of writes
+
+Step 18 (ADR-0028). The writer queue committed what fitted one 16 KiB
+WAL block per `fdatasync`: about 120 puts of 100 bytes, or two batches
+of 50. horton's `Db::write_group` now places each client's batch inside
+a block, writes up to 16 blocks, flushes once, and only then makes them
+visible; the queue commits through it.
+
+Every write synced, `fillrandom` at 200 K keys, two runs of each build:
+
+| writers, batch | syncs before → after | batches per sync | ops/s before | ops/s after |
+|---|---|---:|---:|---:|
+| 8 threads, 50 puts | 2,001 → 933 / 936 | 2.0 → 4.3 | 147,970 / 137,755 | 180,503 / 173,998 |
+| 16 threads, 20 puts | 2,015 / 2,005 → 1,112 / 1,120 | 5.0 → 9.0 | 135,157 / 140,050 | 157,498 / 167,361 |
+| 4 threads, 1 put (40 K keys) | about 15,700 either way | 2.5 | 12,834 / 12,905 | 13,135 / 12,185 |
+
+Where the block was the limit, half the syncs and a fifth more writes.
+Four writers of single puts never filled a block, and do not change.
+
 ## What the remaining gap is made of
 
 | workload, 1 M keys | horton / RocksDB (same memory) | why |
@@ -1032,12 +1051,7 @@ Measured or scoped while doing this, and left:
 - **Slicing-by-16 CRC-32**: 2.0 → 2.7 GB/s on this machine, for 8 KiB
   more constant tables. Superseded by step 16: three slicing-by-8
   chains reach 3.6 GB/s with the tables there are.
-- **Group commit across WAL blocks.** A write group is one WAL block
-  and one `fdatasync`, at most about 120 puts of 100 bytes. With four
-  writers a synced group averages 2.6 client writes, so the block is
-  not what limits a group here. Covering several blocks with one sync
-  would also need `Db::write` split into a WAL append and a memtable
-  apply, so that no reader sees a write before it is durable.
+- **Group commit across WAL blocks.** Done in step 18 (ADR-0028).
 - **Inflating a data block only up to the key.** Done in step 17
   (ADR-0027).
 - **Index blocks verified by the entry.** Needs checksums inside the

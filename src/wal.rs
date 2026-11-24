@@ -167,6 +167,22 @@ fn scan_record(buf: &[u8]) -> Scan<'_> {
     decode_record(buf).map_or(Scan::Corrupt, Scan::Record)
 }
 
+/// The highest sequence number of any intact record in `block`, at any
+/// offset: a record left behind a torn write need not start where a scan
+/// from the block's start would look. `None` when there is none.
+fn highest_seq_anywhere(block: &[u8]) -> Option<u64> {
+    let magic = WAL_MAGIC.to_le_bytes();
+    let mut highest = None;
+    for off in 0..block.len().saturating_sub(WAL_HEADER_LEN) {
+        if block[off..off + 2] == magic
+            && let Some(rec) = decode_record(&block[off..])
+        {
+            highest = Some(highest.map_or(rec.seq, |h: u64| h.max(rec.seq)));
+        }
+    }
+    highest
+}
+
 /// `true` if every byte in `bytes` is zero.
 ///
 /// Word-chunked instead of a byte-at-a-time `iter().all()`: a run of live
@@ -394,6 +410,106 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
         self.next_block = block;
     }
 
+    /// WAL blocks left before the end of the region: how many more
+    /// commits (or sealed stages) fit.
+    #[must_use]
+    pub(crate) const fn blocks_left(&self) -> u64 {
+        self.wal_end.saturating_sub(self.next_block)
+    }
+
+    /// Writes the stage out as a block of its own, without a flush, when
+    /// `bytes` more would not fit it: the atomic group about to be
+    /// appended then starts a fresh block and stays inside one. The
+    /// group commit ([`Db::write_group`](crate::Db::write_group)) seals
+    /// blocks this way and flushes once at the end.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::WalFull`] when the region is exhausted, or
+    /// [`Error::Device`] on I/O failure.
+    pub(crate) async fn make_room(&mut self, bytes: usize) -> Result<(), Error<D::Error>> {
+        debug_assert!(!self.group_open, "make_room inside an open group");
+        if self.stage_len > 0 && self.stage_len + bytes > BLOCK {
+            self.write_stage().await?;
+        }
+        Ok(())
+    }
+
+    /// After recovery: makes what lies just past the recovered log
+    /// harmless (ADR-0028). Reads the block recovery stopped at and the
+    /// `span - 1` after it; zeroes (then flushes) each of the later ones
+    /// that holds a record newer than `newer_than` (the newest sequence
+    /// number recovery saw, or the flush floor if higher); and returns the
+    /// highest sequence number of any record found in them, at any
+    /// offset, so the caller can resume numbering above it.
+    ///
+    /// A group commit writes up to `span` blocks before its one flush,
+    /// and a device may reach the medium in any order before a flush, so
+    /// a crash can leave records of the group that recovery did not take.
+    /// Two things could bring them back later:
+    ///
+    /// - **A stranded block.** Recovery stopped at a gap, and writing
+    ///   resumes there; once the gap is filled the next recovery reads on
+    ///   into a later block of the group. Zeroing it prevents that. Only
+    ///   the `span - 1` blocks after the stop can hold such records, and
+    ///   only records newer than everything recovered: older ones are
+    ///   stale, and every recovery stops at them as before.
+    /// - **Bytes left behind a torn write.** A block written again in
+    ///   place can tear, keeping its old bytes past the tear. Recovery
+    ///   takes records in a block only while their sequence numbers rise,
+    ///   so old records after new ones are rejected, provided the new
+    ///   ones are numbered above them. Recovery would otherwise number
+    ///   new writes from the newest record it took, reusing the numbers
+    ///   of the ones it dropped. The returned maximum is what the caller
+    ///   numbers above. It is searched for at every offset, because a
+    ///   tear can expose a record that a scan from the block's start would
+    ///   not reach.
+    ///
+    /// Blocks are only read unless one needs zeroing, so an open costs
+    /// nothing on flash in the common case.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Device`] on I/O failure.
+    pub(crate) async fn scrub_stranded(
+        &mut self,
+        newer_than: u64,
+        span: u64,
+    ) -> Result<(u64, u64), Error<D::Error>> {
+        debug_assert_eq!(self.stage_len, 0, "scrub with records staged");
+        let first = self.next_block;
+        let end = self.next_block.saturating_add(span).min(self.wal_end);
+        let mut scrubbed = 0;
+        let mut highest = 0u64;
+        for id in first..end {
+            let device = &mut self.device;
+            let block = &mut self.stage;
+            poll_fn(|cx| device.poll_read_block(cx, id, block))
+                .await
+                .map_err(Error::Device)?;
+            let seen = highest_seq_anywhere(&self.stage);
+            highest = highest.max(seen.unwrap_or(0));
+            if id > first && seen.is_some_and(|seq| seq > newer_than) {
+                self.stage.fill(0);
+                let device = &mut self.device;
+                let block = &self.stage;
+                poll_fn(|cx| device.poll_write_block(cx, id, block))
+                    .await
+                    .map_err(Error::Device)?;
+                scrubbed += 1;
+            }
+        }
+        // The stage held the blocks read: none of it is known to be zero.
+        self.dirty_to = BLOCK;
+        if scrubbed > 0 {
+            let device = &mut self.device;
+            poll_fn(|cx| device.poll_flush(cx))
+                .await
+                .map_err(Error::Device)?;
+        }
+        Ok((scrubbed, highest))
+    }
+
     /// Highest sequence number appended or recovered so far.
     #[must_use]
     pub const fn max_seq(&self) -> u64 {
@@ -576,7 +692,16 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     ///
     /// The batch is prefix-atomic (SPEC §11): once a full staging block
     /// lands on the device it cannot be unwritten, so a failed batch
-    /// resolves to a durable prefix, never to a hole. See [`BatchReport`]
+    /// resolves to a durable prefix, never to a hole.
+    ///
+    /// Several blocks are written before the one flush, and a device may
+    /// persist them in any order, so a crash can keep a later block
+    /// without an earlier one. [`Db::open`](crate::Db::open) zeroes such
+    /// stranded blocks within [`GROUP_BLOCKS_MAX`](crate::GROUP_BLOCKS_MAX)
+    /// blocks of where recovery stopped (ADR-0028); keep a batch to that
+    /// many blocks, as [`Db::write_group`](crate::Db::write_group) does,
+    /// for the guarantee that a later recovery never brings back a record
+    /// an earlier one dropped. See [`BatchReport`]
     /// for the exact `durable` / `consumed` / `error` contract. This is the
     /// primitive the multiwriter drainer sweep is built on: drain up to
     /// `max_writes` tickets, `append_batch`, flush once.
@@ -732,7 +857,10 @@ impl<D: BlockDevice, const BLOCK: usize> WalWriter<D, BLOCK> {
     /// # Errors
     ///
     /// [`Error::CorruptWal`] if a structurally valid record does not fit the
-    /// table (practically unreachable through [`crate::Db`]), or
+    /// table. Through [`crate::Db`] that would take a WAL holding more than
+    /// one memtable's worth of records past `wal_head`: every write checks
+    /// capacity counting the records a failed commit may have left there
+    /// (ADR-0028), so it does not happen short of corruption. Or
     /// [`Error::Device`] on I/O failure.
     pub async fn recover_from<
         const CAP: usize,

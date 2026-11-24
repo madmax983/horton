@@ -43,7 +43,7 @@ future, and the executor stores the future: in a static task arena
 | `flush()` | 17,640 | table writer (data + index blocks) and trial-compression scratch |
 | `open()` | 7,216 | WAL recovery |
 | `compact_step()` | 3,032 | merge state lives in the caller's `Compaction` |
-| `get()` | 1,376 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |
+| `get()` | 1,432 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |
 | `ingest_table()` | 608 | copies through the `Db`'s block scratch |
 | `put()`, `delete()`, `write()`, … | ≤ 496 | |
 | `Scan::next()`, `RevScan::prev()` | ≤ 1,280 | |
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 96,456 + max(17,688, 1,376 + 1,288) = 114,144 bytes
+= 96,456 + max(17,688, 1,432 + 1,288) = 114,144 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
