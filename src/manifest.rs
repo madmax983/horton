@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman09" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman10" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -40,7 +40,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman09".
+/// Manifest block magic: ASCII "hrtman10".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -56,11 +56,15 @@ use crate::error::Error;
 /// section in full (`bloom_blocks`, `bloom_k`, `bloom_len`), so a reader
 /// needs nothing from a table's footer, and names tables in the
 /// `hrtsst04` format, so an image whose tables carry an older bloom
-/// filter is rejected when it is opened, not at its first read. A
-/// foreign magic decodes
+/// filter is rejected when it is opened, not at its first read.
+/// "hrtman10" (v0.20) is the same layout over a WAL whose atomic groups
+/// may span blocks ([`SPAN`](crate::wal::SPAN), ADR-0029): an older
+/// reader would replay part of such a group, so it must not open the
+/// image, and this one must not open an older image's WAL. A foreign
+/// magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman09");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman10");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.
@@ -1064,10 +1068,14 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
     /// replays everything — no data loss, the orphaned blocks are simply
     /// never referenced.
     ///
+    /// A copy that begins with another version's magic (`hrtman` and other
+    /// digits) rejects the whole image.
+    ///
     /// # Errors
     ///
-    /// [`Error::CorruptManifest`] when no copy is intact or blank, or
-    /// [`Error::Device`] on I/O failure.
+    /// [`Error::CorruptManifest`] when no copy is intact or blank, or a
+    /// copy is another format version's, or [`Error::Device`] on I/O
+    /// failure.
     pub async fn recover_from<D: BlockDevice, const BLOCK: usize>(
         device: &mut D,
         scratch: &mut [u8; BLOCK],
@@ -1086,6 +1094,10 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
                 }
                 Probe::Blank => blank = true,
                 Probe::Corrupt => {}
+                // Another version's image: rejected, never read as a
+                // fresh device beside a blank copy (its WAL would replay
+                // over tables this version cannot see).
+                Probe::Foreign => return Err(Error::CorruptManifest),
             }
         }
         let Some((seq, start, count)) = best else {
@@ -1123,6 +1135,9 @@ impl<const LEVELS: usize, const TABLES: usize, const KEY_MAX: usize>
         read_block(device, start, scratch).await?;
         if scratch.iter().all(|&b| b == 0) || scratch.iter().all(|&b| b == 0xFF) {
             return Ok(Probe::Blank);
+        }
+        if scratch[..6] == *b"hrtman" && scratch[..8] != MANIFEST_MAGIC.to_le_bytes() {
+            return Ok(Probe::Foreign);
         }
         let Some(head) = check_block::<BLOCK>(scratch) else {
             return Ok(Probe::Corrupt);
@@ -1546,6 +1561,8 @@ enum Probe {
     Blank,
     /// Written but not intact (torn or damaged).
     Corrupt,
+    /// A manifest of another format version ("hrtman" with other digits).
+    Foreign,
 }
 
 /// A manifest block's parsed header.

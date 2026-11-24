@@ -12,9 +12,11 @@ misread (SPEC §4.5).
 ## [Unreleased]
 
 The next release is 0.20.0. **The on-disk format changes** (manifest
-`hrtman09`, SSTable `hrtsst04`): v0.19 images, and archives exported by
-v0.19, are rejected, not misread. So are images written by a build
-from before this release (`hrtman07`, `hrtman08`, `hrtsst03`).
+`hrtman10`, SSTable `hrtsst04`, WAL records with `SPAN` and `CONT`
+flags): v0.19 images, and archives exported by v0.19, are rejected, not
+misread. So are images written by a build from before this release
+(`hrtman07` to `hrtman09`, `hrtsst03`); archives exported by those
+builds (`hrtsst04`) still ingest.
 
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
@@ -34,6 +36,15 @@ the same memory, from 0.37.
 
 ### Added
 
+- **Atomic batches across WAL blocks** (ADR-0029). A `WriteBatch`, and
+  a `write_group` unit, may span up to `GROUP_BLOCKS_MAX` (16) WAL
+  blocks; recovery replays it only when every block of it is intact,
+  whatever subset a crash leaves. Two op-byte flags, `SPAN` and `CONT`,
+  mark where a group goes on and where it continues. A batch that does
+  not fit 16 blocks, or an empty memtable, is `BatchTooLarge`; one the
+  WAL region cannot take before its end is `WalFull` before any block is
+  written, and the next flush wraps the region. `RecoverState` gains
+  `blocks_read`. The kvstore's `Batch` may span blocks too.
 - **Group commit across WAL blocks** (ADR-0028). `Db::write_group`
   commits many atomic units (`GroupOp` slices: each a client's batch,
   borrowed) under one device flush, each unit inside one WAL block, at
@@ -319,6 +330,11 @@ the same memory, from 0.37.
 
 ### Fixed
 
+- **An image of another format version is rejected even when one of its
+  manifest copies is blank.** Such a copy read as damaged, and beside a
+  blank one the device read as fresh: the WAL replayed over tables the
+  build could not see. A copy that starts with `hrtman` and another
+  version now rejects the image (ADR-0029).
 - **A crash can no longer bring back a write that recovery dropped.**
   A group of WAL blocks written before one flush (`write_group`, and
   `WalWriter::append_batch`) can be left with a later block on the

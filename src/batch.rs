@@ -107,7 +107,9 @@ pub(crate) fn check_op<const KEY_MAX: usize, const VAL_MAX: usize>(
 /// All memory is inline: `OPS * (13 + KEY_MAX + VAL_MAX)` bytes plus a
 /// length. Queueing validates sizes eagerly, so a batch handed to
 /// [`Db::write`](crate::Db::write) is already well-formed; the write then
-/// checks only capacity (memtable slots/arena, one WAL block).
+/// checks only capacity (memtable slots/arena, and at most
+/// [`GROUP_BLOCKS_MAX`](crate::GROUP_BLOCKS_MAX) WAL blocks: a batch may
+/// span blocks, ADR-0029).
 #[derive(Debug, Clone)]
 pub struct WriteBatch<const KEY_MAX: usize, const VAL_MAX: usize, const OPS: usize> {
     ops: [BatchOp<KEY_MAX, VAL_MAX>; OPS],

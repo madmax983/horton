@@ -4,10 +4,11 @@
 //! is pending, and a crash decides each pending write's fate (lands,
 //! lost, torn with zeros after the tear, or torn in place with the old
 //! bytes after it). Each seed runs four rounds of: an acknowledged put,
-//! sometimes a flush, sometimes a committed group, then an in-flight
-//! group whose flush fails (and sometimes one of its block writes), a
-//! crash, and a reopen that may itself crash part way. After every
-//! reopen:
+//! sometimes a flush, sometimes a committed group, sometimes a batch over
+//! several blocks whose block write fails and a put after it, then an
+//! in-flight group whose flush fails (and sometimes one of its block
+//! writes), a crash, and a reopen that may itself crash part way. One unit
+//! in four spans WAL blocks (ADR-0029). After every reopen:
 //!
 //! - every acknowledged write is there;
 //! - every unit of every group is there whole or not at all;
@@ -168,7 +169,13 @@ type Unit = Vec<(Vec<u8>, Vec<u8>)>;
 fn units(rng: &mut Rng, tag: &str, n: usize) -> Vec<Unit> {
     (0..n)
         .map(|u| {
-            let ops = 1 + rng.below(3);
+            // One unit in four is large: up to 20 records, which spans
+            // up to seven WAL blocks (ADR-0029).
+            let ops = if rng.below(4) == 0 {
+                4 + rng.below(17)
+            } else {
+                1 + rng.below(3)
+            };
             (0..ops)
                 .map(|j| {
                     let key = format!("{tag}u{u:02}k{j}").into_bytes();
@@ -258,6 +265,70 @@ fn flush(db: &mut GroupDb) {
     }
 }
 
+/// A `Db::write` of one spanning batch (6 to 20 records of 900 bytes,
+/// two to seven WAL blocks) whose block write number `fail` fails: an
+/// error, or acknowledged when `fail` lies past its blocks. `None` when
+/// it was refused before any I/O.
+fn failed_batch(db: &mut GroupDb, unit: &Unit, fail: usize) -> Option<bool> {
+    let mut b = horton::WriteBatch::<256, 1024, 32>::new();
+    for (k, v) in unit {
+        b.put(k, v).expect("op");
+    }
+    db.device().fail_write.set(Some(db.device().writes + fail));
+    let res = block_on(db.write(&b));
+    db.device().fail_write.set(None);
+    match res {
+        Ok(_) => Some(true),
+        Err(Error::Device(Fault)) => Some(false),
+        Err(Error::WalFull | Error::TableFull | Error::ArenaFull) => None,
+        Err(e) => panic!("write: {e:?}"),
+    }
+}
+
+/// Sometimes a spanning batch fails part way (a block write fails, no
+/// crash) and stays on the device unflushed until the next write syncs
+/// it; sometimes an acknowledged put follows it, landing behind its dead
+/// blocks (review findings, ADR-0029). Returns the failed batch's unit,
+/// if one failed: its fate is decided at the next reopen.
+fn failed_step(
+    rng: &mut Rng,
+    db: &mut GroupDb,
+    round: usize,
+    acked: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Vec<Unit> {
+    let mut undecided = Vec::new();
+    if rng.below(3) == 0 {
+        let n = 6 + rng.below(15);
+        let unit: Unit = (0..n)
+            .map(|j| {
+                let mut val = format!("f{round}-{j}:").into_bytes();
+                val.resize(900, b'.');
+                (format!("f{round}k{j:02}").into_bytes(), val)
+            })
+            .collect();
+        let fail = rng.below(8);
+        let mut out = failed_batch(db, &unit, fail);
+        if out.is_none() {
+            flush(db);
+            out = failed_batch(db, &unit, fail);
+        }
+        match out {
+            Some(true) => acked.extend(unit.iter().cloned()),
+            Some(false) => undecided.push(unit),
+            None => {}
+        }
+        if rng.below(2) == 0 {
+            let key = format!("after{round}").into_bytes();
+            if block_on(db.put(&key, b"w")).is_err() {
+                flush(db);
+                block_on(db.put(&key, b"w")).expect("put after a flush");
+            }
+            acked.push((key, b"w".to_vec()));
+        }
+    }
+    undecided
+}
+
 /// One seed: four rounds of writes, a group in flight, a crash, a reopen.
 fn run(seed: u64, cfg: Config) -> Result<(), String> {
     let mut rng = Rng(seed * 7919 + 1);
@@ -301,6 +372,7 @@ fn run(seed: u64, cfg: Config) -> Result<(), String> {
                 Err(_) => flush(&mut db),
             }
         }
+        let undecided = failed_step(&mut rng, &mut db, round, &mut acked);
         // The group in flight: its flush fails, and sometimes a write.
         let n = 2 + rng.below(30);
         let g = units(&mut rng, &format!("g{round}"), n);
@@ -347,6 +419,11 @@ fn run(seed: u64, cfg: Config) -> Result<(), String> {
         let data = g[..tried].to_vec();
         let now = present(&db, &data).map_err(|e| format!("round {round}: new group {e}"))?;
         decided.push((data, now));
+        if !undecided.is_empty() {
+            let now =
+                present(&db, &undecided).map_err(|e| format!("round {round}: failed batch {e}"))?;
+            decided.push((undecided, now));
+        }
     }
     Ok(())
 }

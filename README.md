@@ -30,7 +30,7 @@ doesn't exist: firmware, kernels, bootloaders.
 
 | Area | What you get |
 |---|---|
-| Writes | `put`, `delete`, `delete_range` (range tombstones), `put_with_ttl` (caller-clock expiry), atomic multi-op `WriteBatch` (up to one WAL block; also the group-commit path) |
+| Writes | `put`, `delete`, `delete_range` (range tombstones), `put_with_ttl` (caller-clock expiry), atomic multi-op `WriteBatch` (up to 16 WAL blocks; also the group-commit path) |
 | Reads | `get`, snapshot reads (`snapshot` / `get_at`), forward `Scan` and reverse `RevScan` merge iterators with prefix/range bounds |
 | Durability | WAL-first. Every mutation's CRC-framed record is on the device before the call returns. The manifest (two copies, or a ring of `n` for flash endurance) is the single atomic commit point for flushes, compactions and archive operations |
 | Tables | Immutable SSTables with restart-point data blocks, a per-table bloom filter, one index block, a range-tombstone section, and optional hand-rolled LZ77 block compression |
@@ -106,7 +106,7 @@ Capacity errors name their remedy:
 | `RegionFull` | no slot is free and compaction cannot free one | delete (or set `purge_before`), `request_compaction(0)` and compact; archive; or grow the region |
 | `SnapshotLimit` | eight snapshots are live | release one |
 | `TableTooLarge` | an entry, index, or range-tombstone section does not fit | smaller entries, bigger blocks or slots |
-| `BatchTooLarge` | a batch does not fit one WAL block | split it |
+| `BatchTooLarge` | a batch does not fit `GROUP_BLOCKS_MAX` (16) WAL blocks or an empty memtable, or a record does not fit a block | split it |
 | `Busy` | another `get` on this handle holds the read buffers | finish it, retry |
 | `BadConfig` | regions overlap or are too small, or the device is below `MIN_DEVICE_BLOCKS` (from `open`) | fix the `Config`, or use a bigger device |
 
@@ -229,9 +229,9 @@ takes no lock at all:
 | LevelDB | here |
 |---|---|
 | `DB::Open` on a directory | `Store::open` on one file, created sparse at `--size-mb` (256 MiB); a `BlockDevice` over `pread`/`pwrite` and `fdatasync` ([`device.rs`](examples/kvstore/device.rs)) |
-| `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and must fit one WAL block (16 KiB) |
+| `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and may span up to 16 WAL blocks (about 256 KiB, ADR-0029) |
 | `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
-| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same WAL block: one block write and one `fdatasync` for all of them |
+| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same 16 WAL blocks: one `fdatasync` for all of them (ADR-0028) |
 | background compaction | two compaction threads, one for each of horton's two compaction lanes (ADR-0025), each merging outside the engine lock (horton's detached merge, ADR-0024) through a file handle of its own. Two jobs run side by side when they share no table and write to different levels. A step under the lock selects a job, or seals and commits an output; whichever thread has the lock takes it. A full memtable or WAL is flushed under the lock by the write that finds it. A write that finds level 0 full waits for compaction without the lock, so callers never see those errors and readers do not wait behind them |
 | `Get` from many threads at once | the caller reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). A read of a key the memtable cannot hold takes no lock anywhere: a filter over the keys written since the last flush and the manifest's published sequence number tell it so (ADR-0023). Any other read takes the engine lock for its memtable probe. Flush and compaction shut the readers' gate and wait for them to leave the tables |
 | `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
@@ -328,7 +328,7 @@ These are the limits it meets, and each is a property of the library:
   entries/s here. Lent 32 blocks it does 1.9 M on one thread. Each
   `next` still compares the head of every table in range, and a
   reverse seek still positions all of them.
-- **Batches are one WAL block**, keys and values have compile-time
+- **Batches are at most 16 WAL blocks** (about 256 KiB), keys and values have compile-time
   maximums (128 B and 4 KiB here), and at most eight snapshots (so eight
   iterators) are live at once.
 
@@ -401,7 +401,7 @@ rebuilds the slot map from the manifest.
 ```text
 block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
              └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
-               blocks, magic "hrtman09"
+               blocks, magic "hrtman10"
 
 SSTable:    [data]* [rdel]* [bloom]+ [index] [footer]
              │       │        │        │       └ magic "hrtsst04", ids, entry count, k, rdel count, min seq, filter length
@@ -499,7 +499,11 @@ returning `BadConfig` otherwise:
 - **Tables:** the region splits into `LEVELS × TABLES` equal slots, and a
   slot must hold a full memtable's table. A table never outgrows its slot,
   so the region holds `LEVELS × TABLES × slot_blocks` blocks of tables.
-- **WAL:** one block per durable commit between flushes.
+- **WAL:** one block per durable commit between flushes, and one per
+  block of a batch larger than a block (up to 16). On NOR flash each is
+  a sector erase, and a batch of many blocks waits for all of them before
+  its one flush: size the WAL region for the largest batch, and keep
+  batches small where latency matters.
 
 The const generics behind `db_types!` (`BLOCK`, `KEY_MAX`, `VAL_MAX`,
 `CAP`, `ARENA`, `LEVELS`, `TABLES`, `BLOOM_BYTES`, `CACHE`) and the rules

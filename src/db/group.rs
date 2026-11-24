@@ -1,13 +1,13 @@
 //! Group commit across WAL blocks (ADR-0028): [`Db::write_group`].
 //!
-//! [`Db::write`] makes one batch durable with one WAL block and one
-//! device flush, so a batch must fit a block and every flush pays for at
-//! most a block of writes. A host that queues writes from many clients
-//! (the `examples/kvstore` writer queue) wants one flush to cover all of
-//! them. `write_group` takes many atomic units, each a client's batch,
-//! places each inside one WAL block (sealing a block without a flush when
-//! the next unit does not fit it), flushes once, and only then applies
-//! every unit to the memtable. Nothing is visible before it is durable.
+//! [`Db::write`] makes one batch durable with one device flush. A host
+//! that queues writes from many clients (the `examples/kvstore` writer
+//! queue) wants one flush to cover all of them. `write_group` takes many
+//! atomic units, each a client's batch, places them in WAL blocks (a unit
+//! that does not fit what is left of a block starts a fresh one, sealed
+//! without a flush; a unit larger than a block spans blocks, ADR-0029),
+//! flushes once, and only then applies every unit to the memtable.
+//! Nothing is visible before it is durable.
 
 use core::convert::Infallible;
 
@@ -120,10 +120,54 @@ pub struct GroupCommit {
 struct UnitCost {
     /// Ops that write a record.
     ops: usize,
+    /// WAL bytes of its largest record.
+    largest: usize,
     /// WAL bytes of those records.
     wal: usize,
     /// Memtable arena bytes.
     arena: usize,
+}
+
+/// Where WAL records land, block by block, as `WalWriter` places them:
+/// a unit that does not fit what is left of the block being filled
+/// starts a new one (`WalWriter::make_room`), and within a unit, a record
+/// that does not fit starts the next block, the group going on there
+/// ([`SPAN`](crate::wal::SPAN), ADR-0029). `Db::write` and
+/// [`Db::write_group`] plan with it, so what they check is what the
+/// writer will do.
+#[derive(Debug, Clone, Copy)]
+pub struct Placement<const BLOCK: usize> {
+    /// Blocks written out so far.
+    pub sealed: usize,
+    /// Bytes in the block being filled.
+    pub filling: usize,
+}
+
+impl<const BLOCK: usize> Placement<BLOCK> {
+    /// Places a unit of `wal` bytes in all, whose records are `records`
+    /// bytes each (each at most a block). An empty unit takes nothing.
+    pub fn unit(&mut self, wal: usize, records: impl Iterator<Item = usize>) {
+        if wal == 0 {
+            return;
+        }
+        if self.filling > 0 && self.filling.saturating_add(wal) > BLOCK {
+            self.sealed += 1;
+            self.filling = 0;
+        }
+        for rlen in records {
+            if self.filling + rlen > BLOCK {
+                self.sealed += 1;
+                self.filling = rlen;
+            } else {
+                self.filling += rlen;
+            }
+        }
+    }
+
+    /// Blocks written once the block being filled is written too.
+    pub const fn blocks(&self) -> usize {
+        self.sealed + if self.filling > 0 { 1 } else { 0 }
+    }
 }
 
 /// The prefix of a group that fits, and what it takes.
@@ -154,14 +198,16 @@ impl<
     ///
     /// Each unit is one client's batch of ops: all of it becomes durable
     /// and visible, or none of it does, exactly as with [`Db::write`].
-    /// Units are placed in WAL blocks in order, each inside one block
-    /// (a block is written out, without a flush, when the next unit does
-    /// not fit what is left of it); then the device is flushed once, and
+    /// Units are placed in WAL blocks in order (a block is written out,
+    /// without a flush, when the next unit does not fit what is left of
+    /// it, and a unit larger than a block spans blocks from a fresh one,
+    /// ADR-0029); then the device is flushed once, and
     /// only then are the units applied to the memtable, in order. A
     /// reader never sees a unit before it is durable.
     ///
     /// The longest prefix of `units` that fits is committed: every unit
-    /// must fit a WAL block, the prefix must fit the memtable's slots and
+    /// must fit [`GROUP_BLOCKS_MAX`] WAL blocks and an empty memtable,
+    /// the prefix must fit the memtable's slots and
     /// arena and the WAL blocks left, and it spans at most
     /// [`GROUP_BLOCKS_MAX`] blocks. The units after it are not written;
     /// the result says how many were, and the caller passes the rest
@@ -179,7 +225,8 @@ impl<
     ///
     /// When the first unit does not fit: [`Error::EmptyKey`],
     /// [`Error::KeyTooLarge`] or [`Error::ValueTooLarge`] for a bad op,
-    /// [`Error::BatchTooLarge`] when it exceeds a WAL block,
+    /// [`Error::BatchTooLarge`] when it exceeds [`GROUP_BLOCKS_MAX`] WAL
+    /// blocks or an empty memtable (or one of its records a block),
     /// [`Error::TableFull`] / [`Error::ArenaFull`] when the memtable
     /// cannot take it, [`Error::WalFull`] when the WAL region is out of
     /// blocks. Then [`Error::CounterExhausted`], or [`Error::Device`] when
@@ -257,11 +304,12 @@ impl<
     /// The longest prefix of `units` that fits; the error the first unit
     /// would get alone when none does. Capacity counts the records a
     /// failed commit left in the WAL (see `Unapplied`).
-    fn plan_group(&self, units: &[&[GroupOp<'_>]]) -> Result<GroupPlan, Error<D::Error>> {
+    fn plan_group(&mut self, units: &[&[GroupOp<'_>]]) -> Result<GroupPlan, Error<D::Error>> {
         let (mut slots, mut arena) = self.memtable_taken();
         // Blocks written out so far, and bytes in the one being filled.
         let (mut sealed, mut filling) = (0usize, 0usize);
         let left = usize::try_from(self.wal.blocks_left()).unwrap_or(usize::MAX);
+        let most = self.span_blocks_max();
         let mut plan = GroupPlan {
             units: 0,
             ops: 0,
@@ -269,36 +317,70 @@ impl<
         };
         for unit in units {
             let fits = Self::unit_cost(unit).and_then(|c| {
-                if c.wal > BLOCK {
+                // Where the unit's records land: the writer's own rule
+                // (`Placement`), so a unit larger than a block spans
+                // blocks exactly as it will be written (ADR-0029).
+                let records = || {
+                    unit.iter()
+                        .filter(|op| !op.is_noop())
+                        .map(|op| op.cost::<KEY_MAX, VAL_MAX>().map_or(0, |(wal, _)| wal))
+                };
+                // A record must fit a block, and a unit must fit the most
+                // blocks one commit writes, even alone.
+                if c.largest > BLOCK {
                     return Err(Error::BatchTooLarge {
-                        bytes: c.wal,
+                        bytes: c.largest,
                         max: BLOCK,
                     });
                 }
+                let mut alone = Placement::<BLOCK> {
+                    sealed: 0,
+                    filling: 0,
+                };
+                alone.unit(c.wal, records());
+                if alone.blocks() > most {
+                    return Err(Error::BatchTooLarge {
+                        bytes: c.wal,
+                        max: most.saturating_mul(BLOCK),
+                    });
+                }
+                // Nor may it outgrow an empty memtable: a flush would not
+                // make room for it.
+                if c.ops > CAP {
+                    return Err(Error::BatchTooLarge {
+                        bytes: c.ops,
+                        max: CAP,
+                    });
+                }
+                if c.arena > ARENA {
+                    return Err(Error::BatchTooLarge {
+                        bytes: c.arena,
+                        max: ARENA,
+                    });
+                }
+                let mut place = Placement::<BLOCK> { sealed, filling };
+                place.unit(c.wal, records());
                 if slots.saturating_add(c.ops) > CAP {
                     return Err(Error::TableFull);
                 }
                 if arena.saturating_add(c.arena) > ARENA {
                     return Err(Error::ArenaFull);
                 }
-                let (s, f) = if c.ops == 0 {
-                    (sealed, filling)
-                } else if filling + c.wal > BLOCK {
-                    (sealed + 1, c.wal)
-                } else {
-                    (sealed, filling + c.wal)
-                };
-                let blocks = s + usize::from(f > 0);
-                if blocks > left {
-                    return Err(Error::WalFull);
-                }
-                Ok((c, s, f, blocks))
+                Ok((c, place.sealed, place.filling, place.blocks()))
             });
             let (c, s, f, blocks) = match fits {
                 Ok(fit) => fit,
                 Err(e) if plan.units == 0 => return Err(e),
                 Err(_) => break,
             };
+            if blocks > left {
+                if plan.units == 0 {
+                    // The flush that answers it wraps the region now.
+                    self.wal_wanted = u64::try_from(blocks).unwrap_or(u64::MAX);
+                    return Err(Error::WalFull);
+                }
+                break;
+            }
             if blocks > GROUP_BLOCKS_MAX {
                 break;
             }
@@ -316,12 +398,14 @@ impl<
     fn unit_cost(unit: &[GroupOp<'_>]) -> Result<UnitCost, Error<D::Error>> {
         let mut cost = UnitCost {
             ops: 0,
+            largest: 0,
             wal: 0,
             arena: 0,
         };
         for op in unit.iter().filter(|op| !op.is_noop()) {
             let (wal, arena) = op.cost::<KEY_MAX, VAL_MAX>().map_err(Error::widen)?;
             cost.ops += 1;
+            cost.largest = cost.largest.max(wal);
             cost.wal = cost.wal.saturating_add(wal);
             cost.arena = cost.arena.saturating_add(arena);
         }

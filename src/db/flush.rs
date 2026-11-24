@@ -28,7 +28,7 @@ impl<
     /// the flush; stale pre-wrap blocks are skipped at recovery by the
     /// sequence floor (see `WalWriter::recover_from`).
     async fn retire_wal(&mut self) -> Result<(), Error<D::Error>> {
-        let full = self.wal.next_block() >= self.cfg.wal_end;
+        let full = self.wal_spent();
         if !full && self.unapplied == Unapplied::NONE {
             return Ok(());
         }
@@ -59,12 +59,22 @@ impl<
         Ok(())
     }
 
+    /// The WAL region does not hold the next commit: no block is left, or
+    /// fewer than the last commit refused with `WalFull` needed (a batch
+    /// may span blocks, ADR-0029). A flush wraps it then, so `WalFull`
+    /// always has a flush for its remedy. The blocks skipped are reused on
+    /// the next pass.
+    fn wal_spent(&self) -> bool {
+        self.wal.blocks_left() < self.wal_wanted.max(1)
+    }
+
     /// After a manifest commit moved `wal_head` to the append position
     /// (or, when `wrapped`, back to `wal_start`): appending restarts at
     /// `wal_start` if wrapped, and no record a failed commit left behind
     /// lies past `wal_head` any more (see [`Unapplied`]).
     fn wal_head_moved(&mut self, wrapped: bool) {
         if wrapped {
+            self.wal_wanted = 1;
             self.wal.reset_to(self.cfg.wal_start);
         }
         self.unapplied = Unapplied::NONE;
@@ -161,13 +171,14 @@ impl<
     /// returned I/O error leaves the in-memory state exactly as it was and
     /// the flush can simply be retried.
     ///
-    /// When the WAL region is exhausted, the flush wraps it: every record is
-    /// flushed at that point, so `wal_head` restarts at `wal_start` in the
-    /// same atomic manifest commit, giving the WAL an unbounded lifetime.
-    /// Stale pre-wrap blocks are skipped at recovery by the sequence floor.
+    /// When the WAL region is exhausted (no block left, or fewer than a
+    /// batch refused with [`Error::WalFull`] needs), the flush wraps it: every record is flushed at that point, so
+    /// `wal_head` restarts at `wal_start` in the same atomic manifest
+    /// commit, giving the WAL an unbounded lifetime. Stale pre-wrap blocks
+    /// are skipped at recovery by the sequence floor.
     ///
     /// A flush with an empty memtable still commits the WAL and wraps it if
-    /// full, and is otherwise a no-op.
+    /// exhausted, and is otherwise a no-op.
     ///
     /// # Errors
     ///
@@ -284,7 +295,7 @@ impl<
         // Advance the WAL head past the flushed records; wrap the region
         // when it is exhausted. Folded into this same atomic commit, so no
         // extra crash window opens between the wrap and its durability.
-        let wrap = self.wal.next_block() >= self.cfg.wal_end;
+        let wrap = self.wal_spent();
         edit.set_wal_head(if wrap {
             self.cfg.wal_start
         } else {

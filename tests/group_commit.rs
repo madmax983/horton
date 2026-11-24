@@ -41,6 +41,8 @@ struct Lab {
     fail_write: Cell<Option<usize>>,
     writes: usize,
     fail_flush: Cell<bool>,
+    /// With `fail_flush` set, this many flushes still pass first.
+    pass_flushes: Cell<usize>,
 }
 
 impl BlockDevice for Lab {
@@ -83,7 +85,9 @@ impl BlockDevice for Lab {
 
     fn poll_flush(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Fault>> {
         self.flushes += 1;
-        if self.fail_flush.get() {
+        if self.fail_flush.get() && self.pass_flushes.get() > 0 {
+            self.pass_flushes.set(self.pass_flushes.get() - 1);
+        } else if self.fail_flush.get() {
             return Poll::Ready(Err(Fault));
         }
         Poll::Ready(Ok(()))
@@ -226,22 +230,232 @@ fn a_group_spans_at_most_the_block_limit() {
     assert_eq!(db.device().wal_writes.len() - wal, GROUP_BLOCKS_MAX);
 }
 
-/// A unit larger than a block: an error when it is first, the end of the
-/// prefix otherwise. Each unit must fit one block to stay atomic.
+/// A unit larger than a block spans blocks (ADR-0029): it starts a fresh
+/// block, commits whole under the group's one flush, and reads back after
+/// a reopen. One larger than `GROUP_BLOCKS_MAX` blocks is an error when
+/// it is first, the end of the prefix otherwise.
 #[test]
-fn a_unit_larger_than_a_block_ends_the_prefix() {
+fn a_unit_larger_than_a_block_spans_blocks() {
     let mut db = open(Lab::default());
-    let big = units(0, 1, 5, 1000);
-    assert!(matches!(
-        write_group(&mut db, &big),
-        Err(Error::BatchTooLarge { .. })
-    ));
-    assert!(get(&db, &key(0)).is_none());
-    let mut data = units(100, 2, 1, 10);
-    data.push(big[0].clone());
-    data.extend(units(200, 1, 1, 10));
+    let (flushes, wal) = (db.device().flushes, db.device().wal_writes.len());
+    // A small unit, then one of five 1,000-byte puts (three to a block):
+    // the big unit starts a fresh block and takes two.
+    let mut data = units(0, 1, 1, 10);
+    data.extend(units(10, 1, 5, 1000));
     assert_eq!(write_group(&mut db, &data).expect("group").units, 2);
-    assert!(get(&db, &key(200)).is_none());
+    assert_eq!(db.device().flushes - flushes, 1, "one flush");
+    assert_eq!(db.device().wal_writes.len() - wal, 3, "three WAL blocks");
+    let mut db = open(db.into_device());
+    for (k, v) in data.iter().flatten() {
+        assert_eq!(get(&db, k).as_deref(), Some(v.as_slice()));
+    }
+    // 49 such puts need 17 blocks.
+    let huge = units(100, 1, 3 * GROUP_BLOCKS_MAX + 1, 1000);
+    assert_eq!(
+        write_group(&mut db, &huge).map(|d| d.units),
+        Err(Error::BatchTooLarge {
+            bytes: (3 * GROUP_BLOCKS_MAX + 1) * (23 + 5 + 1000),
+            max: GROUP_BLOCKS_MAX * 4096,
+        })
+    );
+    assert!(get(&db, &key(100)).is_none());
+    let mut data = units(200, 2, 1, 10);
+    data.push(huge[0].clone());
+    data.extend(units(300, 1, 1, 10));
+    assert_eq!(write_group(&mut db, &data).expect("group").units, 2);
+    assert!(get(&db, &key(300)).is_none());
+}
+
+/// Nine 1,000-byte puts: one unit over three WAL blocks.
+fn spanning_unit(first: usize) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+    units(first, 1, 9, 1000)
+}
+
+/// The same unit as a `WriteBatch`, for `Db::write`.
+fn as_batch(unit: &[(Vec<u8>, Vec<u8>)]) -> horton::WriteBatch<256, 1024, 16> {
+    let mut b = horton::WriteBatch::new();
+    for (k, v) in unit {
+        b.put(k, v).expect("op");
+    }
+    b
+}
+
+/// A block write that fails in the middle of a spanning unit, through
+/// `write_group` and through `Db::write`: an error, nothing visible, its
+/// sequence numbers consumed, and nothing of it staged for a later commit
+/// to write. A write after it lands behind the dead span and survives
+/// reopens (review finding: recovery must read on past a span that broke
+/// off when the next block is newer).
+#[test]
+fn a_failed_block_mid_span_leaves_nothing_behind() {
+    for via_write in [false, true] {
+        let mut db = open(Lab::default());
+        let data = spanning_unit(0);
+        db.device().fail_write.set(Some(db.device().writes + 1));
+        let res = if via_write {
+            block_on(db.write(&as_batch(&data[0]))).map(|_| ())
+        } else {
+            write_group(&mut db, &data).map(|_| ())
+        };
+        assert_eq!(res, Err(Error::Device(Fault)), "via write: {via_write}");
+        for (k, _) in data.iter().flatten() {
+            assert!(get(&db, k).is_none(), "nothing of it is visible");
+        }
+        let seq = block_on(db.put(b"next", b"write")).expect("a later write");
+        // The records a landed block holds are consumed (all nine through
+        // `Db::write`; through `write_group`, the six appended before the
+        // failure, the last three never reached the device).
+        assert!(seq > 6, "its sequence numbers are consumed, got {seq}");
+        for _ in 0..2 {
+            db = open(db.into_device());
+            assert_eq!(get(&db, b"next").as_deref(), Some(&b"write"[..]));
+            for (k, _) in data.iter().flatten() {
+                assert!(get(&db, k).is_none(), "the broken unit never lands");
+            }
+        }
+    }
+}
+
+/// A spanning unit needs all its blocks before the region's end: with
+/// fewer left it is `WalFull` before any block is written, through
+/// `write_group` and `Db::write`, and a flush makes room.
+#[test]
+fn a_spanning_unit_needs_all_its_blocks_left() {
+    for via_write in [false, true] {
+        let mut db = open(Lab::default());
+        let left = WAL.end - WAL.start;
+        for i in 0..left - 2 {
+            let key = format!("f{i}");
+            block_on(db.put(key.as_bytes(), b"x")).expect("fill");
+        }
+        let data = spanning_unit(0);
+        let wal = db.device().wal_writes.len();
+        let res = if via_write {
+            block_on(db.write(&as_batch(&data[0]))).map(|_| ())
+        } else {
+            write_group(&mut db, &data).map(|_| ())
+        };
+        assert_eq!(res, Err(Error::WalFull), "via write: {via_write}");
+        assert_eq!(db.device().wal_writes.len(), wal, "no block written");
+        let seq = block_on(db.put(b"next", b"x")).expect("put");
+        assert_eq!(seq, left - 1, "no sequence number consumed");
+        block_on(db.flush()).expect("flush");
+        assert_eq!(write_group(&mut db, &data).expect("after a flush").units, 1);
+    }
+}
+
+/// Only the middle block of a spanning unit reached the medium: recovery
+/// stops at the hole before it, and open zeroes the stranded block (its
+/// records carry `CONT`, which the scrub must still see), so writes that
+/// fill the hole never bring any of the unit back.
+#[test]
+fn a_lone_middle_block_of_a_span_is_scrubbed() {
+    let mut db = open(Lab::default());
+    block_on(db.put(b"acked", b"1")).expect("put");
+    let first = db.device().wal_writes.last().copied().expect("a WAL write") + 1;
+    db.device().lose.borrow_mut().extend([first, first + 2]);
+    db.device().fail_flush.set(true);
+    let data = spanning_unit(0);
+    assert_eq!(
+        write_group(&mut db, &data).map(|d| d.units),
+        Err(Error::Device(Fault))
+    );
+    let dev = db.into_device();
+    dev.lose.borrow_mut().clear();
+    dev.fail_flush.set(false);
+    let mut middle = [0u8; 4096];
+    block_on(std::future::poll_fn(|cx| {
+        dev.poll_read_block(cx, first + 1, &mut middle)
+    }))
+    .expect("read");
+    assert!(
+        middle.iter().any(|&b| b != 0),
+        "setup: the middle block landed"
+    );
+    let mut db = open(dev);
+    block_on(std::future::poll_fn(|cx| {
+        db.device().poll_read_block(cx, first + 1, &mut middle)
+    }))
+    .expect("read");
+    assert!(middle.iter().all(|&b| b == 0), "open zeroed it");
+    for i in 0..3 {
+        block_on(db.put(format!("later{i}").as_bytes(), b"2")).expect("put");
+    }
+    let db = open(db.into_device());
+    assert_eq!(get(&db, b"later2").as_deref(), Some(&b"2"[..]));
+    for (k, _) in data.iter().flatten() {
+        assert!(get(&db, k).is_none(), "a dropped unit came back");
+    }
+}
+
+/// Review finding: a spanning unit whose third block failed to write
+/// leaves its first two on the device; the next group commit flushes
+/// them, then writes 16 blocks after them, and power fails before its
+/// flush with its first block lost. Recovery drops the broken span and
+/// resumes at its first block, two blocks before where it stopped
+/// reading, so open's scrub must reach `GROUP_BLOCKS_MAX` past the stop,
+/// not past the resume point. Otherwise the group's last blocks are never
+/// scrubbed, writes that fill the gap reach them, and the next recovery
+/// replays units the first one dropped.
+#[test]
+fn a_broken_span_does_not_hide_a_later_group_from_the_scrub() {
+    let mut db = open(Lab::default());
+    block_on(db.put(b"acked", b"1")).expect("put");
+    let first = db.device().wal_writes.last().copied().expect("a WAL write") + 1;
+    // The unit's blocks would be `first..first + 3`; the third fails.
+    db.device().fail_write.set(Some(db.device().writes + 2));
+    let broken = spanning_unit(0);
+    assert_eq!(
+        write_group(&mut db, &broken).map(|d| d.units),
+        Err(Error::Device(Fault))
+    );
+    // 16 units of three puts, one to a block, from `first + 2`. Its first
+    // block is lost; its flush fails (after the one that syncs the broken
+    // unit's blocks).
+    db.device().lose.borrow_mut().insert(first + 2);
+    db.device().fail_flush.set(true);
+    db.device().pass_flushes.set(1);
+    let later = units(100, GROUP_BLOCKS_MAX, 3, 1000);
+    assert_eq!(
+        write_group(&mut db, &later).map(|d| d.units),
+        Err(Error::Device(Fault))
+    );
+    assert_eq!(
+        db.device().wal_writes.last().copied(),
+        Some(first + 2 + GROUP_BLOCKS_MAX as u64 - 1),
+        "setup: the group took 16 blocks after the broken unit's two"
+    );
+    let dev = db.into_device();
+    dev.lose.borrow_mut().clear();
+    dev.fail_flush.set(false);
+    let mut db = open(dev);
+    assert_eq!(get(&db, b"acked").as_deref(), Some(&b"1"[..]));
+    let dropped: Vec<bool> = later
+        .iter()
+        .map(|u| u.iter().all(|(k, _)| get(&db, k).is_none()))
+        .collect();
+    assert!(dropped.iter().all(|&d| d), "past the hole: {dropped:?}");
+    // Fill the 16 blocks from where writing resumed (the broken unit's
+    // first), up to the group's last two, then reopen: recovery reads on
+    // into them unless open zeroed them.
+    for i in 0..GROUP_BLOCKS_MAX {
+        block_on(db.put(format!("fill{i}").as_bytes(), b"f")).expect("put");
+    }
+    assert_eq!(
+        db.device().wal_writes.last().copied(),
+        Some(first + GROUP_BLOCKS_MAX as u64 - 1),
+        "setup: the fills took the broken unit's blocks and 14 after"
+    );
+    let db = open(db.into_device());
+    assert_eq!(get(&db, b"fill15").as_deref(), Some(&b"f"[..]));
+    for (u, unit) in later.iter().enumerate() {
+        for (k, _) in unit {
+            assert!(get(&db, k).is_none(), "unit {u} came back");
+        }
+    }
+    for (k, _) in broken.iter().flatten() {
+        assert!(get(&db, k).is_none(), "the broken unit came back");
+    }
 }
 
 /// Ops are validated as `WriteBatch` validates them; an inverted range
@@ -544,7 +758,10 @@ fn a_group_at_the_top_of_the_counter() {
     let big_ops: Vec<GroupOp<'_>> = big.iter().map(|(k, v)| GroupOp::put(k, v)).collect();
     assert!(matches!(
         block_on(db.write_group(&[&big_ops])),
-        Err(Error::BatchTooLarge { .. } | Error::TableFull)
+        Err(Error::BatchTooLarge {
+            bytes: 300,
+            max: 256
+        })
     ));
 }
 

@@ -215,16 +215,17 @@ fn old_magic_is_rejected_not_misparsed() {
 fn a_v019_manifest_is_rejected_not_misparsed() {
     // v0.20 changes what a manifest's tables hold (the bucketed bloom
     // filter, then a filter that may span blocks: `hrtsst04`) and records
-    // each table's bloom section, so the magic is "hrtman09". A v0.19
-    // image ("hrtman06"), and one from an unreleased v0.20 build
-    // ("hrtman07", "hrtman08"), is refused when it is opened, before any
-    // of its tables is read by the new rule.
+    // each table's bloom section, and its WAL groups may span blocks
+    // (ADR-0029), so the magic is "hrtman10". A v0.19 image ("hrtman06"),
+    // and one from an unreleased v0.20 build ("hrtman07" to "hrtman09"),
+    // is refused when it is opened, before any of its tables or its WAL
+    // is read by the new rules.
     let mut m = TestManifest::new();
     m.add_table_to_level::<DevError>(0, tref(0, 100)).unwrap();
     let mut buf = [0u8; BLOCK];
     m.encode::<DevError, BLOCK>(&mut buf).unwrap();
-    assert_eq!(&buf[0..8], b"hrtman09");
-    for old in [b"hrtman06", b"hrtman07", b"hrtman08"] {
+    assert_eq!(&buf[0..8], b"hrtman10");
+    for old in [b"hrtman06", b"hrtman07", b"hrtman08", b"hrtman09"] {
         buf[0..8].copy_from_slice(old);
         // A real older block carries a CRC over its own magic.
         let crc = horton::crc32(&buf[..BLOCK - 4]);
@@ -233,6 +234,41 @@ fn a_v019_manifest_is_rejected_not_misparsed() {
         assert!(
             matches!(res, Err(Error::CorruptManifest)),
             "an older manifest must be rejected, got {res:?}"
+        );
+    }
+}
+
+/// An older image whose manifest was committed once has one intact copy
+/// and one blank one. Read as "one corrupt copy, one blank", it would be a
+/// fresh device: its WAL replayed from the start over tables this version
+/// never sees. Another version's copy rejects the image instead (review
+/// finding, ADR-0029).
+#[test]
+fn an_older_image_with_one_copy_is_rejected_not_taken_for_fresh() {
+    for old in [b"hrtman06", b"hrtman09"] {
+        let mut dev = MemDevice::<BLOCK>::new();
+        let mut m = TestManifest::new();
+        m.set_wal_head(8);
+        m.add_l0_table::<DevError>(tref(0, 136)).unwrap();
+        let mut scratch = [0u8; BLOCK];
+        block_on(m.commit(&mut dev, &mut scratch, SLOT_A, SLOT_B)).unwrap();
+        let slot = [SLOT_A, SLOT_B]
+            .into_iter()
+            .find(|&s| slot_seq(&dev, s).is_some())
+            .expect("one copy written");
+        let mut block = read_block(&dev, slot);
+        block[0..8].copy_from_slice(old);
+        write_block(&mut dev, slot, &block);
+        let res = block_on(TestManifest::recover(
+            &mut dev,
+            &mut scratch,
+            SLOT_A,
+            SLOT_B,
+        ));
+        assert!(
+            matches!(res, Err(Error::CorruptManifest)),
+            "{old:?}: an older image must be rejected, got {:?}",
+            res.map(|(_, fresh)| fresh)
         );
     }
 }

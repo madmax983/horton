@@ -360,15 +360,21 @@ fn a_group_recovers_all_or_nothing_at_every_tear_point() {
     }
 }
 
-/// A group that would not fit the block is refused before any of it is
-/// written, so a group can never straddle two blocks.
+/// A group that does not fit the block goes on in the next one
+/// (ADR-0029): the first block is written as the group's first part and
+/// the group replays whole once it closes. `tests/wal_span.rs` has the
+/// crash cases.
 #[test]
-fn a_group_never_straddles_blocks() {
+fn a_group_may_straddle_blocks() {
+    // Twelve records of 23 + 2 + 30 bytes: more than one 512-byte block.
     let mut w = writer();
-    block_on(w.append_grouped(1, Op::Put, b"k", &[7u8; 300], true)).unwrap();
-    let err = block_on(w.append_grouped(2, Op::Put, b"k", &[7u8; 300], false)).unwrap_err();
-    assert!(
-        matches!(err, horton::Error::BatchTooLarge { .. }),
-        "got {err:?}"
-    );
+    for i in 0..12u8 {
+        block_on(w.append_grouped(u64::from(i) + 1, Op::Put, &[b'k', i], &[i; 30], i < 11))
+            .unwrap();
+    }
+    assert_eq!(w.next_block(), 1, "the first part was written out");
+    block_on(w.commit()).unwrap();
+    let mut w = WalWriter::<MemDevice<512>, 512>::new(w.into_device(), 0, 16);
+    let mut t = T16::new();
+    assert_eq!(block_on(w.recover(&mut t)).unwrap().records, 12);
 }

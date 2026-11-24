@@ -108,20 +108,39 @@ magic: u16 = 0x6C73 | len: u32 | seq: u64 | op: u8 | key_len: u16
 | val_len: u16 | key | val | [expire_at: u64 for op 4] | crc32: u32
 ```
 
-Ops: 1 put, 2 delete, 3 range delete (`key` = start, `val` = end),
-4 put with TTL. The op byte's high bit (`MORE`, `0x80`) groups records: it
-is set on every record of a `WriteBatch` but the last. `crc32` covers
-everything after `magic`. Records never span blocks.
+The op byte is the op (bits 0 to 4: 1 put, 2 delete, 3 range delete with
+`key` = start and `val` = end, 4 put with TTL; any other value is not a
+record) and three flags (ADR-0029):
+
+| Flag | Bit | Meaning |
+|---|---|---|
+| `MORE` | `0x80` | more records of this record's atomic group follow: set on every record of a group but the last |
+| `SPAN` | `0x40` | the group goes on in the next block; only with `MORE`, only on a block's last record, which clean zero padding follows |
+| `CONT` | `0x20` | the record continues the group the previous block's `SPAN` record left open; only on a block's first record |
+
+`crc32` covers everything after `magic`, the op byte with its flags
+included. A record never spans blocks; a group may.
 
 - Each durable write commits one whole block (zero-padded) and moves on;
   a block holding acknowledged records is never rewritten. A
-  `WriteBatch` stages all its ops into one block (group commit); a batch
-  larger than a block is `BatchTooLarge`, never split.
+  `WriteBatch` is one group (group commit) and starts a fresh block.
+  A group larger than what is left of a block goes on into the next
+  ones: the writer marks the block's last record `SPAN` (re-sealing its
+  CRC), writes the block without a flush, and marks the next block's
+  first record `CONT`. A group spans blocks only from the start of its
+  first block, over at most `GROUP_BLOCKS_MAX` (16) blocks (or the WAL
+  region, if smaller), and its records take consecutive sequence
+  numbers. A batch larger than that, a record larger than a block, or a
+  batch an empty memtable cannot hold is `BatchTooLarge`, never split.
 - `Db::write_group` commits many such units under one flush (ADR-0028):
-  each unit stays inside one block, a block is written without a flush
-  when the next unit does not fit it, at most `GROUP_BLOCKS_MAX` blocks
-  are written, and the device is flushed once before any unit is applied
-  to the memtable. Units take consecutive sequence numbers in order.
+  a unit that does not fit what is left of a block starts a fresh one
+  (written without a flush), a unit larger than a block spans blocks as
+  above, at most `GROUP_BLOCKS_MAX` blocks are written in all, and the
+  device is flushed once before any unit is applied to the memtable.
+  Units take consecutive sequence numbers in order.
+- A commit needs all its blocks before the region's end, checked before
+  any is written; otherwise it is `WalFull`, and the next flush wraps the
+  region (when no block is left, or fewer than that commit needed).
 - Recovery replays `[wal_head, …)` in order and stops at the first
   corrupt or truncated record: the torn tail is the crash boundary, not an
   error. Records at or below the manifest's `flushed_seq` are stale
@@ -133,9 +152,25 @@ everything after `magic`. Records never span blocks.
   resumes on it. A block torn after complete groups ends the log unless
   the next block starts with a newer sequence number: an earlier recovery
   resumed past the tear, and the writes after it are live.
-- After recovery, open zeroes any of the `GROUP_BLOCKS_MAX - 1` blocks
-  after the one it stopped at that hold a record newer than every record
-  it recovered (and than `flushed_seq`), and flushes. A device may persist
+- A group that spans blocks replays only when every block of it is
+  intact and its closing record is there: each block after the first
+  must begin with a `CONT` record numbered one past the previous block's
+  `SPAN` record, the group must have begun at its first block's start,
+  and the chain may not exceed `GROUP_BLOCKS_MAX` blocks. The group is
+  replayed by reading its blocks again once the close is found, so no
+  part of it reaches the memtable before the whole is known. Anything
+  else drops all of it, and writing resumes at its first block. If the
+  block where the chain broke begins with a record that is not `CONT`
+  and is newer than everything replayed and than `flushed_seq`, the log
+  goes on there (a failed commit left a dead span, and later writes
+  landed after it); otherwise it ends. A block that begins with `CONT`
+  while no span is open, a `CONT` record anywhere but first, and a
+  `SPAN` record not followed by clean zero padding are torn bytes.
+- After recovery, open zeroes any block after the one writing resumes at,
+  up to `GROUP_BLOCKS_MAX` blocks past the one recovery stopped reading
+  at, that holds a record newer than every record it recovered (and than
+  `flushed_seq`), and flushes. (The two differ when a spanning group
+  broke off: writing resumes at its first block.) A device may persist
   a group's blocks in any order before the flush, so a later block can
   outlive an earlier one; without this, the next recovery would read it
   once the gap is written over, and bring back a write this recovery
@@ -148,8 +183,9 @@ everything after `magic`. Records never span blocks.
   applied, but its records may replay: until a flush moves `wal_head`
   past them, capacity checks count them as taken, and the next write
   flushes the device before adding blocks.
-- When the region is exhausted the next flush wraps it: `wal_head`
-  returns to `wal_start` in the same manifest commit.
+- When the region is exhausted (see `WalFull` above) the next flush
+  wraps it: `wal_head` returns to `wal_start` in the same manifest
+  commit.
 
 ### 4.3 BlockDevice — the only I/O boundary
 
@@ -236,13 +272,13 @@ shared by the levels. L0 holds at most `TABLES` refs, oldest first;
 deeper levels hold disjoint runs sorted by first key, in any share of
 the pool.
 
-Storage (format `hrtman09`, ADR-0011): two or more **copies**
+Storage (format `hrtman10`, ADR-0011): two or more **copies**
 (`ManifestLayout::pair` or `ManifestLayout::ring`), each
 `Manifest::max_blocks::<BLOCK>()` blocks long, the compile-time worst
 case. Block layout:
 
 ```
-magic: u64 = "hrtman09" | seq: u64 | index: u16 | count: u16 | len: u32
+magic: u64 = "hrtman10" | seq: u64 | index: u16 | count: u16 | len: u32
 | body chunk[len] | crc32: u32
 ```
 
@@ -263,8 +299,14 @@ and its table refs.
   applies the edit in memory only after the commit lands, so a failed
   commit changes nothing.
 - **Format policy (pre-1.0):** no compatibility across minor versions.
-  The WAL, SSTable, and manifest each carry a magic that changes with the
-  layout; a foreign magic is rejected, never misread.
+  SSTables and the manifest carry a magic that changes with the layout;
+  a foreign magic is rejected, never misread. The WAL's layout is
+  versioned by the manifest's magic (its record magic stays `0x6C73`, and
+  a foreign one reads as a torn tail): a manifest copy that starts with
+  `hrtman` and another version rejects the whole image, even beside a
+  blank copy, rather than reading as a fresh device. A WAL with no
+  manifest yet (never flushed) written by an older build holds only
+  records the current format reads the same way.
 
 ### 4.6 Table region — fixed slots
 
@@ -482,7 +524,7 @@ never panicked. Capacity errors name their remedy (ADR-0013):
 | `RegionFull` | no slot, and compaction cannot free one | delete (or set `purge_before`), `request_compaction(0)` and compact; archive; or grow the region |
 | `SnapshotLimit` | 8 snapshots live | release one |
 | `TableTooLarge` | an entry, index, or rdel section does not fit | smaller entries, bigger blocks or slots |
-| `BatchTooLarge`, `BatchFull` | batch exceeds a WAL block / `OPS` | split it |
+| `BatchTooLarge`, `BatchFull` | batch exceeds `GROUP_BLOCKS_MAX` WAL blocks or an empty memtable (or a record a block) / `OPS` | split it |
 | `Busy` | another `get` holds the shared read buffers | finish it, retry |
 | `BadConfig` | regions overlap or are too small | fix the `Config` |
 | `NotOpen` | used before `open()` | call `open()` |
