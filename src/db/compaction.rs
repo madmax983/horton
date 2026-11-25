@@ -1151,6 +1151,11 @@ impl<
         (lane, need): (usize, u64),
     ) -> Result<(), Error<D::Error>> {
         c.target_level = tgt;
+        c.output_blocks = if self.cfg.compresses(tgt) {
+            crate::compact::OutputBlocks::Compressed
+        } else {
+            crate::compact::OutputBlocks::Raw
+        };
         // The first output's range tombstones are clipped to the job's
         // range: an input's range-tombstone section can reach below its
         // live lower bound (the part a past job already merged).
@@ -1342,10 +1347,11 @@ impl<
         lane: usize,
     ) -> Result<Option<TableRef<KEY_MAX>>, Error<D::Error>> {
         let device = self.wal.device_mut();
-        let data_blocks = c
-            .writer
-            .seal_data(&mut *device, Some(&mut c.compress))
-            .await?;
+        let cs = match c.output_blocks {
+            crate::compact::OutputBlocks::Compressed => Some(&mut c.compress),
+            crate::compact::OutputBlocks::Raw => None,
+        };
+        let data_blocks = c.writer.seal_data(&mut *device, cs).await?;
         let last_key = c.writer.last_key();
         let hi = if last_output {
             None

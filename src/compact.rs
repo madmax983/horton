@@ -79,6 +79,15 @@ pub enum Progress {
     More,
 }
 
+/// How a compaction job stores its outputs' data blocks (ADR-0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputBlocks {
+    /// Trial-compressed with LZ77, kept compressed when it saves enough.
+    Compressed,
+    /// Stored as they are.
+    Raw,
+}
+
 /// What [`Compaction::merge_detached`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detached {
@@ -237,12 +246,17 @@ pub struct Compaction<
     /// stale and resets instead of touching the device.
     pub(crate) job_gen: u32,
     pub(crate) writer: TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>,
-    /// Caller-owned compression scratch for the output tables: every
-    /// sealed data block is trial-compressed (see
+    /// Caller-owned compression scratch for the output tables: when the
+    /// job compresses (`output_blocks`), every sealed data block is
+    /// trial-compressed (see
     /// [`TableWriter::push`](crate::sstable::TableWriter::push)). Lives
     /// for the job's duration; `const`-constructible so [`new`](Self::new)
     /// stays `const`.
     pub(crate) compress: CompressScratch<BLOCK>,
+    /// How this job's outputs store their data blocks: compressed when
+    /// its target level is at or past `Config::compression_from_level`
+    /// (ADR-0030). Set when the job is selected.
+    pub(crate) output_blocks: OutputBlocks,
     /// Shared physical-read scratch: one block buffer lent to
     /// [`read_data_block`] on every cursor fill. The physical bytes are
     /// dead once inflated into the cursor's `block`, so the merge cursors
@@ -450,6 +464,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             job_gen: 0,
             writer: TableWriter::new(0, 0),
             compress: CompressScratch::new(),
+            output_blocks: OutputBlocks::Compressed,
             raw: [0u8; BLOCK],
             cursors: [Cursor::EMPTY; COMPACTION_KMAX],
             key: [0u8; KEY_MAX],
@@ -1000,9 +1015,11 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                         tombstone: tombstone || purged,
                         expire_at: if tombstone || purged { 0 } else { expire_at },
                     };
-                    self.writer
-                        .push(device, e, Some(&mut self.compress))
-                        .await?
+                    let cs = match self.output_blocks {
+                        OutputBlocks::Compressed => Some(&mut self.compress),
+                        OutputBlocks::Raw => None,
+                    };
+                    self.writer.push(device, e, cs).await?
                 };
                 // The emitted version is the newest at or below every
                 // threshold it satisfies (versions surface newest-first),

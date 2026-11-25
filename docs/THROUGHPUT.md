@@ -28,7 +28,10 @@ point reads 1.6. Then one `fdatasync` came to cover many WAL blocks of
 writes, and one atomic batch to span them
 ([steps 18 and 19](#then-one-fdatasync-for-more-than-a-block-of-writes)),
 and the host store's memtable grew to fill its arena
-([step 20](#then-a-memtable-as-large-as-its-arena)).
+([step 20](#then-a-memtable-as-large-as-its-arena)). Last, tables
+written into levels 0 and 1 stopped compressing
+([step 21](#then-no-compression-in-levels-0-and-1)): fills and
+overwrites 16% to 43% faster, point reads 5% to 8% and seeks about 40%.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1139,6 +1142,71 @@ and its `pwrite`) are work a larger memtable does not reduce. Reads are within t
 table now holds 8,192 entries, and its bloom filter still fits one
 block (10 bits a key).
 
+### Then: no compression in levels 0 and 1
+
+Step 21 (ADR-0030). A table's blocks are a fixed size and its entries
+are packed by their raw size, so LZ77 never saved a table a block: it
+cost a trial compression for every block written and an inflate for
+every block read. Tables written into levels 0 and 1, the ones written
+most and kept least, now store their data blocks raw
+(`Config::compression_from_level`, 2 by default); deeper ones are
+compressed as before.
+
+1 M keys, no `fdatasync`, 4 threads, the build that compressed every
+level ("before") beside this one, two runs, ops/s:
+
+| | before | after | change |
+|---|---:|---:|---:|
+| `fillseq` | 220,209 / 215,215 | 254,371 / 268,289 | +16%, +25% |
+| `fillrandom` | 145,615 / 154,361 | 198,115 / 216,566 | +36%, +40% |
+| `overwrite` | 138,014 / 138,486 | 197,351 / 196,485 | +43%, +42% |
+| `deleterandom` | 177,567 / 187,631 | 226,115 / 198,462 | +27%, +6% |
+| `readwhilewriting` | 123,359 / 129,024 | 146,111 / 139,111 | +18%, +8% |
+
+Batched, one run each:
+
+| writes a batch | `fillseq` | `fillrandom` | `overwrite` |
+|---|---:|---:|---:|
+| 100, no `fdatasync` | 549 K → 822 K | 306 K → 410 K | 303 K → 398 K |
+| 1,000, no `fdatasync` | 557 K → 763 K | 333 K → 383 K | 265 K → 341 K |
+| 100, synced | 320 K → 362 K | 189 K → 215 K | 194 K → 228 K |
+| 1,000, synced | 442 K → 503 K | 210 K → 251 K | 202 K → 230 K |
+
+One synced `fillrandom` of 1 M keys into an empty store wrote the same
+blocks either way (68,740 and 68,737 at 100 writes a batch; 67,400 and
+67,401 at 1,000) at 164,505 → 216,207 and 178,340 → 227,560 entries a
+second: the work saved was CPU only.
+
+Reads, on identical tables (fills on one thread: 6, 5, 6 and 1 tables
+per level in every run), three interleaved pairs on an idle machine,
+ops/s (entries/s for the scan):
+
+| | 1 reader | 4 readers |
+|---|---:|---:|
+| `readrandom`, before | 100 K to 114 K (mean 111 K) | 395 K to 417 K (mean 404 K) |
+| `readrandom`, after | 114 K to 125 K (mean 120 K) | 418 K to 433 K (mean 425 K) |
+| `seekrandom` | 15.4 K → 21.0 K | 57.8 K → 80.8 K |
+| `readseq` | 1.85–2.02 M → 1.76–2.06 M | 6.2–7.4 M → 5.9–8.1 M |
+| the fill, on one thread | 84 K–92 K → 129 K–132 K | 87 K–91 K → 120 K–132 K |
+
+Point reads are 5% to 8% faster and seeks 37% to 40%: a point read in a
+raw level-0 or level-1 table searches the block where it lies, and a
+seek positions a cursor in every table that could hold its key without
+inflating any of the shallow ones. A scan is level. An earlier set of
+runs on a busier machine had point reads 4% to 12% slower and scans 7%
+to 20%; callgrind on the same tables showed the after build doing
+fewer instructions per read (4% fewer at 1 M keys, 19% at 300 K, 1.4%
+fewer per scanned entry) with the same cache hits and misses, so those
+were the machine. The one cost that grew is the CRC of a block read
+from the device: CRC-32 carries runs of zero bytes across, and a
+compressed block is half zero padding, so a raw block's check costs
+about half again as much (62.8 K instructions against 41.7 K), less
+than the inflate it saves.
+
+Against RocksDB with the same memory, in the same session: `fillseq`
+1.33× and 1.43×, `fillrandom` 1.20× and 1.40×, `overwrite` 1.51× and
+1.44×, `readrandom` 0.88× and 0.87×, `seekrandom` 0.34× and 0.42×.
+
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
@@ -1234,10 +1302,17 @@ Measured or scoped while doing this, and left:
   experiment before step 20 (a copy of the kvstore with timers in it,
   1 M keys, four threads, 1,000 writes a batch, no `fdatasync`),
   `fillrandom` was 70% faster and `fillseq` up to 85%; with 8,192
-  entries as well, 2.3 times. Compressing only deeper
-  levels (RocksDB's `compression_per_level`), resetting LZ77's hash
-  table by generation rather than per block, and not summing a
-  block's padding would keep most of that and the space.
+  entries as well, 2.3 times. Step 21 stopped compressing levels 0 and
+  1. Resetting LZ77's hash table by generation rather than per block,
+  and not summing a block's padding, would cheapen the deeper levels'.
+  Packing a block by its compressed size would make compression save
+  blocks at all (a format change).
+- **A cache hit that checks only what a point read reads.** A hit
+  checks the whole 16 KiB image's RAM checksums, about 16.8 K
+  instructions; a lookup reads a fraction of it. Checking only the
+  chunks the search touches measured 8.5% fewer instructions per read
+  at 300 K keys and 1.3% at 1 M (step 21's profile), behind a new
+  `CachePort` method. Not done.
 - **Waiting writers that do not wake each other.** A writer waiting for
   compaction parks with a timeout, and a commit that finds the stall
   wakes the next one at once: 7 to 23 million wake-ups per million

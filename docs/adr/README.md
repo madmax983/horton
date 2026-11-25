@@ -42,6 +42,7 @@ history keeps it); its §9 milestone log now lives in
 | [0027](0027-point-reads-inflate-to-the-key.md) | A point read inflates a compressed data block only as far as its key (a resumable decoder and a scan from the first entry), and leaves what the scan cannot decide to the whole-block search |
 | [0028](0028-group-commit-across-wal-blocks.md) | Group commit across WAL blocks: `Db::write_group` commits the longest prefix of atomic units that fits, each inside one block, under one flush, visible only after it; open zeroes blocks a reordering device stranded past the recovered log, so a dropped write never comes back |
 | [0029](0029-atomic-batches-across-wal-blocks.md) | An atomic batch may span up to 16 WAL blocks: `SPAN` and `CONT` op-byte flags and consecutive sequence numbers tie its blocks together, recovery replays it only when all are intact, open's scrub reaches 16 blocks past where recovery stopped; manifest `hrtman10` |
+| [0030](0030-no-compression-in-shallow-levels.md) | Tables written into levels 0 and 1 store their data blocks raw (`Config::compression_from_level`, default 2): a table's blocks are packed by raw size, so compression saved no blocks there and cost a pass to write and to read |
 
 ## Adding a record
 

@@ -26,10 +26,10 @@ not counted here.
 
 | Struct | Bytes | Notes |
 |---|---|---|
-| `Db` | 25,968 | memtable (with its sorted view: ADR-0026), WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
+| `Db` | 25,976 | memtable (with its sorted view: ADR-0026), WAL stage block, manifest, slot map, two shared read buffers (point reads and the block scratch of every `&mut self` call), 2-slot block cache (each slot a 4 KiB image, a tag and 16 chunk sums: ADR-0016), the region layout, the requested-compaction state |
 | `Scan` | 10,904 | one decoded block, the physical read buffer, cursors; block buffers lent with `use_block_pool` are the caller's and not counted (the profile lends none) |
 | `Compaction` | 59,640 | 8 merge cursors (one logical block each) sharing one physical read buffer, the output table writer, trial-compression scratch, the range-tombstone coverage stream (2,728 bytes: F16, F22) |
-| **Structs** | **96,512** | |
+| **Structs** | **96,520** | |
 
 ## Measured futures
 
@@ -40,7 +40,7 @@ future, and the executor stores the future: in a static task arena
 | Future | Bytes | Notes |
 |---|---|---|
 | `archive_commit()` | 17,688 | the resurrection review's entry stream over the candidate |
-| `flush()` | 17,640 | table writer (data + index blocks) and trial-compression scratch |
+| `flush()` | 17,648 | table writer (data + index blocks) and trial-compression scratch |
 | `open()` | 7,216 | WAL recovery |
 | `compact_step()` | 3,032 | merge state lives in the caller's `Compaction` |
 | `get()` | 1,432 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |
@@ -55,7 +55,7 @@ peak is therefore
 
 ```
 structs + max(largest &mut self future, get + largest scan future)
-= 96,512 + max(17,688, 1,432 + 1,288) = 114,200 bytes
+= 96,520 + max(17,688, 1,432 + 1,288) = 114,208 bytes
 ```
 
 Budget: **114,688 bytes (112 KiB)**, `ESP32S3_RAM_BUDGET` in
@@ -74,7 +74,7 @@ History:
   table writer's idle data block, and commits the manifest as a small
   `ManifestEdit` instead of a full copy. `get()` returns `Error::Busy`
   instead of carrying two fallback block buffers in every future.
-- Still 112 KiB at v0.20, with 488 bytes to spare: the block cache
+- Still 112 KiB at v0.20, with 480 bytes to spare: the block cache
   keeps 16 checksums per slot (ADR-0016), 264 bytes for the two slots,
   and the read futures carry a bloom probe and a byte range. `get()`
   grew by another 152 bytes when its table phase became shared with
@@ -91,7 +91,8 @@ History:
   that runs one job at a time pays those and nothing else. Atomic
   batches across WAL blocks (ADR-0029) added 56 bytes to the `Db` (the
   WAL writer's open group and the blocks a refused batch needed) and up
-  to 32 to the write futures (`delete_range()` is 528).
+  to 32 to the write futures (`delete_range()` is 528). The
+  compression threshold in `Config` (ADR-0030) added 8.
 
 ## Context
 

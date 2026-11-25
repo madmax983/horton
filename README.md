@@ -98,7 +98,7 @@ in the [ADRs](docs/adr/README.md).
 | Atomic batches | `WriteBatch` through `write`. `write_group` commits many atomic units (`GroupOp` slices) under one device sync, as many as fit `GROUP_BLOCKS_MAX` WAL blocks, and says how many it wrote |
 | Reads | `get`, `snapshot` and `get_at`, `get_with_time` for TTL; forward `Scan` and reverse `RevScan` over a key range |
 | Durability | WAL first. The manifest (two copies, or a ring of `n`) is the one commit point for every flush, compaction and archive step |
-| Tables | Immutable: restart-point data blocks, a bloom filter sized to the table, range tombstones, LZ77 block compression wherever it saves at least 128 bytes |
+| Tables | Immutable: restart-point data blocks, a bloom filter sized to the table, range tombstones, LZ77 block compression for tables written into level 2 and deeper (`Config::with_compression_from_level`), wherever it saves at least 128 bytes |
 | Compaction | Leveled and caller-driven. `compact_step` does at most one output block, or one output's seal and commit, per call, so firmware can interleave it with real-time work. Deletes and expiry give their space back |
 | Cache | Optional CLOCK block cache inside `Db` (`cache_blocks: 0` turns it off) |
 | Cold storage | `archive_plan` / `archive_commit` move a sealed table to your own sink; `ingest_table` brings it back |
@@ -294,7 +294,7 @@ compacting.
 
 [`horton::profile`](src/profile.rs) is a measured ESP32-S3 shape: 4 KiB
 blocks, 32-byte keys, 64-byte values, a 16-entry memtable, 4 × 4 tables,
-a 2-block cache. It needs 114,200 bytes: 96,512 of structs, plus the
+a 2-block cache. It needs 114,208 bytes: 96,520 of structs, plus the
 largest future (`archive_commit`, 17,688 bytes). `tests/profile.rs`
 fails the test suite past 114,688 bytes (112 KiB). The breakdown, the futures
 and the history are in [`BUDGET.md`](BUDGET.md).
@@ -545,8 +545,8 @@ has the exports, the tests and how CI runs them.
 usually fills: one file, a handle any thread can use, and compaction that
 runs by itself. `Store` is an example, not part of the published crate:
 to use it, copy `examples/kvstore/` (`store.rs`, the modules it uses, and
-the shape in `main.rs`). Its shape holds about 200 MiB of compressed
-tables (28 tables of about 7 MiB); past that, writes report `RegionFull`.
+the shape in `main.rs`). Its shape holds about 200 MiB of tables (28
+tables of about 7 MiB); past that, writes report `RegionFull`.
 
 The `Db` sits behind one engine lock, and callers run horton on their own
 threads. The thread that holds the lock commits everyone's queued writes,

@@ -92,6 +92,23 @@ pub struct Config {
     /// the *handle's* identity, so reopening under a different id is a
     /// caller bug, not a format concern.
     pub node_id: u32,
+    /// The shallowest level a table is written into with its data blocks
+    /// compressed (LZ77, ADR-0008): flushes (level 0) and compaction
+    /// outputs into shallower levels store their blocks raw. 2 by
+    /// default, so levels 0 and 1, the ones rewritten soonest, are
+    /// written raw (ADR-0030); 0 compresses every table, and `LEVELS` or
+    /// more none. It applies when a table is written: a table compaction
+    /// moves down whole keeps its blocks as they are, and so does an
+    /// ingested one.
+    ///
+    /// A table's blocks are a fixed size and its entries are packed by
+    /// their raw size, so compressing a table saves none of its blocks:
+    /// it costs a trial compression for every block written and an
+    /// inflate for every block read. Not part of the on-device layout:
+    /// every block says whether it is compressed, so reopening under
+    /// another threshold reads everything and changes only what is
+    /// written next.
+    pub compression_from_level: u8,
 }
 
 impl Config {
@@ -126,6 +143,7 @@ impl Config {
             manifest_ring: 0,
             device_blocks,
             node_id: 0,
+            compression_from_level: DEFAULT_COMPRESSION_FROM_LEVEL,
         }
     }
 
@@ -155,6 +173,7 @@ impl Config {
             manifest_ring: 0,
             device_blocks: 0,
             node_id: 0,
+            compression_from_level: DEFAULT_COMPRESSION_FROM_LEVEL,
         }
     }
 
@@ -179,7 +198,26 @@ impl Config {
         self.node_id = node_id;
         self
     }
+
+    /// Compresses the data blocks of tables written into `level` and
+    /// deeper levels only (see the
+    /// [`compression_from_level`](Self#structfield.compression_from_level)
+    /// field): 0 compresses every table, and `LEVELS` (the level count)
+    /// or more none. The default is 2.
+    #[must_use]
+    pub const fn with_compression_from_level(mut self, level: u8) -> Self {
+        self.compression_from_level = level;
+        self
+    }
+
+    /// Whether tables written into `level` compress their data blocks.
+    pub(crate) const fn compresses(&self, level: usize) -> bool {
+        level >= self.compression_from_level as usize
+    }
 }
+
+/// [`Config::compression_from_level`] unless set: levels 0 and 1 raw.
+pub const DEFAULT_COMPRESSION_FROM_LEVEL: u8 = 2;
 
 /// Table-region occupancy, from [`Db::slot_stats`].
 ///
@@ -605,6 +643,7 @@ impl<
             manifest_ring: c.manifest_ring,
             device_blocks: total,
             node_id: c.node_id,
+            compression_from_level: c.compression_from_level,
         }
     }
 

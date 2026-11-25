@@ -222,7 +222,11 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   key | val [| expire_at u64]`, sorted by key then sequence descending,
   then `u16` restart offsets (one per 16 entries) and a `u16` count. Bit
   15 of the count flags an LZ77-compressed block (ADR-0008); readers
-  inflate transparently.
+  inflate transparently. Tables written into a level shallower than
+  `Config::compression_from_level` (2 by default: flushes and level-1
+  compaction outputs) store their data blocks raw (ADR-0030); a table
+  moved down whole, or ingested, keeps its blocks as they are. A block
+  says which it is, so the setting is not part of the format.
 - **Rdel block:** range tombstones `start_len u16 | end_len u16 | seq u64
   | start | end`, sorted by start, then a `u16` count. Never compressed.
 - **Bloom blocks:** a bit array in 64-byte buckets. A key hashes to one
