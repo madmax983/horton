@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # horton's kvstore against RocksDB, on db_bench's workloads.
 #
-#   examples/kvstore/vs-rocksdb.sh [NUM] [--sync]
+#   examples/kvstore/vs-rocksdb.sh [NUM] [--sync] [--batch N]
 #
 # Runs the same benchmarks, with the same keys and values, on:
 #
@@ -15,7 +15,11 @@
 # and prints operations per second side by side. NUM is the number of
 # distinct keys (default 100000). --sync makes every write durable
 # before it returns (db_bench --sync=1; the kvstore's default) and runs
-# the write benchmarks only.
+# the write benchmarks only. --batch N writes N entries in each client
+# batch (db_bench --batch_size, the kvstore's --batch) and also runs the
+# write benchmarks only. A batch of more than about 117 entries is more
+# than one 16 KiB WAL block, which horton takes atomically from 0.20
+# (ADR-0029); a build before that refuses it, and its column shows "-".
 #
 # Needs RocksDB's db_bench on PATH (Debian/Ubuntu: apt install
 # rocksdb-tools). Set KVSTORE_BASELINE to another kvstore binary to add
@@ -31,10 +35,18 @@ set -euo pipefail
 
 num=100000
 sync=0
-for arg in "$@"; do
+batch=1
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  arg=${args[i]}
   case "$arg" in
     --sync) sync=1 ;;
-    ''|*[!0-9]*) echo "usage: $0 [NUM] [--sync]" >&2; exit 2 ;;
+    --batch)
+      i=$((i + 1))
+      batch=${args[i]:-}
+      case "$batch" in ''|*[!0-9]*|0) echo "usage: $0 [NUM] [--sync] [--batch N]" >&2; exit 2 ;; esac
+      ;;
+    ''|*[!0-9]*) echo "usage: $0 [NUM] [--sync] [--batch N]" >&2; exit 2 ;;
     *) num=$arg ;;
   esac
 done
@@ -47,7 +59,7 @@ command -v db_bench >/dev/null || {
 
 work=target/vs-rocksdb
 mkdir -p "$work"
-if [ "$sync" = 1 ]; then
+if [ "$sync" = 1 ] || [ "$batch" -gt 1 ]; then
   benchmarks=fillseq,fillrandom,overwrite
 else
   benchmarks=fillseq,fillrandom,overwrite,readrandom,readmissing,readseq,readreverse,seekrandom,readwhilewriting,deleterandom,compact,readrandom
@@ -68,7 +80,7 @@ rocksdb() { # column-file, extra db_bench flags...
   rm -rf "$work/rocksdb"
   db_bench --db="$work/rocksdb" --benchmarks="$benchmarks" --num="$num" \
     --threads=4 --key_size=16 --value_size=100 --compression_ratio=0.5 \
-    --bloom_bits=10 --sync="$sync" "$@" 2>&1 |
+    --bloom_bits=10 --sync="$sync" --batch_size="$batch" "$@" 2>&1 |
     awk '$2 == ":" && /ops\/sec/ { for (i = 1; i <= NF; i++) if ($i == "ops/sec") print $1, $(i - 1) }' |
     number >"$out"
   rm -rf "$work/rocksdb"
@@ -77,9 +89,11 @@ rocksdb() { # column-file, extra db_bench flags...
 horton() { # column-file, kvstore binary
   local out=$1 bin=$2 flag=--no-sync
   [ "$sync" = 1 ] && flag=
-  # `compact` reports seconds, not a rate: left out of the table.
-  "$bin" --db "$work/horton.db" $flag bench --num "$num" --threads 4 \
-    --benchmarks "$benchmarks" 2>&1 |
+  # `compact` reports seconds, not a rate: left out of the table. A
+  # build that refuses the batch size stops: what it ran is shown.
+  rm -f "$work/horton.db"
+  { "$bin" --db "$work/horton.db" $flag bench --num "$num" --threads 4 \
+    --batch "$batch" --benchmarks "$benchmarks" 2>&1 || true; } |
     awk '$2 == ":" && /ops\/s\)/ { for (i = 1; i <= NF; i++) if ($i ~ /^\(/ && $(i + 1) == "ops/s)") print $1, substr($i, 2) }' |
     number >"$out"
 }
@@ -97,19 +111,21 @@ if [ -n "${KVSTORE_BASELINE:-}" ]; then
   files+=("$work/col.3")
 fi
 echo "horton ..." >&2
-horton "$work/col.4" target/release/examples/kvstore
+horton "$work/col.4" "${CARGO_TARGET_DIR:-target}/release/examples/kvstore"
 columns+=("horton")
 files+=("$work/col.4")
 
 echo
 db_bench --version 2>&1 | head -1
-echo "$num keys, 16-byte keys, 100-byte values, 4 threads, $([ "$sync" = 1 ] && echo "every write synced" || echo "no fsync"); ops/s"
+echo "$num keys, 16-byte keys, 100-byte values, 4 threads, $([ "$batch" -gt 1 ] && echo "$batch writes per batch, ")$([ "$sync" = 1 ] && echo "every write synced" || echo "no fsync"); ops/s"
 echo
 # One row per benchmark the kvstore reported, one column per run, and the
 # ratio of the last column (horton) to the second (rocksdb, small).
 awk -v names="$(IFS='|'; echo "${columns[*]}")" '
-  FNR == 1 { run++ }
-  { rate[run, $1] = $2; if (run == ARGC - 1) order[++rows] = $1 }
+  # By file name, not by FNR == 1: a column whose build refused the
+  # benchmarks is an empty file, which has no first line.
+  BEGIN { for (i = 1; i < ARGC; i++) column[ARGV[i]] = i }
+  { run = column[FILENAME]; rate[run, $1] = $2; if (run == ARGC - 1) order[++rows] = $1 }
   END {
     n = split(names, title, "|")
     printf "%-26s", "benchmark"

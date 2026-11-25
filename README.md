@@ -263,29 +263,32 @@ prints the tombstone blocks as they come and go.
 `bench` runs db_bench's workloads (16-byte keys, 100-byte values that
 compress by half, four client threads), and
 [`vs-rocksdb.sh`](examples/kvstore/vs-rocksdb.sh) runs them on RocksDB's
-`db_bench` too. On a 4-vCPU Linux VM, in ops/s:
+`db_bench` too. On a 4-vCPU Linux VM, in ops/s (after ADR-0029,
+RocksDB run beside it):
 
 | | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
 |---|---:|---:|---:|
-| `fillseq`, no fsync | 251 K | 222 K | 242 K |
-| `fillrandom`, no fsync | 168 K | 133 K | 190 K |
-| `overwrite`, no fsync | 169 K | 129 K | 134 K |
-| `fillrandom`, fdatasync on | 16.4 K (2.6 writes per commit) | | 16.0 K (100 K keys) |
-| `readrandom` | 443 K | 190 K | 357 K |
-| `readmissing` | 6,441 K | 4,958 K | 4,761 K |
-| `seekrandom` | 96 K | 118 K | 302 K |
-| `readwhilewriting`, four readers and a writer | 272 K | 102 K | 192 K |
-| `readseq`, entries/s over four scanning threads | 12,040 K | 8,149 K | 16,119 K |
-| `readreverse`, the same | 6,783 K | 4,839 K | 16,524 K |
+| `fillseq`, no fsync | 246 K | 196 K | 233 K |
+| `fillrandom`, no fsync | 180 K | 153 K | 163 K |
+| `overwrite`, no fsync | 169 K | 132 K | 124 K |
+| `fillrandom`, 1,000 writes a batch, no fsync | | 280 K | 235 K |
+| `fillrandom`, fdatasync on | 15.5 K (2.5 writes per commit) | 15.5 K | 12.5 K (100 K keys) |
+| `fillrandom`, 1,000 writes a batch, fdatasync on | | 196 K | 233 K |
+| `readrandom` | 483 K | 249 K | 327 K |
+| `readmissing` | 10,027 K | 5,720 K | 3,779 K |
+| `seekrandom` | 146 K | 84 K | 296 K |
+| `readwhilewriting`, four readers and a writer | 435 K | 125 K | 168 K |
+| `readseq`, entries/s over four scanning threads | 12,625 K | 5,971 K | 15,975 K |
+| `readreverse`, the same | 4,855 K | 3,025 K | 14,920 K |
 
 These are single runs, and the read rows move from one run to the next
 with the number of level-0 tables the fills leave (`seekrandom` most:
 45 K to 120 K at 1 M keys, and 59 K to 394 K at 100 K).
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
-spread, where the time goes, and what v0.20 changed. Against 0.19, at
-1 M keys on four threads, point reads are 26 times faster, reads of
-absent keys 620 times, seeks 60 times, scans 39 times and random
-writes 2.8 times.
+spread, batches, where the time goes, and what v0.20 changed. Against
+0.19, at 1 M keys on four threads, point reads are 35 times faster,
+reads of absent keys 715 times, seeks 43 times, scans 28 times and
+random writes 3.3 times.
 
 ### Where horton stops at host scale
 
@@ -316,9 +319,11 @@ These are the limits it meets, and each is a property of the library:
   Writes and flushes take turns under the engine lock. Compaction's
   merges run on two threads outside it, a job each (ADR-0024,
   ADR-0025), so reads go on while the store is written to (four
-  readers get 102 K reads a second with a fifth thread writing 90 K),
-  and random writes at 1 M keys are 133 K ops/s, where RocksDB's
-  background threads keep it at 190 K. Two jobs run side by side only
+  readers get 125 K reads a second with a fifth thread writing), and
+  random writes at 1 M keys are 153 K ops/s, where RocksDB with the
+  same memory does 163 K. A batched writer waits for compaction most of
+  the time (81% in a profile of random writes), which is why batches
+  larger than 100 writes go no faster. Two jobs run side by side only
   on different levels: with slots to spare nearly all the work is
   level 0 draining into level 1, on one thread (75 K random writes a
   second at 600,000 keys).
