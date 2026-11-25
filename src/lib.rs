@@ -23,8 +23,10 @@
 //! ([`Db::archive_plan`], [`Db::archive_commit`], [`ArchivePlan`]) — seal
 //! a table, stream its blocks to caller-owned remote storage through
 //! [`Db::device`], then forget it locally — hand-rolled LZ77 block
-//! compression ([`compress`]): the writer trial-compresses every data
-//! block and keeps the compressed form when it saves at least
+//! compression ([`compress`]): the writer trial-compresses the data
+//! blocks of tables written into level
+//! [`Config::compression_from_level`] (2 by default) and deeper, and
+//! keeps the compressed form when it saves at least
 //! [`compress::COMPRESS_MIN_SAVING`] bytes; every read path decompresses
 //! transparently — range deletes ([`Db::delete_range`](Db::delete_range))
 //! with per-range tombstone sections in every table, and absolute-tick
@@ -84,8 +86,9 @@ pub use cache::{BlockCache, CachePort, CacheStats};
 pub use compact::{COMPACTION_KMAX, Compaction, Detached, Progress};
 pub use crc::crc32;
 pub use db::{
-    ArchivePlan, COMPACTION_LANES, Config, Db, GROUP_BLOCKS_MAX, GroupCommit, GroupOp, Lane,
-    MemProbe, OpenReport, ReadScratch, SealedTable, SlotStats, TableView,
+    ArchivePlan, COMPACTION_LANES, Config, DEFAULT_COMPRESSION_FROM_LEVEL, Db, GROUP_BLOCKS_MAX,
+    GroupCommit, GroupOp, Lane, MemProbe, OpenReport, ReadScratch, SealedTable, SlotStats,
+    TableView,
 };
 pub use device::BlockDevice;
 pub use diff::{Delta, Diff, SortedEntries};

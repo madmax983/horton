@@ -237,12 +237,17 @@ pub struct Compaction<
     /// stale and resets instead of touching the device.
     pub(crate) job_gen: u32,
     pub(crate) writer: TableWriter<BLOCK, BLOOM_BYTES, KEY_MAX>,
-    /// Caller-owned compression scratch for the output tables: every
-    /// sealed data block is trial-compressed (see
+    /// Caller-owned compression scratch for the output tables: when the
+    /// job compresses (`compress_outputs`), every sealed data block is
+    /// trial-compressed (see
     /// [`TableWriter::push`](crate::sstable::TableWriter::push)). Lives
     /// for the job's duration; `const`-constructible so [`new`](Self::new)
     /// stays `const`.
     pub(crate) compress: CompressScratch<BLOCK>,
+    /// Whether this job's outputs compress their data blocks: its target
+    /// level is at or past `Config::compression_from_level` (ADR-0030).
+    /// Set when the job is selected.
+    pub(crate) compress_outputs: bool,
     /// Shared physical-read scratch: one block buffer lent to
     /// [`read_data_block`] on every cursor fill. The physical bytes are
     /// dead once inflated into the cursor's `block`, so the merge cursors
@@ -450,6 +455,7 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
             job_gen: 0,
             writer: TableWriter::new(0, 0),
             compress: CompressScratch::new(),
+            compress_outputs: true,
             raw: [0u8; BLOCK],
             cursors: [Cursor::EMPTY; COMPACTION_KMAX],
             key: [0u8; KEY_MAX],
@@ -1000,9 +1006,12 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
                         tombstone: tombstone || purged,
                         expire_at: if tombstone || purged { 0 } else { expire_at },
                     };
-                    self.writer
-                        .push(device, e, Some(&mut self.compress))
-                        .await?
+                    let cs = if self.compress_outputs {
+                        Some(&mut self.compress)
+                    } else {
+                        None
+                    };
+                    self.writer.push(device, e, cs).await?
                 };
                 // The emitted version is the newest at or below every
                 // threshold it satisfies (versions surface newest-first),

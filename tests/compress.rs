@@ -241,13 +241,20 @@ fn flagged_blocks(db: &TestDb<MemDevice<BLOCK>>) -> (u32, u32) {
     (flagged, total)
 }
 
+/// The test layout with every level compressed, flushes included: the
+/// default leaves levels 0 and 1 raw (ADR-0030), and these tests are
+/// about the compressed path.
+fn compressing() -> horton::Config {
+    test_config().with_compression_from_level(0)
+}
+
 /// Realistic end-to-end ratio: compressible KV data through the real
 /// flush path. Data blocks must actually carry the compression flag,
 /// and every key must read back exactly.
 #[test]
 #[allow(clippy::cast_possible_truncation)]
 fn flush_compresses_realistic_data() {
-    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), compressing());
     block_on(db.open()).unwrap();
     // Values share long prefixes; flush whenever the arena fills.
     for i in 0..64u32 {
@@ -360,7 +367,7 @@ fn flush_leaves_random_data_raw() {
 #[test]
 #[allow(clippy::cast_possible_truncation)]
 fn mixed_table_reads_exactly() {
-    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), compressing());
     block_on(db.open()).unwrap();
     let mut rng = Lcg::new(0x9999);
     // 32 small puts fit the arena in one flush (L0 holds 4 tables; the
@@ -434,7 +441,7 @@ fn read_block<D: horton::BlockDevice>(dev: &D, id: u64) -> [u8; BLOCK] {
 #[test]
 fn compaction_merges_compressed_tables() {
     type TestCompaction = Compaction<4096, 256, 1024, 1024>;
-    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), compressing());
     block_on(db.open()).unwrap();
     // Four tables of compressible data (values share long prefixes).
     // 16 puts × ~210 B ≈ 3.4 KiB per table: one solid data block each;
@@ -489,7 +496,7 @@ fn compaction_merges_compressed_tables() {
 /// the compressed payloads are never inflated and re-compressed.
 #[test]
 fn archive_ingest_preserves_compressed_blocks() {
-    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), test_config());
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), compressing());
     block_on(db.open()).unwrap();
     // 28 puts x ~140 B ~= 3.9 KiB: one flush, one table.
     for i in 0..20u32 {
