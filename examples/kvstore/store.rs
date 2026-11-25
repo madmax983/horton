@@ -2494,8 +2494,9 @@ mod tests {
     #[test]
     fn an_oversized_batch_does_not_fail_the_writes_grouped_with_it() {
         let store = TempStore::new("oversized-neighbour");
-        // Review finding: 4,097 deletes of a one-byte key fit seven 16 KiB
-        // WAL blocks, but not the memtable's 4,096 slots, which horton
+        // Review finding: one delete of a one-byte key more than the
+        // memtable has slots (8,193) fits 13 16 KiB WAL blocks, but not
+        // the memtable, which horton
         // refuses (BatchTooLarge). `Batch::check` let it through on blocks
         // alone, and its refusal failed every write grouped with it. Now
         // it is refused before it queues.
@@ -2566,7 +2567,7 @@ mod tests {
     #[test]
     fn concurrent_writers_fill_flush_compact_and_reopen() {
         let mut store = TempStore::new("load");
-        let (threads, per) = (4, 1500);
+        let (threads, per) = (4, 2500);
         std::thread::scope(|s| {
             for t in 0..threads {
                 let h = store.handle();
@@ -2584,7 +2585,7 @@ mod tests {
         assert!(stats.groups <= stats.grouped_writes);
         assert!(
             stats.flushes > 0,
-            "6000 writes overflow a 4096-entry memtable"
+            "10,000 writes overflow an 8,192-entry memtable"
         );
         // How often the writes flushed depends on how they grouped (one
         // WAL block per commit): flush eight more tables by hand, so

@@ -55,18 +55,23 @@ pub const TABLES_PER_LEVEL: usize = 7;
 /// as its entry count calls for (`horton::BloomShape`).
 pub const BLOOM_BYTES: usize = 16 * ((BLOCK - 4) / 64) * 64;
 /// Writes the memtable holds before it is flushed to a table.
-pub const MEMTABLE_ENTRIES: usize = 4096;
+///
+/// As many `db_bench` writes (16-byte keys, 100-byte values) as the
+/// arena holds, about 950 KB of it. At 4,096 the slots filled at half
+/// the arena, and the store flushed twice as often as a 1 MiB memtable
+/// does elsewhere (docs/THROUGHPUT.md, step 20).
+pub const MEMTABLE_ENTRIES: usize = 8192;
 /// Bytes of keys and values the memtable holds.
 pub const MEMTABLE_ARENA: usize = 1 << 20;
 
 // The shape of the store: 4 levels of up to 7 tables, so at most 28
 // tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
-// file gives each table an 8 MiB slot). The memtable (4096 writes, 1 MiB)
+// file gives each table an 8 MiB slot). The memtable (8192 writes, 1 MiB)
 // is what one flush turns into a table. A point read probes up to 7
 // tables in level 0 and one per level below.
 //
 // A table's bloom filter is sized to it, 10 bits a key: one 16 KiB block
-// for the 4096 entries of a flush, up to sixteen for the 100,000 and
+// for the 8192 entries of a flush, up to sixteen for the 100,000 and
 // more of a full table at the bottom. The writer keeps the largest
 // filter in RAM while it writes (`BLOOM_BYTES`, 255 KiB), which is what
 // lets a filter span blocks at all.

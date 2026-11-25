@@ -1,4 +1,4 @@
-# horton — SPEC v0.17
+# horton — SPEC v0.20 (unreleased)
 
 A log-structured merge-tree key-value store for places where
 `malloc` doesn't exist: firmware, kernels, bootloaders.
@@ -563,8 +563,9 @@ the table region, and every manifest copy are disjoint, and that a table
 slot can hold a full memtable's table (`BadConfig` otherwise).
 
 Sizing: the table region holds `LEVELS × TABLES` tables of at most
-`slot_blocks` blocks each; a WAL block holds one durable commit, so the
-WAL region bounds the commits between flushes.
+`slot_blocks` blocks each; a durable commit takes one WAL block, or up
+to `GROUP_BLOCKS_MAX` (16) for a batch larger than a block (§4.2), so
+the WAL region bounds the commits between flushes.
 
 ## 8. Testing strategy
 
@@ -599,7 +600,9 @@ WAL region bounds the commits between flushes.
 | v0.9–v0.12 | Crash hardening, archive, reverse scans, ingest |
 | v0.13–v0.16 | Block compression, range deletes and TTL, block cache |
 | v0.17 | Architecture review fixes: fixed table slots, split-output compaction, multi-block manifest with ring and staged edits, remedy-named errors, measured futures, range-delete space reclamation |
-| Unreleased | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015) |
+| v0.18 | Release build profiles (fat LTO); no format change |
+| v0.19 | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015) |
+| Unreleased (v0.20) | Reads, scans and compaction merges a host can run outside its lock, bloom filters sized to their tables, two compaction jobs at a time (ADR-0016 to ADR-0027). Group commit across WAL blocks and atomic batches that span them (ADR-0028, ADR-0029). Format change |
 
 Details: [`CHANGELOG.md`](CHANGELOG.md) and
 [`docs/history/milestones-v0.1-v0.16.md`](docs/history/milestones-v0.1-v0.16.md).

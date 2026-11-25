@@ -1,358 +1,75 @@
 # horton
 
 A log-structured merge-tree key-value store for places where `malloc`
-doesn't exist: firmware, kernels, bootloaders.
+doesn't exist: firmware, kernels, bootloaders. It runs in a browser as
+WebAssembly too, and on a desktop or server
+[`examples/kvstore`](#host-key-value-store) wraps it as a LevelDB-style
+store over one file.
 
-- **`#![no_std]`, no `alloc`, zero dependencies.** The `[dependencies]` table
-  is empty; the crate uses nothing but `core`. (Loom is a test-only
-  dependency behind `--cfg horton_loom`.)
-- **`#![forbid(unsafe_code)]`.** The ESP32-S3 flash driver's register logic
-  is safe too. The volatile MMIO half lives in the board crate.
-- **Every byte is caller-owned and sized at compile time.** The database, a
-  scan, and the compaction scratch are fixed-size values sized by const
-  generics. Put them in `static`s and you know your RAM bill before you
-  flash the board.
-- **No panics in library code.** Every failure is an [`Error`](src/error.rs)
-  variant, including `BufferTooSmall { need }` instead of silent truncation.
-  The one exception is `FlashBlockDevice::new`, which rejects a wrong board
+- **`#![no_std]`, no `alloc`, no dependencies.** The `[dependencies]`
+  table is empty; the library uses only `core`. Loom is a test-only
+  dependency behind `--cfg horton_loom`.
+- **`#![forbid(unsafe_code)]`.** The ESP32-S3 flash driver's register
+  logic is safe too. The volatile MMIO half lives in the board crate.
+- **Every byte is caller-owned and sized at compile time.** The database,
+  a scan and the compaction scratch are fixed-size values. Put them in
+  `static`s and you know the RAM bill before you flash the board. A
+  measured ESP32-S3 shape and its CI gate are under [RAM](#ram).
+- **No panics.** Every failure is an [`Error`](src/error.rs) variant,
+  including `BufferTooSmall { need }` instead of truncation. The one
+  exception is `FlashBlockDevice::new`, which rejects a wrong board
   configuration; in a `static` that check runs at compile time.
-- **Async from the bottom.** The only I/O boundary is a poll-based
-  [`BlockDevice`](src/device.rs) trait. The API is `async fn`s that allocate
-  nothing, and horton ships no executor: use embassy, RTIC, or a poll loop.
+- **Async from the bottom.** The only I/O boundary is the poll-based
+  [`BlockDevice`](src/device.rs) trait. The API is `async fn`s that
+  allocate nothing. horton ships no executor: use embassy, RTIC or a
+  poll loop. The NOR stack horton ships is synchronous, though: see
+  [Porting](#porting-the-blockdevice-trait).
+- **A write is durable when its call returns**: horton has synced it
+  with your `BlockDevice::poll_flush`. A batch lands whole or not at
+  all, even when power is cut in the middle of it.
 
-> **Status: pre-1.0 (v0.17), experimental.** The on-disk format changes
-> between minor versions, and old images are rejected rather than misread.
-> v0.17 fixes every finding of [the architecture review](docs/ARCHITECTURE_REVIEW.md)
-> (each has a regression test in `tests/review_findings.rs`). It is not yet
-> verified on ESP32-S3 silicon.
+> **Status: pre-1.0 (v0.20), experimental.** The on-disk format changes
+> between minor versions, and an image of another version is rejected,
+> never misread. So a firmware update to a new horton minor version
+> cannot open the data already on the device: `open()` returns
+> `CorruptManifest`. Read the data out first (see
+> [Format changes](#format-changes)). Every finding of
+> [the architecture review](docs/ARCHITECTURE_REVIEW.md) (F1-F22) is
+> fixed and has a regression test. **horton is not yet verified on
+> ESP32-S3 silicon:** the flash driver is tested against a mock NOR
+> chip, because QEMU does not emulate the SPI user-command path.
 
-## Features
+Rust 1.88 or later (edition 2024).
 
-| Area | What you get |
-|---|---|
-| Writes | `put`, `delete`, `delete_range` (range tombstones), `put_with_ttl` (caller-clock expiry), atomic multi-op `WriteBatch` (up to 16 WAL blocks; also the group-commit path) |
-| Reads | `get`, snapshot reads (`snapshot` / `get_at`), forward `Scan` and reverse `RevScan` merge iterators with prefix/range bounds |
-| Durability | WAL-first. Every mutation's CRC-framed record is on the device before the call returns. The manifest (two copies, or a ring of `n` for flash endurance) is the single atomic commit point for flushes, compactions and archive operations |
-| Tables | Immutable SSTables with restart-point data blocks, a per-table bloom filter, one index block, a range-tombstone section, and optional hand-rolled LZ77 block compression |
-| Compaction | Leveled and caller-driven: `compact_step` does bounded work per call, so firmware can interleave it with real-time work. Outputs split at slot size and commit one by one; trivial moves, small-table consolidation, and region-pressure push-down keep the region usable until it is mostly full. Snapshot-aware version retention; point and range deletes give their space back |
-| Replica checks | `fingerprint`: a 16-byte, layout-independent digest of the visible key-value set. Range digests merge, so `fingerprint_buckets` compares a device with its replica bucket by bucket in one scan pass and narrows a mismatch to the key ranges that disagree; `Diff` then merge-joins the two sides over that range and yields the exact repair list (`OnlyLeft` / `OnlyRight` / `Differs`) |
-| Caching | Optional fixed-slot CLOCK block cache inside `Db` (`CACHE = 0` turns it off) |
-| Cold storage | Archive API: seal a table, stream its blocks to your own remote sink, then forget it locally (`archive_plan` / `archive_commit`). `ingest_table` re-attaches it later. The archive commit refuses any removal that would bring deleted data back |
-| Hardware | `FlashBlockDevice` (erase-aware NOR adapter) and an ESP32-S3 SPI1 flash driver over a pluggable register bus |
+## How it works
 
-## Quick start
+New writes go to two places: a log on the device (the **WAL**, so they
+survive a crash) and a sorted buffer in RAM (the **memtable**, so they can
+be read back). When the memtable fills, `flush()` writes it to the device
+as one sorted, read-only **table** (an SSTable). Tables are grouped into
+**levels**: new tables land in level 0, and **compaction** merges them
+into deeper levels, which keeps reads short and frees the space of
+overwritten and deleted data. The **manifest** records which tables exist
+and where.
 
-```toml
-[dependencies]
-horton = "0.17"
-```
-
-Implement `BlockDevice` for your storage, choose the sizes, and drive the
-futures with your executor. Condensed from
-[`examples/quickstart.rs`](examples/quickstart.rs), which is complete and
-runs with `cargo run --example quickstart`. The code below runs inside an
-`async fn`:
-
-```rust,ignore
-use horton::{BlockDevice, Config, Progress, Scan};
-
-// The sizes horton compiles in. It allocates nothing, so every buffer is
-// a fixed size chosen here. Only these three are required; the tuning
-// knobs have defaults (see "Sizing" below for what each one means).
-horton::db_types! {
-    block: 4096,  // bytes per device block (your flash sector size)
-    key_max: 64,  // longest key you will store, in bytes
-    val_max: 256; // longest value you will store, in bytes
-    type Db = MyDb;
-    type Compaction = MyCompaction;
-}
-
-// Tell horton how many blocks the device has; it decides where the
-// manifest, the WAL and the tables go.
-let config = Config::whole_device(512);
-let mut db = MyDb::new(RamDisk::new(512), config); // `const fn`: fine in a `static`
-db.open().await?; // recover manifest, rebuild table slots, replay WAL
-
-db.put(b"sensor/001", b"21.5C").await?; // durable when this returns
-db.delete(b"sensor/002").await?;
-
-let mut val = [0u8; 256];
-if let Some(n) = db.get(b"sensor/001", &mut val).await? {
-    // &val[..n] == b"21.5C"
-}
-
-db.flush().await?; // memtable -> immutable SSTable (atomic manifest commit)
-
-let mut scan = Scan::new(&db); // borrows `db`: no writes while it lives
-scan.seek(b"sensor/", Some(b"sensor0"), u64::MAX).await?;
-let mut key = [0u8; 64];
-while let Some((kl, vl)) = scan.next(&mut key, &mut val).await? {
-    // (&key[..kl], &val[..vl])
-}
-
-let mut scratch = MyCompaction::new(); // caller-owned
-while db.compaction_pending() {
-    while db.compact_step(&mut scratch).await? == Progress::More {}
-}
-```
-
-Capacity errors name their remedy:
-
-| Error | Meaning | Do this |
-|---|---|---|
-| `TableFull`, `ArenaFull` | the memtable is full | `flush()`, retry |
-| `WalFull` | the WAL region is exhausted | `flush()` (it wraps the WAL), retry |
-| `NeedsCompaction` | level 0 is full, or no slot is free until tables merge | `compact_step` until `Done`, retry |
-| `RegionFull` | no slot is free and compaction cannot free one | delete (or set `purge_before`), `request_compaction(0)` and compact; archive; or grow the region |
-| `SnapshotLimit` | eight snapshots are live | release one |
-| `TableTooLarge` | an entry, index, or range-tombstone section does not fit | smaller entries, bigger blocks or slots |
-| `BatchTooLarge` | a batch does not fit `GROUP_BLOCKS_MAX` (16) WAL blocks or an empty memtable, or a record does not fit a block | split it |
-| `Busy` | another `get` on this handle holds the read buffers | finish it, retry |
-| `BadConfig` | regions overlap or are too small, or the device is below `MIN_DEVICE_BLOCKS` (from `open`) | fix the `Config`, or use a bigger device |
-
-`NeedsCompaction` is only returned while `compaction_pending()` is true, so
-a compact-then-retry loop always makes progress.
-
-To give deleted and expired space back, also below the level triggers:
-
-```rust,ignore
-scratch.purge_before = now; // expired values become tombstones
-db.request_compaction(0)?; // every table, from level 0 down, once
-while db.compaction_pending() {
-    db.compact_step(&mut scratch).await?;
-}
-```
-
-`RegionFull` from this loop means the rest is live data: delete, archive,
-or grow the region.
-
-## Demo: a flight recorder that survives power cuts
-
-[`examples/flight_recorder`](examples/flight_recorder) is a sensor logger
-built the way firmware would use horton, and it exercises the whole API.
-It runs on a simulated NOR flash chip that counts erases and can lose power
-in the middle of any erase or program. Each tick it commits a four-sensor
-frame as one `WriteBatch`, writes a debug trace that expires, and runs one
-bounded compaction step. Every 1000 ticks it purges a glitch window with a
-range delete, checking that a snapshot taken before the purge still sees
-it. Tables older than the hot window stream to object storage and are
-committed away locally.
-
-```sh
-cargo run --release --example flight_recorder                  # record; Ctrl-C or kill -9 any time, run again
-cargo run --release --example flight_recorder -- torture 1000  # 1000 power cuts, each tearing a write
-cargo run --release --example flight_recorder -- restore       # rebuild the history from the archive
-```
-
-`record` keeps its flash image and archive under `target/flight_recorder/`.
-Kill it whenever you like; the next run recovers, proves every
-acknowledged frame is still there (on flash or in the archive), and
-resumes. `torture` does the same after every simulated power cut:
-
-```text
-power cuts             1000, each tearing an erase or program partway
-acknowledged frames    144494 ticks, every one present (on flash or in the archive)
-frames cut mid-write   716 landed whole, the rest not at all; never in part
-lost or corrupt        0
-snapshots, TTLs        139 snapshot and 2864 TTL checks passed
-archive                212 tables, 21340 KiB, each re-ingested and checked
-```
-
-To archive to S3 or any S3-compatible store (MinIO, Cloudflare R2,
-LocalStack), add `--s3 s3://bucket/prefix`. The example signs requests
-with `curl --aws-sigv4`, so it needs no extra crates; it reads
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` and, for a
-non-AWS endpoint, `AWS_ENDPOINT_URL`. `restore --s3 …` rebuilds the
-history from the bucket on a "ground station".
-
-This demo found two WAL bugs, F18 and F19 in the
-[review status](docs/ARCHITECTURE_REVIEW.md): a torn block could replay
-part of a batch, and writes after a reopen could be lost behind a torn
-block. Both are fixed.
-
-## Demo: the same recorder, in a browser
-
-[`examples/ground_station`](examples/ground_station) compiles the flight
-recorder's horton to `wasm32-unknown-unknown` for two web pages:
-
-- **Open a dump.** Drop a recorder's `flash.img` on the page and it runs
-  the device's real recovery (manifest, table slots, WAL replay up to a
-  torn tail), checks every entry against the recorder's key hash, and
-  charts the sensors. The format changes between versions, so the
-  writer's own code is the only reader sure to understand a device's
-  flash. The module is a `no_std` `cdylib` with no imports, 46 KB
-  gzipped.
-- **Live telemetry.** A simulated recorder streams frames to a Web
-  Worker, where horton logs each one durably before acknowledging it.
-  The flash is an OPFS file behind the sync access handle, and cold tables
-  go to IndexedDB through the archive API, whose asynchronous `await` falls
-  between two horton calls. Kill the Worker or crash the tab: nothing
-  acknowledged is lost, and a *Verify* button proves the whole history is
-  on flash or in IndexedDB.
-
-The logger writes the recorder's own formats, so its flash opens in the
-dump viewer and the native recorder's `restore` reads its archive. Its
-power-cut test found two bugs, F20 and F21 in the
-[review status](docs/ARCHITECTURE_REVIEW.md): scans panicked on a level
-holding more than `TABLES` tables, and on a device that overwrites in
-place a torn batch could recover in part. Both are fixed.
-
-```sh
-rustup target add wasm32-unknown-unknown
-examples/ground_station/build.sh
-python3 -m http.server -d examples/ground_station/web 8000   # then open /live.html
-```
-
-## Demo: a key-value store on a host, the way LevelDB is used
-
-[`examples/kvstore`](examples/kvstore) is horton on x86-64 (or any
-desktop OS) in the role LevelDB and RocksDB usually fill: a store in one
-file, a handle any thread can clone, and compaction that runs by itself.
-
-```sh
-cargo run --release --example kvstore -- demo              # a checked tour of the API
-cargo run --release --example kvstore -- put hello world   # a command-line store, like LevelDB's `ldb`
-cargo run --release --example kvstore -- scan --limit 10
-cargo run --release --example kvstore -- bench             # db_bench's workloads
-cargo run --release --example kvstore -- crash 25          # kill -9 the writer 25 times, check everything
-```
-
-horton's `Db` is one value with `&mut self` writes and no locks, which
-suits firmware. The example puts it behind one lock and gives every
-thread a `Handle`. A thread that wants a write queues it; whichever
-thread holds the lock commits the queue in order, its own write and
-everyone else's. Reads and scans read the tables on their own threads.
-A scan page takes the lock to copy its part of the memtable. A point
-read takes it only when the memtable could hold its key, and otherwise
-takes no lock at all:
-
-| LevelDB | here |
-|---|---|
-| `DB::Open` on a directory | `Store::open` on one file, created sparse at `--size-mb` (256 MiB); a `BlockDevice` over `pread`/`pwrite` and `fdatasync` ([`device.rs`](examples/kvstore/device.rs)) |
-| `Put`, `Delete`, `Write(WriteBatch)` | the same; a batch is atomic and may span up to 16 WAL blocks (about 256 KiB, ADR-0029) |
-| `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
-| writer queue, group commit | the thread holding the lock commits every write queued behind the first that fits the same 16 WAL blocks: one `fdatasync` for all of them (ADR-0028) |
-| background compaction | two compaction threads, one for each of horton's two compaction lanes (ADR-0025), each merging outside the engine lock (horton's detached merge, ADR-0024) through a file handle of its own. Two jobs run side by side when they share no table and write to different levels. A step under the lock selects a job, or seals and commits an output; whichever thread has the lock takes it. A full memtable or WAL is flushed under the lock by the write that finds it. A write that finds level 0 full waits for compaction without the lock, so callers never see those errors and readers do not wait behind them |
-| `Get` from many threads at once | the caller reads the tables on its own thread (horton's detached read, ADR-0018), through a read-only file handle and a cache shared by all readers, in which a hit takes no lock and writes nothing another reader reads (ADR-0022). A read of a key the memtable cannot hold takes no lock anywhere: a filter over the keys written since the last flush and the manifest's published sequence number tell it so (ADR-0023). Any other read takes the engine lock for its memtable probe. Flush and compaction shut the readers' gate and wait for them to leave the tables |
-| `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
-| `NewIterator`, `Seek` from many threads at once | `range(start, end, reverse)`: pins a snapshot and pages through horton's `Scan` or `RevScan`. Each page copies its memtable keys under the lock, then merges them with the tables on the caller's thread (a detached scan, ADR-0019), with 32 decoded blocks of its own |
-| `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default (survives a process crash, not power loss) |
-
-`crash` runs a writer process with several threads (puts, deletes,
-atomic batches, range deletes, each thread on its own keys) that prints
-each write once acknowledged, kills it at a random moment, reopens, and
-compares the whole store with a model of the acknowledged writes. A
-reader thread meanwhile checks through snapshots that no batch is ever
-half visible. It tests process crashes on a real file system; the flight
-recorder's `torture` covers torn writes on simulated flash.
-
-```text
-process kills          25
-acknowledged writes    208710, every one present
-in flight at the kill  20 landed whole, the rest not at all; never in part
-WAL records replayed   22048
-after compacting       1151 keys, unchanged
-```
-
-This test found F22 in the [review status](docs/ARCHITECTURE_REVIEW.md):
-range deletes that overlap again and again piled up tombstones compaction
-never collected, until every compaction job failed with `TableTooLarge`
-and the store could not flush again. It is fixed; the crash test now
-prints the tombstone blocks as they come and go.
-
-`bench` runs db_bench's workloads (16-byte keys, 100-byte values that
-compress by half, four client threads), and
-[`vs-rocksdb.sh`](examples/kvstore/vs-rocksdb.sh) runs them on RocksDB's
-`db_bench` too. On a 4-vCPU Linux VM, in ops/s (after ADR-0029,
-RocksDB run beside it):
-
-| | horton, 100 K keys | horton, 1 M keys | RocksDB given the same memory, 1 M keys |
-|---|---:|---:|---:|
-| `fillseq`, no fsync | 246 K | 196 K | 233 K |
-| `fillrandom`, no fsync | 180 K | 153 K | 163 K |
-| `overwrite`, no fsync | 169 K | 132 K | 124 K |
-| `fillrandom`, 1,000 writes a batch, no fsync | | 280 K | 235 K |
-| `fillrandom`, fdatasync on | 15.5 K (2.5 writes per commit) | 15.5 K | 12.5 K (100 K keys) |
-| `fillrandom`, 1,000 writes a batch, fdatasync on | | 196 K | 233 K |
-| `readrandom` | 483 K | 249 K | 327 K |
-| `readmissing` | 10,027 K | 5,720 K | 3,779 K |
-| `seekrandom` | 146 K | 84 K | 296 K |
-| `readwhilewriting`, four readers and a writer | 435 K | 125 K | 168 K |
-| `readseq`, entries/s over four scanning threads | 12,625 K | 5,971 K | 15,975 K |
-| `readreverse`, the same | 4,855 K | 3,025 K | 14,920 K |
-
-These are single runs, and the read rows move from one run to the next
-with the number of level-0 tables the fills leave (`seekrandom` most:
-45 K to 120 K at 1 M keys, and 59 K to 394 K at 100 K).
-[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the full tables, the
-spread, batches, where the time goes, and what v0.20 changed. Against
-0.19, at 1 M keys on four threads, point reads are 35 times faster,
-reads of absent keys 715 times, seeks 43 times, scans 28 times and
-random writes 3.3 times.
-
-### Where horton stops at host scale
-
-The example is also a measurement of how far a firmware store stretches.
-These are the limits it meets, and each is a property of the library:
-
-- **A point read costs 19 µs of one core at 1 M keys**, 0.9 µs when the
-  key is absent. Ruling out a table
-  that does not hold the key is cheap (one bloom bucket from the
-  cache; the manifest says where it is). The table that may hold it costs an index
-  block and a data block, each checked whole, and the data block
-  inflated, on every read: the cache keeps the compressed image. A
-  block that is not cached costs a 16 KiB CRC in software on top
-  (8 µs). Readers run in parallel and nearly all of them take no
-  lock (ADR-0023), so four threads do 3.8 times one thread's rate of
-  either kind of read.
-- **Capacity is at most `levels × tables_per_level` (64) tables**, and a
-  table's index is one block, so the block size bounds a table: about
-  7 MiB of 16-byte keys at 16 KiB. This shape holds 28 such tables, about
-  200 MiB compressed; 1 M db_bench entries take 15. A fuller store gets
-  `RegionFull`: the flight recorder's answer is to archive cold tables.
-- **A table's bloom filter is sized to it, up to sixteen blocks**
-  (ten bits a key up to 209,000 keys), and the table writer holds the
-  largest one, 255 KiB, in RAM while it writes. With one block per
-  table, which is what firmware uses, a 100,000-entry table had 1.3
-  bits a key and filtered almost nothing (ADR-0020).
-- **One thread at a time writes, and level 0 compacts as one job.**
-  Writes and flushes take turns under the engine lock. Compaction's
-  merges run on two threads outside it, a job each (ADR-0024,
-  ADR-0025), so reads go on while the store is written to (four
-  readers get 125 K reads a second with a fifth thread writing), and
-  random writes at 1 M keys are 153 K ops/s, where RocksDB with the
-  same memory does 163 K. A batched writer waits for compaction most of
-  the time (81% in a profile of random writes), which is why batches
-  larger than 100 writes go no faster. Two jobs run side by side only
-  on different levels: with slots to spare nearly all the work is
-  level 0 draining into level 1, on one thread (75 K random writes a
-  second at 600,000 keys).
-- **A scan pays for its memory.** With one block for all its table
-  cursors, which is what firmware gives it, a merge over overlapping
-  tables decodes a block again each time it changes table: 0.5 M
-  entries/s here. Lent 32 blocks it does 1.9 M on one thread. Each
-  `next` still compares the head of every table in range, and a
-  reverse seek still positions all of them.
-- **Batches are at most 16 WAL blocks** (about 256 KiB), keys and values have compile-time
-  maximums (128 B and 4 KiB here), and at most eight snapshots (so eight
-  iterators) are live at once.
-
-## Architecture
+The table region is split into fixed, equal **slots**, one table each.
+When the WAL region is used up, `flush()` **wraps** it back to its first
+block in the same manifest commit.
 
 ```mermaid
 flowchart LR
     subgraph RAM["RAM (caller-owned, fixed size)"]
         MT["MemTable<br/>sorted view + bump arena"]
-        WS["WAL stage<br/>1 block"]
-        MF["Manifest<br/>levels → TableRefs"]
-        BC["BlockCache<br/>CLOCK, CACHE slots"]
+        WS["WAL stage"]
+        MF["Manifest<br/>levels → tables"]
+        BC["BlockCache<br/>CLOCK"]
     end
     subgraph DEV["BlockDevice"]
         MS["Manifest copies<br/>pair or ring"]
         WAL["WAL region<br/>CRC-framed records"]
-        TBL["Table region<br/>SSTables"]
+        TBL["Table region<br/>one table per slot"]
     end
-    W(["put / delete / write"]) --> WS -->|"commit: 1 block write + flush"| WAL
+    W(["put / delete / write"]) --> WS -->|"block writes + one poll_flush"| WAL
     W --> MT
     MT -->|"flush()"| TBL
     TBL -->|"compact_step()"| TBL
@@ -361,261 +78,658 @@ flowchart LR
     R --> BC --> TBL
 ```
 
-**Write path.** A mutation is encoded into the WAL stage block, written and
-flushed to the device, and only then inserted into the memtable. A torn WAL
-tail is the expected crash boundary, and recovery replays up to it.
+The crash model in three sentences. A write is in the WAL, CRC-framed
+and synced with `poll_flush`, before it reaches the memtable, and a torn
+WAL tail is the expected crash boundary: recovery replays up to it, and
+replays a batch only if every block of it is intact. Every structural
+change (flush, compaction output, archive, ingest, WAL wrap) becomes
+visible in exactly one manifest commit, and recovery takes the newest
+manifest copy whose blocks all agree. Blocks written before that commit
+sit in a slot no table references, which is free again after `open()`.
 
-**Flush.** The memtable is streamed into a new SSTable in a free *table
-slot*. The table region is split into `LEVELS × TABLES` equal slots, one
-table per slot, so the manifest's table capacity and the region's space
-are one budget and a table can never grow into its neighbour. The slot is
-claimed only when the manifest commit lands, so a failed or interrupted
-flush changes nothing.
+The format and protocol are in [`SPEC.md`](SPEC.md) §3-4; the reasons are
+in the [ADRs](docs/adr/README.md).
 
-**Read path.** Reads check the memtable, then level 0 newest-first, then
-deeper levels. Tables are pruned by key range and max sequence and gated by
-the bloom filter. The highest sequence number wins, and range tombstones
-and TTL expiry are applied afterwards.
+## What you get
 
-**Compaction.** Full levels compact first, deepest first; when the region
-runs short, pressure pushes tables down too. A job merges L0 (or its oldest
-tables), or one table of a deeper level, with the overlapping tables below
-in a linear-scan k-way merge (at most 8 cursors) that keeps the newest
-version of each key plus the newest version visible to each live snapshot.
-Outputs split at slot size and commit one at a time: inputs the output has
-passed retire, the one it is inside is narrowed past it. Tombstones — point
-and range — are dropped once no reader can see what they hide
-([ADR-0010](docs/adr/0010-split-output-compaction.md)). When no job fits
-its slot estimate, a *tight* job runs with one free slot and never grows
-the region, so a full region of deleted or expired data gives its space
-back. `request_compaction(level)` compacts each table from `level` down
-once, below the triggers too; at the bottom it rewrites tables in place
-([ADR-0015](docs/adr/0015-tight-jobs-and-requested-compaction.md)).
+| Area | API |
+|---|---|
+| Writes | `put`, `delete`, `delete_range`, `put_with_ttl` (expiry on a clock you supply) |
+| Atomic batches | `WriteBatch` through `write`. `write_group` commits many atomic units (`GroupOp` slices) under one device sync, as many as fit `GROUP_BLOCKS_MAX` WAL blocks, and says how many it wrote |
+| Reads | `get`, `snapshot` and `get_at`, `get_with_time` for TTL; forward `Scan` and reverse `RevScan` over a key range |
+| Durability | WAL first. The manifest (two copies, or a ring of `n`) is the one commit point for every flush, compaction and archive step |
+| Tables | Immutable: restart-point data blocks, a bloom filter sized to the table, range tombstones, LZ77 block compression wherever it saves at least 128 bytes |
+| Compaction | Leveled and caller-driven. `compact_step` does at most one output block, or one output's seal and commit, per call, so firmware can interleave it with real-time work. Deletes and expiry give their space back |
+| Cache | Optional CLOCK block cache inside `Db` (`cache_blocks: 0` turns it off) |
+| Cold storage | `archive_plan` / `archive_commit` move a sealed table to your own sink; `ingest_table` brings it back |
+| Replica checks | `fingerprint`: a 16-byte digest of the visible data that does not depend on layout. `fingerprint_buckets` compares a device with its replica bucket by bucket in one pass and narrows a mismatch to key ranges; `Diff` then lists the keys the two sides disagree on (`OnlyLeft`, `OnlyRight`, `Differs`) |
+| Hosts | Point reads, scans and compaction merges that a multi-threaded host can run on its own threads, outside its lock (see [Host key-value store](#host-key-value-store)) |
+| Hardware | `FlashBlockDevice` for NOR flash; an ESP32-S3 SPI1 flash driver |
 
-**Crash model.** The manifest is stored as whole copies (a pair, or a ring
-of `n`), each spanning as many blocks as the worst case needs; every block
-carries the commit's sequence number and CRC, and recovery takes the
-newest copy whose blocks all agree. Every structural change (flush,
-compaction output, archive, ingest, WAL wrap) becomes visible in exactly
-one manifest commit. Blocks written before that point sit in a slot no
-manifest table references, which is simply free again after `open()`
-rebuilds the slot map from the manifest.
+The API's shape is in [`SPEC.md`](SPEC.md) §5; the rustdoc is the
+reference.
 
-### On-device layout
+## Limits
 
-```text
-block ids:  [manifest copy]×2..n ... [ WAL region ) ... [ table region: LEVELS×TABLES slots )
-             └ each Manifest::max_blocks  └ wal_start..wal_end   └ tbl_start..tbl_end
-               blocks, magic "hrtman10"
+What to design around:
 
-SSTable:    [data]* [rdel]* [bloom]+ [index] [footer]
-             │       │        │        │       └ magic "hrtsst04", ids, entry count, k, rdel count, min seq, filter length
-             │       │        │        └ per data block: first key, block id, max seq
-             │       │        └ bit array in 64-byte buckets, up to BLOOM_BYTES, sized to the table's entry count
-             │       └ range tombstones sorted by start
-             └ entries + restart points; optionally LZ77-compressed (flag bit in trailer)
-every block ends in a CRC32 of its payload
+- **One writer.** Writes take `&mut self`. The library has no threads or
+  locks; a host that wants many writers puts `Db` behind its own lock, as
+  the [kvstore](#host-key-value-store) does, or uses the `multiwriter`
+  feature.
+- **At most 64 tables** (`levels × tables_per_level`), and a table's
+  index is one block, so the block size bounds a table. A fuller store
+  gets `RegionFull`: delete, archive or grow the region.
+- **Keys and values have compile-time maximums.**
+- **At most eight live snapshots.**
+- **A batch, or one `write_group` call, is at most 16 WAL blocks**
+  (`GROUP_BLOCKS_MAX`, or the WAL region if that is smaller), and a
+  single record never spans blocks.
+- **`flush()` is not bounded the way `compact_step` is.** One call
+  writes a whole table and a manifest copy (see
+  [Running it on a device](#running-it-on-a-device)).
+- **NOR: one sector erase per block write**, and no wear leveling beyond
+  next-fit slots and the manifest ring. See
+  [Flash endurance](#flash-endurance) for what that means in writes per
+  second and lifetime.
+
+## Quick start
+
+```toml
+[dependencies]
+horton = "0.20"
 ```
 
-The full format and protocol spec is [`SPEC.md`](SPEC.md) §4.
+0.20 is not on crates.io yet (0.19 is, with an older on-disk format);
+until it is, depend on the repository:
+`horton = { git = "https://github.com/madmax983/horton" }`.
 
-## Sizing
+Condensed from [`examples/quickstart.rs`](examples/quickstart.rs), which
+is complete and runs with `cargo run --example quickstart`. The example
+also defines `RamDisk`, a `BlockDevice` over a `Vec` of blocks, and a
+ten-line `block_on` that busy-polls with a no-op waker. That is enough
+for a device that is always ready, like this one. A real device needs a
+real executor (embassy, RTIC, or a host executor).
 
-horton allocates nothing, so you choose every buffer size when you
-compile, and you tell it how much of the device it may use. Both have
-defaults; this section explains what they mean when you want to change
-them.
+```rust,ignore
+use horton::{BlockDevice, Config, Error, Progress};
 
-### How horton stores data
+// The sizes horton compiles in. Only these three are required; the
+// tuning knobs have defaults (see "Sizing").
+horton::db_types! {
+    block: 4096,  // bytes per device block (your flash sector size)
+    key_max: 64,  // longest key, in bytes
+    val_max: 256; // longest value, in bytes
+    type Db = MyDb;
+    type Scan = MyScan;
+    type Compaction = MyCompaction;
+}
 
-New writes go to two places: a log on the device (the **WAL**, so they
-survive a crash) and a sorted buffer in RAM (the **memtable**, so they can
-be read back fast). When the memtable fills up, `flush()` writes it to the
-device as one sorted, read-only **table**. Tables are grouped into
-**levels**: new tables land in level 0, and **compaction** merges them
-into deeper levels, which keeps reads fast and frees the space of
-overwritten and deleted data. The **manifest** is the record of which
-tables exist and where.
+// Tell horton how many blocks the device has; it places the manifest,
+// the WAL and the tables.
+let config = Config::whole_device(512);
+let mut db = Box::new(MyDb::new(RamDisk::new(512), config)); // a `static` on a board
+// Recover the manifest, rebuild the slots, replay the WAL. A blank device
+// (all 0x00, or erased NOR's 0xFF) opens as an empty database.
+block_on(db.open())?;
+
+block_on(db.put(b"sensor/001", b"21.5C"))?; // durable when this returns
+block_on(db.put(b"sensor/002", b"19.0C"))?;
+block_on(db.put(b"sensor/003", b"22.1C"))?;
+block_on(db.delete(b"sensor/002"))?;
+
+let mut val = [0u8; 256];
+if let Some(n) = block_on(db.get(b"sensor/001", &mut val))? {
+    // &val[..n] == b"21.5C"
+}
+assert_eq!(block_on(db.get(b"sensor/002", &mut val))?, None);
+
+block_on(db.flush())?; // memtable -> one table, in one manifest commit
+
+{
+    let mut scan = Box::new(MyScan::new(&db)); // borrows `db`: no writes while it lives
+    // [sensor/, sensor0): every key starting "sensor/"; u64::MAX = as of the newest write
+    block_on(scan.seek(b"sensor/", Some(b"sensor0"), u64::MAX))?;
+    let mut key = [0u8; 64];
+    while let Some((kl, vl)) = block_on(scan.next(&mut key, &mut val))? {
+        // (&key[..kl], &val[..vl])
+    }
+}
+
+let mut scratch = Box::new(MyCompaction::new()); // only needed while compacting
+while db.compaction_pending() {
+    while block_on(db.compact_step(&mut scratch))? == Progress::More {}
+}
+
+// Reopen from the same device: the tables come back from the manifest.
+let mut db = Box::new(MyDb::new(db.into_device(), config));
+block_on(db.open())?;
+```
+
+On a board, `MyDb::new` is a `const fn`, so the database can be a
+`static`. To get `&mut` to it in safe code, use a cell (for example from
+the `static_cell` crate), or keep it as a local in a `main` that never
+returns. [`xtensa-smoke/src/main.rs`](xtensa-smoke/src/main.rs) is a
+bare-metal example; it uses a `static mut`, with the `unsafe` in the
+board crate.
+
+## Porting: the `BlockDevice` trait
+
+This is all horton asks of your storage. Every call moves one whole block.
+
+```rust,ignore
+pub trait BlockDevice {
+    type Error;               // returned as Error::Device(e)
+    const BLOCK: usize;       // at least 512; must equal db_types!'s `block`
+
+    fn poll_read_block(&self, cx: &mut Context<'_>, id: u64, buf: &mut [u8])
+        -> Poll<Result<(), Self::Error>>;
+    fn poll_write_block(&mut self, cx: &mut Context<'_>, id: u64, buf: &[u8])
+        -> Poll<Result<(), Self::Error>>;
+    // Must not return Ready(Ok) until every earlier write would survive
+    // power loss: horton's durability rests on it.
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+```
+
+`poll_flush` is a barrier. If your device has a write cache, it must
+drain it before returning `Ready(Ok(()))`; one that returns early loses
+the "durable when the call returns" guarantee without any error.
+
+For NOR flash, implement the smaller [`horton::flash::Flash`](src/flash.rs)
+trait (`SECTOR`, `read`, `erase_sector`, `program`) and wrap it in
+`FlashBlockDevice<F, BLOCK, N>`, which erases each sector before it
+programs it. On the ESP32-S3, [`horton::esp32s3::SpiFlash`](src/esp32s3.rs)
+implements `Flash` over the SPI1 registers. It is generic over a
+`RegBus` (read and write a register), so the volatile MMIO is a few lines
+in your board crate.
+
+`Flash` is a blocking trait. `FlashBlockDevice` erases and programs
+inline and always returns `Poll::Ready`, and `SpiFlash` spin-waits on the
+chip's busy bit. So with the shipped stack, every block write holds the
+CPU and the executor for a full sector erase (45-400 ms on W25Q-class
+NOR), and other tasks do not run meanwhile. For flash I/O that does not
+block, write your own `BlockDevice` that returns `Poll::Pending` while
+the chip is busy, for example over a DMA or interrupt-driven driver.
+
+## Sizing: RAM and flash
+
+horton allocates nothing, so every buffer size is chosen when you
+compile, and you tell it how much of the device it may use.
 
 ### The sizes in `db_types!`
 
+Give the parameters in this order. Leave out a tuning knob to keep its
+default. A misspelled, repeated or misordered parameter does not compile,
+and neither does a shape that breaks a rule below. The const generic
+each one sets on `Db` is in parentheses; the rustdoc and error docs use
+those names.
+
 | Parameter | What it is | How to choose | Default |
 |---|---|---|---|
-| `block` | Bytes the device reads or writes at once | Your device's block size: the erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and `key_max + val_max + 23` must fit | required |
-| `key_max` | Longest key, in bytes | Longer keys fail with `KeyTooLarge`. RAM buffers are sized for it, so do not round up much | required |
-| `val_max` | Longest value, in bytes | Longer values fail with `ValueTooLarge` | required |
-| `memtable_entries` | Writes held in RAM before they must be flushed. Every `put` or `delete` takes one until the next flush | More means fewer flushes and less flash wear, but more RAM. When full, writes fail with `TableFull`: call `flush()` | 64 |
-| `memtable_arena` | RAM bytes for those writes' keys and values | About `memtable_entries` × your typical key + value size. When full, writes fail with `ArenaFull`: call `flush()` | 128 per entry, at least `key_max + val_max` |
-| `levels` | Levels of tables on the device | 4 suits most uses | 4 |
-| `tables_per_level` | Tables each level holds | Below 8. `levels × tables_per_level` (at most 64) is how many tables exist. More tables mean more data between compactions, but more tables to check per read and smaller table slots | 4 |
-| `bloom_bytes` | The most filter a table carries: what lets a read skip tables that cannot hold the key | About 1.25 bytes per key in the largest table gives about 1% wasted reads. Past `block - 4` the filter spans blocks, and each table stores what its entry count calls for (ADR-0020) | 256 |
-| `cache_blocks` | Recently read blocks kept in RAM, `block` bytes each | 0 turns it off. A few blocks speed up repeated reads | 0 |
+| `block` (`BLOCK`) | Bytes per device read or write | The erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and at least `key_max + val_max + 23` | required |
+| `key_max` (`KEY_MAX`) | Longest key, in bytes (1 to 65,535) | RAM buffers are sized for it, so do not round up much | required |
+| `val_max` (`VAL_MAX`) | Longest value, in bytes (up to 65,535) | As for keys | required |
+| `memtable_entries` (`CAP`) | Writes held in RAM until a flush | More means fewer flushes and less flash wear, and more RAM | 64 |
+| `memtable_arena` (`ARENA`) | RAM bytes for those writes' keys and values | About `memtable_entries` × a typical key and value | 128 per entry, at least `key_max + val_max` |
+| `levels` (`LEVELS`) | Levels of tables | 4 suits most uses | 4 |
+| `tables_per_level` (`TABLES`) | Tables each level holds | At most 7, and `levels × tables_per_level` at most 64 | 4 |
+| `bloom_bytes` (`BLOOM_BYTES`) | The most bloom filter a table carries | About 1.25 bytes per key of the largest table, for about 1% wasted reads. Past `block - 4` the filter spans blocks (ADR-0020). The table writer holds all of it, so it costs `bloom_bytes` of RAM in `flush()`'s future and in `Compaction` | 256 |
+| `cache_blocks` (`CACHE`) | Blocks cached in RAM, `block` bytes each | 0 turns it off | 0 |
 
-Give the parameters in this order and leave out any tuning knob to keep
-its default. A misspelled, repeated or misordered name does not compile,
-and neither does a shape that breaks a rule above (for example an arena
-smaller than one largest entry).
+`OPS`, which also appears in the docs, is a `WriteBatch<…, OPS>`'s
+capacity, chosen where you declare the batch.
 
-**What it costs in RAM:** the structs are the whole bill. Print
-`size_of::<MyDb<YourDevice>>()` and the same for your `Scan` and
-`Compaction` types; `cargo run --example quickstart` does. With the quick
-start's sizes that is about 25 KiB for `Db`, 11 KiB for a `Scan` and
-62 KiB for `Compaction` (you only need one while compacting). The
-`async` calls' futures add at most about 18 KiB more (`flush()`,
-`archive_commit()`).
+After the sizes come the type aliases: `Db`, `Scan`, `RevScan`,
+`Compaction`, `TableView`, `MemProbe` and `ReadScratch`, each optional,
+each with optional `pub` and doc comments. An unknown alias kind does not
+compile. The full list of rules is on `Db` in the API docs.
 
-`horton::profile` has a measured ESP32-S3 instantiation (4 KiB blocks,
-32-byte keys, 64-byte values, 16-entry memtable, 4 × 4 levels, 2-slot
-cache): `Db` 25,408 + `Scan` 10,824 + `Compaction` 59,568 = 95,800 bytes
-of structs, plus at most 17.6 KiB of live futures (`archive_commit()`),
-for a measured peak of 113,432 bytes under a 112 KiB budget asserted by
-`tests/profile.rs`. See [`BUDGET.md`](BUDGET.md).
+### RAM
 
-### Mapping it onto your device
+The structs and the futures in flight are the whole bill. Print
+`size_of` of your `Db`, `Scan` and `Compaction` types;
+`cargo run --example quickstart` does. You need a `Compaction` only while
+compacting.
 
-horton addresses the device in blocks, numbered from 0. It needs three
+[`horton::profile`](src/profile.rs) is a measured ESP32-S3 shape: 4 KiB
+blocks, 32-byte keys, 64-byte values, a 16-entry memtable, 4 × 4 tables,
+a 2-block cache. It needs 114,200 bytes: 96,512 of structs, plus the
+largest future (`archive_commit`, 17,688 bytes). `tests/profile.rs`
+fails the test suite past 114,688 bytes (112 KiB). The breakdown, the futures
+and the history are in [`BUDGET.md`](BUDGET.md).
+
+The library's code size (the flash its `.text` and `.rodata` take) has
+not been measured.
+
+### Flash
+
+horton addresses the device in blocks numbered from 0, and needs three
 regions that do not overlap:
 
-| Region | What it holds | Size |
+| Region | Holds | Size |
 |---|---|---|
-| Manifest | The record of which tables exist, in two copies so a crash mid-update always leaves one whole | `Manifest::max_blocks` blocks per copy (one for small shapes) |
-| WAL | Every write, until the next flush | One block per write or `WriteBatch` between flushes; when it runs out, writes fail with `WalFull` (call `flush()`) |
-| Tables | The flushed and compacted tables | `levels × tables_per_level` equal slots, each big enough for a full memtable's table |
+| Manifest | Which tables exist, in two copies (or a ring) so a crash mid-update leaves one whole | `Manifest::max_blocks` blocks a copy (one for small shapes) |
+| WAL | Every write until the next flush | A block per commit, more for a batch larger than a block. When it runs out, writes return `WalFull` |
+| Tables | Flushed and compacted tables | `levels × tables_per_level` equal slots, each large enough for a full memtable's table |
 
-**The easy way:** `Config::whole_device(n)` gives horton blocks `0..n` and
-lets it place the regions: manifest first, then the WAL (about an eighth
-of the rest), then the tables to the end of the device. `n` is your
-device's (or flash partition's) size divided by `block`: a 1 MiB
-partition of 4 KiB sectors is 256 blocks. `MyDb::<D>::MIN_DEVICE_BLOCKS`
-is the smallest `n` the shape fits (166 for the quick start); below it,
-`open()` returns `BadConfig`. `db.config()` shows where everything went.
-The layout depends only on `n` and the manifest's size, so reopening finds
-the data where it left it.
+`Config::whole_device(n)` gives horton blocks `0..n` and places the
+regions: manifest copies first, then the WAL (about an eighth of the
+rest, at least two blocks, plus whatever rounding the slots leaves
+over), then table slots to the end. `n` is the partition size divided by
+`block`: a 1 MiB partition of 4 KiB sectors is 256 blocks.
+`MyDb::<D>::MIN_DEVICE_BLOCKS` is the smallest `n` the shape fits: 166
+blocks (664 KiB) for the quick start. Below it `open()` returns
+`BadConfig`. `db.config()` shows where everything went. The layout
+depends only on `n`, `block`, `key_max`, `levels`, `tables_per_level`
+and the number of manifest copies, so a reopen with the same values finds
+the data where it left it. Changing the memtable sizes moves nothing.
 
-**By hand:** `Config::new(wal_start, wal_end, tbl_start, tbl_end,
-manifest_a, manifest_b)` places each region yourself (ranges include the
-start and exclude the end), for example to leave part of the device to
-other data or to give the WAL more room for wear. `open()` checks it,
-returning `BadConfig` otherwise:
-
-- **Manifest:** each copy is `Manifest::max_blocks::<BLOCK>()` blocks, the
-  worst case for `LEVELS × TABLES` tables with `KEY_MAX` bounds (1 block
-  for the ESP32 profile, 4 for 256-byte keys × 28 tables).
-- **Tables:** the region splits into `LEVELS × TABLES` equal slots, and a
-  slot must hold a full memtable's table. A table never outgrows its slot,
-  so the region holds `LEVELS × TABLES × slot_blocks` blocks of tables.
-- **WAL:** one block per durable commit between flushes, and one per
-  block of a batch larger than a block (up to 16). On NOR flash each is
-  a sector erase, and a batch of many blocks waits for all of them before
-  its one flush: size the WAL region for the largest batch, and keep
-  batches small where latency matters.
-
-The const generics behind `db_types!` (`BLOCK`, `KEY_MAX`, `VAL_MAX`,
-`CAP`, `ARENA`, `LEVELS`, `TABLES`, `BLOOM_BYTES`, `CACHE`) and the rules
-each must meet are listed on `Db` in the API docs.
+To share the device with other data, `Config::new(wal_start, wal_end,
+tbl_start, tbl_end, manifest_a, manifest_b)` places each region by hand,
+with half-open ranges. See [`SPEC.md`](SPEC.md) §7.
 
 ### Flash endurance
 
-On NOR flash every block write is a sector erase. Batch writes that arrive
-together into one `WriteBatch` (one erase instead of one per op), and use
-`Config::with_manifest_ring(n)` to spread manifest erases over `n` copies.
-Table slots are allocated next-fit, so table erases spread across the
-region. See [ADR-0012](docs/adr/0012-nor-flash-endurance.md).
+On NOR flash every block write is a sector erase, so a lone `put` costs
+one erase. Put writes that arrive together in one `WriteBatch`: one
+erase per WAL block the batch fills, not one per write. A batch of many
+blocks is acknowledged only after all of its erases and the device sync,
+so size the WAL region for the largest batch, and keep batches small
+where latency matters
+([ADR-0029](docs/adr/0029-atomic-batches-across-wal-blocks.md#consequences)).
+`Config::with_manifest_ring(n)` spreads manifest erases over `n` copies,
+and table slots are allocated next-fit, so table erases spread across
+the region. There is no other wear leveling.
+
+What that means on W25Q-class NOR (100k erase cycles, 45-400 ms per
+4 KiB erase), from
+[ADR-0012](docs/adr/0012-nor-flash-endurance.md); these are analysis,
+not measurements:
+
+- Erase time caps durable single writes at roughly 20 a second. A
+  worst-case ESP32-profile record (119 bytes) costs a 4,096-byte erase,
+  about 34× write amplification.
+- The WAL region lasts about `100k × wal_blocks` commits.
+- With the default two manifest copies, the manifest wears out first: on
+  the order of a month at one write a second with a 16-entry memtable. A
+  ring of `n` copies multiplies that by `n / 2`.
+
+## Running it on a device
+
+Writes return capacity errors instead of blocking. Each one names its
+remedy, so the firmware loop is: write; on a capacity error, do what it
+says; retry. `flush()` can itself fail with `NeedsCompaction`, so its
+result goes through the same remedy:
+
+```rust,ignore
+loop {
+    let r = match db.put(key, val).await {
+        Ok(_) => break,
+        Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => db.flush().await,
+        Err(e) => Err(e),
+    };
+    match r {
+        Ok(()) => {} // flushed: retry the write
+        Err(Error::NeedsCompaction) => {
+            // from the write or from the flush
+            while db.compact_step(&mut scratch).await? == Progress::More {}
+        }
+        Err(e) => return Err(e), // RegionFull and the rest: see the table
+    }
+}
+```
+
+The inner `while` is for when the write must succeed now. In a real-time
+loop, call `compact_step` once per tick while `compaction_pending()` is
+true, as the [flight recorder](#demo-a-flight-recorder-that-survives-power-cuts)
+does; [`make_room`](examples/flight_recorder/recorder.rs) there handles
+every remedy, nested ones included.
+
+`flush()` is the expensive call. One call writes the memtable's whole
+table (up to a slot's worth of blocks) and then a manifest copy; on NOR
+each of those blocks is a sector erase. `compact_step`, by contrast,
+writes at most one output block, or one output's seal and commit. Plan
+real-time deadlines around a write that triggers a flush.
+
+| Error | Meaning | Do this |
+|---|---|---|
+| `TableFull` (the memtable's entry slots), `ArenaFull` (its bytes) | the memtable is full | `flush()`, retry |
+| `WalFull` | the WAL region is used up | `flush()` (it wraps the WAL), retry |
+| `NeedsCompaction` | level 0 is full, or no slot is free until tables merge | `compact_step` until `Done`, retry |
+| `RegionFull` | no slot is free and compaction cannot free one | delete or set `purge_before`, then `request_compaction(0)` and compact; archive; or a bigger region. Reads keep working |
+| `SnapshotLimit` | eight snapshots are live | `release_snapshot` |
+| `BatchFull` | a `WriteBatch` holds its `OPS` operations | write it, start another |
+| `BatchTooLarge { bytes, max }` | a record is larger than one WAL block, or the batch needs more than `GROUP_BLOCKS_MAX` WAL blocks or more than an empty memtable | split it |
+| `TableTooLarge` | an entry, the index or the range tombstones do not fit a table | smaller entries, fewer range tombstones, bigger blocks or slots |
+| `KeyTooLarge { len, max }`, `ValueTooLarge { len, max }` | a key or value longer than `key_max` / `val_max` | a shorter key or value |
+| `EmptyKey` | the key is empty | a non-empty key |
+| `BufferTooSmall { need }` | your read buffer is short; nothing was truncated | a buffer of `need` bytes |
+| `Busy` | two `get` futures were polled at once on one `Db` | finish the other, or read through a `Scan` |
+| `NotOpen` | a call came before `open()` succeeded | `open()` first |
+| `BadConfig` | regions overlap or are too small, or the device is below `MIN_DEVICE_BLOCKS` | fix the `Config`, or a bigger device |
+| `CorruptBlock { id }` | a stored block failed its check on read | the data on the device is damaged. The call that read the block fails; reads that do not touch it go on. To start over, erase the regions: `open()` on a blank device gives an empty store |
+| `CorruptWal { offset }`, `CorruptManifest` | from `open()`: the WAL is damaged beyond a torn tail, no manifest copy is intact, or the image is of another format version (`CorruptManifest`). The handle stays closed | the data is damaged or from another version: erase the regions and `open()` for an empty store. For a version change, see [Format changes](#format-changes) |
+| `WouldResurrect { table }`, `IngestConflict { id }`, `StampConflict { id }` | an archive, an ingest, or a table's origin stamp (replica merging) was refused; nothing changed | see the variant's docs |
+| `Device(e)` | your `BlockDevice` failed | yours to handle; see below |
+
+A write that fails with `Device(e)` is not "not written": its outcome is
+unknown until the next `open()`. If a block of it reached the device, its
+sequence numbers are consumed, and the next `open()` may replay it,
+whole, never in part. So do not blindly retry a write that is not
+idempotent, and do not report it as lost. The handle stays open, and its
+records count against the memtable until the next `flush()`.
+
+`NeedsCompaction` is only returned while `compaction_pending()` is true,
+so a compact-then-retry loop always makes progress. `Error` is
+`#[non_exhaustive]` (a `match` needs a `_` arm), and implements `Display`
+and `core::error::Error` when your device's error type does. The rest of
+the variants and their remedies are in [`src/error.rs`](src/error.rs) and
+[ADR-0013](docs/adr/0013-capacity-errors-name-their-remedy.md).
+
+To give deleted and expired space back, also below the level triggers:
+
+```rust,ignore
+scratch.purge_before = now; // expired values become tombstones
+db.request_compaction(0)?;  // every table, from level 0 down, once
+while db.compaction_pending() {
+    db.compact_step(&mut scratch).await?;
+}
+```
+
+`RegionFull` from this loop means the rest is live data: delete, archive,
+or give it a bigger region.
+
+### Format changes
+
+A new horton minor version rejects the old image as a whole
+(`CorruptManifest` from `open()`), and archived tables carry the old
+format too, so they do not ingest into the new version either. To keep
+the data across such an update, read it out with a `Scan` under the old
+build, then erase the regions and write it back under the new one.
+Within a version, changing `block`, `key_max`, `levels`,
+`tables_per_level` or the number of manifest copies moves the layout;
+the memtable sizes do not.
 
 ## Platforms
 
-- **Host (x86_64 / macOS / Linux / Windows):** CI runs the test suite on
-  Linux, and the kvstore example on a real file on Linux, macOS and
-  Windows. `std` appears only in tests, benches, and examples.
-- **WebAssembly (`wasm32-unknown-unknown`):** the library builds
-  unchanged, `multiwriter` included. The ground station example runs it in
-  the browser and in Node, and CI tests it on real recordings.
-- **ESP32-S3 (`xtensa-esp32s3-none-elf`):** the library builds with the ESP
-  Rust fork (`./xtensa-check.sh`). A bare-metal smoke binary
-  (`xtensa-smoke/`) boots under QEMU and exercises
-  put/get/delete/flush/compact/scan/snapshot. `src/esp32s3.rs` follows
-  ESP-IDF v5.2's register sequences and is verified against a mock NOR chip.
-  **It has not been verified on silicon yet** (timing, power loss), because
-  QEMU does not emulate the SPI user-command path.
+- **Host (Linux, macOS, Windows).** CI runs the test suite on Linux and
+  the kvstore on a real file on all three. `std` appears only in tests,
+  benches and examples.
+- **WebAssembly (`wasm32-unknown-unknown`).** The ground station builds
+  the library unchanged, with default features, into two browser
+  modules, and CI lints and tests them.
+- **ESP32-S3 (`xtensa-esp32s3-none-elf`).** The library (default
+  features, `--lib` only) builds with the ESP Rust fork
+  (`./xtensa-check.sh`; a manual CI workflow runs it). A bare-metal smoke
+  binary ([`xtensa-smoke/`](xtensa-smoke/run-smoke.sh)) boots under
+  Espressif's QEMU and runs put/get/delete/flush/compact/scan/snapshot on
+  a RAM disk. The SPI flash driver follows ESP-IDF v5.2's register
+  sequences and is tested against a mock NOR chip (`tests/esp32s3.rs`).
+  Flash timing and power-loss behavior on silicon are unverified, and
+  the NOR endurance figures in ADR-0012 are analysis, not measurements.
+- **Other targets.** Nothing for ARM Cortex-M (`thumbv*`) or RISC-V
+  (`riscv32*`) is built or tested in CI.
+
+## Demo: a flight recorder that survives power cuts
+
+[`examples/flight_recorder`](examples/flight_recorder/main.rs) is a sensor
+logger built the way firmware would use horton, on a simulated 2 MiB NOR
+chip (512 sectors of 4 KiB) that counts erases and can lose power in the
+middle of any erase or program. Each tick it commits a four-sensor frame
+as one `WriteBatch`, writes a debug trace that expires after 64 ticks, and
+runs one bounded compaction step. Every 1000 ticks it purges a glitch
+window with a range delete and checks that a snapshot taken before still
+sees it. Tables older than 3000 ticks stream to an archive and are
+committed away locally.
+
+```sh
+cargo run --release --example flight_recorder                  # record; kill -9 any time, run again
+cargo run --release --example flight_recorder -- torture 1000  # 1000 power cuts (default 500)
+cargo run --release --example flight_recorder -- restore       # rebuild the history from the archive
+```
+
+`record` keeps `flash.img` and `archive/` under `target/flight_recorder/`
+(`--dir` moves them, `--fresh` starts over, `--fast` drops the 2000
+ticks/s pacing). Kill it whenever you like: the next run recovers,
+checks that every acknowledged frame is on flash or in the archive, and
+resumes. `torture` runs on an in-RAM chip and archive, cuts power after 1
+to 1500 operations, tearing that operation partway, and after every cut
+reboots and checks the lot. Any lost or corrupt frame fails the run; CI
+runs 300 cuts on every push. The result begins:
+
+```text
+power cuts             1000, each tearing an erase or program partway
+acknowledged frames    <n> ticks, every one present (on flash or in the archive)
+frames cut mid-write   <n> landed whole, the rest not at all; never in part
+lost or corrupt        0
+snapshots, TTLs        <n> snapshot and <n> TTL checks passed
+archive                <n> tables, <n> KiB, each re-ingested and checked
+```
+
+and a table of erases per sector, by region, follows.
+
+`--s3 s3://bucket/prefix` archives to S3 or a compatible store, signed by
+`curl --aws-sigv4`, so the example needs no crates;
+[`cloud.rs`](examples/flight_recorder/cloud.rs) lists the variables it
+reads. The recorder's shape, layout, key schema and archive object are
+defined once, in [`format.rs`](examples/flight_recorder/format.rs), which
+both browser modules compile too.
+
+## Demo: the same recorder, in a browser
+
+[`examples/ground_station`](examples/ground_station/README.md) compiles the
+recorder's horton to WebAssembly for two pages. The **dump viewer** opens
+a recorder's `flash.img` with horton's real recovery and checks and charts
+every entry; its wasm module imports nothing from JavaScript and uploads
+nothing. The **live logger** runs horton in a Web Worker over a file in
+the browser's Origin Private File System (OPFS) and acknowledges each
+frame only once it is durable; cold tables go to IndexedDB through the
+archive API. Kill the Worker or crash the tab and nothing acknowledged is
+lost. The two write the recorder's own formats, so the logger's flash
+opens in the viewer and `flight_recorder -- restore` reads its archive.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo run --release --example flight_recorder -- --fresh --fast --ticks 12000
+examples/ground_station/build.sh
+python3 -m http.server -d examples/ground_station/web 8000   # / and /live.html
+```
+
+The live logger needs a secure context (`localhost` counts). Its README
+has the exports, the tests and how CI runs them.
+
+## Host key-value store
+
+[`examples/kvstore`](examples/kvstore/main.rs) is horton in the role LevelDB
+usually fills: one file, a handle any thread can use, and compaction that
+runs by itself. `Store` is an example, not part of the published crate:
+to use it, copy `examples/kvstore/` (`store.rs`, the modules it uses, and
+the shape in `main.rs`). Its shape holds about 200 MiB of compressed
+tables (28 tables of about 7 MiB); past that, writes report `RegionFull`.
+
+The `Db` sits behind one engine lock, and callers run horton on their own
+threads. The thread that holds the lock commits everyone's queued writes,
+as many WAL blocks as one batch may span, under one `fdatasync`
+(ADR-0028). Compaction merges run outside the lock on two threads, one
+per compaction job (horton runs up to two at a time; ADR-0024,
+ADR-0025). Most point reads take no lock at all (ADR-0023), and scans
+merge the tables on the caller's thread (ADR-0019).
+
+```sh
+cargo run --release --example kvstore -- demo              # a checked tour of the API
+cargo run --release --example kvstore -- put hello world   # also get, del, delrange, scan, compact, stats
+cargo run --release --example kvstore -- scan --limit 10
+cargo run --release --example kvstore -- bench             # db_bench's workloads
+cargo run --release --example kvstore -- crash 25          # kill -9 a writer 25 times (default 20)
+```
+
+The store is `target/kvstore/kv.db` (`--db`), created sparse at 256 MiB
+(`--size-mb`). `--no-sync` skips `fdatasync`, as LevelDB does by default:
+a write then survives a process crash but not power loss. Its shape:
+16 KiB blocks, 128-byte keys, 4 KiB values, an 8,192-entry memtable in a
+1 MiB arena, 4 × 7 tables, and its own 16 MiB block cache.
+
+| LevelDB | here |
+|---|---|
+| `DB::Open` | `Store::open(path, Options)`, on one file, returns the store and an `OpenReport`; `store.handle()` for another thread |
+| `Put`, `Delete`, `Write(WriteBatch)` | `put`, `delete`, `write(Batch)`; a batch is atomic |
+| `Get` | `get`, into a `Vec` |
+| `DeleteRange` (RocksDB) | `delete_range`, one range tombstone |
+| `GetSnapshot`, `ReadOptions::snapshot` | `snapshot()`, released on drop; `get_at` |
+| `NewIterator` | `range(start, end, reverse)`, pinned to a snapshot |
+| `WriteOptions::sync` | on by default; `--no-sync` is LevelDB's default |
+
+`crash` runs a writer process with several threads (puts, deletes,
+atomic batches and range deletes, each thread on its own keys), kills it
+at a random moment, reopens, and compares the whole store with a model of
+the acknowledged writes. A reader thread checks through snapshots that no
+batch is ever half visible. It prints:
+
+```text
+process kills          25
+acknowledged writes    <n>, every one present
+in flight at the kill  <n> landed whole, the rest not at all; never in part
+WAL records replayed   <n>
+after compacting       <n> keys, unchanged
+time                   <t>
+```
+
+### Performance against RocksDB
+
+`bench` runs db_bench's workloads (16-byte keys, 100-byte values that
+compress by half, four client threads; 100 K keys unless `--num`, every
+write synced unless `--no-sync`), and
+[`vs-rocksdb.sh`](examples/kvstore/vs-rocksdb.sh) runs them on RocksDB's
+`db_bench` too. The table is `vs-rocksdb.sh 1000000` (no `fdatasync`,
+1 M keys) on a 4-vCPU Linux VM: horton's rate as a fraction of RocksDB
+given the same memory (1 MiB memtable, 16 MiB cache, 16 KiB
+blocks). RocksDB with its shipped settings (a 64 MiB memtable) is faster
+again on most rows.
+
+| db_bench workload | horton / RocksDB, same memory |
+|---|---:|
+| `fillseq` | 1.1–1.3× |
+| `fillrandom` | 1.0–1.2× |
+| `overwrite` | 1.2–1.3× |
+| `readrandom` | 0.86× |
+| `readmissing` | 1.2–1.8× |
+| `seekrandom` | 0.3–0.5× |
+| `readseq` | 0.4–0.6× |
+| `readreverse` | 0.3–0.5× |
+| `readwhilewriting` | 0.8× |
+| `deleterandom` | 0.6× |
+| `fillrandom`, every write synced (100 K keys) | 1.38× |
+| `fillrandom`, 100 writes a batch | 1.73× |
+| `fillrandom`, 1,000 writes a batch, synced | 0.97× |
+
+Two runs at 1 M keys, where there is a range; one run for the last
+three rows. The read rows move from run to run with the number of
+level-0 tables the fills leave, `seekrandom` most, and RocksDB ran
+slower that day than the day before (3% to 23% on unbatched writes), so a ratio
+is good to a factor of 1.5 at best.
+[`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the ops/s, the method and
+its caveats, where horton's time goes, what changed in v0.20, and
+[what the remaining gap is made of](docs/THROUGHPUT.md#what-the-remaining-gap-is-made-of).
 
 ## Testing
 
 ```sh
-cargo test                        # ~350 tests: unit, integration, crash injection, fuzz
-LIFECYCLE_SEEDS=300 cargo test --release --test lifecycle   # wider fuzz sweep
-cargo test --release              # same suite, optimized
-cargo run --example quickstart
-cargo +nightly miri test --test <name>          # UB check (the crate has no unsafe)
-cargo build --profile valgrind --benches        # callgrind instruction-count harnesses
-./xtensa-check.sh                               # ESP32-S3 build gate (needs the esp toolchain)
-examples/ground_station/build.sh && node examples/ground_station/test.mjs target/flight_recorder/flash.img
-node examples/ground_station/live-test.mjs 300                # live logger: 300 power cuts
-cargo run --release --example kvstore -- crash 25             # host store: 25 kill -9s of a writer process
-cargo run --release --example kvstore -- demo                 # host store: a checked API tour
+cargo test                                   # unit, integration, crash injection, fuzz
+cargo test --release
+cargo test --features multiwriter
+RUSTFLAGS="--cfg horton_loom" cargo test --release --features multiwriter --test loom_ring
+LIFECYCLE_SEEDS=300 cargo test --release --test lifecycle   # a wider fuzz sweep
+cargo run --release --example flight_recorder -- torture 300
 ```
 
-What the suite covers:
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the full list.
 
-- **Crash injection.** Every block write is enumerated as a crash point over
-  flush, compaction (multi-output jobs included), TTL purge, batches,
-  archive and ingest. The recovered state must be one of the committed
-  states. A torn-write variant models partially written blocks, including
-  torn multi-block manifest commits.
-- **Lifecycle fuzzer** (`tests/lifecycle.rs`): long random operation
-  sequences with reopen, WAL wrap, archive and re-ingest on small regions,
-  checking `Db::check_invariants` after every op against a `BTreeMap`
-  oracle.
-- **Review regressions** (`tests/review_findings.rs`): one test per
-  architecture-review finding; CI fails if one is ignored.
-- **Differential and property tests** against a `BTreeMap` oracle and the
-  executable models in `src/model.rs` (visibility, the per-key keep-set,
-  TTL and range-delete winners).
-- **In-tree, dependency-free fuzzers** for the WAL, SSTable, manifest and
-  LZ77 decoders. Bit flips, truncations and splices must produce clean
-  `Error`s and never a panic.
-- **Mutation testing** with `cargo-mutants` on the core modules. See
-  [`MUTATION_TRIAGE.md`](MUTATION_TRIAGE.md).
+What the tests check:
+
+- **Crash injection.** Every block write of a flush, compaction, TTL
+  purge, batch, archive and ingest is a crash point, and the recovered
+  state must be a committed one. Torn-write models cover partly written
+  blocks and manifest copies, and `tests/group_commit_crash.rs` models a
+  volatile write cache in which each pending write lands, is lost or
+  tears.
+- **Lifecycle and differential fuzzers** (`tests/lifecycle.rs`,
+  `tests/fuzz_differential.rs`): long random operation sequences with
+  reopen, WAL wrap, archive and re-ingest, checked after every op against
+  a `BTreeMap` oracle and the executable models in `src/model.rs`.
+- **Decoder fuzzers**, in-tree and dependency-free: bit flips,
+  truncations and splices of WAL, SSTable, manifest and LZ77 data must
+  give a clean `Error`, never a panic.
+- **Review regressions**: a regression test for each architecture-review
+  finding (`tests/review_findings.rs`, plus `tests/profile.rs` and
+  `tests/manifest.rs` for F8 and F9), and CI fails if one is
+  `#[ignore]`d. The demos found F18-F22.
+- **Loom models** of the `multiwriter` ring, and a **RAM gate**
+  (`tests/profile.rs`) for the ESP32-S3 profile.
+
+A one-off mutation-testing campaign is in
+[`MUTATION_TRIAGE.md`](MUTATION_TRIAGE.md); its killer tests are
+`tests/mutants.rs`. The [`benches/`](benches/write_path.rs) are
+deterministic instruction-count harnesses for valgrind:
+`cargo build --profile valgrind --benches`.
+
+## Cargo features
+
+- **`multiwriter`** (off by default) puts a lock-free admission ring in
+  front of the single-threaded core. Writers on many tasks or cores
+  submit 32-byte payloads (at most 29 bytes of key and value); one
+  poll-based `Drainer` owns the `Db` and commits each sweep as one batch;
+  a writer's future resolves once its write is durable. Tickets are
+  31 bits in an `AtomicU32`, so it needs no 64-bit atomics, but it does
+  need 32-bit atomic compare-and-swap, which Cortex-M0/M0+ (`thumbv6m`)
+  lacks. It is built and tested on the host only. It does not change the
+  default build or the on-disk format. The spec is
+  [`docs/multiwriter-spec.md`](docs/multiwriter-spec.md).
+- **`--cfg horton_loom`** (a `RUSTFLAGS` cfg, not a feature) swaps the
+  ring's atomics for Loom's, for the model tests.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `src/db/` | `Db`: `mod.rs` (config, open/recovery, write path), `read.rs`, `flush.rs`, `compaction.rs` (job policy and commits), `archive.rs` (archive and ingest), `invariants.rs` |
-| `src/wal.rs` | WAL record codec, writer, recovery |
-| `src/memtable.rs` | Sorted-slot memtable over a bump arena |
-| `src/sstable.rs` | SSTable writer and reader, bloom filter, index, range-tombstone blocks, relocation |
-| `src/compact.rs` | Merge engine, cursors, range-tombstone merger |
-| `src/scan.rs` | `Scan` / `RevScan` merge iterators |
-| `src/manifest.rs` | Manifest: multi-block copies, pair or ring layout, staged edits, commit/recover |
-| `src/slots.rs` | Table-slot allocator: one table per fixed slot, next-fit, reservations |
-| `src/cache.rs` | CLOCK block cache |
-| `src/compress.rs` | LZ77 block codec |
-| `src/batch.rs` | `WriteBatch` |
-| `src/crc.rs` | Slicing-by-8 CRC-32: three interleaved chains on 64-bit targets, zero runs carried across (ADR-0026) |
-| `src/model.rs` | Executable models used as test oracles |
-| `src/device.rs`, `src/flash.rs`, `src/esp32s3.rs` | `BlockDevice` trait, NOR flash adapter, ESP32-S3 SPI flash driver |
-| `src/profile.rs`, `src/macros.rs`, `src/defaults.rs` | Measured ESP32-S3 profile; the `db_types!` macro and its defaults |
+| `src/` | The library. `src/db/` is `Db`; one module per component (WAL, memtable, SSTable, manifest, slots, compaction, scan, cache) |
+| `tests/` | Integration, crash, fuzz, differential, review-regression and Loom tests |
+| `benches/` | Instruction-count harnesses for valgrind |
 | `examples/quickstart.rs` | The quick start, complete |
-| `examples/flight_recorder/` | The flight recorder demo: its on-flash format (`format.rs`), simulated NOR flash with power cuts, the recorder, a checker, and archiving to a directory or S3 |
-| `examples/kvstore/` | The host key-value store: a file-backed block device (`device.rs`), the engine lock with its write queue, group commit and background compaction (`store.rs`), the readers' block cache (`cache.rs`), the gate that lets most point reads take no lock (`gate.rs`) and the hand-off that lets compaction merge outside the lock (`handoff.rs`), db_bench's workloads (`bench.rs`), the kill -9 crash test (`crash.rs`), and the comparison with RocksDB (`vs-rocksdb.sh`) |
-| `examples/ground_station/` | The browser ground station: the dump viewer (`src/`) and the live logger (`live/`) as wasm modules, their pages (`web/`), and their Node and browser tests |
-| `tests/` | Integration, crash, fuzz, differential, and mutation-killing tests |
-| `benches/` | `harness = false` callgrind/cachegrind harnesses |
-| `xtensa-smoke/` | Bare-metal ESP32-S3 QEMU smoke test |
+| `examples/flight_recorder/` | The power-cut demo on simulated NOR flash |
+| `examples/ground_station/` | The browser modules (two crates of their own) and their tests |
+| `examples/kvstore/` | The host key-value store and its RocksDB comparison |
+| `xtensa-smoke/` | The bare-metal ESP32-S3 QEMU smoke test (a crate of its own) |
+| `docs/` | ADRs, the architecture review, design notes, history |
 
 ## Documents
 
-- [`SPEC.md`](SPEC.md): normative spec: constraints, formats, protocols, API.
+Start with this file, then [`SPEC.md`](SPEC.md), then the
+[ADR index](docs/adr/README.md).
+
+- [`SPEC.md`](SPEC.md): the normative spec: constraints, formats,
+  protocols, API.
 - [`CHANGELOG.md`](CHANGELOG.md): what changed in each version.
 - [`docs/adr/`](docs/adr/README.md): architecture decision records.
+- [`BUDGET.md`](BUDGET.md): ESP32-S3 RAM accounting.
+- [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md): the host store against
+  RocksDB, and where the time goes.
 - [`docs/ARCHITECTURE_REVIEW.md`](docs/ARCHITECTURE_REVIEW.md): the v0.16
   architecture review and the status of each finding.
-- [`docs/history/`](docs/history/milestones-v0.1-v0.16.md): the v0.1–v0.16
-  milestone log with its test-run reports.
-- [`BUDGET.md`](BUDGET.md): ESP32-S3 RAM accounting.
-- [`MUTATION_TRIAGE.md`](MUTATION_TRIAGE.md): mutation-testing results and
-  equivalent-mutant reasoning.
+- [`docs/multiwriter-spec.md`](docs/multiwriter-spec.md): the
+  `multiwriter` feature's spec;
+  [`docs/multi-writer-design.md`](docs/multi-writer-design.md) is the
+  background research behind it.
+- [`docs/tiered-sweeper.md`](docs/tiered-sweeper.md): a design for
+  archiving by age and pressure, and replication by table shipping.
+- [`docs/history/`](docs/history/milestones-v0.1-v0.16.md): the
+  v0.1-v0.16 milestone log.
+- [`MUTATION_TRIAGE.md`](MUTATION_TRIAGE.md): the mutation-testing
+  campaign.
+- [`CLAUDE.md`](CLAUDE.md): how the project is worked on, and the
+  commands CI runs.
 
 ## License
 
-Dual-licensed under MIT OR Apache-2.0, as declared in `Cargo.toml`.
+MIT OR Apache-2.0, at your option: [`LICENSE-MIT`](LICENSE-MIT),
+[`LICENSE-APACHE`](LICENSE-APACHE).
