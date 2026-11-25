@@ -52,7 +52,7 @@ on the same machine; it is the first of two runs.
 Every column but the first is one run. The 0.19 column is from an
 earlier run on the same kind of machine. **RocksDB ran slower in this
 session** than the day before on the same kind of machine, by 3% to 23%
-on writes and 12% to 38% on most reads with the same memory
+on writes without large batches and 12% to 38% on most reads with the same memory
 ([Results](#results)), so its ratios are good to a factor of 1.5 at
 best, as [Method](#method) says. **The read rows move from run to
 run** (see [Run to run](#run-to-run)): what a read costs depends on how
@@ -203,7 +203,8 @@ the earlier steps see [What changed in v0.20](#what-changed-in-v020).
 
 RocksDB was slower in this session than in step 19's, the day before
 on the same kind of machine: with the same memory, 3% to 23% on the
-write rows and 12% to 38% on most reads. Its ratios here carry
+write rows (but faster on `fillseq` at 1,000 writes a batch, 2.0 to 2.2
+times without `fdatasync`) and 12% to 38% on most reads. Its ratios here carry
 that; the two horton columns, run side by side, are the comparison
 between builds.
 
@@ -368,7 +369,7 @@ With 8,192 entries batched writes are 1.0 to 1.7 times as fast as with
 `fdatasync`, 270 K to 367 K with it), random writes 2% to 38%, the most
 at 1,000 a batch. (RocksDB's `fillseq` with the same memory at 1,000
 writes a batch without `fdatasync`, 830,588, is 3.4 times its rate at
-100; in step 19's two runs it was 1.4 and 1.6 times. One run, and it
+100; in step 19's two runs it was 1.4 and 1.5 times. One run, and it
 may not repeat.)
 
 What horton's writer queue did, one synced `fillrandom` of 1 M keys
@@ -1131,17 +1132,17 @@ One synced `fillrandom` of 1 M keys into an empty store, 4 threads:
 Batched writes, which were waiting for compaction, gain 1.44 to 1.48
 times here, and 1.0 to 1.7 times in the db_bench runs
 ([Batches](#batches-and-batches-larger-than-a-wal-block)). Single
-writes do not change (within 5%, synced or not): each is its own
-commit, and in step 19's profile a commit's fixed cost was a fifth to
-a third of a single write's instructions, work a larger memtable does
-not reduce. Reads are within the spread of single runs. A level-0
+writes do not change at 1 M keys (`fillseq`, `fillrandom` and
+`overwrite` within 5% in both runs; synced, within 3%): each is its own
+commit, and a commit's fixed costs (the lock, the queue, the WAL block
+and its `pwrite`) are work a larger memtable does not reduce. Reads are within the spread of single runs. A level-0
 table now holds 8,192 entries, and its bloom filter still fits one
 block (10 bits a key).
 
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
-session where RocksDB ran 3% to 23% slower on writes than the day
+session where RocksDB ran 3% to 23% slower on unbatched writes than the day
 before; the read rows carry the tables the fills left, as
 [Run to run](#run-to-run) says.
 

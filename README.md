@@ -98,7 +98,7 @@ in the [ADRs](docs/adr/README.md).
 | Atomic batches | `WriteBatch` through `write`. `write_group` commits many atomic units (`GroupOp` slices) under one device sync, as many as fit `GROUP_BLOCKS_MAX` WAL blocks, and says how many it wrote |
 | Reads | `get`, `snapshot` and `get_at`, `get_with_time` for TTL; forward `Scan` and reverse `RevScan` over a key range |
 | Durability | WAL first. The manifest (two copies, or a ring of `n`) is the one commit point for every flush, compaction and archive step |
-| Tables | Immutable: restart-point data blocks, a bloom filter sized to the table, range tombstones, optional LZ77 block compression |
+| Tables | Immutable: restart-point data blocks, a bloom filter sized to the table, range tombstones, LZ77 block compression wherever it saves at least 128 bytes |
 | Compaction | Leveled and caller-driven. `compact_step` does at most one output block, or one output's seal and commit, per call, so firmware can interleave it with real-time work. Deletes and expiry give their space back |
 | Cache | Optional CLOCK block cache inside `Db` (`cache_blocks: 0` turns it off) |
 | Cold storage | `archive_plan` / `archive_commit` move a sealed table to your own sink; `ingest_table` brings it back |
@@ -139,6 +139,10 @@ What to design around:
 [dependencies]
 horton = "0.20"
 ```
+
+0.20 is not on crates.io yet (0.19 is, with an older on-disk format);
+until it is, depend on the repository:
+`horton = { git = "https://github.com/madmax983/horton" }`.
 
 Condensed from [`examples/quickstart.rs`](examples/quickstart.rs), which
 is complete and runs with `cargo run --example quickstart`. The example
@@ -290,9 +294,9 @@ compacting.
 
 [`horton::profile`](src/profile.rs) is a measured ESP32-S3 shape: 4 KiB
 blocks, 32-byte keys, 64-byte values, a 16-entry memtable, 4 × 4 tables,
-a 2-block cache. It needs 114,144 bytes: 96,456 of structs, plus the
+a 2-block cache. It needs 114,200 bytes: 96,512 of structs, plus the
 largest future (`archive_commit`, 17,688 bytes). `tests/profile.rs`
-fails the build past 114,688 bytes (112 KiB). The breakdown, the futures
+fails the test suite past 114,688 bytes (112 KiB). The breakdown, the futures
 and the history are in [`BUDGET.md`](BUDGET.md).
 
 The library's code size (the flash its `.text` and `.rodata` take) has
@@ -310,8 +314,9 @@ regions that do not overlap:
 | Tables | Flushed and compacted tables | `levels × tables_per_level` equal slots, each large enough for a full memtable's table |
 
 `Config::whole_device(n)` gives horton blocks `0..n` and places the
-regions: manifest copies first, then the WAL (an eighth of the rest),
-then table slots to the end. `n` is the partition size divided by
+regions: manifest copies first, then the WAL (about an eighth of the
+rest, at least two blocks, plus whatever rounding the slots leaves
+over), then table slots to the end. `n` is the partition size divided by
 `block`: a 1 MiB partition of 4 KiB sectors is 256 blocks.
 `MyDb::<D>::MIN_DEVICE_BLOCKS` is the smallest `n` the shape fits: 166
 blocks (664 KiB) for the quick start. Below it `open()` returns
@@ -592,11 +597,13 @@ time                   <t>
 
 ### Performance against RocksDB
 
-`bench` runs db_bench's workloads (1 M 16-byte keys, 100-byte values
-that compress by half, four client threads), and
+`bench` runs db_bench's workloads (16-byte keys, 100-byte values that
+compress by half, four client threads; 100 K keys unless `--num`, every
+write synced unless `--no-sync`), and
 [`vs-rocksdb.sh`](examples/kvstore/vs-rocksdb.sh) runs them on RocksDB's
-`db_bench` too. On a 4-vCPU Linux VM, horton's rate as a fraction of
-RocksDB given the same memory (1 MiB memtable, 16 MiB cache, 16 KiB
+`db_bench` too. The table is `vs-rocksdb.sh 1000000` (no `fdatasync`,
+1 M keys) on a 4-vCPU Linux VM: horton's rate as a fraction of RocksDB
+given the same memory (1 MiB memtable, 16 MiB cache, 16 KiB
 blocks). RocksDB with its shipped settings (a 64 MiB memtable) is faster
 again on most rows.
 
@@ -619,7 +626,7 @@ again on most rows.
 Two runs at 1 M keys, where there is a range; one run for the last
 three rows. The read rows move from run to run with the number of
 level-0 tables the fills leave, `seekrandom` most, and RocksDB ran
-slower that day than the day before (3% to 23% on writes), so a ratio
+slower that day than the day before (3% to 23% on unbatched writes), so a ratio
 is good to a factor of 1.5 at best.
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) has the ops/s, the method and
 its caveats, where horton's time goes, what changed in v0.20, and

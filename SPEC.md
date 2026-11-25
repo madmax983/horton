@@ -601,7 +601,8 @@ the WAL region bounds the commits between flushes.
 | v0.13–v0.16 | Block compression, range deletes and TTL, block cache |
 | v0.17 | Architecture review fixes: fixed table slots, split-output compaction, multi-block manifest with ring and staged edits, remedy-named errors, measured futures, range-delete space reclamation |
 | v0.18 | Release build profiles (fat LTO); no format change |
-| Unreleased (v0.20) | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015). Reads, scans and compaction merges a host can run outside its lock, bloom filters sized to their tables, two compaction jobs at a time (ADR-0016 to ADR-0027). Group commit across WAL blocks and atomic batches that span them (ADR-0028, ADR-0029). Format change |
+| v0.19 | Space reclaim: tight jobs at the reserve, `request_compaction`, bottom-level rewrites (ADR-0015) |
+| Unreleased (v0.20) | Reads, scans and compaction merges a host can run outside its lock, bloom filters sized to their tables, two compaction jobs at a time (ADR-0016 to ADR-0027). Group commit across WAL blocks and atomic batches that span them (ADR-0028, ADR-0029). Format change |
 
 Details: [`CHANGELOG.md`](CHANGELOG.md) and
 [`docs/history/milestones-v0.1-v0.16.md`](docs/history/milestones-v0.1-v0.16.md).

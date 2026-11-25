@@ -33,8 +33,8 @@ lock on the way: at 1 M keys on four threads, point reads are 33 times
 reads go on while it is written to, and two compaction jobs run at a
 time: random writes at 1 M keys are at 1.0 to 1.2 times RocksDB's
 rate given the same memory, from 0.37. A batch may span WAL blocks
-(ADR-0029); with 100 writes a batch the host store writes 1.7 to 2.6
-times as fast as RocksDB given the same memory.
+(ADR-0029); with 100 writes a batch and no `fdatasync` the host store
+writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
@@ -155,13 +155,6 @@ times as fast as RocksDB given the same memory.
   buffers. `SortedEntries` is the source trait; `Scan` implements it.
   After `fingerprint_buckets` finds the bucket that disagrees, a diff of
   that bucket is the exact repair list.
-- `Db::request_compaction(level)` compacts every table from `level` down
-  to the bottom once, also below the level triggers. Bottom tables are
-  rewritten in place, so `purge_before` and range tombstones free space
-  there (issue #32, ADR-0015).
-- `model_tight_commit_ok`, `model_tight_job` and `TightJob` in
-  `horton::model`.
-- The kvstore `compact` command uses `request_compaction(0)`.
 - **`CachePort::with_range`** and `BlockCache::with_range` lend a
   checked range of a cached image to a closure in place, with no copy
   (ADR-0026). The index search and the inflate of a compressed data
@@ -330,9 +323,6 @@ times as fast as RocksDB given the same memory.
   the lock (flat combining, which gives group commit), and waiters
   spin for 100 µs before they park. Dropping the `Store` closes it: surviving handles
   return `Closed`.
-- `compaction_pending()` is also true while a request has work.
-- `compact_step` can return `RegionFull` from a tight job that cannot
-  free a slot. It changes nothing then.
 
 ### Fixed
 
@@ -367,6 +357,27 @@ times as fast as RocksDB given the same memory.
 - The kvstore's deadlock guard in its tests allows five minutes in an
   unoptimized build. One test took 52 s of its one-minute limit alone,
   and timed out beside the rest of `cargo test`.
+
+## [0.19.0] - 2026-10-11
+
+### Added
+
+- `Db::request_compaction(level)` compacts every table from `level` down
+  to the bottom once, also below the level triggers. Bottom tables are
+  rewritten in place, so `purge_before` and range tombstones free space
+  there (issue #32, ADR-0015).
+- `model_tight_commit_ok`, `model_tight_job` and `TightJob` in
+  `horton::model`.
+- The kvstore `compact` command uses `request_compaction(0)`.
+
+### Changed
+
+- `compaction_pending()` is also true while a request has work.
+- `compact_step` can return `RegionFull` from a tight job that cannot
+  free a slot. It changes nothing then.
+
+### Fixed
+
 - A full table region no longer stops all writes. When no job fits its slot
   estimate, a *tight* job runs with one free slot and never grows the
   region. A region full of expired or deleted data now gives its space
