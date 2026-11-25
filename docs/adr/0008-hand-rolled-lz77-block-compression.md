@@ -17,7 +17,9 @@ in-tree. Point reads go through the block index to a single data block
   staging).
 - The writer trial-compresses every sealed data block and keeps the
   compressed form only if it saves at least `COMPRESS_MIN_SAVING` (128)
-  bytes; otherwise the block is stored raw. Bloom, index and footer
+  bytes; otherwise the block is stored raw. (Since ADR-0030, only the
+  data blocks of tables written into level
+  `Config::compression_from_level`, 2 by default, and deeper.) Bloom, index and footer
   blocks are never compressed.
 - The flag lives in the existing trailer. The last `u16` of a data
   block is the restart count, capped at 128 by the writer, so bit 15 is

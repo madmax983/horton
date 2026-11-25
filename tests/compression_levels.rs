@@ -1,7 +1,8 @@
 //! Compression by level: tables written into levels above
 //! `Config::compression_from_level` (2 by default: level 0's flushes and
-//! level 1's compaction outputs) store their data blocks raw; deeper
-//! levels trial-compress them as before. A table's blocks are a fixed
+//! level 1's compaction outputs) store their data blocks raw; tables
+//! written deeper trial-compress them as before. A table compaction
+//! moves down whole keeps its blocks as they are. A table's blocks are a fixed
 //! size and entries are packed by their raw size, so a compressed table
 //! takes as many blocks as a raw one: compression there costs a pass to
 //! write and one to read, and saves no blocks.
@@ -10,7 +11,7 @@ mod common;
 
 use std::future::poll_fn;
 
-use common::{MemDevice, TestDb, block_on, test_config};
+use common::{MemDevice, TestDb, block_on, test_config, tight_config};
 use horton::{BlockDevice, Config, Progress};
 
 const BLOCK: usize = 4096;
@@ -160,4 +161,48 @@ fn the_threshold_covers_every_level_or_none() {
 fn the_default_threshold_is_level_2() {
     assert_eq!(Config::whole_device(1024).compression_from_level, 2);
     assert_eq!(test_config().compression_from_level, 2);
+}
+
+/// A table compaction moves down whole, with nothing below to merge it
+/// with, keeps the blocks it was written with: a raw level-1 table moved
+/// to level 2 or deeper stays raw, and reads the same. The threshold
+/// applies to tables being written; rewriting a table only to compress
+/// it would cost block writes and save none (ADR-0030).
+#[test]
+fn a_table_moved_down_keeps_its_blocks() {
+    // tight_config: slots of 8 blocks, so a table that overlaps nothing
+    // below moves down whole. Keys in order, so nothing overlaps.
+    let config = tight_config();
+    let mut db = TestDb::new(MemDevice::<BLOCK>::new(), config);
+    block_on(db.open()).expect("open");
+    let mut c = Box::new(horton::Compaction::<BLOCK, 256, 1024, 1024>::new());
+    let rounds = 50;
+    for round in 0..rounds {
+        let mut batch = horton::WriteBatch::<256, 1024, 64>::new();
+        for i in 0..60 {
+            let k = round * 60 + i;
+            batch.put(&key(k), &val(k)).expect("op");
+        }
+        block_on(db.write(&batch)).expect("write");
+        block_on(db.flush()).expect("flush");
+        while db.compaction_pending() {
+            while block_on(db.compact_step(&mut c)).expect("compact") == Progress::More {}
+        }
+    }
+    let levels = census(&db);
+    let deep_raw = levels[2..]
+        .iter()
+        .flatten()
+        .filter(|&&(c, _)| c == 0)
+        .count();
+    assert!(
+        deep_raw > 0,
+        "setup: a raw table moved below level 1: {levels:?}"
+    );
+    for tables in &levels[..2] {
+        for &(c, n) in tables {
+            assert_eq!(c, 0, "levels 0 and 1 are written raw: {c} of {n}");
+        }
+    }
+    check_reads(&db, rounds);
 }

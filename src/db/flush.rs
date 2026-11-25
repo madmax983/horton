@@ -1,6 +1,7 @@
 //! Flush: the memtable becomes one `SSTable` in a free table slot.
 
 use super::{Db, Unapplied};
+use crate::compress::CompressScratch;
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, ManifestEdit, TableRef};
@@ -249,8 +250,7 @@ impl<
         // reached — but a mismatch fails loudly instead of overrunning
         // the slot. The rdel section is written through the writer's data
         // buffer, idle between `seal_data` and `finish_meta`.
-        let mut cs = crate::compress::CompressScratch::<BLOCK>::new();
-        let compress = self.cfg.compresses(0);
+        let mut cs = self.cfg.compresses(0).then(CompressScratch::<BLOCK>::new);
         {
             let device = self.wal.device_mut();
             let table = &self.table;
@@ -261,11 +261,9 @@ impl<
                 .filter(|e| !e.range_del)
                 .map(sstable::SstEntry::from)
             {
-                w.push(&mut *device, e, compress.then_some(&mut cs)).await?;
+                w.push(&mut *device, e, cs.as_mut()).await?;
             }
-            let data_blocks = w
-                .seal_data(&mut *device, compress.then_some(&mut cs))
-                .await?;
+            let data_blocks = w.seal_data(&mut *device, cs.as_mut()).await?;
             debug_assert_eq!(data_blocks, plan.data_blocks);
             let rdel_base = base.checked_add(data_blocks).ok_or(Error::TableTooLarge)?;
             let rdel_written =

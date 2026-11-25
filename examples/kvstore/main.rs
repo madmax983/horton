@@ -65,7 +65,7 @@ pub const MEMTABLE_ENTRIES: usize = 8192;
 pub const MEMTABLE_ARENA: usize = 1 << 20;
 
 // The shape of the store: 4 levels of up to 7 tables, so at most 28
-// tables of about 7 MiB, some 200 MiB of compressed tables (a 256 MiB
+// tables of about 7 MiB, some 200 MiB of tables (a 256 MiB
 // file gives each table an 8 MiB slot). The memtable (8192 writes, 1 MiB)
 // is what one flush turns into a table. A point read probes up to 7
 // tables in level 0 and one per level below.

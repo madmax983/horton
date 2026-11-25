@@ -244,7 +244,7 @@ fn flagged_blocks(db: &TestDb<MemDevice<BLOCK>>) -> (u32, u32) {
 /// The test layout with every level compressed, flushes included: the
 /// default leaves levels 0 and 1 raw (ADR-0030), and these tests are
 /// about the compressed path.
-fn compressing() -> horton::Config {
+const fn compressing() -> horton::Config {
     test_config().with_compression_from_level(0)
 }
 
@@ -288,8 +288,8 @@ fn flush_compresses_realistic_data() {
 /// than [`COMPRESS_MIN_SAVING`] bytes of zero fill and negligible entry
 /// framing, there is nothing worth saving. (Small random values would
 /// still flag: their entry headers and sequence numbers compress, and
-/// the zero fill after a few entries compresses too. Both are correct —
-/// flagging those blocks genuinely saves flash.)
+/// the zero fill after a few entries compresses too. Both are correct:
+/// the codec keeps any block that saves `COMPRESS_MIN_SAVING` bytes.)
 #[test]
 #[allow(clippy::cast_possible_truncation)]
 fn flush_leaves_random_data_raw() {

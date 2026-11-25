@@ -40,7 +40,7 @@ future, and the executor stores the future: in a static task arena
 | Future | Bytes | Notes |
 |---|---|---|
 | `archive_commit()` | 17,688 | the resurrection review's entry stream over the candidate |
-| `flush()` | 17,640 | table writer (data + index blocks) and trial-compression scratch |
+| `flush()` | 17,648 | table writer (data + index blocks) and trial-compression scratch |
 | `open()` | 7,216 | WAL recovery |
 | `compact_step()` | 3,032 | merge state lives in the caller's `Compaction` |
 | `get()` | 1,432 | blocks are read through the `Db`'s shared buffers; a table's reader is built from its manifest record, with no footer read to hold state for (ADR-0021) |

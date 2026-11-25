@@ -38,6 +38,14 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`Config::compression_from_level`** (ADR-0030), with
+  `Config::with_compression_from_level` and
+  `DEFAULT_COMPRESSION_FROM_LEVEL` (2): tables written into shallower
+  levels store their data blocks raw. 0 compresses every level, as
+  before. Not part of the on-device format: a store reopened under
+  another threshold reads every table, and images stay compatible both
+  ways. `Config` gains a public field, so code that builds it as a
+  struct literal must add it.
 - **kvstore: a memtable of 8,192 entries** in the same 1 MiB arena
   (from 4,096, which filled at half the arena). Half the flushes and
   two fifths fewer compaction jobs; batched writes 1.0 to 1.7 times as
@@ -163,6 +171,14 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   implementations work unchanged. The kvstore's `SharedCache` lends.
 
 ### Changed
+
+- **Levels 0 and 1 are written uncompressed by default** (ADR-0030):
+  flushes and level-1 compaction outputs skip LZ77. A table's blocks
+  are packed by raw size, so their compression saved no blocks and cost
+  a trial compression per block written and an inflate per block read.
+  In the host store, writes are 16% to 43% faster and seeks about 40%;
+  point reads are 4% to 12% slower and scans 7% to 20% (docs/THROUGHPUT.md,
+  step 21).
 
 - **A point read inflates a data block only as far as its key**
   (ADR-0027). The LZ77 decoder can stop and resume; a point lookup

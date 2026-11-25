@@ -92,11 +92,14 @@ pub struct Config {
     /// the *handle's* identity, so reopening under a different id is a
     /// caller bug, not a format concern.
     pub node_id: u32,
-    /// The shallowest level whose tables' data blocks are compressed
-    /// (LZ77, ADR-0008): flushes (level 0) and compaction outputs into
-    /// shallower levels store their blocks raw. 2 by default, so levels 0
-    /// and 1, the ones rewritten soonest, are raw (ADR-0030); 0 compresses
-    /// every table, and `LEVELS` or more none.
+    /// The shallowest level a table is written into with its data blocks
+    /// compressed (LZ77, ADR-0008): flushes (level 0) and compaction
+    /// outputs into shallower levels store their blocks raw. 2 by
+    /// default, so levels 0 and 1, the ones rewritten soonest, are
+    /// written raw (ADR-0030); 0 compresses every table, and `LEVELS` or
+    /// more none. It applies when a table is written: a table compaction
+    /// moves down whole keeps its blocks as they are, and so does an
+    /// ingested one.
     ///
     /// A table's blocks are a fixed size and its entries are packed by
     /// their raw size, so compressing a table saves none of its blocks:
@@ -199,8 +202,8 @@ impl Config {
     /// Compresses the data blocks of tables written into `level` and
     /// deeper levels only (see the
     /// [`compression_from_level`](Self#structfield.compression_from_level)
-    /// field): 0 compresses every table, and a value at or past the last
-    /// level none. The default is 2.
+    /// field): 0 compresses every table, and `LEVELS` (the level count)
+    /// or more none. The default is 2.
     #[must_use]
     pub const fn with_compression_from_level(mut self, level: u8) -> Self {
         self.compression_from_level = level;

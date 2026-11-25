@@ -281,12 +281,30 @@ fn a_block_read_is_counted_once() {
                 .collect::<Vec<u8>>(),
         ),
     ] {
-        let mut db = TestDb::new(CountingDevice::new(), test_config());
+        // The compressed case compresses level 0 (the default stores it
+        // raw, ADR-0030). The raw case keeps the default: its random
+        // values alone would not keep the block raw, since the zero fill
+        // after five entries compresses.
+        let config = if what == "compressed" {
+            test_config().with_compression_from_level(0)
+        } else {
+            test_config()
+        };
+        let mut db = TestDb::new(CountingDevice::new(), config);
         block_on(db.open()).unwrap();
         for i in 0u8..5 {
             block_on(db.put(&[b'k', i], &value)).unwrap();
         }
         block_on(db.flush()).unwrap();
+        let first = db.level_tables(0).unwrap()[0].first_block;
+        let mut block = [0u8; 4096];
+        block_on(core::future::poll_fn(|cx| {
+            db.device().poll_read_block(cx, first, &mut block)
+        }))
+        .unwrap();
+        // Bit 15 of the restart count, before the CRC: compressed.
+        let flagged = u16::from_le_bytes([block[4090], block[4091]]) & 0x8000 != 0;
+        assert_eq!(flagged, what == "compressed", "{what}: setup");
 
         let mut buf = [0u8; 1024];
         let (reads, before) = (db.device().reads(), db.cache_stats());
