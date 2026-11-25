@@ -23,21 +23,25 @@ Read throughput is the subject:
 key-value store against RocksDB on db_bench's workloads, before and
 after. Against 0.19, one point read is 5 times cheaper (10 for an
 absent key), one thread's scan 9 times and its seek 7 times, and
-unsynced writes 2.2 to 3.3 times; synced writes are about unchanged.
+unsynced writes 2.5 to 3.3 times; synced writes are about unchanged.
 With detached reads the host store's point reads, scans and seeks also
 run on every reader thread at once, and with bloom filters sized to
 their tables a read of an absent key stops at the filter, and takes no
-lock on the way: at 1 M keys on four threads, point reads are 35 times
-0.19's rate, reads of absent keys 715 times, seeks 43 times and scans
-28 times. Compaction's merge runs outside the host store's lock, so
+lock on the way: at 1 M keys on four threads, point reads are 33 times
+0.19's rate, reads of absent keys 629 times, seeks 51 times and scans
+35 times. Compaction's merge runs outside the host store's lock, so
 reads go on while it is written to, and two compaction jobs run at a
-time: random writes at 1 M keys are at 0.94 of RocksDB's rate given
-the same memory, from 0.37. A batch may span WAL blocks (ADR-0029);
-with 100 writes a batch the host store writes 1.6 to 2.0 times as fast
-as RocksDB given the same memory.
+time: random writes at 1 M keys are at 1.0 to 1.2 times RocksDB's
+rate given the same memory, from 0.37. A batch may span WAL blocks
+(ADR-0029); with 100 writes a batch the host store writes 1.7 to 2.6
+times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **kvstore: a memtable of 8,192 entries** in the same 1 MiB arena
+  (from 4,096, which filled at half the arena). Half the flushes and
+  two fifths fewer compaction jobs; batched writes 1.0 to 1.7 times as
+  fast, single writes unchanged (docs/THROUGHPUT.md, step 20).
 - **Atomic batches across WAL blocks** (ADR-0029). A `WriteBatch`, and
   a `write_group` unit, may span up to `GROUP_BLOCKS_MAX` (16) WAL
   blocks; recovery replays it only when every block of it is intact,
