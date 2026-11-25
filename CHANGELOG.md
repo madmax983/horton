@@ -176,9 +176,8 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   flushes and level-1 compaction outputs skip LZ77. A table's blocks
   are packed by raw size, so their compression saved no blocks and cost
   a trial compression per block written and an inflate per block read.
-  In the host store, writes are 16% to 43% faster and seeks about 40%;
-  point reads are 4% to 12% slower and scans 7% to 20% (docs/THROUGHPUT.md,
-  step 21).
+  In the host store, fills and overwrites are 16% to 43% faster, point reads 5% to 8%
+  and seeks about 40%; scans are level (docs/THROUGHPUT.md, step 21).
 
 - **A point read inflates a data block only as far as its key**
   (ADR-0027). The LZ77 decoder can stop and resume; a point lookup

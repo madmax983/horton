@@ -65,7 +65,7 @@ compression save space there first.
 Measured on the host store (docs/THROUGHPUT.md, step 21), against the
 build that compressed every level, side by side:
 
-- **Writes are faster.** At 1 M keys without `fdatasync`, two runs:
+- **Fills and overwrites are faster.** At 1 M keys without `fdatasync`, two runs:
   `fillseq` 16% and 25%, `fillrandom` 36% and 40%, `overwrite` 43% and
   42%. Batched writes 13% to 50%, synced or not. One synced random fill
   into an empty store wrote the same blocks (68,740 before, 68,737
@@ -73,9 +73,13 @@ build that compressed every level, side by side:
 - **Seeks are faster** (by 39% and 43% at one and four reader threads,
   on identical tables): a seek positions a cursor in every table that
   could hold its key, and the shallow ones no longer inflate a block.
-- **Point reads and scans are slower** on identical tables: point reads
-  by 4% to 12%, scans by 7% to 20%. Why a raw block costs a reader more
-  than inflating a compressed one is being measured (step 21).
+- **Point reads are 5% to 8% faster and scans level** on identical
+  tables, in interleaved runs on an idle machine. (A first set of runs
+  on a busy machine had them slower; callgrind showed fewer
+  instructions per read in the new build, with the same cache hits and
+  misses.) The one cost that grew is the CRC of a raw block read from
+  the device, which has less zero padding to skip: about half again as
+  much, less than the inflate it saves.
 
 - **No change in space or flash wear.** Tables keep their block counts,
   so slots, the region's capacity and the erases a flush or compaction
