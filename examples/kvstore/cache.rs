@@ -34,7 +34,9 @@
 //! horton's rule for cached blocks (ADR-0016) holds unchanged: only
 //! verified images are inserted (the read path does that), and every hit
 //! is checked against a RAM checksum of the image before its bytes are
-//! used. The checksum here is kept per [`SUM_BYTES`] bytes, finer than
+//! used. A point read's data block is lent with a check instead
+//! ([`SharedCache::with_checked`], ADR-0031): the search checks each
+//! range it reads before it acts on it, and only those. The checksum here is kept per [`SUM_BYTES`] bytes, finer than
 //! the library's sixteenth of a block, so the 64 bytes of a bloom bucket
 //! cost the summing of 256 bytes and not of a kilobyte.
 //!
@@ -541,9 +543,11 @@ impl CachePort<BLOCK> for SharedCache {
     }
 
     /// Lends the whole image unchecked, with a `check` that sums only
-    /// the chunks `read` asks about, each once. A raw point lookup asks
-    /// about the block's trailer and a few entries: two to four of the
-    /// 64 chunks, where a whole-image check sums all of them.
+    /// the chunks `read` asks about, each once (ADR-0031). A point lookup
+    /// in a raw block asks about its trailer, the restarts its binary
+    /// search parses and the run it scans: about 8 of the 64 chunks
+    /// (docs/THROUGHPUT.md, step 22), where a whole-image check sums all
+    /// of them.
     fn with_checked(
         &self,
         table_id: u32,

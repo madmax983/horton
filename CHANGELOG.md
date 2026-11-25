@@ -38,6 +38,11 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`CachePort::with_checked`** and **`cache::CheckedRead`** (ADR-0031):
+  a cache lends a block image unchecked with a `check(from, to)` that
+  sums only the chunks a range overlaps. `BlockCache` and the host
+  store's cache implement it; the provided method checks the whole
+  image first, so other implementations behave as before.
 - **`Config::compression_from_level`** (ADR-0030), with
   `Config::with_compression_from_level` and
   `DEFAULT_COMPRESSION_FROM_LEVEL` (2): tables written into shallower
@@ -171,6 +176,17 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   implementations work unchanged. The kvstore's `SharedCache` lends.
 
 ### Changed
+
+- **A point read checks only the cached bytes it reads** (ADR-0031). A
+  data-block hit summed the whole image against its RAM checksums
+  before the search; now the search checks each range just before it
+  acts on it, about 8 of the host store's 64 chunks of a raw block. A
+  search that fails on bytes it had not checked has the whole image
+  checked, so a fault in RAM is a miss and a device read, never
+  `CorruptBlock`; a flip in bytes no lookup reads stays until one does
+  or the slot is evicted. In the host store, point reads served from
+  the cache are 10% to 15% faster; with most reads going to the device
+  the difference is inside the noise (docs/THROUGHPUT.md, step 22).
 
 - **Levels 0 and 1 are written uncompressed by default** (ADR-0030):
   flushes and level-1 compaction outputs skip LZ77. A table's blocks
