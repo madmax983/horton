@@ -530,22 +530,11 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         whole: bool,
         f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<D::Error>>,
     ) -> Result<R, Error<D::Error>> {
-        if self.find(bid) {
-            let block = self.current();
-            if block.valid == full::<BLOCK>() {
-                // Every byte is in, checked: nothing to gate, and an
-                // error stands.
-                return f(&block.data, &mut Gate::Open);
-            }
-            let mut gate = Gate::Held(Gated::<BLOCK> {
-                valid: block.valid,
-                missed: false,
-            });
-            let answer = f(&block.data, &mut gate);
-            let missed = matches!(gate, Gate::Held(Gated { missed: true, .. }));
-            if !missed && (answer.is_ok() || block.valid == full::<BLOCK>()) {
-                return answer;
-            }
+        if let Some(answer) = self.held(bid, f) {
+            return answer;
+        }
+        if self.current().id == Some(bid) {
+            // `held` found the buffer, and it lacks what the parse reads.
             self.complete(device, cache, table_id, bid).await?;
             return f(&self.current().data, &mut Gate::Open);
         }
@@ -562,6 +551,46 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             .await?;
         self.loaded(bid, full::<BLOCK>());
         f(&self.current().data, &mut Gate::Open)
+    }
+
+    /// The first step of [`load_with`](Self::load_with), synchronous so
+    /// that a scan's step over a block it holds builds no future: the
+    /// parse `f` over the buffer holding block `bid`, when one does and
+    /// the answer stands. `None` when no buffer holds the block (the
+    /// current buffer is then not `bid`'s), or when the one that does
+    /// lacks what the parse reads (it is then current).
+    fn held<E, R>(
+        &mut self,
+        bid: u64,
+        f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
+    ) -> Option<Result<R, Error<E>>> {
+        if !self.find(bid) {
+            return None;
+        }
+        let block = self.current();
+        if block.valid == full::<BLOCK>() {
+            // Every byte is in, checked: nothing to gate, and an error
+            // stands.
+            return Some(f(&block.data, &mut Gate::Open));
+        }
+        let mut gate = Gate::Held(Gated::<BLOCK> {
+            valid: block.valid,
+            missed: false,
+        });
+        let answer = f(&block.data, &mut gate);
+        let missed = matches!(gate, Gate::Held(Gated { missed: true, .. }));
+        (!missed && answer.is_ok()).then_some(answer)
+    }
+
+    /// [`value_into`](Self::value_into) from a buffer that holds the
+    /// block, synchronously (see [`held`](Self::held)); `None` when none
+    /// holds what the copy reads.
+    fn value_held<E>(
+        &mut self,
+        (_, bid, off, end): (u32, u64, usize, usize),
+        out: &mut [u8],
+    ) -> Option<Result<usize, Error<E>>> {
+        self.held(bid, &mut |b, g| value_at(b, off, end, bid, g, out))
     }
 
     /// Copies the value of the entry at `(table_id, bid, off, end)` (a
@@ -1422,10 +1451,14 @@ impl<
             } else {
                 let db = self.src;
                 let at = (winner_table, winner_bid, winner_off, winner_end);
-                let copied = self
-                    .blocks
-                    .value_into(db.device, db.cache, at, val_buf)
-                    .await?;
+                let copied = match self.blocks.value_held(at, val_buf) {
+                    Some(copied) => copied?,
+                    None => {
+                        self.blocks
+                            .value_into(db.device, db.cache, at, val_buf)
+                            .await?
+                    }
+                };
                 debug_assert_eq!(copied, winner_val_len);
             }
             // Advance every head sitting on the minimum key — the winner
@@ -1669,12 +1702,17 @@ impl<
         // unchanged.
         loop {
             let db = self.src;
-            let parked = self
-                .blocks
-                .load_with(db.device, db.cache, tid, bid, false, &mut |b, g| {
-                    park_in::<D::Error, BLOCK, KEY_MAX>(b, off, end, floor, max_seq, bid, g)
-                })
-                .await?;
+            let mut park = |b: &[u8; BLOCK], g: &mut Gate<'_, '_, BLOCK>| {
+                park_in::<D::Error, BLOCK, KEY_MAX>(b, off, end, floor, max_seq, bid, g)
+            };
+            let parked = match self.blocks.held(bid, &mut park) {
+                Some(parked) => parked?,
+                None => {
+                    self.blocks
+                        .load_with(db.device, db.cache, tid, bid, false, &mut park)
+                        .await?
+                }
+            };
             if let Some(h) = parked {
                 let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
                 c.block_id = bid;
@@ -2307,10 +2345,14 @@ impl<
             } else {
                 let db = self.src;
                 let at = (winner_table, winner_bid, winner_off, winner_end);
-                let copied = self
-                    .blocks
-                    .value_into(db.device, db.cache, at, val_buf)
-                    .await?;
+                let copied = match self.blocks.value_held(at, val_buf) {
+                    Some(copied) => copied?,
+                    None => {
+                        self.blocks
+                            .value_into(db.device, db.cache, at, val_buf)
+                            .await?
+                    }
+                };
                 debug_assert_eq!(copied, winner_val_len);
             }
             // Advance every head sitting on the maximum key — the winner
@@ -2534,26 +2576,30 @@ impl<
             // compaction already merged them into a newer table), and a
             // backward walk only goes lower.
             let lower = db.manifest.find_table(tid).map(|t| t.first_key);
-            let (end, found) = self
-                .blocks
-                .load_with(db.device, db.cache, tid, bid, whole, &mut |b, g| {
-                    let (end, hit) = search_block_rev::<D::Error, BLOCK, KEY_MAX>(
-                        b, bound_copy, max_seq, bid, g,
-                    )?;
-                    let Some(h) = hit else {
-                        return Ok((end, RevFound::Nothing));
-                    };
-                    if lower.is_some_and(|l| h.0[..h.1] < *l.as_slice()) {
-                        return Ok((end, RevFound::Dead));
-                    }
-                    // A version run can straddle data blocks: when the
-                    // candidate is the block's first key, newer versions
-                    // may live in earlier blocks.
-                    let at_first = idx > 0
-                        && entry_key_at::<D::Error, BLOCK>(b, 0, end, bid, g)? == &h.0[..h.1];
-                    Ok((end, RevFound::Head(h, at_first)))
-                })
-                .await?;
+            let mut search = |b: &[u8; BLOCK], g: &mut Gate<'_, '_, BLOCK>| {
+                let (end, hit) =
+                    search_block_rev::<D::Error, BLOCK, KEY_MAX>(b, bound_copy, max_seq, bid, g)?;
+                let Some(h) = hit else {
+                    return Ok((end, RevFound::Nothing));
+                };
+                if lower.is_some_and(|l| h.0[..h.1] < *l.as_slice()) {
+                    return Ok((end, RevFound::Dead));
+                }
+                // A version run can straddle data blocks: when the
+                // candidate is the block's first key, newer versions
+                // may live in earlier blocks.
+                let at_first =
+                    idx > 0 && entry_key_at::<D::Error, BLOCK>(b, 0, end, bid, g)? == &h.0[..h.1];
+                Ok((end, RevFound::Head(h, at_first)))
+            };
+            let (end, found) = match self.blocks.held(bid, &mut search) {
+                Some(found) => found?,
+                None => {
+                    self.blocks
+                        .load_with(db.device, db.cache, tid, bid, whole, &mut search)
+                        .await?
+                }
+            };
             match found {
                 RevFound::Head(h, at_first) => {
                     // A block can seal mid-run, so the run's first block
