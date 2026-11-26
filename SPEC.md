@@ -245,7 +245,11 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   ends at the CRC: the `u16` offset of every 16th entry (the first is
   0), then the entry count as a `u16` (ADR-0032). A search
   binary-searches the offsets and scans at most 16 entries; it reads
-  neither the entries it does not need nor the padding.
+  neither the entries it does not need nor the padding. A table's
+  index is one block, so a table of `n` data blocks with keys of `k`
+  bytes needs `n × (18 + k) + 2 + 2⌈n/16⌉ ≤ BLOCK − 4`; a `Db` shape
+  whose index could not hold one key's run of versions (compaction
+  never splits a key) fails to compile.
 - **Footer:** `magic u64 = "hrtsst05" | index_block u64 | bloom_block u64
   | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64 |
   bloom_len u32`. The bloom section is `[bloom_block, index_block)`,

@@ -62,7 +62,9 @@ its first read.
   what such a lookup now reads besides its data block. Verifying only
   the index entries a search touches needs per-entry or per-group
   checksums in the block, which costs index capacity (a table's index
-  is one block). That trade is left for when it is needed.
+  is one block). That trade is left for when it is needed. (Done
+  since: ADR-0032, with the cache's RAM checksums and restart offsets
+  in the index block instead of checksums in it.)
 
 ## References
 

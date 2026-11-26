@@ -37,6 +37,9 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`sstable::index_tail`** (ADR-0032): the bytes of trailer an index
+  block of `n` entries ends with, `2 + 2⌈n/16⌉`, for sizing a table's
+  index.
 - **`CachePort::with_checked`** and **`cache::CheckedRead`** (ADR-0031):
   a cache lends a block image unchecked with a `check(from, to)` that
   sums only the chunks a range overlaps. `BlockCache` and the host
@@ -176,6 +179,26 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **An index block ends in restart offsets, and its search checks only
+  the cached bytes it reads** (ADR-0032). The block now ends in the
+  offset of every 16th entry and the entry count; a search
+  binary-searches them and scans at most 16 entries, where it parsed
+  every entry. A cached index block is lent with a check, as a data
+  block is (ADR-0031), for point reads and for both seek directions;
+  a search that fails has the whole image checked, so a fault in RAM
+  is a miss, never `CorruptBlock`. In the host store at 1 M keys,
+  point reads are 32% to 41% faster when cached and 14% to 19% on the
+  full key range; cached seeks are 58% to 75% faster
+  (docs/THROUGHPUT.md, step 23). The trailer takes `2 + 2⌈n/16⌉`
+  bytes of the index, so a table holds slightly fewer data blocks (479
+  instead of 481 for the host store's 16-byte keys);
+  `TableWriter::index_len` counts it. Stray bytes in an index block's
+  padding are no longer found as corruption; they cannot change an
+  answer. A `Db` shape whose one-block index cannot hold one key's run
+  of versions under the most snapshots now fails to compile
+  (`ASSERT_INDEX`), where its compaction could fail with
+  `TableTooLarge` on every retry.
+
 - **A point read checks only the cached bytes it reads** (ADR-0031). A
   data-block hit summed the whole image against its RAM checksums
   before the search; now the search checks each range just before it
@@ -250,7 +273,8 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   hand over all slots, as before.
 - An index-block search parses the index once. It used to re-parse it
   from the start for every step of a binary search, about 2,000 entry
-  parses for a full 16 KiB index.
+  parses for a full 16 KiB index. (Since ADR-0032 it reads one run of
+  at most 16 entries.)
 - `CachePort` has a new required method, `get_range_into`, and
   `CacheStats` a new field, `rejected`.
 - The ESP32-S3 profile's `Db` grows by 264 bytes (the cache's per-chunk

@@ -111,7 +111,8 @@ flowchart TD
   (1.2 MiB each) for all scanners.
 - **Not done:** the per-entry merge still compares every cursor's head
   (a heap, or a level iterator that keeps one cursor per level, would
-  cut that); the index block is still read whole per table; a scan's
+  cut that); the index block is still read whole per table (done
+  since: ADR-0032, which checks only what a seek's search reads); a scan's
   values are copied out one entry at a time.
 
 ## References

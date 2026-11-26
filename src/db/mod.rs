@@ -575,6 +575,17 @@ impl<
         12 + 2 * KEY_MAX + 6 <= BLOCK,
         "BLOCK must fit one maximal range tombstone (12 + 2 * KEY_MAX bytes) plus its trailer"
     );
+    const ASSERT_INDEX: () = assert!(
+        sstable::index_holds::<BLOCK>(
+            crate::compact::Compaction::<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>::key_run_blocks(
+                MAX_SNAPSHOTS
+            ),
+            KEY_MAX
+        ),
+        "A table's one index block (an entry of 18 + KEY_MAX bytes per data block, \
+         plus its trailer) must hold one key's run of versions under MAX_SNAPSHOTS \
+         snapshots: compaction never splits a key, so a longer run could never fit"
+    );
     // `&&` short-circuits in const evaluation: `max_blocks` (which divides
     // by the body bytes per block) is only evaluated when a block has any.
     const ASSERT_MANIFEST: () = assert!(
@@ -664,6 +675,7 @@ impl<
         let () = Self::ASSERT_JOB;
         let () = Self::ASSERT_RDEL;
         let () = Self::ASSERT_MANIFEST;
+        let () = Self::ASSERT_INDEX;
         let config = Self::resolve_layout(config);
         Self {
             wal: WalWriter::new(device, config.wal_start, config.wal_end),

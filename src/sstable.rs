@@ -216,6 +216,46 @@ pub(crate) const fn packed_blocks_bound(
     bound as u64
 }
 
+/// Upper bound on the data blocks one flush can seal: a full memtable
+/// (`cap` entries over `arena` key and value bytes) packed into data
+/// blocks. Each gets an index entry.
+#[must_use]
+pub(crate) const fn max_flush_data_blocks<const BLOCK: usize>(
+    cap: usize,
+    arena: usize,
+    key_max: usize,
+    val_max: usize,
+) -> u64 {
+    // Point entries: header, key, value, and an optional TTL expiry.
+    let emax = ENTRY_HEADER + key_max + val_max + 8;
+    let data_total = arena + cap * (ENTRY_HEADER + 8);
+    // 2048 entries per block: the conversion is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let per_block = MAX_ENTRIES_PER_BLOCK as usize;
+    packed_blocks_bound(
+        data_total,
+        cap,
+        emax,
+        BLOCK.saturating_sub(MAX_DATA_TAIL),
+        per_block,
+    )
+}
+
+/// Whether one index block holds `blocks` entries of keys up to
+/// `key_max` bytes, its trailer included (ADR-0032).
+#[must_use]
+pub(crate) const fn index_holds<const BLOCK: usize>(blocks: u64, key_max: usize) -> bool {
+    let room = BLOCK.saturating_sub(CRC_LEN);
+    // Callers pass a few hundred blocks at most; a count past `room` cannot
+    // fit whatever its width.
+    if blocks > room as u64 {
+        return false;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let n = blocks as usize;
+    n * (18 + key_max) + index_tail(n) <= room
+}
+
 /// Upper bound on the blocks one flush can occupy: a full memtable
 /// (`cap` entries over `arena` key and value bytes) packed into a data
 /// section and a range-tombstone section, plus the bloom blocks a table of
@@ -232,19 +272,7 @@ pub(crate) const fn max_flush_blocks<const BLOCK: usize>(
     val_max: usize,
     bloom_bytes: usize,
 ) -> u64 {
-    // Point entries: header, key, value, and an optional TTL expiry.
-    let emax = ENTRY_HEADER + key_max + val_max + 8;
-    let data_total = arena + cap * (ENTRY_HEADER + 8);
-    // 2048 entries per block: the conversion is exact.
-    #[allow(clippy::cast_possible_truncation)]
-    let per_block = MAX_ENTRIES_PER_BLOCK as usize;
-    let data = packed_blocks_bound(
-        data_total,
-        cap,
-        emax,
-        BLOCK.saturating_sub(MAX_DATA_TAIL),
-        per_block,
-    );
+    let data = max_flush_data_blocks::<BLOCK>(cap, arena, key_max, val_max);
     // Range tombstones: `start_len u16 | end_len u16 | seq u64 | start | end`.
     let rmax = 12 + 2 * key_max;
     let rdel_total = arena + cap * 12;
@@ -3677,6 +3705,242 @@ mod tests {
             let key = k(probe);
             let got = index_lookup::<()>(payload, &key, 9, &mut |_, _| true).unwrap();
             assert_eq!(got, model_lookup(&keys, &key));
+        }
+    }
+
+    /// The trailer is part of the index's room: two 236-byte keys' entries
+    /// fill a 512-byte block's body exactly, so with the trailer they do
+    /// not fit, and a shape whose compaction must write one key's run of
+    /// such blocks into one table is refused at compile time (`Db`'s
+    /// `ASSERT_INDEX`). Realistic shapes keep ample room.
+    #[test]
+    fn the_index_must_hold_one_keys_run_with_its_trailer() {
+        use super::index_holds;
+        use crate::compact::Compaction;
+        assert!(index_holds::<512>(1, 236));
+        assert!(!index_holds::<512>(2, 236));
+        // 4 entries of 18 + 108 bytes and a 4-byte trailer: all 508.
+        assert!(index_holds::<512>(4, 108) && !index_holds::<512>(4, 109));
+        // 17 entries of 18 + 222 bytes and a 6-byte trailer (two
+        // restarts): 4,086 of 4,092.
+        assert!(index_holds::<4096>(17, 222) && !index_holds::<4096>(17, 223));
+        assert!(!index_holds::<512>(u64::MAX, 1));
+        let run = Compaction::<512, 236, 200, 64>::key_run_blocks(crate::db::MAX_SNAPSHOTS);
+        assert!(!index_holds::<512>(run, 236));
+        let run = Compaction::<4096, 256, 1024, 1024>::key_run_blocks(crate::db::MAX_SNAPSHOTS);
+        assert!(index_holds::<4096>(run, 256));
+        let run = Compaction::<16384, 128, 4096, 4096>::key_run_blocks(crate::db::MAX_SNAPSHOTS);
+        assert!(index_holds::<16384>(run, 128));
+    }
+
+    /// A small xorshift generator: the tests below need many tables.
+    struct Rng(u64);
+
+    impl Rng {
+        const fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        const fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// `n` sorted keys of `len` bytes (a range) over an `alpha`-letter
+    /// alphabet, each a duplicate of the one before with `dup` percent
+    /// odds: runs of equal first keys cross restarts.
+    fn keys_for(
+        r: &mut Rng,
+        n: usize,
+        len: (usize, usize),
+        dup: usize,
+        alpha: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..n {
+            if let Some(last) = keys.last()
+                && r.below(100) < dup
+            {
+                keys.push(last.clone());
+                continue;
+            }
+            let l = len.0 + r.below(len.1 - len.0 + 1);
+            #[allow(clippy::cast_possible_truncation)]
+            keys.push((0..l).map(|_| b'a' + r.below(alpha) as u8).collect());
+        }
+        keys.sort();
+        keys
+    }
+
+    /// An index body over as many of `keys` as fit a `B`-byte block, its
+    /// trailer written.
+    fn index_over<const B: usize>(keys: &[Vec<u8>]) -> Vec<u8> {
+        let mut block = [0u8; B];
+        let (mut len, mut n) = (0usize, 0usize);
+        for (i, k) in keys.iter().enumerate() {
+            if append_index::<(), B>(&mut block, &mut len, i, Some(k), 100 + i as u64, 0).is_err() {
+                break;
+            }
+            n += 1;
+        }
+        write_index_tail::<(), B>(&mut block, len, n).unwrap();
+        block[..B - CRC_LEN].to_vec()
+    }
+
+    /// Every key, the key with a byte added, lowered or dropped, keys
+    /// below and above all of them, and a few random ones.
+    fn probes_for(r: &mut Rng, keys: &[Vec<u8>], alpha: usize) -> Vec<Vec<u8>> {
+        #[allow(clippy::cast_possible_truncation)]
+        let top = b'a' + alpha as u8;
+        let mut p = vec![vec![], vec![0], vec![0xff; 40], vec![b'a'], vec![top]];
+        for key in keys {
+            p.push(key.clone());
+            let mut longer = key.clone();
+            longer.push(0);
+            p.push(longer);
+            let mut lower = key.clone();
+            if let Some(b) = lower.last_mut() {
+                *b = b.saturating_sub(1);
+            }
+            p.push(lower);
+            p.push(key[..key.len() - 1].to_vec());
+        }
+        for _ in 0..30 {
+            let l = 1 + r.below(6);
+            #[allow(clippy::cast_possible_truncation)]
+            p.push((0..l).map(|_| b'a' + r.below(alpha + 1) as u8).collect());
+        }
+        p
+    }
+
+    /// Both searches of `payload` for `key`, as text, under `check`.
+    fn both(
+        payload: &[u8],
+        key: &[u8],
+        check: &mut dyn FnMut(usize, usize) -> bool,
+    ) -> (std::string::String, std::string::String) {
+        (
+            format!("{:?}", index_lookup::<()>(payload, key, 9, check)),
+            format!("{:?}", index_last_le_block::<()>(payload, key, 9, check)),
+        )
+    }
+
+    /// What a search answers depends only on the bytes it checked:
+    /// with every other byte of the block randomized, both searches give
+    /// the same answers and check no new range. So no byte the search
+    /// acts on escapes a check (ADR-0032). Key lengths 1 to 120,
+    /// duplicates, up to a full block.
+    #[test]
+    fn a_search_answers_from_the_bytes_it_checked() {
+        let mut r = Rng(0x0dd_ba11_cafe_f00d);
+        let rounds = if cfg!(debug_assertions) { 60 } else { 400 };
+        for round in 0..rounds {
+            let len = [(1, 1), (6, 6), (1, 30), (14, 14), (60, 120)][round % 5];
+            let dup = [0, 10, 60, 95][round % 4];
+            let alpha = [2, 5, 26][round % 3];
+            let n = r.below(260);
+            let keys = keys_for(&mut r, n, len, dup, alpha);
+            let payload = index_over::<BLOCK>(&keys);
+            for probe in probes_for(&mut r, &keys, alpha).iter().step_by(5) {
+                let mut seen = vec![false; payload.len()];
+                let want = both(&payload, probe, &mut |from, to| {
+                    seen[from..to].fill(true);
+                    true
+                });
+                let mut img = payload.clone();
+                for (b, _) in img.iter_mut().zip(&seen).filter(|(_, s)| !**s) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let x = r.next() as u8;
+                    *b = x;
+                }
+                let got = both(&img, probe, &mut |from, to| {
+                    assert!(seen[from..to].iter().all(|&s| s), "new range {from}..{to}");
+                    true
+                });
+                assert_eq!(got, want, "{n} keys, probe {probe:?}");
+            }
+        }
+    }
+
+    /// One bit of every byte flipped, with a check that fails exactly on
+    /// the ranges over the flip: every search answers as over the intact
+    /// block or fails, and none answers after a check failed.
+    fn flips<const B: usize>(keys: &[Vec<u8>], probes: &[Vec<u8>]) {
+        let payload = index_over::<B>(keys);
+        let want: Vec<_> = probes
+            .iter()
+            .map(|p| both(&payload, p, &mut |_, _| true))
+            .collect();
+        let mut img = payload.clone();
+        for at in 0..payload.len() {
+            for bit in 0..8 {
+                img[at] ^= 1 << bit;
+                for (probe, want) in probes.iter().zip(&want) {
+                    let mut failed = false;
+                    let mut check = |from: usize, to: usize| {
+                        let over = from <= at && at < to;
+                        failed |= over;
+                        !over
+                    };
+                    let a = index_lookup::<()>(&img, probe, 9, &mut check);
+                    if let Ok(v) = a {
+                        assert!(!failed, "an answer after a failed check");
+                        assert_eq!(
+                            format!("{:?}", Ok::<_, ()>(v)),
+                            want.0,
+                            "byte {at} bit {bit}"
+                        );
+                    }
+                    let mut failed = false;
+                    let mut check = |from: usize, to: usize| {
+                        let over = from <= at && at < to;
+                        failed |= over;
+                        !over
+                    };
+                    let b = index_last_le_block::<()>(&img, probe, 9, &mut check);
+                    if let Ok(v) = b {
+                        assert!(!failed, "an answer after a failed check");
+                        assert_eq!(
+                            format!("{:?}", Ok::<_, ()>(v)),
+                            want.1,
+                            "byte {at} bit {bit}"
+                        );
+                    }
+                }
+                img[at] ^= 1 << bit;
+            }
+        }
+    }
+
+    #[test]
+    fn a_flip_the_checks_see_never_changes_an_answer() {
+        let mut r = Rng(0xfeed_beef_1234_5677);
+        let shapes: [(usize, (usize, usize), usize, usize); 10] = [
+            (0, (1, 1), 0, 26),
+            (1, (3, 3), 0, 26),
+            (15, (3, 3), 0, 26),
+            (16, (6, 6), 0, 26),
+            (17, (6, 6), 40, 3),
+            (33, (1, 5), 50, 2),
+            (48, (14, 14), 0, 26),
+            (100, (1, 30), 30, 4),
+            (300, (6, 6), 20, 26),
+            (3000, (1, 1), 0, 26),
+        ];
+        let sample = if cfg!(debug_assertions) { 6 } else { 24 };
+        for (n, len, dup, alpha) in shapes {
+            let keys = keys_for(&mut r, n, len, dup, alpha);
+            let probes = probes_for(&mut r, &keys, alpha);
+            let step = (probes.len() / sample).max(1);
+            let probes: Vec<_> = probes.into_iter().step_by(step).collect();
+            flips::<512>(&keys, &probes);
+            if n <= 300 {
+                flips::<BLOCK>(&keys, &probes);
+            }
         }
     }
 

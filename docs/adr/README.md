@@ -44,6 +44,7 @@ history keeps it); its §9 milestone log now lives in
 | [0029](0029-atomic-batches-across-wal-blocks.md) | An atomic batch may span up to 16 WAL blocks: `SPAN` and `CONT` op-byte flags and consecutive sequence numbers tie its blocks together, recovery replays it only when all are intact, open's scrub reaches 16 blocks past where recovery stopped; manifest `hrtman10` |
 | [0030](0030-no-compression-in-shallow-levels.md) | Tables written into levels 0 and 1 store their data blocks raw (`Config::compression_from_level`, default 2): a table's blocks are packed by raw size, so compression saved no blocks there and cost a pass to write and to read |
 | [0031](0031-point-reads-check-what-they-read.md) | A point read searches a cached data block where it lies and checks against the RAM checksums only the ranges it acts on (`CachePort::with_checked`); a search that fails on unchecked bytes checks the whole image, so a RAM fault is a miss, never `CorruptBlock` |
+| [0032](0032-index-blocks-end-in-restart-offsets.md) | An index block ends in a trailer, the offset of every 16th entry and the count (`hrtsst05`, manifest `hrtman11`): a search binary-searches it and checks only the cached bytes it reads, for point reads and seeks; a shape whose index cannot hold one key's run of versions no longer builds |
 
 ## Adding a record
 

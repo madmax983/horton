@@ -129,7 +129,8 @@ or the same answers, as before.
   are at the end of the block. (Done since: ADR-0027.) Inflating only up to the key would need a
   resumable decoder and a linear search. The index search still parses
   every entry of the index, which the walk bound and the check for
-  structural corruption both use.
+  structural corruption both use. (Done since: ADR-0032, which counts
+  and locates them with a trailer.)
 
 ## References
 
