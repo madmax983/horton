@@ -76,7 +76,8 @@
 /// doc comments, which are kept. The aliases are generic where the
 /// underlying type is: `Db = Name` gives `Name<D>` for any device `D`,
 /// `Scan`/`RevScan = Name` give `Name<'d, D>`, and `Compaction = Name`
-/// gives a plain `Name`. Every alias is the same type as the positional
+/// gives a plain `Name`, as do `ScanState` and `RevScanState` (a scan's
+/// buffers kept between scans: [`Scan::detached_in`](crate::Scan::detached_in)). Every alias is the same type as the positional
 /// spelling:
 ///
 /// ```
@@ -223,5 +224,15 @@ macro_rules! __db_type_alias {
         ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
         $(#[$meta])*
         $vis type $name = $crate::ReadScratch<{ $b }>;
+    };
+    (ScanState [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name = $crate::ScanState<{ $b }, { $k }, { $v }, { $l }, { $t }>;
+    };
+    (RevScanState [$(#[$meta:meta])*] $vis:vis $name:ident
+        ($b:expr, $k:expr, $v:expr, $cap:expr, $a:expr, $l:expr, $t:expr, $bl:expr, $c:expr)) => {
+        $(#[$meta])*
+        $vis type $name = $crate::RevScanState<{ $b }, { $k }, { $v }, { $l }, { $t }>;
     };
 }

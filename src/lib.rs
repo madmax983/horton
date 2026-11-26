@@ -96,7 +96,7 @@ pub use error::Error;
 pub use fingerprint::Fingerprint;
 pub use manifest::{KeyBound, MANIFEST_MAGIC, Manifest, ManifestEdit, ManifestLayout, TableRef};
 pub use memtable::{Entry as MemTableEntry, MemTable};
-pub use scan::{RevScan, Scan, ScanBlock};
+pub use scan::{RevScan, RevScanState, Scan, ScanBlock, ScanState};
 pub use slots::{MAX_SLOTS, SlotMap};
 pub use sstable::{Lookup as SstLookup, SSTABLE_MAGIC, TableReader};
 // Low-level table construction, for tests and tooling: `Db` builds its

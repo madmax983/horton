@@ -28,6 +28,13 @@ type RevScanOver<'d, D> = RevScan<'d, D, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 
 type Page = MemTable<64, 4096, 256, 1024>;
 type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 type Manifest = horton::Manifest<7, 4, 256>;
+type State = horton::ScanState<4096, 256, 1024, 7, 4>;
+type RevState = horton::RevScanState<4096, 256, 1024, 7, 4>;
+
+thread_local! {
+    /// The states every scan of a test is built in, when it keeps one.
+    static KEPT: RefCell<Option<(Box<State>, Box<RevState>)>> = const { RefCell::new(None) };
+}
 
 fn key(i: usize) -> Vec<u8> {
     format!("key-{i:05}").into_bytes()
@@ -155,48 +162,67 @@ fn run<D: BlockDevice>(
     cache: Option<&dyn CachePort<4096>>,
     r: Run<'_>,
 ) -> Result<Entries, Error<D::Error>> {
-    let mut pool: Vec<ScanBlock<4096>> = (0..4).map(|_| ScanBlock::new()).collect();
-    let (mut k, mut v) = (vec![0u8; 256], vec![0u8; 1024]);
-    let mut out = Vec::new();
-    let take = r.limit.unwrap_or(usize::MAX);
-    if r.rev {
-        let mut scan = Box::new(RevScanOver::<D>::detached(
-            src.page,
-            src.manifest,
-            src.device,
-            cache,
-            src.node,
-        ));
-        if r.pool {
-            scan.use_block_pool(&mut pool);
+    // A kept pair of states, when the test set one: every scan of the
+    // run is built in it (ADR-0036).
+    let mut kept = KEPT.with(|k| k.borrow_mut().take());
+    let result = (|| -> Result<Entries, Error<D::Error>> {
+        let mut pool: Vec<ScanBlock<4096>> = (0..4).map(|_| ScanBlock::new()).collect();
+        let (mut k, mut v) = (vec![0u8; 256], vec![0u8; 1024]);
+        let mut out = Vec::new();
+        let take = r.limit.unwrap_or(usize::MAX);
+        if r.rev {
+            let mut scan = Box::new(match kept.as_mut() {
+                Some((_, rev)) => RevScanOver::<D>::detached_in(
+                    rev,
+                    src.page,
+                    src.manifest,
+                    src.device,
+                    cache,
+                    src.node,
+                ),
+                None => {
+                    RevScanOver::<D>::detached(src.page, src.manifest, src.device, cache, src.node)
+                }
+            });
+            if r.pool {
+                scan.use_block_pool(&mut pool);
+            }
+            block_on(scan.seek_prev(r.start, None, u64::MAX))?;
+            while out.len() < take {
+                let Some((kl, vl)) = block_on(scan.prev(&mut k, &mut v))? else {
+                    break;
+                };
+                out.push((k[..kl].to_vec(), v[..vl].to_vec()));
+            }
+        } else {
+            let mut scan = Box::new(match kept.as_mut() {
+                Some((fwd, _)) => ScanOver::<D>::detached_in(
+                    fwd,
+                    src.page,
+                    src.manifest,
+                    src.device,
+                    cache,
+                    src.node,
+                ),
+                None => {
+                    ScanOver::<D>::detached(src.page, src.manifest, src.device, cache, src.node)
+                }
+            });
+            if r.pool {
+                scan.use_block_pool(&mut pool);
+            }
+            block_on(scan.seek(r.start, None, u64::MAX))?;
+            while out.len() < take {
+                let Some((kl, vl)) = block_on(scan.next(&mut k, &mut v))? else {
+                    break;
+                };
+                out.push((k[..kl].to_vec(), v[..vl].to_vec()));
+            }
         }
-        block_on(scan.seek_prev(r.start, None, u64::MAX))?;
-        while out.len() < take {
-            let Some((kl, vl)) = block_on(scan.prev(&mut k, &mut v))? else {
-                break;
-            };
-            out.push((k[..kl].to_vec(), v[..vl].to_vec()));
-        }
-    } else {
-        let mut scan = Box::new(ScanOver::<D>::detached(
-            src.page,
-            src.manifest,
-            src.device,
-            cache,
-            src.node,
-        ));
-        if r.pool {
-            scan.use_block_pool(&mut pool);
-        }
-        block_on(scan.seek(r.start, None, u64::MAX))?;
-        while out.len() < take {
-            let Some((kl, vl)) = block_on(scan.next(&mut k, &mut v))? else {
-                break;
-            };
-            out.push((k[..kl].to_vec(), v[..vl].to_vec()));
-        }
-    }
-    Ok(out)
+        Ok(out)
+    })();
+    KEPT.with(|k| *k.borrow_mut() = kept);
+    result
 }
 
 /// A database of several tables over 3000 keys, the last of them a
@@ -331,6 +357,21 @@ fn a_bit_flipped_on_the_first_lend_only_never_changes_a_scan() {
 #[test]
 fn a_lend_that_ends_false_is_discarded_even_when_its_checks_held() {
     flip_every_byte_with(test_config(), Fault::Stuck, true);
+}
+
+/// Every scan of the run built in one kept pair of states, so each
+/// starts in buffers whose grains an earlier scan's lends checked, of
+/// blocks with the same ids: none of them is trusted, and no flip the
+/// earlier scans saw or missed changes an answer (ADR-0035, ADR-0036).
+#[test]
+fn a_kept_scan_state_trusts_no_grain_an_earlier_scan_checked() {
+    KEPT.with(|k| *k.borrow_mut() = Some((Box::new(State::new()), Box::new(RevState::new()))));
+    flip_every_byte(test_config(), Fault::Once);
+    flip_every_byte(test_config(), Fault::Stuck);
+    assert!(
+        KEPT.with(|k| k.borrow_mut().take()).is_some(),
+        "the states were kept"
+    );
 }
 
 #[test]
