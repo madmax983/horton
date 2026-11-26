@@ -37,7 +37,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
-- **`sstable::index_tail`** (ADR-0033): the bytes of trailer an index
+- **`sstable::index_tail`** (ADR-0034): the bytes of trailer an index
   block of `n` entries ends with, `2 + 2⌈n/16⌉`, for sizing a table's
   index.
 - **`CachePort::with_checked`** and **`cache::CheckedRead`** (ADR-0031):
@@ -180,7 +180,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 ### Changed
 
 - **An index block ends in restart offsets, and its search checks only
-  the cached bytes it reads** (ADR-0033). The block now ends in the
+  the cached bytes it reads** (ADR-0034). The block now ends in the
   offset of every 16th entry and the entry count; a search
   binary-searches them and scans at most 16 entries, where it parsed
   every entry. A cached index block is lent with a check, as a data
@@ -273,7 +273,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   hand over all slots, as before.
 - An index-block search parses the index once. It used to re-parse it
   from the start for every step of a binary search, about 2,000 entry
-  parses for a full 16 KiB index. (Since ADR-0033 it reads one run of
+  parses for a full 16 KiB index. (Since ADR-0034 it reads one run of
   at most 16 entries.)
 - `CachePort` has a new required method, `get_range_into`, and
   `CacheStats` a new field, `rejected`.
@@ -387,6 +387,15 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   a message that starts "the store is open already". `Store::destroy`
   deletes a closed store under its lock; `demo`, `bench` and `crash` use
   it (ADR-0032, issue #44).
+- **The host store refuses bad input before it writes** (ADR-0033,
+  issue #46). An open with too few blocks for the shape does not size
+  the file, and gives `StoreError::TooSmall`. Its message names the
+  remedy, and the CLI gives the `--size-mb` to use. A CLI usage error
+  or inverted range opens no store, and too many arguments is a usage
+  error. An inverted
+  range (`start > end`) in `delete_range`, `scan` or `range` gives
+  `StoreError::InvertedRange`; an empty range is not an error. A huge
+  `--size-mb` is an error, not an overflow.
 - **An image of another format version is rejected even when one of its
   manifest copies is blank.** Such a copy read as damaged, and beside a
   blank one the device read as fresh: the WAL replayed over tables the

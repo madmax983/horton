@@ -1,4 +1,4 @@
-# ADR-0033: Index blocks end in restart offsets, and a search checks what it reads
+# ADR-0034: Index blocks end in restart offsets, and a search checks what it reads
 
 Status: Accepted (unreleased, 2026-11-26)
 

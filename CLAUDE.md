@@ -46,8 +46,9 @@ cargo run --release --example kvstore -- demo
 cargo run --release --example kvstore -- crash 25
 cargo run --release --example kvstore -- --no-sync crash 25
 cargo run --release --example kvstore -- --no-sync bench --num 30000
-# plus the put/get/scan/del/delrange/compact checks and the two-opener
-# race (issue 44) in ci.yml's kvstore job
+# plus the put/get/scan/del/delrange/compact checks, the bad-input
+# checks (issue 46) and the two-opener race (issue 44) in ci.yml's
+# kvstore job
 ```
 
 The kvstore's `FileDevice` has `cfg(unix)` and `cfg(windows)` halves;

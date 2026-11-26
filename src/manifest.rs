@@ -63,7 +63,7 @@ use crate::error::Error;
 /// drop a spanning group and every write after it and write over them;
 /// it must not open the image, and this one must not open an older
 /// image's. "hrtman11" (v0.20) names tables in the `hrtsst05` format,
-/// whose index blocks end in a trailer of restart offsets (ADR-0033): a
+/// whose index blocks end in a trailer of restart offsets (ADR-0034): a
 /// `Db` reads no footer, so the manifest's magic is what keeps an image
 /// of `hrtsst04` tables from being searched by the new rule. A foreign
 /// magic decodes

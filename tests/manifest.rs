@@ -217,7 +217,7 @@ fn a_v019_manifest_is_rejected_not_misparsed() {
     // filter, then a filter that may span blocks: `hrtsst04`) and records
     // each table's bloom section, and its WAL groups may span blocks
     // (ADR-0029), and its tables' index blocks end in restart offsets
-    // (`hrtsst05`, ADR-0033), so the magic is "hrtman11". A v0.19 image
+    // (`hrtsst05`, ADR-0034), so the magic is "hrtman11". A v0.19 image
     // ("hrtman06"), and one from an unreleased v0.20 build ("hrtman07" to
     // "hrtman10"),
     // is refused when it is opened, before any of its tables or its WAL

@@ -1,5 +1,5 @@
 //! A scan's seek searches a cached index block range by range
-//! (ADR-0033). A detached scan, forward and reverse, through a cache
+//! (ADR-0034). A detached scan, forward and reverse, through a cache
 //! whose RAM copy of an index block has one bit flipped yields exactly
 //! what an uncached scan yields: a flip the search reads fails its check
 //! and the block is read from the device again.
