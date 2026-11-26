@@ -192,13 +192,21 @@ does compaction, which reads past the cache.
     - dropping the entry check, the restart-array check, the reverse
       walk's check, the padding check or the lookahead.
 
-    Three mutants survive as equivalent:
+    Two more were found by the third review (below), and their tests
+    added:
+    - `complete` keeping a lend that returned `Some(false)` after every
+      check it asked held, which the `with_checked` contract allows;
+    - `load_with` lending a partial buffer's block again instead of
+      completing it.
+
+    Four mutants survive as equivalent:
     - copying before the check: a failed check fails the whole lend,
       and nothing is kept;
     - `victim` keeping `valid`: `valid` is meaningful only under a tag,
       and every tag sets it;
-    - `complete` committing on a failed lend: a failed check ends the
-      copy loop before the map is full.
+    - a lookahead taken by every gate: only a lend's does anything;
+    - `held` parsing a full buffer through the buffer gate: the same
+      answer, with one extra lookup on an error.
 
 - **Review.** An adversarial review checked the gates byte by byte, the
   rule for believing an error, the `id` and `valid` bookkeeping, the
@@ -241,6 +249,19 @@ does compaction, which reads past the cache.
       names the padding.
       `a_seek_onto_a_blocks_last_entry_takes_its_padding` fails without
       it.
+  - Measuring then showed full scans 5% to 9% slower in wall clock, with
+    flat instructions and fewer simulated cache misses. Two changes
+    brought forward scans level and reverse scans to within 3%:
+    - The gate became an enum, so a check over a whole buffer is a
+      branch rather than a call.
+    - A step over a block the scan holds runs synchronously
+      (`Blocks::held`), so it builds no future carrying the device
+      read.
+  - A third round reviewed those changes and re-ran the mutants against
+    them. It found no wrong answer, and found the two test gaps above.
+    `loaded` now asserts, in debug builds, that no two buffers hold one
+    block. `held` and `lend_into` fail closed if a parser ever swaps
+    its gate.
 
 ## References
 

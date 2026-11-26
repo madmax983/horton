@@ -478,6 +478,15 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
     fn loaded(&mut self, id: u64, valid: u64) {
         self.tick += 1;
         let tick = self.tick;
+        // At most one buffer holds a block: a buffer is filled only when
+        // `find` found none for it, or refilled in place (`complete`).
+        debug_assert!(
+            core::iter::once(&self.own)
+                .chain(self.pool.iter())
+                .enumerate()
+                .all(|(at, b)| at == self.cur || b.id != Some(id)),
+            "block {id} in two buffers"
+        );
         let block = self.slot_mut(self.cur);
         block.id = Some(id);
         block.used = tick;
@@ -578,8 +587,9 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             missed: false,
         });
         let answer = f(&block.data, &mut gate);
-        let missed = matches!(gate, Gate::Held(Gated { missed: true, .. }));
-        (!missed && answer.is_ok()).then_some(answer)
+        // Fails closed: only a buffer gate that saw no miss vouches.
+        let held = matches!(gate, Gate::Held(Gated { missed: false, .. }));
+        (held && answer.is_ok()).then_some(answer)
     }
 
     /// [`value_into`](Self::value_into) from a buffer that holds the
@@ -670,12 +680,15 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
                 check,
             });
             let parsed = f(image, &mut gate);
-            if let Gate::Lent(c) = gate {
-                if parsed.is_err() {
-                    let _ = (c.check)(0, BLOCK);
-                }
-                valid = c.valid;
+            // Fails closed: a gate that is no longer the lend's answers
+            // nothing, and the lend is a miss.
+            let Gate::Lent(c) = gate else {
+                return;
+            };
+            if parsed.is_err() {
+                let _ = (c.check)(0, BLOCK);
             }
+            valid = c.valid;
             answer = Some(parsed);
         });
         match (lent, answer) {
@@ -3439,5 +3452,51 @@ mod tests {
         holds::<4096>();
         holds::<16384>();
         holds::<64>();
+    }
+
+    /// `held` answers from a buffer only what it can stand behind: a
+    /// whole buffer's answer, error or not; a partial buffer's answer
+    /// when its parse stayed inside the grains it holds and succeeded.
+    /// Otherwise it leaves the buffer current, for `load_with` to take
+    /// the rest of the block.
+    #[test]
+    fn held_answers_only_from_what_it_holds() {
+        use super::{Blocks, ScanBlock};
+        const B: usize = 4096;
+        let mut pool = [ScanBlock::<B>::new(), ScanBlock::<B>::new()];
+        let mut blocks = Blocks::<B>::new();
+        blocks.lend(&mut pool);
+        // own: block 9, whole. pool[0]: block 7, grain 0 only.
+        blocks.own.id = Some(9);
+        blocks.own.valid = full::<B>();
+        blocks.pool[0].id = Some(7);
+        blocks.pool[0].valid = 1;
+        let mut calls = 0;
+        let mut err = |_: &[u8; B], g: &mut Gate<'_, '_, B>| -> R<u8> {
+            calls += 1;
+            assert!(!g.takes_ahead());
+            Err(Error::CorruptBlock { id: 0 })
+        };
+        // Whole: the error stands.
+        assert!(matches!(blocks.held(9, &mut err), Some(Err(_))));
+        assert_eq!(blocks.current().id, Some(9));
+        // Partial, an error without a miss: not believed, buffer current.
+        assert!(blocks.held(7, &mut err).is_none());
+        assert_eq!(blocks.current().id, Some(7));
+        // Not held: the current buffer is not its.
+        assert!(blocks.held(5, &mut err).is_none());
+        assert_ne!(blocks.current().id, Some(5));
+        assert_eq!(calls, 2);
+        // Partial, a parse inside what it holds: believed.
+        let mut ok = |_: &[u8; B], g: &mut Gate<'_, '_, B>| -> R<u8> {
+            Ok(u8::from(g.check(0, grain::<B>())))
+        };
+        assert!(matches!(blocks.held(7, &mut ok), Some(Ok(1))));
+        // Partial, a parse that reaches past it: a miss, even if Ok.
+        let mut past = |_: &[u8; B], g: &mut Gate<'_, '_, B>| -> R<u8> {
+            Ok(u8::from(g.check(0, grain::<B>() + 1)))
+        };
+        assert!(blocks.held(7, &mut past).is_none());
+        assert_eq!(blocks.current().id, Some(7));
     }
 }

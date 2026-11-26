@@ -68,6 +68,11 @@ struct FlipCache {
     lent_flipped: Cell<u64>,
     lookups: Cell<u64>,
     misses: Cell<u64>,
+    /// Checks answer `true` and the lend's result says whether they
+    /// held: a cache that verifies its sums once the read is done, as
+    /// the `CachePort::with_checked` contract allows (`Some(false)`:
+    /// whatever `read` made of the image is discarded).
+    defer: Cell<bool>,
 }
 
 impl CachePort<4096> for FlipCache {
@@ -104,7 +109,7 @@ impl CachePort<4096> for FlipCache {
         read(&lent, &mut |from, to| {
             let good = ok && (to <= from || (to <= 4096 && lent[from..to] == pristine[from..to]));
             ok &= good;
-            good
+            good || self.defer.get()
         });
         if !ok {
             self.images.borrow_mut().remove(&(t, b));
@@ -239,6 +244,10 @@ fn data_blocks(m: &Manifest) -> HashSet<u64> {
 }
 
 fn flip_every_byte(config: Config, fault: Fault) {
+    flip_every_byte_with(config, fault, false);
+}
+
+fn flip_every_byte_with(config: Config, fault: Fault, defer: bool) {
     let db = build(config);
     let manifest = *db.manifest();
     let device = db.device().clone();
@@ -284,6 +293,7 @@ fn flip_every_byte(config: Config, fault: Fault) {
     // A reverse scan from below the first key yields nothing; the rest do.
     assert!(want.iter().filter(|w| w.is_empty()).count() <= 8);
     let cache = FlipCache::default();
+    cache.defer.set(defer);
     *cache.targets.borrow_mut() = data_blocks(&manifest);
     for &r in &runs {
         run(&src, Some(&cache), r).unwrap();
@@ -312,6 +322,15 @@ fn a_stuck_bit_in_a_raw_data_block_never_changes_a_scan() {
 #[test]
 fn a_bit_flipped_on_the_first_lend_only_never_changes_a_scan() {
     flip_every_byte(test_config(), Fault::Once);
+}
+
+/// A lend that returns `Some(false)` is discarded whole, even when
+/// every check it was asked answered `true`. Found by mutation (r3,
+/// mutant 9): `Blocks::complete` kept the grains of a lend that ended
+/// `Some(false)` once they made the buffer whole.
+#[test]
+fn a_lend_that_ends_false_is_discarded_even_when_its_checks_held() {
+    flip_every_byte_with(test_config(), Fault::Stuck, true);
 }
 
 #[test]
@@ -460,5 +479,64 @@ fn a_seek_onto_a_blocks_last_entry_takes_its_padding() {
             data <= if last { 1 } else { 2 },
             "key {n}: {data} data-block lookups"
         );
+    }
+}
+
+/// A seek takes the few grains of its data block it reads; the first
+/// step past them takes the rest of that block in one lend, after which
+/// every step over the block is parsed in the buffer. A scan through a
+/// table from a seek therefore asks the cache for each data block at
+/// most twice (the seek's block) or once (every later block), plus
+/// index blocks. Found by mutation (r3, mutant 3): a step over a buffer
+/// that held only part of its block lent the block again, partially,
+/// on every step that went past what the buffer held.
+#[test]
+fn a_scan_takes_the_rest_of_its_seek_block_in_one_lend() {
+    let db = build(test_config());
+    let manifest = *db.manifest();
+    let device = db.device().clone();
+    let page = Box::new(Page::new());
+    let deepest = (1..7)
+        .rev()
+        .find(|&l| manifest.level(l).is_some_and(|t| !t.is_empty()))
+        .unwrap();
+    let mut solo = Manifest::new();
+    for t in manifest.level(deepest).unwrap() {
+        solo.add_table_to_level::<()>(deepest, *t).unwrap();
+    }
+    let src = Src {
+        page: &page,
+        manifest: &solo,
+        device: &device,
+        node: db.node_id(),
+    };
+    let cache = FlipCache::default();
+    let all = Run {
+        rev: false,
+        start: b"",
+        limit: None,
+        pool: false,
+    };
+    let want = run(&src, Some(&cache), all).unwrap();
+    for pool in [false, true] {
+        for i in [3usize, 700, 1500] {
+            let k = key(i);
+            let r = Run {
+                rev: false,
+                start: &k,
+                limit: Some(60),
+                pool,
+            };
+            let before = (cache.lookups.get(), cache.misses.get());
+            let got = run(&src, Some(&cache), r).unwrap();
+            let from = want.iter().position(|(w, _)| *w >= k).unwrap();
+            assert_eq!(got, want[from..from + 60]);
+            assert_eq!(cache.misses.get(), before.1, "seek {i}");
+            let asked = cache.lookups.get() - before.0;
+            // 60 entries of 20-120 bytes span at most three 4 KiB
+            // blocks: their lends, one more for the seek block's rest,
+            // and the index blocks.
+            assert!(asked <= 8, "pool {pool} seek {i}: {asked} lookups");
+        }
     }
 }
