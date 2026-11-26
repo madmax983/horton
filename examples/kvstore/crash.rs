@@ -450,6 +450,6 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
     println!("after compacting       {} keys, unchanged", actual.len());
     println!("time                   {:.1?}", started.elapsed());
     drop(store);
-    let _ = std::fs::remove_file(&common.db);
+    Store::destroy(&common.db);
     Ok(())
 }

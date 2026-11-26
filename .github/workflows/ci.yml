@@ -203,6 +203,22 @@ jobs:
           kv delrange a c
           test "$(kv scan)" = "c = 3"
           kv compact
+      - name: two openers at once (issue 44)
+        # Pairs of puts at the same time. A put that exits 0 is in the
+        # store; a put that fails gives the lock error.
+        run: |
+          K=target/release/examples/kvstore; D=target/kvstore; DB=$D/race.db
+          rm -f "$DB" "$DB.lock"; "$K" --db "$DB" --size-mb 128 stats > /dev/null
+          check() { # key, exit status of its put
+            if [ "$2" = 0 ]; then test "$("$K" --db "$DB" get "$1")" = 1
+            else grep -q "open already" "$D/$1.err"; fi
+          }
+          for i in $(seq 1 20); do
+            "$K" --db "$DB" put "a$i" 1 2> "$D/a$i.err" & a=$!
+            "$K" --db "$DB" put "b$i" 1 2> "$D/b$i.err" & b=$!
+            sa=0; wait "$a" || sa=$?; sb=0; wait "$b" || sb=$?
+            check "a$i" "$sa"; check "b$i" "$sb"
+          done
       - name: crash test (fdatasync on)
         run: cargo run --release --example kvstore -- crash 25
       - name: crash test (no fdatasync, so more flushes and compactions per kill)

@@ -114,7 +114,7 @@ use horton::{
 };
 
 use crate::cache::SharedCache;
-use crate::device::{FileDevice, IoError, IoStats, ReadDevice};
+use crate::device::{FileDevice, IoError, IoStats, ReadDevice, StoreLock};
 use crate::gate::{Gate, Pin, Slot};
 use crate::handoff::{Handoff, Next};
 use crate::{
@@ -1332,6 +1332,9 @@ pub struct Handle {
 pub struct Store {
     handle: Handle,
     threads: Vec<JoinHandle<()>>,
+    /// Released after [`Drop`] has closed the store: fields drop after
+    /// `drop` returns.
+    _lock: StoreLock,
 }
 
 impl core::ops::Deref for Store {
@@ -1378,6 +1381,9 @@ impl Store {
     /// Opens (or creates) the store in the file at `path`, recovering it
     /// if the last process died mid-write.
     pub fn open(path: &Path, options: Options) -> Result<(Self, OpenReport), StoreError> {
+        // Lock first: two openers must not both set a new file's size.
+        let lock = StoreLock::acquire(path)
+            .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
         let device = FileDevice::open(path, options.create_blocks, options.sync)
             .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
         // The database is built on the stack before it is boxed, and it
@@ -1428,6 +1434,7 @@ impl Store {
         let mut store = Self {
             handle: Handle { shared },
             threads: Vec::new(),
+            _lock: lock,
         };
         for lane in 0..COMPACTION_LANES {
             // Each compaction thread's own handle to the file. Opened,
@@ -1443,6 +1450,16 @@ impl Store {
             store.threads.push(thread);
         }
         Ok((store, report))
+    }
+
+    /// Deletes the files of the store at `path`: the store and its lock
+    /// file. Call it only when no process has the store open. Errors are
+    /// ignored: a file that is not there is already deleted.
+    pub fn destroy(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        if let Ok(lock) = crate::device::lock_path(path) {
+            let _ = std::fs::remove_file(lock);
+        }
     }
 
     /// A handle for another thread.
@@ -2338,12 +2355,15 @@ mod tests {
             Self { store, path }
         }
 
-        fn open_at(path: &Path) -> Store {
-            let options = Options {
+        fn options() -> Options {
+            Options {
                 create_blocks: KvDb::<FileDevice>::MIN_DEVICE_BLOCKS + 64,
                 sync: false,
-            };
-            Store::open(path, options).expect("open").0
+            }
+        }
+
+        fn open_at(path: &Path) -> Store {
+            Store::open(path, Self::options()).expect("open").0
         }
 
         fn reopen(&mut self) {
@@ -2362,7 +2382,7 @@ mod tests {
     impl Drop for TempStore {
         fn drop(&mut self) {
             drop(self.store.take());
-            let _ = std::fs::remove_file(&self.path);
+            Store::destroy(&self.path);
         }
     }
 
@@ -2698,6 +2718,55 @@ mod tests {
         drop(snapshot);
         // The reopened store has the write, and none of the refused ones.
         assert_eq!(store.get(b"k").expect("get"), Some(b"v".to_vec()));
+    }
+
+    /// Issue #44: one opener at a time. A second open of an open store
+    /// fails, and the first store keeps all its writes.
+    #[test]
+    fn a_second_open_of_an_open_store_is_refused() {
+        let store = TempStore::new("open-twice");
+        store.put(b"a", b"1").expect("put");
+        match Store::open(&store.path, TempStore::options()).err() {
+            Some(StoreError::Open(e)) => assert!(e.contains("open already"), "{e}"),
+            Some(e) => panic!("wrong error: {e}"),
+            None => panic!("a second open of an open store succeeded"),
+        }
+        store.put(b"b", b"2").expect("put");
+        assert_eq!(store.get(b"a").expect("get"), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"b").expect("get"), Some(b"2".to_vec()));
+    }
+
+    /// An open that is refused does not set the size of a new file: a
+    /// second opener cannot change the shape of a store that the first
+    /// opener creates.
+    #[test]
+    fn a_refused_open_does_not_size_a_new_file() {
+        let path = std::env::temp_dir().join(format!(
+            "horton-kvstore-{}-refused-new.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let held = StoreLock::acquire(&path).expect("lock");
+        let second = Store::open(&path, TempStore::options()).err();
+        let len = std::fs::metadata(&path).expect("metadata").len();
+        drop(held);
+        Store::destroy(&path);
+        assert!(matches!(second, Some(StoreError::Open(_))), "{second:?}");
+        assert_eq!(len, 0);
+    }
+
+    /// A symbolic link to an open store is the same store: its open
+    /// fails too.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_an_open_store_is_refused() {
+        let store = TempStore::new("open-via-link");
+        let link = store.path.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&store.path, &link).expect("symlink");
+        let second = Store::open(&link, TempStore::options()).err();
+        let _ = std::fs::remove_file(&link);
+        assert!(matches!(second, Some(StoreError::Open(_))), "{second:?}");
     }
 
     /// Reads, writes, scans and a forced compaction from many threads at

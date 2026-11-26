@@ -225,7 +225,7 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
     print_stats(&store)?;
     drop(store);
     // Leave no 256 MiB file behind (it is sparse, but still).
-    let _ = std::fs::remove_file(&common.db);
+    Store::destroy(&common.db);
     Ok(())
 }
 

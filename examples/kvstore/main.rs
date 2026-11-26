@@ -13,7 +13,8 @@
 //!
 //! The store is one file (default `target/kvstore/kv.db`, `--db PATH`),
 //! created sparse at `--size-mb` (default 256) and horton's device from
-//! then on. `store.rs` turns horton's single-owner `Db` into a shared
+//! then on. One process at a time opens it: a second opener gets an
+//! error (ADR-0032). `store.rs` turns horton's single-owner `Db` into a shared
 //! handle with group commit and background compaction; `device.rs` is the
 //! file-backed block device; `bench.rs` and `crash.rs` are the benchmark
 //! and the crash test. `vs-rocksdb.sh` runs the benchmark against
@@ -409,7 +410,7 @@ fn demo(common: &Common) -> Result<(), String> {
         "3499 users after reopen",
     )?;
     drop(store);
-    let _ = std::fs::remove_file(&common.db);
+    Store::destroy(&common.db);
     println!("\ndemo passed");
     Ok(())
 }
