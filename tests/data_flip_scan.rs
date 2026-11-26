@@ -34,6 +34,10 @@ type RevState = horton::RevScanState<4096, 256, 1024, 7, 4>;
 thread_local! {
     /// The states every scan of a test is built in, when it keeps one.
     static KEPT: RefCell<Option<(Box<State>, Box<RevState>)>> = const { RefCell::new(None) };
+    /// A twin of the store a test scans (see [`build_with`]): when set,
+    /// every run over kept states first scans the twin through them,
+    /// so the states hold blocks with the same ids and other bytes.
+    static TWIN: RefCell<Option<TestDb<MemDevice<4096>>>> = const { RefCell::new(None) };
 }
 
 fn key(i: usize) -> Vec<u8> {
@@ -157,6 +161,41 @@ struct Src<'a, D> {
     node: u32,
 }
 
+/// One run `r` over `twin`, uncached, in the kept states: it leaves in
+/// them the twin's blocks, under the ids the run that follows reads.
+fn twin_scan(twin: &TestDb<MemDevice<4096>>, (fwd, rev): (&mut State, &mut RevState), r: Run<'_>) {
+    let page = Box::new(Page::new());
+    let manifest = *twin.manifest();
+    let mut pool: Vec<ScanBlock<4096>> = (0..4).map(|_| ScanBlock::new()).collect();
+    let (mut k, mut v) = (vec![0u8; 256], vec![0u8; 1024]);
+    let take = r.limit.unwrap_or(usize::MAX);
+    let device = twin.device();
+    if r.rev {
+        let mut scan =
+            RevScanOver::detached_in(rev, &page, &manifest, device, None, twin.node_id());
+        if r.pool {
+            scan.use_block_pool(&mut pool);
+        }
+        block_on(scan.seek_prev(r.start, None, u64::MAX)).unwrap();
+        for _ in 0..take {
+            if block_on(scan.prev(&mut k, &mut v)).unwrap().is_none() {
+                break;
+            }
+        }
+    } else {
+        let mut scan = ScanOver::detached_in(fwd, &page, &manifest, device, None, twin.node_id());
+        if r.pool {
+            scan.use_block_pool(&mut pool);
+        }
+        block_on(scan.seek(r.start, None, u64::MAX)).unwrap();
+        for _ in 0..take {
+            if block_on(scan.next(&mut k, &mut v)).unwrap().is_none() {
+                break;
+            }
+        }
+    }
+}
+
 fn run<D: BlockDevice>(
     src: &Src<'_, D>,
     cache: Option<&dyn CachePort<4096>>,
@@ -165,6 +204,13 @@ fn run<D: BlockDevice>(
     // A kept pair of states, when the test set one: every scan of the
     // run is built in it (ADR-0036).
     let mut kept = KEPT.with(|k| k.borrow_mut().take());
+    if let Some((fwd, rev)) = kept.as_mut() {
+        TWIN.with(|t| {
+            if let Some(twin) = t.borrow().as_ref() {
+                twin_scan(twin, (fwd, rev), r);
+            }
+        });
+    }
     let result = (|| -> Result<Entries, Error<D::Error>> {
         let mut pool: Vec<ScanBlock<4096>> = (0..4).map(|_| ScanBlock::new()).collect();
         let (mut k, mut v) = (vec![0u8; 256], vec![0u8; 1024]);
@@ -229,12 +275,22 @@ fn run<D: BlockDevice>(
 /// flushed table that overlaps the others, so a merge turns between
 /// tables and a scan's one buffer is taken back and forth.
 fn build(config: Config) -> TestDb<MemDevice<4096>> {
+    build_with(config, false)
+}
+
+/// [`build`], with every value upper-cased when `upper`: the same keys,
+/// lengths and writes, so the same tables in the same blocks, holding
+/// other bytes.
+fn build_with(config: Config, upper: bool) -> TestDb<MemDevice<4096>> {
     let mut db = TestDb::new(MemDevice::<4096>::new(), config);
     block_on(db.open()).unwrap();
     let mut rng = Lcg::new(0xDA7A_F11F);
     let put = |db: &mut TestDb<MemDevice<4096>>, rng: &mut Lcg| {
         let k = key(rng.next_bounded(3000));
-        let fill = b"abcdefghijklmnopqrstuvwxyz"[rng.next_bounded(26)];
+        let mut fill = b"abcdefghijklmnopqrstuvwxyz"[rng.next_bounded(26)];
+        if upper {
+            fill = fill.to_ascii_uppercase();
+        }
         let val = vec![fill; 20 + rng.next_bounded(100)];
         for attempt in 0..2 {
             match block_on(db.put(&k, &val)) {
@@ -359,15 +415,18 @@ fn a_lend_that_ends_false_is_discarded_even_when_its_checks_held() {
     flip_every_byte_with(test_config(), Fault::Stuck, true);
 }
 
-/// Every scan of the run built in one kept pair of states, so each
-/// starts in buffers whose grains an earlier scan's lends checked, of
-/// blocks with the same ids: none of them is trusted, and no flip the
+/// Every scan of the run built in one kept pair of states, each after a
+/// scan of a twin store through them: so each starts in buffers that
+/// hold blocks of the same ids with other bytes, and grains an earlier
+/// scan's lends checked. None of them is trusted, and no flip the
 /// earlier scans saw or missed changes an answer (ADR-0035, ADR-0036).
 #[test]
 fn a_kept_scan_state_trusts_no_grain_an_earlier_scan_checked() {
     KEPT.with(|k| *k.borrow_mut() = Some((Box::new(State::new()), Box::new(RevState::new()))));
+    TWIN.with(|t| *t.borrow_mut() = Some(build_with(test_config(), true)));
     flip_every_byte(test_config(), Fault::Once);
     flip_every_byte(test_config(), Fault::Stuck);
+    TWIN.with(|t| t.borrow_mut().take());
     assert!(
         KEPT.with(|k| k.borrow_mut().take()).is_some(),
         "the states were kept"

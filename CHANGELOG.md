@@ -37,6 +37,12 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`ScanState`, `RevScanState`, `Scan::detached_in` and
+  `RevScan::detached_in`** (ADR-0036): a detached scan built in buffers
+  and cursors its caller keeps between scans, so that building one
+  zeroes nothing. A scan in a kept state yields what a new one yields.
+  `db_types!` takes `ScanState` and `RevScanState` alias kinds.
+  `Scan::new` and `Scan::detached` are unchanged.
 - **`CachePort::checks_ranges`** (ADR-0035): whether `with_checked`
   checks only the ranges it is asked about. A scan then takes from a
   lent block only what it reads, and otherwise takes each block whole
@@ -185,6 +191,17 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **The host store keeps a scan state per reader thread** (ADR-0036). A
+  page used to build a fresh scan, zeroing some 44 KiB; each thread now
+  keeps one forward and one reverse state and builds its pages' scans
+  in them. A seek takes 39,400 fewer instructions (−38% at 300 K keys,
+  −22% at 1 M), and one-thread seeks at 1 M keys are 8% to 12% faster
+  (docs/THROUGHPUT.md, step 25). Each scanning thread keeps about
+  86 KiB more.
+- **A reverse seek forgets its decoded blocks**, as a forward seek
+  does. Nothing it yields changes.
+- **`Scan` is a key buffer smaller**: the copy of the start key, which
+  nothing read, is gone (40 bytes on the ESP32-S3 profile).
 - **A scan copies from a cached data block only what it checks**
   (ADR-0035). It used to sum a block's RAM checksums whole, copy it
   twice, and walk it from its first entry to the seek key.
@@ -405,6 +422,13 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Fixed
 
+- **A step after a failed seek yields no stale cursor.** A forward seek
+  counted a table's cursor slot before reading the cursor into place,
+  so a seek that failed there (a device error on the index block) left
+  an earlier seek's cursor counted, and a `next` without a new seek
+  could yield its head. The slot is now emptied first (found in the
+  review of ADR-0036, where a kept state made it reachable across
+  scans).
 - **A scan that retries after a failed device read gets the right
   value.** A forward cursor that crossed two blocks in one step (the
   first with nothing visible at the scan's snapshot) was moved to the

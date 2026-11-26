@@ -47,6 +47,7 @@ history keeps it); its §9 milestone log now lives in
 | [0033](0033-host-store-refuses-bad-input-first.md) | The host store checks its input before it writes: a size too small for the shape gives `StoreError::TooSmall` and leaves the file unsized; a CLI usage error or inverted range creates no file; `delete_range` and scans refuse `start > end` |
 | [0034](0034-index-blocks-end-in-restart-offsets.md) | An index block ends in a trailer, the offset of every 16th entry and the count (`hrtsst05`, manifest `hrtman11`): a search binary-searches it and checks only the cached bytes it reads, for point reads and seeks; a shape whose index cannot hold one key's run of versions no longer builds |
 | [0035](0035-scans-copy-only-what-they-check.md) | A scan keeps a map of the grains of each block buffer it has checked, copies from a cached data block only what it checks as it reads it (`CopyIn`), and takes the rest only when it reads further; a forward seek positions by the block's restarts; `CachePort::checks_ranges` |
+| [0036](0036-scans-over-a-kept-state.md) | A scan can be built in buffers its caller keeps (`ScanState`, `RevScanState`, `Scan::detached_in`): everything that decides whether a byte of them is read stays in the scan and starts fresh; the host store keeps one forward and one reverse state per reader thread, so a page zeroes nothing |
 
 ## Adding a record
 

@@ -1027,3 +1027,136 @@ fn a_kept_scan_state_carries_nothing_from_one_scan_to_the_next() {
         }
     }
 }
+
+/// A device that fails reads of the blocks in `bad`.
+struct FailOn<'a> {
+    inner: &'a MemDevice<4096>,
+    bad: std::collections::HashSet<u64>,
+}
+
+impl BlockDevice for FailOn<'_> {
+    type Error = &'static str;
+    const BLOCK: usize = 4096;
+    fn poll_read_block(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        if self.bad.contains(&id) {
+            return core::task::Poll::Ready(Err("bad block"));
+        }
+        self.inner
+            .poll_read_block(cx, id, buf)
+            .map(|r| r.map_err(|e| match e {}))
+    }
+    fn poll_write_block(
+        &mut self,
+        _cx: &mut core::task::Context<'_>,
+        _id: u64,
+        _buf: &[u8],
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        core::task::Poll::Ready(Err("read only"))
+    }
+    fn poll_flush(
+        &mut self,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        core::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// What a step after a failed seek gave: the entry, or that it failed.
+fn step_after<E: core::fmt::Debug>(
+    r: Result<Option<(usize, usize)>, Error<E>>,
+    (k, v): (&[u8], &[u8]),
+) -> Result<Option<Entries>, String> {
+    r.map(|o| o.map(|(kl, vl)| vec![(k[..kl].to_vec(), v[..vl].to_vec())]))
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A seek that fails part-way over a kept state, then a step without a
+/// new seek, does what it does on a fresh scan: no cursor an earlier
+/// scan left in the state is counted, so the step cannot yield that
+/// scan's head. Found in review of ADR-0036: a forward seek counted a
+/// table's cursor slot before reading it into place.
+#[test]
+fn a_failed_seek_over_a_kept_state_yields_what_a_fresh_one_does() {
+    let db = twin(b'x');
+    let manifest = *db.manifest();
+    let mut page = Box::new(Page::<64, 4096>::new());
+    let from = key(151);
+    let (mut k, mut v) = ([0u8; 256], [0u8; 1024]);
+    let good = FailOn {
+        inner: db.device(),
+        bad: std::collections::HashSet::new(),
+    };
+    let failing = FailOn {
+        inner: db.device(),
+        bad: (0..7)
+            .flat_map(|li| manifest.level(li).unwrap_or(&[]))
+            .map(|t| t.index_block().unwrap())
+            .collect(),
+    };
+    let empty = Box::new(Page::<64, 4096>::new());
+    let mut state = Box::new(State::new());
+    let mut rev_state = Box::new(RevState::new());
+    // Forward.
+    db.copy_memtable_range(&from, None, 10_000, &mut page)
+        .unwrap();
+    {
+        let mut scan =
+            ScanOver::<_, 64, 4096>::detached_in(&mut state, &page, &manifest, &good, None, 1);
+        block_on(scan.seek(&from, None, u64::MAX)).unwrap();
+        assert!(block_on(scan.next(&mut k, &mut v)).unwrap().is_some());
+    }
+    let kept = {
+        let mut scan =
+            ScanOver::<_, 64, 4096>::detached_in(&mut state, &empty, &manifest, &failing, None, 1);
+        assert!(block_on(scan.seek(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.next(&mut k, &mut v)), (&k, &v))
+    };
+    let fresh = {
+        let mut scan = Box::new(ScanOver::<_, 64, 4096>::detached(
+            &empty, &manifest, &failing, None, 1,
+        ));
+        assert!(block_on(scan.seek(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.next(&mut k, &mut v)), (&k, &v))
+    };
+    assert_eq!(kept, fresh, "forward");
+    // Reverse.
+    db.copy_memtable_range_rev(&from, None, 10_000, &mut page)
+        .unwrap();
+    {
+        let mut scan = RevScanOver::<_, 64, 4096>::detached_in(
+            &mut rev_state,
+            &page,
+            &manifest,
+            &good,
+            None,
+            1,
+        );
+        block_on(scan.seek_prev(&from, None, u64::MAX)).unwrap();
+        assert!(block_on(scan.prev(&mut k, &mut v)).unwrap().is_some());
+    }
+    let kept = {
+        let mut scan = RevScanOver::<_, 64, 4096>::detached_in(
+            &mut rev_state,
+            &empty,
+            &manifest,
+            &failing,
+            None,
+            1,
+        );
+        assert!(block_on(scan.seek_prev(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.prev(&mut k, &mut v)), (&k, &v))
+    };
+    let fresh = {
+        let mut scan = Box::new(RevScanOver::<_, 64, 4096>::detached(
+            &empty, &manifest, &failing, None, 1,
+        ));
+        assert!(block_on(scan.seek_prev(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.prev(&mut k, &mut v)), (&k, &v))
+    };
+    assert_eq!(kept, fresh, "reverse");
+}

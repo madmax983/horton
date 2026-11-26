@@ -233,7 +233,6 @@ struct ScanKeys<
     const LEVELS: usize,
     const TABLES: usize,
 > {
-    start: [u8; KEY_MAX],
     end: [u8; KEY_MAX],
     mem_key: [u8; KEY_MAX],
     mem_val: [u8; VAL_MAX],
@@ -245,7 +244,6 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const LEVELS: usize, const TABL
 {
     const fn new() -> Self {
         Self {
-            start: [0u8; KEY_MAX],
             end: [0u8; KEY_MAX],
             mem_key: [0u8; KEY_MAX],
             mem_val: [0u8; VAL_MAX],
@@ -258,8 +256,10 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const LEVELS: usize, const TABL
 /// scans ([`Scan::detached_in`]).
 ///
 /// A caller that scans often, over a source that changes each time,
-/// builds them once instead of for every scan: some 37 KiB at 16 KiB
-/// blocks, zeroed. A state holds nothing a scan reads from. What decides
+/// builds and zeroes them once instead of for every scan: a block
+/// buffer and a read scratch of `BLOCK` bytes each, three key buffers
+/// and the cursors (44,000 bytes at the host store's shape of 16 KiB
+/// blocks, 128-byte keys and 4 KiB values). A state holds nothing a scan reads from. What decides
 /// whether a scan reads a byte of it (key lengths, cursor counts, the
 /// memtable head, which block a buffer holds and which of its grains
 /// were checked) lives in the scan and starts fresh with it, so a scan
@@ -283,7 +283,7 @@ impl<
     const TABLES: usize,
 > ScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>
 {
-    /// An empty set. `const`, so it can sit in a `static`.
+    /// An empty set. `const`, so it can be built in place.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -1257,7 +1257,6 @@ pub struct Scan<
     const CACHE: usize,
 > {
     src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
-    start_len: usize,
     end_len: usize,
     has_end: bool,
     max_seq: u64,
@@ -1278,14 +1277,15 @@ pub struct Scan<
     mem_live: bool,
     /// Absolute expiry tick of the memtable head; 0 = no expiry.
     mem_expire_at: u64,
-    /// One pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
+    /// The end bound's bytes, the memtable head's key and value, and one
+    /// pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
     /// capacity, used level-major: level `li`'s cursors are the
     /// `cursor_counts[li]` slots from `level_base[li]` of the flattened
     /// pool. A level below 0 may hold more than `TABLES` tables (they
     /// share the pool; F20), so rows per level would overflow. (Declared
     /// nested because stable Rust forbids const-generic products like
-    /// `LEVELS * TABLES` in array lengths.)
-    /// Key buffers and the cursor pool (level-major; see `level_base`).
+    /// `LEVELS * TABLES` in array lengths.) The scan's own, or kept by
+    /// the caller ([`Scan::detached_in`]).
     k: Held<'d, ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>>,
     cursor_counts: [usize; LEVELS],
     /// Where each level's cursors start in the flattened pool.
@@ -1328,7 +1328,6 @@ impl<
     ) -> Self {
         Self {
             src,
-            start_len: 0,
             end_len: 0,
             has_end: false,
             max_seq: u64::MAX,
@@ -1350,8 +1349,14 @@ impl<
     /// [`detached`](Self::detached), in buffers the caller keeps:
     /// `state` serves this scan for its life, and the next one after
     /// it. A scan in a kept `state` starts as a new scan does and
-    /// yields the same entries; what it saves is building and zeroing
-    /// its buffers (some 37 KiB at 16 KiB blocks) for every scan.
+    /// yields the same entries, whatever an earlier scan in it saw or
+    /// how it ended; what it saves is building and zeroing its buffers
+    /// for every scan (see [`ScanState`]).
+    ///
+    /// The scan itself is still as large as one that owns its buffers
+    /// (`size_of::<Scan>()`): build it where it is used, not to move it.
+    /// Building one in a kept state writes a few words and zeroes
+    /// nothing. One state serves one scan at a time.
     #[must_use]
     pub const fn detached_in(
         state: &'d mut ScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>,
@@ -1501,8 +1506,6 @@ impl<
                 self.end_len = 0;
             }
         }
-        self.k.start[..start.len()].copy_from_slice(start);
-        self.start_len = start.len();
         self.max_seq = max_seq;
         self.now = now;
         self.blocks.forget();
@@ -1557,9 +1560,11 @@ impl<
     /// own comparisons) never re-derive it through another `cursor_pos`
     /// lookup.
     fn min_src(&self, total: usize) -> Option<(usize, &[u8])> {
+        // Through the keys once, not once a source.
+        let keys = &*self.k;
         let mut best: Option<(usize, &[u8])> = None;
         for src in 0..=total {
-            let Some(k) = self.head_key(src) else {
+            let Some(k) = self.head_key(keys, src) else {
                 continue;
             };
             if best.is_none_or(|(_, m)| k < m) {
@@ -1567,6 +1572,17 @@ impl<
             }
         }
         best
+    }
+
+    /// The first table source still waiting at its lower bound with that
+    /// bound on `key`, if any (see [`ScanCursor::pending`]).
+    fn pending_on(&self, total: usize, key: &[u8]) -> Option<usize> {
+        let cursors = self.k.cursors.as_flattened();
+        (1..=total).find(|&src| {
+            let (li, ti) = self.cursor_pos(src);
+            let c = &cursors[self.level_base[li] + ti];
+            c.live && c.pending && &c.key[..c.key_len] == key
+        })
     }
 
     /// Yields the next entry: copies the key into `key_buf` and the value
@@ -1604,11 +1620,7 @@ impl<
             // reached the front: position it for real, then look again.
             // Its first entry sorts at or after the bound, so nothing
             // already compared is disturbed.
-            if let Some(src) = (1..=total).find(|&src| {
-                let (li, ti) = self.cursor_pos(src);
-                let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
-                c.live && c.pending && &c.key[..c.key_len] == min_key
-            }) {
+            if let Some(src) = self.pending_on(total, min_key) {
                 self.position_pending(src).await?;
                 continue;
             }
@@ -1626,14 +1638,15 @@ impl<
             let mut winner_key_len = min_key.len();
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
+            let keys = &*self.k;
             for src in 0..=total {
-                let Some((k, _seq, tomb, vlen, exp)) = self.head(src) else {
+                let Some((k, _seq, tomb, vlen, exp)) = self.head(keys, src) else {
                     continue;
                 };
                 if k != min_key {
                     continue;
                 }
-                let ver = self.head_version(src);
+                let ver = self.head_version(keys, src);
                 if version_gt(ver, winner_ver) {
                     winner_ver = ver;
                     winner_src = src;
@@ -1744,12 +1757,8 @@ impl<
         for src in 1..=total {
             let (li, ti) = self.cursor_pos(src);
             loop {
-                if !self.k.cursors.as_flattened()[self.level_base[li] + ti].live {
-                    break;
-                }
                 let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
-                let tied = &c.key[..c.key_len] == minkey;
-                if !tied {
+                if !c.live || &c.key[..c.key_len] != minkey {
                     break;
                 }
                 self.park_cursor(li, ti, None).await?;
@@ -1775,6 +1784,15 @@ impl<
             return Ok(());
         }
         let ti = self.cursor_counts[li];
+        // Emptied before it is counted: until `position_cursor` has read
+        // it into place, the slot holds no cursor, whatever an earlier
+        // seek, or an earlier scan in a kept state, left in it.
+        *self
+            .k
+            .cursors
+            .as_flattened_mut()
+            .get_mut(self.level_base[li] + ti)
+            .ok_or(Error::CorruptManifest)? = ScanCursor::empty();
         self.cursor_counts[li] += 1;
         self.position_cursor(tref, li, ti, start).await
     }
@@ -2054,16 +2072,20 @@ impl<
     /// Head key of a source: source 0 is the memtable, sources 1..=total
     /// are table cursors in level-major order. `None` when the source is
     /// exhausted.
-    fn head_key(&self, src: usize) -> Option<&[u8]> {
+    fn head_key<'a>(
+        &self,
+        keys: &'a ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<&'a [u8]> {
         if src == 0 {
             if self.mem_live {
-                Some(&self.k.mem_key[..self.mem_key_len])
+                Some(&keys.mem_key[..self.mem_key_len])
             } else {
                 None
             }
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             if c.live {
                 Some(&c.key[..c.key_len])
             } else {
@@ -2077,10 +2099,14 @@ impl<
     /// are table cursors in level-major order. One `cursor_pos` lookup
     /// instead of the two `head_key`/`head_meta` used to cost a caller
     /// needing both.
-    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize, u64)> {
+    fn head<'a>(
+        &self,
+        keys: &'a ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<(&'a [u8], u64, bool, usize, u64)> {
         if src == 0 {
             self.mem_live.then_some((
-                &self.k.mem_key[..self.mem_key_len],
+                &keys.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
@@ -2088,7 +2114,7 @@ impl<
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             c.live.then_some((
                 &c.key[..c.key_len],
                 c.seq,
@@ -2102,12 +2128,16 @@ impl<
     /// The head entry's version under the replica LWW merge rule: the
     /// memtable's versions are the node's own newest; table heads carry
     /// their table's origin.
-    fn head_version(&self, src: usize) -> Version {
+    fn head_version(
+        &self,
+        keys: &ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Version {
         if src == 0 {
             Version::memtable(self.src.node_id, self.mem_seq)
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             Version::table(c.node_id, c.seal_wall, c.seq)
         }
     }
@@ -2554,14 +2584,15 @@ impl<
             let mut winner_key_len = max_key.len();
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
+            let keys = &*self.k;
             for src in 0..=total {
-                let Some((k, _seq, tomb, vlen, exp)) = self.head(src) else {
+                let Some((k, _seq, tomb, vlen, exp)) = self.head(keys, src) else {
                     continue;
                 };
                 if k != max_key {
                     continue;
                 }
-                let ver = self.head_version(src);
+                let ver = self.head_version(keys, src);
                 if version_gt(ver, winner_ver) {
                     winner_ver = ver;
                     winner_src = src;
@@ -2664,9 +2695,11 @@ impl<
     /// own comparisons) never re-derive it through another `cursor_pos`
     /// lookup.
     fn max_src(&self, total: usize) -> Option<(usize, &[u8])> {
+        // Through the keys once, not once a source.
+        let keys = &*self.k;
         let mut best: Option<(usize, &[u8])> = None;
         for src in 0..=total {
-            let Some(k) = self.head_key(src) else {
+            let Some(k) = self.head_key(keys, src) else {
                 continue;
             };
             if best.is_none_or(|(_, m)| k > m) {
@@ -3091,16 +3124,20 @@ impl<
     /// Head key of a source: source 0 is the memtable, sources 1..=total
     /// are table cursors in level-major order. `None` when the source is
     /// exhausted.
-    fn head_key(&self, src: usize) -> Option<&[u8]> {
+    fn head_key<'a>(
+        &self,
+        keys: &'a RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<&'a [u8]> {
         if src == 0 {
             if self.mem_live {
-                Some(&self.k.mem_key[..self.mem_key_len])
+                Some(&keys.mem_key[..self.mem_key_len])
             } else {
                 None
             }
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             if c.live {
                 Some(&c.key[..c.key_len])
             } else {
@@ -3114,10 +3151,14 @@ impl<
     /// are table cursors in level-major order. One `cursor_pos` lookup
     /// instead of the two `head_key`/`head_meta` used to cost a caller
     /// needing both.
-    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize, u64)> {
+    fn head<'a>(
+        &self,
+        keys: &'a RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<(&'a [u8], u64, bool, usize, u64)> {
         if src == 0 {
             self.mem_live.then_some((
-                &self.k.mem_key[..self.mem_key_len],
+                &keys.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
@@ -3125,7 +3166,7 @@ impl<
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             c.live.then_some((
                 &c.key[..c.key_len],
                 c.seq,
@@ -3139,12 +3180,16 @@ impl<
     /// The head entry's version under the replica LWW merge rule: the
     /// memtable's versions are the node's own newest; table heads carry
     /// their table's origin.
-    fn head_version(&self, src: usize) -> Version {
+    fn head_version(
+        &self,
+        keys: &RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Version {
         if src == 0 {
             Version::memtable(self.src.node_id, self.mem_seq)
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             Version::table(c.node_id, c.seal_wall, c.seq)
         }
     }

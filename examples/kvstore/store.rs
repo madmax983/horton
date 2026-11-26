@@ -4519,6 +4519,43 @@ mod tests {
         }
     }
 
+    /// A reader thread's kept scan state never answers from a block a
+    /// compaction freed: each round rewrites every key, and its tables
+    /// land in blocks earlier rounds' tables held, which this thread's
+    /// buffers last held, with other bytes. Every scan yields this round's
+    /// values (ADR-0036; found in review: the test above passes with every
+    /// block-forget guard removed, this one does not).
+    #[test]
+    fn a_kept_scan_state_reads_no_block_a_compaction_freed() {
+        let store = TempStore::new("kept-state-reuse");
+        let n = 600;
+        let value =
+            |round: usize, i: usize| format!("g{round}-{i}-{}", "x".repeat(40)).into_bytes();
+        for round in 0..60usize {
+            for i in 0..n {
+                store.put(&key(i), &value(round, i)).expect("put");
+            }
+            store.flush().expect("flush");
+            store.compact().expect("compact");
+            for start in [0usize, 97, 250, 401, 599] {
+                for reverse in [false, true] {
+                    let got = store
+                        .scan(&key(start), None, reverse, 3, None)
+                        .expect("scan");
+                    assert!(!got.is_empty());
+                    for (k, v) in &got {
+                        let i = (0..n).find(|&i| key(i) == *k).expect("a key written");
+                        assert_eq!(
+                            *v,
+                            value(round, i),
+                            "round {round} start {start} reverse {reverse}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Scanners on three threads, forward and in reverse, against two
     /// writers that keep the store flushing and compacting. Every scan
     /// sees every key exactly once, in order, with a whole value that is

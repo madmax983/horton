@@ -33,7 +33,9 @@ instead of a `&Db`. `Scan::new(&db)` takes all four from the `Db`, as
 before. `Scan::detached(memtable, manifest, device, cache, node_id)`
 is handed them, and borrows no `Db`: the scan counterpart of
 ADR-0018's detached point read, under the same rule (no `flush`,
-`compact_step`, `ingest_table` or `archive_commit` while it is alive).
+`compact_step`, `ingest_table` or `archive_commit` while it is alive). A caller
+that scans often can keep the scan's buffers and cursors between
+scans and build each one in them (`Scan::detached_in`, ADR-0036).
 
 **The memtable's share is copied a page at a time.** A scan merges the
 memtable all the way through, so unlike a point read it cannot take
