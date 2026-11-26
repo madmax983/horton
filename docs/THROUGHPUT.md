@@ -1273,7 +1273,7 @@ then 25% to 31% of a read served from the cache. Step 23 took it out.
 
 ### Then: an index search that reads only what it needs
 
-Step 23 (ADR-0032). The index block named one data block per entry,
+Step 23 (ADR-0033). The index block named one data block per entry,
 variable-length, with no offsets: a search parsed every entry to count
 them, so a point read's cache hit summed all 64 chunks of it, and a
 seek copied each index block out of the cache, summed whole. Now the
@@ -1506,12 +1506,12 @@ Measured or scoped while doing this, and left:
 - **A memtable of 8,192 entries in the kvstore.** Done in step 20.
 - **Inflating a data block only up to the key.** Done in step 17
   (ADR-0027).
-- **Index blocks verified by the entry.** Done in step 23 (ADR-0032),
+- **Index blocks verified by the entry.** Done in step 23 (ADR-0033),
   with the cache's RAM checksums rather than checksums in the block:
   an entry count and restart offsets, 2 bytes per 16 entries, let the
   search find and check only the entries it reads.
 - **An index search that reads only what it needs.** Done in step 23
-  (ADR-0032).
+  (ADR-0033).
 - **LZ77 with skip acceleration and word-wide match counting.** Done
   in step 16.
 - **A check that a detached reader's tables are still its own.** The

@@ -63,7 +63,7 @@ its first read.
   the index entries a search touches needs per-entry or per-group
   checksums in the block, which costs index capacity (a table's index
   is one block). That trade is left for when it is needed. (Done
-  since: ADR-0032, with the cache's RAM checksums and restart offsets
+  since: ADR-0033, with the cache's RAM checksums and restart offsets
   in the index block instead of checksums in it.)
 
 ## References

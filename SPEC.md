@@ -243,7 +243,7 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
 - **Index block:** per data block `first_key_len u16 | first_key |
   block_id u64 | max_seq u64`, then zero padding, then a trailer that
   ends at the CRC: the `u16` offset of every 16th entry (the first is
-  0), then the entry count as a `u16` (ADR-0032). A search
+  0), then the entry count as a `u16` (ADR-0033). A search
   binary-searches the offsets and scans at most 16 entries; it reads
   neither the entries it does not need nor the padding. A table's
   index is one block, so a table of `n` data blocks with keys of `k`

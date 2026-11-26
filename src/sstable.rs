@@ -28,7 +28,7 @@
 //! - Index block: one entry per data block,
 //!   `first_key_len u16 | first_key | block_id u64 | max_seq u64`, then
 //!   zero padding and a trailer ending at the CRC: the `u16` offset of
-//!   every 16th entry, then the entry count as a `u16` (ADR-0032).
+//!   every 16th entry, then the entry count as a `u16` (ADR-0033).
 //! - Rdel block: range tombstones `start_len u16 | end_len u16 | seq u64 |
 //!   start | end`, sorted by `start` ascending (ties in any sequence
 //!   order: compaction clips pieces to its outputs' ranges), then
@@ -70,7 +70,7 @@ use crate::wal::Op;
 /// answer "absent" for keys it holds); "hrtsst04" is v0.20 (the filter
 /// may span blocks, and the footer records its length); "hrtsst05" is
 /// v0.20 (the index block ends in a trailer of restart offsets, so a
-/// reader binary-searches it: ADR-0032). A foreign magic is
+/// reader binary-searches it: ADR-0033). A foreign magic is
 /// [`Error::CorruptBlock`], never a misparse.
 pub const SSTABLE_MAGIC: u64 = u64::from_le_bytes(*b"hrtsst05");
 
@@ -242,7 +242,7 @@ pub(crate) const fn max_flush_data_blocks<const BLOCK: usize>(
 }
 
 /// Whether one index block holds `blocks` entries of keys up to
-/// `key_max` bytes, its trailer included (ADR-0032).
+/// `key_max` bytes, its trailer included (ADR-0033).
 #[must_use]
 pub(crate) const fn index_holds<const BLOCK: usize>(blocks: u64, key_max: usize) -> bool {
     let room = BLOCK.saturating_sub(CRC_LEN);
@@ -2038,12 +2038,12 @@ fn index_entry_parse(payload: &[u8], off: usize) -> Result<(&[u8], u64, usize), 
 }
 
 /// Index entries per restart: the trailer of an index block holds the
-/// offset of every `INDEX_STRIDE`th entry (ADR-0032).
+/// offset of every `INDEX_STRIDE`th entry (ADR-0033).
 pub(crate) const INDEX_STRIDE: usize = 16;
 
 /// Bytes of the trailer an index block of `entries` entries ends with:
 /// a `u16` offset for every 16th entry, then the entry count as a `u16`
-/// (ADR-0032).
+/// (ADR-0033).
 #[must_use]
 pub const fn index_tail(entries: usize) -> usize {
     2 + 2 * entries.div_ceil(INDEX_STRIDE)
@@ -2978,7 +2978,7 @@ fn inflate_image<E, const BLOCK: usize>(
 /// keeps nothing of it. A cache that lends its images
 /// ([`CachePort::with_checked`]) has it searched where it lies, with a
 /// `check` that verifies only the ranges the search reads against the
-/// cache's RAM checksums (ADR-0032); a search that ends in an error has
+/// cache's RAM checksums (ADR-0033); a search that ends in an error has
 /// the whole image checked, so that a change in RAM is a miss and read
 /// from the device, and only damage on the device is `CorruptBlock`.
 /// Otherwise the block is read into `scratch` as [`read_block_verified`]
@@ -3649,7 +3649,7 @@ mod tests {
     /// block, restart offsets past the entries, a first restart that is
     /// not the first entry, entries that run into the trailer. Bytes the
     /// search does not read (the padding before the trailer) are not
-    /// looked at: a stray byte there changes no answer (ADR-0032).
+    /// looked at: a stray byte there changes no answer (ADR-0033).
     #[test]
     fn index_search_rejects_a_trailer_that_does_not_fit() {
         type Damage = fn(&mut [u8; BLOCK], usize);
@@ -3832,7 +3832,7 @@ mod tests {
     /// What a search answers depends only on the bytes it checked:
     /// with every other byte of the block randomized, both searches give
     /// the same answers and check no new range. So no byte the search
-    /// acts on escapes a check (ADR-0032). Key lengths 1 to 120,
+    /// acts on escapes a check (ADR-0033). Key lengths 1 to 120,
     /// duplicates, up to a full block.
     #[test]
     fn a_search_answers_from_the_bytes_it_checked() {
@@ -4288,7 +4288,7 @@ mod partial_inflate_tests {
     }
 
     /// A bit flipped in the RAM copy of a cached index block never
-    /// changes what a point read of the table answers (ADR-0032): every
+    /// changes what a point read of the table answers (ADR-0033): every
     /// byte of the block, one bit each, against keys across the table,
     /// present and absent. The index is searched by restarts, so one
     /// read checks a few of its chunks and misses most flips.

@@ -260,7 +260,7 @@ fn reseal(blk: &mut [u8; BLOCK]) {
     blk[BLOCK - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// An index block's trailer (ADR-0032) that does not describe its
+/// An index block's trailer (ADR-0033) that does not describe its
 /// entries, under a valid CRC, is corruption, not a silent miss: here its
 /// one restart offset points past the entry. The padding between the
 /// entries and the trailer is never read, so garbage there changes no
@@ -572,7 +572,7 @@ fn odd_bloom_sizes_have_no_false_negatives() {
 /// as absent, so its footer is refused outright. So is "hrtsst03", an
 /// unreleased v0.20 footer with no filter length in it, and "hrtsst04",
 /// an unreleased v0.20 table whose index block has no trailer of
-/// restart offsets (ADR-0032): an archive exported by such a build is
+/// restart offsets (ADR-0033): an archive exported by such a build is
 /// not ingested.
 #[test]
 fn a_table_with_the_old_magic_is_rejected() {
