@@ -54,10 +54,11 @@ are three gates:
   grains, checked against the cache's RAM sums, and copied into the
   buffer right after the check holds. Only those grains are marked.
 
-A parser may also name the entry after the one it parks on (`ahead`).
-A lend takes it then, so that the advance past the head finds it in the
-buffer. The buffer gate ignores it. A lookahead entry that does not
-parse is left for the step that reaches it to report.
+A parser may also name the entry after the one it parks on (`ahead`),
+or the zero padding there when the head is the block's last entry. A
+lend takes it then, so that the advance past the head finds it in the
+buffer. The buffer gate ignores it. A lookahead entry that parses as
+neither is left for the step that reaches it to report.
 
 **`Blocks::load_with` drives every block read of both scan
 directions.**
@@ -129,8 +130,12 @@ does compaction, which reads past the cache.
 - **Cheaper seeks.** See `docs/THROUGHPUT.md`, step 24.
 - **Stats.** One lend is one lookup, as ADR-0031 has it.
   - A seek that yields one entry asks the cache once for the data block
-    it lands in (`tests/data_flip_scan.rs` asserts it), or twice when
-    its head is the block's last entry.
+    it lands in (`tests/data_flip_scan.rs` asserts it). It asks twice
+    when its head is the block's last entry: the lookahead takes the
+    padding after the head, so the step past it finds the block's end
+    in the buffer and asks only for the next block. It also asks twice
+    when its key is a block's first, as before: the index names the
+    block before it.
   - A scan that reads past what its first lend took asks once more, to
     complete the block.
   - A cursor whose buffer the merge gave to another table asks again
@@ -214,6 +219,28 @@ does compaction, which reads past the cache.
     retried scan must yield exactly the clean one. It fails on the code
     before the fix, both cases, and the forward case fails on `main`
     too.
+  - A second round, of three reviews with a skeptic verifying each
+    finding, found no wrong answer.
+    - One compared both scan directions against a model of the store
+      over random workloads. These had overlapping tables, version runs
+      spanning several blocks, snapshots, TTL, range deletes, bounds,
+      limits, re-seeks, pools of 0 to 5, compressed levels, six cache
+      kinds (one lying about `checks_ranges`) and `BufferTooSmall`
+      retries. Everything matched, on `main` too.
+    - One drove `load_with`, `value_into` and `complete` directly at
+      512, 1,000 and 4,096 bytes. It flipped one and two bits of every
+      byte, stuck or on chosen lends only, and nothing changed an
+      answer.
+    - One fuzzed CRC-valid malformed blocks through 720,000 scans,
+      which gave no panic, and checked the stats, the host store's pool
+      reuse and the RAM numbers.
+    - It found one cost regression. A seek onto a block's last entry
+      did not take the padding after it, so the step past the head
+      asked for the rest of the block only to find zeros: three
+      data-block lookups where `main` took two. The lookahead now
+      names the padding.
+      `a_seek_onto_a_blocks_last_entry_takes_its_padding` fails without
+      it.
 
 ## References
 

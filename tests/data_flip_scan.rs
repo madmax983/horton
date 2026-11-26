@@ -379,3 +379,86 @@ fn a_short_seek_takes_one_lend_of_its_data_block() {
     assert!(data.len() > 4);
     assert!(lookups < 4 * 3, "{lookups}");
 }
+
+/// A store of one table whose data blocks hold four 900-byte values and
+/// several hundred bytes of zero padding.
+fn padded() -> TestDb<MemDevice<4096>> {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    block_on(db.open()).unwrap();
+    for i in 0..40usize {
+        let val = vec![b"abcdefghijklmnopqrstuvwxyz"[i % 26]; 900];
+        for attempt in 0..2 {
+            match block_on(db.put(&key(i), &val)) {
+                Ok(_) => break,
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) if attempt == 0 => {
+                    block_on(db.flush()).unwrap();
+                    drain(&mut db);
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+    block_on(db.flush()).unwrap();
+    drain(&mut db);
+    db
+}
+
+/// A seek whose head is its block's last entry takes the padding after
+/// it along with the head, so the step past the head finds the block's
+/// end in the buffer: two data-block lookups (its block and the next),
+/// not three. The table's last key costs one. Found in review: the
+/// padding was not taken, so the step past the head asked the cache for
+/// the rest of the block only to find zeros.
+#[test]
+fn a_seek_onto_a_blocks_last_entry_takes_its_padding() {
+    let db = padded();
+    let manifest = *db.manifest();
+    let device = db.device().clone();
+    let page = Box::new(Page::new());
+    let (level, table) = (0..7)
+        .flat_map(|l| {
+            manifest
+                .level(l)
+                .unwrap_or(&[])
+                .iter()
+                .map(move |t| (l, *t))
+        })
+        .max_by_key(|(_, t)| t.data_blocks())
+        .unwrap();
+    assert!(table.data_blocks().unwrap() > 3);
+    let mut solo = Manifest::new();
+    solo.add_table_to_level::<()>(level, table).unwrap();
+    let src = Src {
+        page: &page,
+        manifest: &solo,
+        device: &device,
+        node: db.node_id(),
+    };
+    let cache = FlipCache::default();
+    let all = Run {
+        rev: false,
+        start: b"",
+        limit: None,
+        pool: false,
+    };
+    // Warm, and learn which keys end a block.
+    let want = run(&src, Some(&cache), all).unwrap();
+    for (n, (k, _)) in want.iter().enumerate() {
+        let before = (cache.lookups.get(), cache.misses.get());
+        let r = Run {
+            rev: false,
+            start: k,
+            limit: Some(1),
+            pool: false,
+        };
+        assert_eq!(run(&src, Some(&cache), r).unwrap(), want[n..=n]);
+        assert_eq!(cache.misses.get(), before.1, "key {n}");
+        // The index block, then the data blocks.
+        let data = cache.lookups.get() - before.0 - 1;
+        let last = n + 1 == want.len();
+        assert!(
+            data <= if last { 1 } else { 2 },
+            "key {n}: {data} data-block lookups"
+        );
+    }
+}

@@ -762,13 +762,18 @@ fn entry_checked<'b, E, const BLOCK: usize>(
 }
 
 /// Names the entry at `off`, if one parses there, as the next to be
-/// read (see [`Gate::ahead`]). A parse that fails is left for the step
-/// that reaches it to report.
+/// read (see [`Gate::ahead`]); where the entries have ended in zero
+/// padding, names the padding, which the next step checks before it
+/// believes the block is done. A parse that fails on anything else is
+/// left for the step that reaches it to report.
 fn look_ahead<const BLOCK: usize>(b: &[u8; BLOCK], off: usize, end: usize, g: &mut dyn Gate) {
-    if off < end
-        && let Ok(n) = sstable::parse_data_entry::<(), BLOCK>(b, off, end, 0)
-    {
-        g.ahead(off, n.next);
+    if off >= end {
+        return;
+    }
+    match sstable::parse_data_entry::<(), BLOCK>(b, off, end, 0) {
+        Ok(n) => g.ahead(off, n.next),
+        Err(_) if b.get(off..end).is_some_and(sstable::all_zero) => g.ahead(off, end),
+        Err(_) => {}
     }
 }
 
