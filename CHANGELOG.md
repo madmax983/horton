@@ -12,11 +12,10 @@ misread (SPEC §4.5).
 ## [Unreleased]
 
 The next release is 0.20.0. **The on-disk format changes** (manifest
-`hrtman10`, SSTable `hrtsst04`, WAL records with `SPAN` and `CONT`
+`hrtman11`, SSTable `hrtsst05`, WAL records with `SPAN` and `CONT`
 flags): v0.19 images, and archives exported by v0.19, are rejected, not
-misread. So are images written by a build from before this release
-(`hrtman07` to `hrtman09`, `hrtsst03`); archives exported by those
-builds (`hrtsst04`) still ingest.
+misread. So are images and archives written by a build from before this
+release (`hrtman07` to `hrtman10`, `hrtsst03` and `hrtsst04`).
 
 Read throughput is the subject:
 [`docs/THROUGHPUT.md`](docs/THROUGHPUT.md) measures horton's host
