@@ -260,6 +260,11 @@ fn reseal(blk: &mut [u8; BLOCK]) {
     blk[BLOCK - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
+/// An index block's trailer (ADR-0032) that does not describe its
+/// entries, under a valid CRC, is corruption, not a silent miss: here its
+/// one restart offset points past the entry. The padding between the
+/// entries and the trailer is never read, so garbage there changes no
+/// answer.
 #[test]
 fn crc_valid_index_garbage_is_an_error() {
     let mut dev = MemDevice::<BLOCK>::new();
@@ -267,16 +272,27 @@ fn crc_valid_index_garbage_is_an_error() {
     let (n, data_blocks) = write(&items, &mut dev);
     let index_id = BASE + data_blocks + 1;
     let footer = BASE + n - 1;
-    // The single index entry is 2 + 1 + 8 + 8 = 19 bytes; offset 100 is
-    // inside the zero padding. Nonzero garbage there with a valid CRC must
-    // read as corruption, not as a silent end of the index.
-    let mut blk = read_block(&dev, index_id);
-    assert_eq!(blk[100], 0);
-    blk[100] = 0xAB;
+    // The trailer: one restart offset (0) and the entry count (1), ending
+    // at the CRC.
+    let body = BLOCK - 4;
+    let good = read_block(&dev, index_id);
+    assert_eq!(&good[body - 4..body], &[0, 0, 1, 0]);
+
+    let mut blk = good;
+    blk[body - 4] = 19; // past the single 19-byte entry
     reseal(&mut blk);
     write_block(&mut dev, index_id, &blk);
     let err = get(&dev, footer, b"k").unwrap_err();
     assert!(matches!(err, Error::CorruptBlock { id } if id == index_id));
+
+    // The single index entry is 2 + 1 + 8 + 8 = 19 bytes; offset 100 is
+    // inside the padding, which no search reads.
+    let mut blk = good;
+    assert_eq!(blk[100], 0);
+    blk[100] = 0xAB;
+    reseal(&mut blk);
+    write_block(&mut dev, index_id, &blk);
+    assert_eq!(get(&dev, footer, b"k").unwrap(), Some(b"v".to_vec()));
 }
 
 #[test]
@@ -554,7 +570,10 @@ fn odd_bloom_sizes_have_no_false_negatives() {
 /// A table written before v0.20 carries the unbucketed filter under the
 /// magic "hrtsst02". Read by today's rule it would report keys it holds
 /// as absent, so its footer is refused outright. So is "hrtsst03", an
-/// unreleased v0.20 footer with no filter length in it.
+/// unreleased v0.20 footer with no filter length in it, and "hrtsst04",
+/// an unreleased v0.20 table whose index block has no trailer of
+/// restart offsets (ADR-0032): an archive exported by such a build is
+/// not ingested.
 #[test]
 fn a_table_with_the_old_magic_is_rejected() {
     let mut dev = MemDevice::<BLOCK>::new();
@@ -562,7 +581,7 @@ fn a_table_with_the_old_magic_is_rejected() {
     let (n, _) = write(&items, &mut dev);
     let footer = BASE + n - 1;
     assert_eq!(get(&dev, footer, b"k").unwrap(), Some(b"v".to_vec()));
-    for old in [b"hrtsst03", b"hrtsst02", b"lsmtable"] {
+    for old in [b"hrtsst04", b"hrtsst03", b"hrtsst02", b"lsmtable"] {
         let mut blk = read_block(&dev, footer);
         blk[..8].copy_from_slice(old);
         reseal(&mut blk);
@@ -818,9 +837,10 @@ mod spanning {
         used.set_block_limit(1_000);
         push_keys(&mut used, &mut used_dev, (0..9_000).map(|i| i * 7 + 1));
         used.restart(BASE, k);
+        // An empty index is its entry count: two bytes of trailer.
         assert_eq!(
             (used.entry_count(), used.data_blocks(), used.index_len()),
-            (0, 0, 0)
+            (0, 0, horton::sstable::index_tail(0))
         );
         assert_eq!(
             push_keys(&mut used, &mut used_dev, (0..4_000).map(|i| i * 3)),

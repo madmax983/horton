@@ -844,11 +844,13 @@ impl<const BLOCK: usize, const KEY_MAX: usize, const VAL_MAX: usize, const BLOOM
         if self.writer.data_blocks() + self.split_margin > self.data_budget {
             return true;
         }
-        // Every seal adds one index entry of `18 + key` bytes.
+        // Every seal adds one index entry of `18 + key` bytes, and at
+        // most 2 to the index's trailer (`index_len` counts the trailer
+        // as it stands).
         let index_room = BLOCK.saturating_sub(sstable::CRC_LEN);
         // `split_margin` is a handful of blocks: the narrowing is exact.
         #[allow(clippy::cast_possible_truncation)]
-        let index_need = self.split_margin as usize * (18 + KEY_MAX);
+        let index_need = self.split_margin as usize * (18 + KEY_MAX + 2);
         self.writer.index_len() + index_need > index_room
     }
 
@@ -1967,7 +1969,12 @@ pub(crate) async fn init_cursor<
     read_block_into(device, index_id, raw).await?;
     sstable::check_block_crc(raw, index_id)?;
     let payload_end = BLOCK - sstable::CRC_LEN;
-    let start = match sstable::index_lookup::<D::Error>(&raw[..payload_end], floor, index_id)? {
+    let start = match sstable::index_lookup::<D::Error>(
+        &raw[..payload_end],
+        floor,
+        index_id,
+        &mut |_, _| true,
+    )? {
         Some((id, _)) => id
             .checked_sub(cur.first_block)
             .filter(|&i| i < data_blocks)

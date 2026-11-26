@@ -216,16 +216,24 @@ fn a_v019_manifest_is_rejected_not_misparsed() {
     // v0.20 changes what a manifest's tables hold (the bucketed bloom
     // filter, then a filter that may span blocks: `hrtsst04`) and records
     // each table's bloom section, and its WAL groups may span blocks
-    // (ADR-0029), so the magic is "hrtman10". A v0.19 image ("hrtman06"),
-    // and one from an unreleased v0.20 build ("hrtman07" to "hrtman09"),
+    // (ADR-0029), and its tables' index blocks end in restart offsets
+    // (`hrtsst05`, ADR-0032), so the magic is "hrtman11". A v0.19 image
+    // ("hrtman06"), and one from an unreleased v0.20 build ("hrtman07" to
+    // "hrtman10"),
     // is refused when it is opened, before any of its tables or its WAL
     // is read by the new rules.
     let mut m = TestManifest::new();
     m.add_table_to_level::<DevError>(0, tref(0, 100)).unwrap();
     let mut buf = [0u8; BLOCK];
     m.encode::<DevError, BLOCK>(&mut buf).unwrap();
-    assert_eq!(&buf[0..8], b"hrtman10");
-    for old in [b"hrtman06", b"hrtman07", b"hrtman08", b"hrtman09"] {
+    assert_eq!(&buf[0..8], b"hrtman11");
+    for old in [
+        b"hrtman06",
+        b"hrtman07",
+        b"hrtman08",
+        b"hrtman09",
+        b"hrtman10",
+    ] {
         buf[0..8].copy_from_slice(old);
         // A real older block carries a CRC over its own magic.
         let crc = horton::crc32(&buf[..BLOCK - 4]);
