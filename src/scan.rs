@@ -513,6 +513,11 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
     ) -> Result<R, Error<D::Error>> {
         if self.find(bid) {
             let block = self.current();
+            if block.valid == full::<BLOCK>() {
+                // Every byte is in, checked: nothing to gate, and an
+                // error stands.
+                return f(&block.data, &mut Open::<BLOCK>);
+            }
             let mut gate = Gated::<BLOCK> {
                 valid: block.valid,
                 missed: false,
