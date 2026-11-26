@@ -203,6 +203,26 @@ jobs:
           kv delrange a c
           test "$(kv scan)" = "c = 3"
           kv compact
+          # Bad input fails before the store writes (issue 46). Exit
+          # status 2 is a usage error, 1 any other error.
+          E=target/kvstore/bad.err
+          fails() { # exit status, then the command
+            want=$1; shift; s=0; "$@" 2> "$E" || s=$?; test "$s" = "$want"
+          }
+          fails 2 kv put a 1 2
+          fails 1 kv delrange c a; grep -q "swap the bounds" "$E"
+          fails 1 kv scan c a; grep -q "swap the bounds" "$E"
+          test "$(kv scan)" = "c = 3"
+          B=target/kvstore/bad.db; rm -f target/kvstore/bad.db*
+          bad() { cargo run -q --release --example kvstore -- --db "$B" "$@"; }
+          fails 2 bad get
+          fails 1 bad delrange c a
+          test ! -e "$B"
+          fails 1 bad --size-mb 8 put a 1
+          grep -q -- "--size-mb [0-9]* or more" "$E"
+          test "$(wc -c < "$B")" -eq 0
+          bad put a 1
+          test "$(bad get a)" = 1
       - name: two openers at once (issue 44)
         # Pairs of puts at the same time. A put that exits 0 is in the
         # store; a put that fails gives the lock error.

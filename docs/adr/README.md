@@ -44,6 +44,7 @@ history keeps it); its §9 milestone log now lives in
 | [0030](0030-no-compression-in-shallow-levels.md) | Tables written into levels 0 and 1 store their data blocks raw (`Config::compression_from_level`, default 2): a table's blocks are packed by raw size, so compression saved no blocks there and cost a pass to write and to read |
 | [0031](0031-point-reads-check-what-they-read.md) | A point read searches a cached data block where it lies and checks against the RAM checksums only the ranges it acts on (`CachePort::with_checked`); a search that fails on unchecked bytes checks the whole image, so a RAM fault is a miss, never `CorruptBlock` |
 | [0032](0032-one-opener-per-host-store.md) | The host store locks `<store>.lock` before it opens the store: a second opener gets `StoreError::Locked`, not a WAL that two processes write over |
+| [0033](0033-host-store-refuses-bad-input-first.md) | The host store checks its input before it writes: a size too small for the shape gives `StoreError::TooSmall` and leaves the file unsized; a CLI usage error or inverted range creates no file; `delete_range` and scans refuse `start > end` |
 
 ## Adding a record
 

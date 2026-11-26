@@ -201,6 +201,20 @@ pub enum StoreError {
     /// Another opener holds the store (ADR-0032). Try again when it
     /// closes.
     Locked(String),
+    /// The file is too small for the store's shape (ADR-0033). `blocks`
+    /// is the size of the file, or of a new file. `existing` is `true`
+    /// if the file had a size before the open. The open does not size a
+    /// new file. Remedy: open with more blocks. For an existing file,
+    /// use another path or delete the file.
+    TooSmall {
+        path: std::path::PathBuf,
+        blocks: u64,
+        min: u64,
+        existing: bool,
+    },
+    /// A range starts after it ends (`start > end`, ADR-0033). Swap the
+    /// bounds. An empty range (`start == end`) is not an error.
+    InvertedRange,
     /// The store was closed (its [`Store`] was dropped), or a thread
     /// panicked while it held the engine.
     Closed,
@@ -211,12 +225,42 @@ impl core::fmt::Display for StoreError {
         match self {
             Self::Db(e) => write!(f, "{e:?}"),
             Self::Open(e) | Self::Locked(e) => write!(f, "open: {e}"),
+            Self::TooSmall {
+                path,
+                blocks,
+                min,
+                existing,
+            } => {
+                let path = path.display();
+                let mib = mib_for(*min);
+                if *existing {
+                    write!(
+                        f,
+                        "open: {path}: the file holds {blocks} blocks; this shape needs at least \
+                         {min} blocks ({mib} MiB). A store keeps its size: use another path, or \
+                         delete the file"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "open: {path}: a new store of {blocks} blocks is too small; this shape \
+                         needs at least {min} blocks ({mib} MiB). The file is not sized"
+                    )
+                }
+            }
+            Self::InvertedRange => write!(f, "the range starts after it ends: swap the bounds"),
             Self::Closed => write!(f, "the store is closed"),
         }
     }
 }
 
 impl std::error::Error for StoreError {}
+
+/// The mebibytes that hold `blocks` blocks, rounded up.
+#[must_use]
+pub const fn mib_for(blocks: u64) -> u64 {
+    blocks.saturating_mul(BLOCK as u64).div_ceil(1 << 20)
+}
 
 impl From<DbError> for StoreError {
     fn from(e: DbError) -> Self {
@@ -382,6 +426,15 @@ const fn check_key(key: &[u8]) -> Result<(), DbError> {
         })
     } else {
         Ok(())
+    }
+}
+
+/// Refuses a range that starts after it ends (ADR-0033). An open end
+/// (`None`) is the last key.
+pub fn check_order(start: &[u8], end: Option<&[u8]>) -> Result<(), StoreError> {
+    match end {
+        Some(end) if start > end => Err(StoreError::InvertedRange),
+        _ => Ok(()),
     }
 }
 
@@ -1387,6 +1440,8 @@ impl Store {
     pub fn open(path: &Path, options: Options) -> Result<(Self, OpenReport), StoreError> {
         // Lock first: two openers must not both set a new file's size.
         let lock = lock_store(path)?;
+        // Check the size before `FileDevice::open` sizes a new file.
+        check_size(path, options.create_blocks)?;
         let device = FileDevice::open(path, options.create_blocks, options.sync)
             .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
         // The database is built on the stack before it is boxed, and it
@@ -1479,6 +1534,33 @@ impl Store {
     }
 }
 
+/// Refuses a file too small for the shape (ADR-0033). A file of zero
+/// bytes is new: it gets `create_blocks` blocks. A file of part blocks
+/// is not a store: [`FileDevice::open`] refuses it.
+fn check_size(path: &Path, create_blocks: u64) -> Result<(), StoreError> {
+    let len = std::fs::metadata(path)
+        .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?
+        .len();
+    if len % BLOCK as u64 != 0 {
+        return Ok(());
+    }
+    let blocks = if len == 0 {
+        create_blocks
+    } else {
+        len / BLOCK as u64
+    };
+    let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
+    if blocks < min {
+        return Err(StoreError::TooSmall {
+            path: path.to_path_buf(),
+            blocks,
+            min,
+            existing: len != 0,
+        });
+    }
+    Ok(())
+}
+
 /// Locks the store at `path` (ADR-0032).
 fn lock_store(path: &Path) -> Result<StoreLock, StoreError> {
     StoreLock::acquire(path).map_err(|e| {
@@ -1515,9 +1597,11 @@ impl Handle {
 
     /// Deletes every key in `[start, end)` with one range tombstone, like
     /// `RocksDB`'s `DeleteRange`.
+    /// A range that starts after it ends gives [`StoreError::InvertedRange`].
     pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), StoreError> {
         check_key(start)?;
         check_key(end)?;
+        check_order(start, Some(end))?;
         self.shared.with(|e| {
             let gate = &e.gate;
             e.room
@@ -1553,7 +1637,8 @@ impl Handle {
 
     /// Up to `limit` entries of `[start, end)` (an empty `start` is the
     /// first key, `end = None` the last), ascending or, with `reverse`,
-    /// descending, as of `snapshot` (or now).
+    /// descending, as of `snapshot` (or now). A range that starts after
+    /// it ends gives [`StoreError::InvertedRange`].
     pub fn scan(
         &self,
         start: &[u8],
@@ -1562,6 +1647,7 @@ impl Handle {
         limit: usize,
         snapshot: Option<&Snapshot>,
     ) -> Result<Entries, StoreError> {
+        check_order(start, end)?;
         let seq = snapshot.map_or(u64::MAX, |s| s.seq);
         let mut out = Entries::new();
         let mut cursor = None;
@@ -1581,13 +1667,15 @@ impl Handle {
     }
 
     /// Iterates `[start, end)` in order (or in reverse) over a snapshot
-    /// it takes now, fetching [`PAGE`] entries at a time.
+    /// it takes now, fetching [`PAGE`] entries at a time. A range that
+    /// starts after it ends gives [`StoreError::InvertedRange`].
     pub fn range(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
         reverse: bool,
     ) -> Result<Iter, StoreError> {
+        check_order(start, end)?;
         Ok(Iter {
             handle: self.clone(),
             snapshot: self.snapshot()?,
@@ -1762,12 +1850,6 @@ impl Engine {
     )]
     fn open(device: FileDevice, sync: bool) -> Result<Self, StoreError> {
         let blocks = device.blocks();
-        let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
-        if blocks < min {
-            return Err(StoreError::Open(format!(
-                "the file holds {blocks} blocks; this shape needs at least {min}"
-            )));
-        }
         let mut db = Box::new(KvDb::new(device, horton::Config::whole_device(blocks)));
         let open = block_on(db.open())?;
         let tables = Arc::new(*db.manifest());
@@ -2830,8 +2912,164 @@ mod tests {
         let opened = Store::open(&path, TempStore::options()).err();
         let relocked = StoreLock::acquire(&path).map(drop).map_err(|e| e.kind());
         remove_store(&path);
-        assert!(matches!(opened, Some(StoreError::Open(_))), "{opened:?}");
+        assert!(
+            matches!(opened, Some(StoreError::TooSmall { existing: true, .. })),
+            "{opened:?}"
+        );
         assert_eq!(relocked, Ok(()));
+    }
+
+    /// Issue #46, item 1: an open with too few blocks for a new file
+    /// does not size the file. The next open with enough blocks makes
+    /// the store.
+    #[test]
+    fn a_new_store_too_small_for_the_shape_is_not_sized() {
+        let path = temp_path("new-too-small");
+        let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
+        let small = Options {
+            create_blocks: min - 1,
+            sync: false,
+        };
+        let refused = Store::open(&path, small).err();
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let opened = Store::open(&path, TempStore::options()).map(drop);
+        remove_store(&path);
+        let Some(e @ StoreError::TooSmall { .. }) = refused else {
+            panic!("wrong result: {refused:?}");
+        };
+        assert_eq!(
+            e,
+            StoreError::TooSmall {
+                path,
+                blocks: min - 1,
+                min,
+                existing: false,
+            }
+        );
+        assert!(e.to_string().contains("not sized"), "{e}");
+        assert_eq!(len, 0, "the refused open sized the file");
+        assert_eq!(opened, Ok(()));
+    }
+
+    /// A new store too large to make is an error, not an overflow, and
+    /// the file is not sized.
+    #[test]
+    fn a_new_store_too_large_to_make_is_an_error() {
+        let path = temp_path("too-large");
+        let huge = Options {
+            create_blocks: u64::MAX,
+            sync: false,
+        };
+        let refused = Store::open(&path, huge).err();
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        remove_store(&path);
+        let Some(StoreError::Open(e)) = refused else {
+            panic!("wrong result: {refused:?}");
+        };
+        assert!(e.contains("is too large"), "{e}");
+        assert_eq!(len, 0, "the refused open sized the file");
+    }
+
+    /// A file that is not a whole number of blocks is not a store. The
+    /// error says so, and does not tell the user to delete the file.
+    #[test]
+    fn a_file_of_part_blocks_is_not_a_store() {
+        let path = temp_path("part-block");
+        std::fs::write(&path, [0; 100]).expect("write");
+        let refused = Store::open(&path, TempStore::options()).err();
+        remove_store(&path);
+        let Some(StoreError::Open(e)) = refused else {
+            panic!("wrong result: {refused:?}");
+        };
+        assert!(e.contains("not a store"), "{e}");
+    }
+
+    /// The minimum size opens, for a new file and for an existing one.
+    #[test]
+    fn a_store_of_exactly_the_minimum_size_opens() {
+        let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
+        let exact = Options {
+            create_blocks: min,
+            sync: false,
+        };
+        let path = temp_path("exact-min");
+        let new = Store::open(&path, exact).map(drop);
+        let len = std::fs::metadata(&path).map(|m| m.len());
+        remove_store(&path);
+        std::fs::File::create(&path)
+            .and_then(|f| f.set_len(min * BLOCK as u64))
+            .expect("create");
+        let existing = Store::open(&path, TempStore::options()).map(drop);
+        remove_store(&path);
+        assert_eq!(new, Ok(()));
+        assert_eq!(len.ok(), Some(min * BLOCK as u64));
+        assert_eq!(existing, Ok(()));
+    }
+
+    /// Issue #46, item 1: an existing file that is too small gives an
+    /// error that names the remedy (ADR-0013), and the file stays.
+    #[test]
+    fn an_existing_file_too_small_names_the_remedy() {
+        let path = temp_path("old-too-small");
+        let blocks = 512;
+        std::fs::File::create(&path)
+            .and_then(|f| f.set_len(blocks * BLOCK as u64))
+            .expect("create");
+        let refused = Store::open(&path, TempStore::options()).err();
+        let len = std::fs::metadata(&path).map(|m| m.len());
+        remove_store(&path);
+        let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
+        let Some(e) = refused else {
+            panic!("the open succeeded");
+        };
+        assert_eq!(
+            e,
+            StoreError::TooSmall {
+                path,
+                blocks,
+                min,
+                existing: true,
+            }
+        );
+        let text = e.to_string();
+        assert!(text.contains("delete the file"), "{text}");
+        assert!(text.contains(&format!("{} MiB", mib_for(min))), "{text}");
+        assert_eq!(len.ok(), Some(blocks * BLOCK as u64), "the file changed");
+    }
+
+    /// Issue #46, item 3: a range that starts after it ends is an error,
+    /// as in `RocksDB`'s `DeleteRange`. An empty range is not.
+    #[test]
+    fn inverted_ranges_are_refused() {
+        let store = TempStore::new("inverted");
+        for k in [b"a", b"m", b"z"] {
+            store.put(k, b"v").expect("put");
+        }
+        assert_eq!(
+            store.delete_range(b"z", b"a"),
+            Err(StoreError::InvertedRange)
+        );
+        assert_eq!(
+            store.scan(b"z", Some(b"a"), false, 10, None),
+            Err(StoreError::InvertedRange)
+        );
+        assert_eq!(
+            store.scan(b"z", Some(b"a"), true, 10, None),
+            Err(StoreError::InvertedRange)
+        );
+        assert!(matches!(
+            store.range(b"z", Some(b"a"), false),
+            Err(StoreError::InvertedRange)
+        ));
+        // Empty ranges are not errors.
+        assert_eq!(store.delete_range(b"m", b"m"), Ok(()));
+        assert_eq!(
+            store.scan(b"m", Some(b"m"), false, 10, None),
+            Ok(Vec::new())
+        );
+        assert!(keys(&store, b"m", Some(b"m"), true).is_empty());
+        // Nothing was deleted.
+        assert_eq!(keys(&store, b"", None, false), [b"a", b"m", b"z"]);
     }
 
     /// `destroy` deletes the store and keeps the lock file. It refuses
