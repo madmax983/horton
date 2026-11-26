@@ -224,6 +224,12 @@ unchanged.
   poison, and the next sweep writes them again. Do not rebuild the
   drainer on the same ring and `durable`: `into_db` drops the pending
   tickets, and `durable` stops at the first of them.
+- **A sweep writes the longest prefix that the `Db` takes** (ADR-0037,
+  issue #48). It stops at the first ticket that the `Db` cannot hold
+  and writes the tickets before it. On `BatchTooLarge` with more than
+  one op, it tries half the prefix. The rest stays pending. The next
+  sweep that starts at a bad ticket poisons the drainer, and
+  `Drainer::bad_ticket` names that ticket.
 - **O2 — drainer is sole device writer.** Holds by ownership: the
   `WalWriter` (and through it the `Device`) is moved to and exclusively
   owned by the drainer. No `&WalWriter` is ever shared. (The full `Db`
@@ -278,6 +284,10 @@ unchanged.
   removed `NoSpace`; every capacity error names its remedy (ADR-0013),
   and `RingFull`'s is "let the drainer sweep, then retry". A payload the
   drainer cannot decode is `Error::BadPayload` (the drainer poisons).
+- **Limits before the claim** (ADR-0037). `Drainer::writer` gives a
+  `Writer` with the `Db`'s `KEY_MAX` and `VAL_MAX`. `Writer::put`
+  refuses a payload that `payload::check` refuses, before it claims a
+  ticket. `writer::put` refuses only a payload that does not decode.
 
 > **Implemented** (2026-09-26): `src/writer.rs` — `put(ring, durable,
 > payload)` claims a ticket, publishes the 32-byte payload, and returns a
@@ -458,7 +468,8 @@ single-CAS).
   - Decode is total over every 32-byte slot: unknown op bytes, zero or
     overlong lengths, or budget overflows yield `DecodeError` — never a
     panic, never a silent reinterpretation. A decode failure poisons the
-    drainer (`Error::BadPayload`); the host must intervene.
+    drainer (`Error::BadPayload`) when the sweep gets to that ticket;
+    the tickets before it are written (ADR-0037).
 - Everything is `#[cfg(feature = "multiwriter")]`, const-generic,
   no_alloc, safe Rust. No new `Error` variants are added by the ring
   itself except surfacing `WriterFenced` at the `Db` integration layer

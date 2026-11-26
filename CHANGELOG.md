@@ -43,6 +43,11 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   in one lend. The provided method answers `false`; `BlockCache` (with
   slots) and the host store's cache answer `true`. It is advice: a wrong
   answer costs time, never a byte.
+- **`Drainer::writer`, `writer::Writer`, `payload::check` and
+  `Drainer::bad_ticket`** (`multiwriter`, ADR-0037, issue #48).
+  `Writer::put` refuses a payload that the `Db`'s `KEY_MAX` or
+  `VAL_MAX` cannot hold, before it claims a ticket. `bad_ticket` names
+  the ticket that poisoned the drainer.
 - **`Drainer::compact_step`, `Drainer::request_compaction`,
   `Drainer::compaction_pending` and `Drainer::resume`** (`multiwriter`,
   ADR-0036). The host compacts, and retries after poison, without
@@ -209,6 +214,11 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   - `ScanBlock`, `Scan` and `RevScan` grow by 8 bytes. On the ESP32-S3
     profile scan futures grow by 176 to 312 bytes, and the peak is
     unchanged (`BUDGET.md`).
+- **`writer::put` refuses a payload that does not decode**
+  (`multiwriter`, ADR-0037). It returns `BadPayload` before it claims a
+  ticket. Before, the drainer poisoned itself.
+- **`Swept { tickets }` can be less than the tickets drained**
+  (`multiwriter`, ADR-0037). The next sweep writes the rest first.
 - **`SweepOutcome::Stalled` also means "WAL full"** (`multiwriter`,
   ADR-0036). The remedy is the same: `Drainer::flush`, then sweep
   again. A host that counts stalls as memtable flushes now also counts
@@ -438,6 +448,13 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   range (`start > end`) in `delete_range`, `scan` or `range` gives
   `StoreError::InvertedRange`; an empty range is not an error. A huge
   `--size-mb` is an error, not an overflow.
+- **A burst of valid writes no longer poisons the `multiwriter`
+  drainer** (ADR-0037, issue #48). With `MAX_WRITES` over `CAP`, or ops
+  over `ARENA` bytes, `Db::write` gave `BatchTooLarge`, and `resume`
+  gave it again. The sweep now writes half the prefix.
+- **A bad ticket no longer stops the good tickets before it**
+  (`multiwriter`, ADR-0037, issues #48 and #52). The sweep writes them,
+  and poisons the drainer only when it gets to the bad ticket.
 - **The `multiwriter` drainer stalls on `WalFull`** (ADR-0036, issue
   #47). Each sweep of one write used one WAL block, and the drainer
   poisoned itself when the WAL was full (the 79th write on the README

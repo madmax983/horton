@@ -358,3 +358,113 @@ fn delta_key_names_the_differing_key() {
     };
     assert_eq!(d.key(), b"z");
 }
+
+// ── Issue #48 next charter 3: one replica purges, one does not ─────────
+
+/// A TTL put that flushes and retries when the memtable or WAL is full.
+fn put_ttl(db: &mut TestDb<MemDevice<4096>>, k: &[u8], v: &[u8], expire_at: u64) {
+    match block_on(db.put_with_ttl(k, v, expire_at)) {
+        Ok(_) => {}
+        Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
+            flush(db);
+            block_on(db.put_with_ttl(k, v, expire_at)).unwrap();
+        }
+        Err(e) => panic!("unexpected put error: {e:?}"),
+    }
+}
+
+/// Flushes, then compacts every level with `purge_before`.
+fn purge(db: &mut TestDb<MemDevice<4096>>, purge_before: u64) {
+    flush(db);
+    db.request_compaction(0).unwrap();
+    let mut c = Compaction::<4096, 256, 1024, 1024>::new();
+    c.purge_before = purge_before;
+    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+}
+
+/// Fingerprints `db` in four buckets and whole, read at `now`.
+fn fp_at(db: &TestDb<MemDevice<4096>>, now: u64) -> ([Fingerprint; 4], Fingerprint) {
+    let splits: [&[u8]; 3] = [b"k00010", b"k00020", b"k00030"];
+    let (mut k, mut v) = ([0u8; 256], [0u8; 1024]);
+    let mut buckets = [Fingerprint::EMPTY; 4];
+    let mut scan = TestScan::new(db);
+    block_on(scan.seek_with_time(b"", None, u64::MAX, now)).unwrap();
+    block_on(fingerprint_buckets(
+        &mut scan,
+        &splits,
+        &mut buckets,
+        &mut k,
+        &mut v,
+    ))
+    .unwrap();
+    let mut whole = TestScan::new(db);
+    block_on(whole.seek_with_time(b"", None, u64::MAX, now)).unwrap();
+    (
+        buckets,
+        block_on(fingerprint(&mut whole, &mut k, &mut v)).unwrap(),
+    )
+}
+
+#[test]
+fn purged_and_unpurged_replicas_agree_at_the_same_now() {
+    // Replica A purges with `purge_before <= now`; B never purges. Read
+    // at the same `now`, they hold the same visible pairs, so the
+    // fingerprints are equal and `Diff` finds nothing (issue #52 toured
+    // this; here it stays).
+    const FLOOR: u64 = 500;
+    const NOW: u64 = 600;
+    let mut differ_at_zero = 0;
+    for seed in 1..=20 {
+        let mut rng = Lcg::new(seed);
+        let (mut a, mut b) = (fresh(), fresh());
+        for _ in 0..300 {
+            let k = key(rng.next_bounded(40));
+            match rng.next_bounded(8) {
+                0 | 1 => {
+                    let v = key(rng.next_bounded(1000));
+                    put(&mut a, &k, &v);
+                    put(&mut b, &k, &v);
+                }
+                2..=4 => {
+                    let at = [0, 1, FLOOR - 1, FLOOR, FLOOR + 1, NOW, NOW + 1, u64::MAX];
+                    let e = at[rng.next_bounded(at.len())];
+                    put_ttl(&mut a, &k, b"ttl", e);
+                    put_ttl(&mut b, &k, b"ttl", e);
+                }
+                5 => {
+                    del(&mut a, &k);
+                    del(&mut b, &k);
+                }
+                6 => {
+                    purge(&mut a, FLOOR);
+                    flush(&mut b);
+                    drive(&mut b);
+                }
+                _ => {}
+            }
+        }
+        purge(&mut a, FLOOR);
+        let (ba, wa) = fp_at(&a, NOW);
+        let (bb, wb) = fp_at(&b, NOW);
+        assert_eq!(ba, bb, "seed {seed}: buckets");
+        assert_eq!(wa, wb, "seed {seed}: whole");
+        let merged = ba.iter().fold(Fingerprint::EMPTY, |m, f| m.merge(*f));
+        assert_eq!(merged, wa, "seed {seed}: the buckets merge to the whole");
+
+        let mut sa = TestScan::new(&a);
+        let mut sb = TestScan::new(&b);
+        block_on(sa.seek_with_time(b"", None, u64::MAX, NOW)).unwrap();
+        block_on(sb.seek_with_time(b"", None, u64::MAX, NOW)).unwrap();
+        assert_eq!(collect(&mut sa, &mut sb), vec![], "seed {seed}: diff");
+
+        // Harness check: B read with `now = 0` (out of contract) shows
+        // what A purged.
+        if fp_at(&b, 0).1 != wa {
+            differ_at_zero += 1;
+        }
+    }
+    assert!(
+        differ_at_zero > 10,
+        "the purge must remove data: {differ_at_zero}"
+    );
+}

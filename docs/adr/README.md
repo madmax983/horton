@@ -48,6 +48,7 @@ history keeps it); its §9 milestone log now lives in
 | [0034](0034-index-blocks-end-in-restart-offsets.md) | An index block ends in a trailer, the offset of every 16th entry and the count (`hrtsst05`, manifest `hrtman11`): a search binary-searches it and checks only the cached bytes it reads, for point reads and seeks; a shape whose index cannot hold one key's run of versions no longer builds |
 | [0035](0035-scans-copy-only-what-they-check.md) | A scan keeps a map of the grains of each block buffer it has checked, copies from a cached data block only what it checks as it reads it (`CopyIn`), and takes the rest only when it reads further; a forward seek positions by the block's restarts; `CachePort::checks_ranges` |
 | [0036](0036-drainer-stalls-on-wal-full.md) | The `multiwriter` drainer stalls on `WalFull`, as on a full memtable; `Drainer::compact_step` and `Drainer::resume` let the host recover in place, because a rebuild after `into_db` stops `durable` |
+| [0037](0037-drainer-writes-the-prefix-it-can.md) | The `multiwriter` drainer writes the longest pending prefix that the `Db` takes: a burst over `CAP` or `ARENA` splits, the tickets before a bad ticket complete, `Drainer::bad_ticket` names it, and `Writer::put` checks the `Db`'s limits before the claim |
 
 ## Adding a record
 

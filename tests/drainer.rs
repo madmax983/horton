@@ -1036,10 +1036,9 @@ fn stalled_flush_failure_acks_nothing() {
 
 #[test]
 fn poison_with_fenced_ticket_interleaved() {
-    // A malformed payload poisons the drainer even with a fenced (skipped)
-    // ticket interleaved in the batch: the acknowledged prefix is empty —
-    // neither the good put before the fence nor the skipped ticket is
-    // acknowledged — and the pending set is retained, not lost.
+    // A malformed payload after a good put and a fenced (skipped) ticket.
+    // The drainer writes and acknowledges the two tickets before it, then
+    // poisons on it and keeps it pending (issue #48).
     let ring = Ring::<8>::new();
     let durable = AtomicU32::new(0);
     let mut drainer = make_drainer::<8, 8>(&ring, &durable);
@@ -1059,20 +1058,25 @@ fn poison_with_fenced_ticket_interleaved() {
     assert_eq!(ring.publish(t2, &bad), PublishOutcome::Published);
     assert_eq!((t0, t1, t2), (0, 1, 2));
 
+    assert_eq!(
+        block_on(drainer.sweep()).expect("the good prefix is written"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert!(is_ticket_durable(&durable, t0));
+    assert!(is_ticket_durable(&durable, t1));
     let err = block_on(drainer.sweep()).expect_err("malformed must error");
     assert_eq!(err, horton::Error::BadPayload);
     assert!(drainer.is_poisoned());
-    // Nothing was acknowledged: not the good put, not the skipped ticket.
-    assert_eq!(durable.load(Ordering::Acquire), 0);
-    assert!(!is_ticket_durable(&durable, t0));
-    assert!(!is_ticket_durable(&durable, t1));
-    // The pending set is retained (buffered, not lost and not acked).
-    assert_eq!(drainer.pending(), 3);
+    assert_eq!(drainer.bad_ticket(), Some(t2));
+    assert_eq!(durable.load(Ordering::Acquire), 2);
+    assert!(!is_ticket_durable(&durable, t2));
+    // The bad ticket stays pending, not lost and not acked.
+    assert_eq!(drainer.pending(), 1);
 
     // A poisoned drainer stays stopped.
     let outcome = block_on(drainer.sweep()).expect("poisoned sweep stays idle");
     assert_eq!(outcome, SweepOutcome::Idle);
-    assert_eq!(durable.load(Ordering::Acquire), 0);
+    assert_eq!(durable.load(Ordering::Acquire), 2);
 }
 
 #[test]
@@ -2100,7 +2104,8 @@ fn resume_retries_the_batch_after_a_device_error() {
 
 #[test]
 fn resume_after_bad_payload_poisons_again() {
-    // An error that comes from a ticket comes back after `resume`.
+    // An error that comes from a ticket comes back after `resume`. The
+    // good ticket before it completes first (issue #48).
     let (ring, durable) = setup::<8>();
     let mut drainer = make_drainer::<8, 8>(&ring, &durable);
     publish(&ring, b"k0", b"v0");
@@ -2108,18 +2113,22 @@ fn resume_after_bad_payload_poisons_again() {
     bad[0] = 0xEE;
     publish_raw(&ring, &bad);
     assert_eq!(
+        block_on(drainer.sweep()).expect("the good ticket is written"),
+        SweepOutcome::Swept { tickets: 1 }
+    );
+    assert_eq!(
         block_on(drainer.sweep()).expect_err("bad payload"),
         horton::Error::BadPayload
     );
-    assert_eq!(drainer.pending(), 2);
+    assert_eq!(drainer.pending(), 1);
     drainer.resume();
     assert_eq!(
         block_on(drainer.sweep()).expect_err("bad payload again"),
         horton::Error::BadPayload
     );
     assert!(drainer.is_poisoned());
-    assert_eq!(drainer.pending(), 2);
-    assert_eq!(durable.load(Ordering::Acquire), 0);
+    assert_eq!(drainer.pending(), 1);
+    assert_eq!(durable.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -2163,4 +2172,348 @@ fn resume_while_stalled_changes_nothing() {
         SweepOutcome::Swept { tickets: 1 }
     );
     assert!(is_ticket_durable(&durable, t));
+}
+
+// ── Issue #48: bursts and bad tickets ─────────────────────────────────
+
+/// A drainer whose sweep (8 tickets) is larger than its memtable (4).
+type SmallCapDrainer<'r> = Drainer<'r, MemDevice<512>, 512, 32, 32, 4, 1024, 2, 4, 64, 0, 16, 8>;
+
+/// A drainer whose sweep can hold more bytes than its arena (64).
+type SmallArenaDrainer<'r> = Drainer<'r, MemDevice<512>, 512, 32, 32, 16, 64, 2, 4, 64, 0, 16, 8>;
+
+/// A drainer whose `Db` takes keys of at most 8 bytes.
+type ShortKeyDrainer<'r> = Drainer<'r, MemDevice<512>, 512, 8, 16, 16, 1024, 2, 4, 64, 0, 16, 8>;
+
+/// Claims and publishes `p` on a 16-slot ring. Returns the ticket.
+fn publish16(ring: &Ring<16>, p: &[u8; 32]) -> u32 {
+    let t = ring.try_claim().expect("ring has space");
+    assert_eq!(ring.publish(t, p), PublishOutcome::Published);
+    t
+}
+
+/// Sweeps until the drainer has no pending ticket. Flushes on `Stalled`.
+/// Returns the `Swept` ticket counts in order.
+fn sweep_all<const KEY_MAX: usize, const VAL_MAX: usize, const CAP: usize, const ARENA: usize>(
+    drainer: &mut Drainer<
+        '_,
+        MemDevice<512>,
+        512,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        2,
+        4,
+        64,
+        0,
+        16,
+        8,
+    >,
+) -> Vec<usize> {
+    let mut swept = Vec::new();
+    for _ in 0..64 {
+        match block_on(drainer.sweep()).expect("valid writes must not poison") {
+            SweepOutcome::Swept { tickets } => swept.push(tickets),
+            SweepOutcome::Stalled => block_on(drainer.flush()).expect("flush ok"),
+            SweepOutcome::Idle if drainer.pending() == 0 => return swept,
+            SweepOutcome::Idle => panic!("Idle with pending tickets"),
+        }
+    }
+    panic!("sweeps did not settle");
+}
+
+/// Reads `key` from the drained `Db`.
+fn read_back<const KEY_MAX: usize, const VAL_MAX: usize, const CAP: usize, const ARENA: usize>(
+    db: &horton::Db<MemDevice<512>, 512, KEY_MAX, VAL_MAX, CAP, ARENA, 2, 4, 64, 0>,
+    key: &[u8],
+) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 64];
+    block_on(db.get(key, &mut buf))
+        .expect("get ok")
+        .map(|n| buf[..n].to_vec())
+}
+
+#[test]
+fn burst_larger_than_the_memtable_does_not_poison() {
+    // Eight valid puts, a memtable of four. The drainer writes part of
+    // the burst in each sweep. Before the fix, `BatchTooLarge` poisoned
+    // the drainer, and `resume` gave the same error again.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: SmallCapDrainer<'_> = Drainer::new(&ring, db, &durable);
+    for i in 0..8u8 {
+        publish16(&ring, &put_payload(&[b'k', i], &[b'v', i]));
+    }
+    let swept = sweep_all(&mut drainer);
+    assert_eq!(swept.iter().sum::<usize>(), 8);
+    assert!(
+        swept.iter().all(|&n| n <= 4),
+        "no sweep is over CAP: {swept:?}"
+    );
+    assert!(!drainer.is_poisoned());
+    assert_eq!(durable.load(Ordering::Acquire), 8);
+    let db = drainer.into_db();
+    for i in 0..8u8 {
+        assert_eq!(read_back(&db, &[b'k', i]), Some(vec![b'v', i]));
+    }
+}
+
+#[test]
+fn burst_larger_than_the_arena_does_not_poison() {
+    // Eight 29-byte puts, an arena of 64 bytes: two puts fill it.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: SmallArenaDrainer<'_> = Drainer::new(&ring, db, &durable);
+    for i in 0..8u8 {
+        publish16(&ring, &put_payload(&[b'k', i, b'0'], &[i; 26]));
+    }
+    let swept = sweep_all(&mut drainer);
+    assert_eq!(swept.iter().sum::<usize>(), 8);
+    assert!(!drainer.is_poisoned());
+    assert_eq!(durable.load(Ordering::Acquire), 8);
+    let db = drainer.into_db();
+    for i in 0..8u8 {
+        assert_eq!(read_back(&db, &[b'k', i, b'0']), Some(vec![i; 26]));
+    }
+}
+
+#[test]
+fn split_burst_keeps_ticket_order() {
+    // Puts and a delete of one key, over the memtable size. The split
+    // sweeps apply them in ticket order: the last write wins.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: SmallCapDrainer<'_> = Drainer::new(&ring, db, &durable);
+    for i in 0..6u8 {
+        publish16(&ring, &put_payload(b"k", &[b'v', i]));
+    }
+    publish16(
+        &ring,
+        &payload::encode_delete(b"k").expect("delete payload"),
+    );
+    publish16(&ring, &put_payload(b"k", b"last"));
+    assert_eq!(sweep_all(&mut drainer).iter().sum::<usize>(), 8);
+    // Eight ops, so eight seqnums: none is lost or used twice.
+    assert_eq!(drainer.durable_seqnum(), 8);
+    let db = drainer.into_db();
+    assert_eq!(read_back(&db, b"k"), Some(b"last".to_vec()));
+}
+
+#[test]
+fn good_tickets_before_a_bad_ticket_complete() {
+    // Issue #48 next charter 2 and the issue #52 digest: one oversized
+    // key stopped the valid writer in the same sweep.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: ShortKeyDrainer<'_> = Drainer::new(&ring, db, &durable);
+    let t0 = publish16(&ring, &put_payload(b"a", b"1"));
+    let t1 = publish16(&ring, &put_payload(b"0123456789abcdefghij", b"x"));
+    let t2 = publish16(&ring, &put_payload(b"b", b"2"));
+
+    assert_eq!(
+        block_on(drainer.sweep()).expect("the good prefix is written"),
+        SweepOutcome::Swept { tickets: 1 }
+    );
+    assert!(is_ticket_durable(&durable, t0));
+    assert_eq!(drainer.bad_ticket(), None);
+
+    assert_eq!(
+        block_on(drainer.sweep()).expect_err("the bad ticket poisons"),
+        horton::Error::KeyTooLarge { len: 20, max: 8 }
+    );
+    assert!(drainer.is_poisoned());
+    assert_eq!(
+        drainer.bad_ticket(),
+        Some(t1),
+        "the host learns which ticket"
+    );
+    assert_eq!(drainer.pending(), 2);
+    assert!(!is_ticket_durable(&durable, t1));
+    assert!(!is_ticket_durable(&durable, t2));
+}
+
+#[test]
+fn bad_payload_at_the_head_names_its_ticket() {
+    let (ring, durable) = setup::<8>();
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+    let mut bad = [0u8; 32];
+    bad[0] = 0xEE;
+    let t0 = publish_raw(&ring, &bad);
+    publish(&ring, b"k1", b"v1");
+    assert_eq!(
+        block_on(drainer.sweep()).expect_err("bad payload"),
+        horton::Error::BadPayload
+    );
+    assert_eq!(drainer.bad_ticket(), Some(t0));
+    assert_eq!(drainer.pending(), 2);
+}
+
+#[test]
+fn a_device_error_names_no_bad_ticket() {
+    let (ring, durable) = setup::<8>();
+    let mut db = horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0>::new(
+        FailFlush::<512>::new(),
+        test_config(),
+    );
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer =
+        Drainer::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0, 8, 8>::new(&ring, db, &durable);
+    publish(&ring, b"k0", b"v0");
+    assert_eq!(
+        block_on(drainer.sweep()).expect_err("flush failure must error"),
+        horton::Error::Device(TestError)
+    );
+    assert_eq!(drainer.bad_ticket(), None);
+    drainer.resume();
+    assert_eq!(drainer.bad_ticket(), None);
+}
+
+#[test]
+fn resume_clears_the_bad_ticket_until_the_next_sweep() {
+    let (ring, durable) = setup::<8>();
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+    let mut bad = [0u8; 32];
+    bad[0] = 0xEE;
+    let t0 = publish_raw(&ring, &bad);
+    assert!(block_on(drainer.sweep()).is_err());
+    assert_eq!(drainer.bad_ticket(), Some(t0));
+    drainer.resume();
+    assert_eq!(drainer.bad_ticket(), None);
+    assert!(block_on(drainer.sweep()).is_err());
+    assert_eq!(drainer.bad_ticket(), Some(t0));
+}
+
+#[test]
+fn writer_refuses_what_the_db_cannot_hold() {
+    // The writer handle knows the `Db`'s limits. It refuses a bad
+    // payload before it claims a ticket, so no other writer stops.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: ShortKeyDrainer<'_> = Drainer::new(&ring, db, &durable);
+    let writer = drainer.writer();
+
+    let long_key = put_payload(b"0123456789abcdefghij", b"x");
+    let long_val = put_payload(b"k", &[b'v'; 17]);
+    let long_end = payload::encode_range_delete(b"a", b"zzzzzzzzz").expect("fits the codec");
+    let long_ttl_key = payload::encode_put_ttl(b"0123456789", b"", 7).expect("fits the codec");
+    let mut garbage = [0u8; 32];
+    garbage[0] = 0xEE;
+    for (p, want) in [
+        (long_key, horton::Error::KeyTooLarge { len: 20, max: 8 }),
+        (long_val, horton::Error::ValueTooLarge { len: 17, max: 16 }),
+        (long_end, horton::Error::KeyTooLarge { len: 9, max: 8 }),
+        (long_ttl_key, horton::Error::KeyTooLarge { len: 10, max: 8 }),
+        (garbage, horton::Error::BadPayload),
+    ] {
+        assert_eq!(writer.put(&p).map(|put| put.ticket()), Err(want));
+    }
+
+    // No ticket was used: the first good put takes ticket 0.
+    let good = writer
+        .put(&put_payload(b"a", &[b'v'; 16]))
+        .expect("fits the Db");
+    assert_eq!(good.ticket(), 0);
+    // An inverted range is a no-op, not an error, as in `Db::delete_range`.
+    let noop = writer
+        .put(&payload::encode_range_delete(b"zzzzzzzzz", b"a").expect("fits the codec"))
+        .expect("an inverted range is a no-op");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    assert!(is_ticket_durable(&durable, good.ticket()));
+    assert!(is_ticket_durable(&durable, noop.ticket()));
+}
+
+#[test]
+fn writer_check_matches_the_drainer() {
+    // `payload::check` and the drainer agree on every payload: what the
+    // check accepts, the drainer writes; what it refuses, the drainer
+    // refuses with the same error.
+    let mut lcg = common::Lcg::new(48);
+    let mut passed = 0;
+    for _ in 0..4000 {
+        let mut p = [0u8; 32];
+        p[0] = u8::try_from(1 + lcg.next_bounded(4)).expect("small");
+        p[1] = u8::try_from(lcg.next_bounded(24)).expect("small");
+        p[2] = u8::try_from(lcg.next_bounded(24)).expect("small");
+        for b in &mut p[3..] {
+            *b = b'a' + u8::try_from(lcg.next_bounded(3)).expect("small");
+        }
+        let ring = Ring::<16>::new();
+        let durable = AtomicU32::new(0);
+        let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+        block_on(db.open()).expect("db open must succeed");
+        let mut drainer: ShortKeyDrainer<'_> = Drainer::new(&ring, db, &durable);
+        let check = payload::check::<8, 16>(&p);
+        publish16(&ring, &p);
+        let swept = block_on(drainer.sweep());
+        match check {
+            Ok(()) => {
+                passed += 1;
+                assert_eq!(swept, Ok(SweepOutcome::Swept { tickets: 1 }), "{p:?}");
+            }
+            Err(e) => assert_eq!(swept, Err(e.widen()), "{p:?}"),
+        }
+    }
+    assert!(passed > 400, "the mix must test both sides: {passed}");
+}
+
+#[test]
+fn plain_put_refuses_a_payload_that_does_not_decode() {
+    // `writer::put` does not know the `Db`'s limits, but it refuses a
+    // payload that no `Db` can take, before it claims a ticket.
+    let (ring, durable) = setup::<8>();
+    let mut bad = [0u8; 32];
+    bad[0] = 0xEE;
+    assert_eq!(
+        horton::writer::put(&ring, &durable, &bad).map(|put| put.ticket()),
+        Err(horton::Error::BadPayload)
+    );
+    assert_eq!(ring.try_claim(), Some(0), "no ticket was used");
+}
+
+#[test]
+fn ttl_payload_at_the_codec_limit_lands() {
+    // Issue #48 "not toured": 8 + key + value = 29 fits; 30 does not.
+    let (ring, durable) = setup::<8>();
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+    let edge = payload::encode_put_ttl(&[b'k'; 10], &[b'v'; 11], 100).expect("29 fits");
+    assert_eq!(payload::encode_put_ttl(&[b'k'; 10], &[b'v'; 12], 100), None);
+    assert_eq!(payload::encode_put_ttl(&[b'k'; 22], b"", 100), None);
+    let longest_key = payload::encode_put_ttl(&[b'q'; 21], b"", 100).expect("21-byte key fits");
+    publish_raw(&ring, &edge);
+    publish_raw(&ring, &longest_key);
+    // A hand-made TTL payload at 30 bytes does not decode.
+    let mut over = edge;
+    over[2] = 12;
+    assert_eq!(payload::decode(&over), Err(payload::DecodeError::BadValLen));
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 2 }
+    );
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    for (key, val) in [
+        (&[b'k'; 10][..], &[b'v'; 11][..]),
+        (&[b'q'; 21][..], &[][..]),
+    ] {
+        let live = block_on(db.get_with_time(key, &mut buf, 99)).expect("get ok");
+        assert_eq!(live.map(|n| buf[..n].to_vec()), Some(val.to_vec()));
+        assert_eq!(
+            block_on(db.get_with_time(key, &mut buf, 100)).expect("get ok"),
+            None
+        );
+    }
 }
