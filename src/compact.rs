@@ -1870,9 +1870,7 @@ async fn read_data_block<
         })?;
     // Compaction reads bypass the block cache: a merge streams each block
     // once, and its inputs are about to be retired.
-    if !sstable::read_data_block(device, None, 0, id, raw, &mut cur.block, false).await? {
-        cur.block.copy_from_slice(raw);
-    }
+    sstable::read_data_block(device, None, 0, id, raw, &mut cur.block, true).await?;
     let rstart = sstable::data_entries_end(&cur.block, id)?;
     if rstart == 0 {
         // A data block always carries at least one entry.

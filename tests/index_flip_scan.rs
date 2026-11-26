@@ -81,6 +81,9 @@ impl CachePort<4096> for FlipCache {
         }
         Some(ok)
     }
+    fn checks_ranges(&self) -> bool {
+        true
+    }
     fn put(&self, t: u32, b: u64, block: &[u8; 4096], _hot: bool) {
         self.images.borrow_mut().insert((t, b), *block);
     }

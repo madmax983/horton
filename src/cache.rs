@@ -468,6 +468,10 @@ impl<const BLOCK: usize, const SLOTS: usize> BlockCache<BLOCK, SLOTS> {
     /// nothing and holds; a range past the image fails, and once one
     /// check has failed every later one does. `read` must not call back
     /// into the cache, and `check` is valid only while `read` runs.
+    ///
+    /// Bytes `read` copies out right after a check over them held may be
+    /// kept once this returns `true`; nothing copied from a lend that
+    /// returns `false` may be (ADR-0035).
     pub fn with_checked(
         &mut self,
         table_id: u32,
@@ -701,6 +705,12 @@ pub trait CachePort<const BLOCK: usize> {
     /// `read` made of the image must be discarded. `read` must not call
     /// back into the cache, and `check` is valid only while `read` runs.
     ///
+    /// `read` may copy out a range it has checked and keep the copy
+    /// after it returns, once the lend has returned `Some(true)`: the
+    /// check vouched for those bytes as they were copied (ADR-0035). A
+    /// byte copied without a check, or checked in another lend, is never
+    /// vouched for.
+    ///
     /// For a cache that lends whole images but cannot check them a
     /// range at a time, this provided method checks the whole image up
     /// front ([`with_range`](Self::with_range)) and hands `read` a
@@ -715,6 +725,20 @@ pub trait CachePort<const BLOCK: usize> {
         self.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
             read(image, &mut |from, to| to <= from || to <= BLOCK);
         })
+    }
+    /// Whether [`with_checked`](Self::with_checked) checks only the
+    /// ranges `check` is asked about (each against its own RAM
+    /// checksum), rather than the whole image up front. A scan uses it
+    /// to choose how much of a lent block to take: with range checks it
+    /// takes the few ranges it reads now, and asks for the rest only
+    /// when it reads further; without them every lend costs a whole
+    /// check, so it takes the whole block in one (ADR-0035).
+    ///
+    /// It is advice: a wrong answer costs time, never a wrong byte.
+    /// This provided method answers `false`, which matches the provided
+    /// [`with_checked`](Self::with_checked).
+    fn checks_ranges(&self) -> bool {
+        false
     }
     /// Insert a verified image; `hot` sets the CLOCK reference bit.
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool);
@@ -761,6 +785,10 @@ impl<const BLOCK: usize, const SLOTS: usize> CachePort<BLOCK>
             self.try_borrow_mut()
                 .is_ok_and(|mut c| c.with_checked(table_id, block_id, read)),
         )
+    }
+
+    fn checks_ranges(&self) -> bool {
+        SLOTS > 0
     }
 
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool) {
@@ -1147,6 +1175,10 @@ mod tests {
         let _busy = c.borrow_mut();
         assert_eq!(c.with_range(7, 7, 0, 16, &mut |_| n = 0), Some(false));
         assert_eq!(n, 16);
+        // It checks a lend a range at a time; a cache of no slots lends
+        // nothing worth taking in parts.
+        assert!(c.checks_ranges());
+        assert!(!core::cell::RefCell::new(BlockCache::<4096, 0>::new()).checks_ranges());
     }
 
     /// The provided `with_checked`, for a cache that lends only whole
@@ -1190,6 +1222,8 @@ mod tests {
 
         let good = block::<4096>(97);
         let c = WholeOnly(RefCell::new(BlockCache::new()));
+        // Its lends are checked whole, and it says so.
+        assert!(!c.checks_ranges());
         c.put(3, 3, &good, true);
         let mut answers = [false; 4];
         let hit = c.with_checked(3, 3, &mut |image, check| {

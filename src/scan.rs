@@ -185,6 +185,10 @@ pub struct ScanBlock<const BLOCK: usize> {
     id: Option<u64>,
     /// When it was last used, on the scan's own counter.
     used: u64,
+    /// Which grains of `data` hold checked bytes of block `id`, one bit
+    /// per [`grain`] (ADR-0035). [`full`] once the whole block is in.
+    /// Meaningful only while `id` is `Some`.
+    valid: u64,
     data: [u8; BLOCK],
 }
 
@@ -196,6 +200,7 @@ impl<const BLOCK: usize> ScanBlock<BLOCK> {
         Self {
             id: None,
             used: 0,
+            valid: 0,
             data: [0u8; BLOCK],
         }
     }
@@ -207,6 +212,129 @@ impl<const BLOCK: usize> Default for ScanBlock<BLOCK> {
     }
 }
 
+/// The bytes one bit of [`ScanBlock::valid`] stands for: a 64th of the
+/// block, rounded up (256 bytes at 16 KiB, 64 at 4 KiB).
+const fn grain<const BLOCK: usize>() -> usize {
+    let g = BLOCK.div_ceil(64);
+    if g == 0 { 1 } else { g }
+}
+
+/// The grains a block has.
+const fn grains<const BLOCK: usize>() -> usize {
+    BLOCK.div_ceil(grain::<BLOCK>())
+}
+
+/// The bitmap of a block whose every grain is in.
+const fn full<const BLOCK: usize>() -> u64 {
+    let n = grains::<BLOCK>();
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// The grains overlapping bytes `from..to` (`from < to <= BLOCK`).
+const fn mask<const BLOCK: usize>(from: usize, to: usize) -> u64 {
+    let g = grain::<BLOCK>();
+    let first = from / g;
+    let last = (to - 1) / g;
+    let upto = if last >= 63 {
+        u64::MAX
+    } else {
+        (1u64 << (last + 1)) - 1
+    };
+    upto & !((1u64 << first) - 1)
+}
+
+/// What a block parser asks before it acts on bytes of the block it is
+/// handed: their key, their lengths, their sequence number, a restart
+/// offset, a run of padding. `check` says whether bytes `from..to` may
+/// be acted on; a parser that gets `false` stops with
+/// [`Error::CorruptBlock`], which its driver then judges (see
+/// [`Blocks::load_with`]). `ahead` names bytes the next step will
+/// likely read, for a lend to take while it can (ADR-0035).
+trait Gate {
+    /// Whether bytes `from..to` may be acted on.
+    fn check(&mut self, from: usize, to: usize) -> bool;
+    /// Bytes `from..to` the scan's next step will likely read.
+    fn ahead(&mut self, from: usize, to: usize);
+}
+
+/// A gate over a whole verified block: every range inside it holds.
+struct Open<const BLOCK: usize>;
+
+impl<const BLOCK: usize> Gate for Open<BLOCK> {
+    fn check(&mut self, from: usize, to: usize) -> bool {
+        to <= from || to <= BLOCK
+    }
+
+    fn ahead(&mut self, _from: usize, _to: usize) {}
+}
+
+/// A gate over a scan buffer: a range holds when every grain it touches
+/// holds checked bytes. `missed` records that one did not, so that the
+/// driver takes the rest of the block and parses again.
+struct Gated<const BLOCK: usize> {
+    valid: u64,
+    missed: bool,
+}
+
+impl<const BLOCK: usize> Gate for Gated<BLOCK> {
+    fn check(&mut self, from: usize, to: usize) -> bool {
+        if to <= from {
+            return true;
+        }
+        let m = if to > BLOCK {
+            0
+        } else {
+            mask::<BLOCK>(from, to)
+        };
+        let held = to <= BLOCK && self.valid & m == m;
+        self.missed |= !held;
+        held
+    }
+
+    fn ahead(&mut self, _from: usize, _to: usize) {}
+}
+
+/// A gate over a cache's lent image: a range not yet taken is checked
+/// against the cache's RAM checksums, a grain at a time, and copied into
+/// the scan's buffer right after its check held. Only bytes copied that
+/// way are ever marked valid: a check vouches for the image it just
+/// summed, never for what the buffer already holds (ADR-0035).
+struct CopyIn<'a, 'c, const BLOCK: usize> {
+    image: &'a [u8; BLOCK],
+    data: &'a mut [u8; BLOCK],
+    valid: u64,
+    check: &'a mut (dyn FnMut(usize, usize) -> bool + 'c),
+}
+
+impl<const BLOCK: usize> Gate for CopyIn<'_, '_, BLOCK> {
+    fn check(&mut self, from: usize, to: usize) -> bool {
+        if to <= from {
+            return true;
+        }
+        if to > BLOCK {
+            return false;
+        }
+        let m = mask::<BLOCK>(from, to);
+        if self.valid & m == m {
+            return true;
+        }
+        let g = grain::<BLOCK>();
+        let lo = from / g * g;
+        let hi = to.div_ceil(g).saturating_mul(g).min(BLOCK);
+        if !(self.check)(lo, hi) {
+            return false;
+        }
+        self.data[lo..hi].copy_from_slice(&self.image[lo..hi]);
+        self.valid |= m;
+        true
+    }
+
+    fn ahead(&mut self, from: usize, to: usize) {
+        // A failed check is sticky: the lend becomes a miss.
+        let _ = self.check(from, to);
+    }
+}
+
 /// A scan's block buffers. A scan keeps one cursor per table but, by
 /// default, one decoded block for all of them: whenever the merge turns
 /// to another table's cursor, that table's block is fetched and inflated
@@ -214,6 +342,11 @@ impl<const BLOCK: usize> Default for ScanBlock<BLOCK> {
 /// a scan's time when tables overlap. A caller with memory to spare
 /// lends the scan more buffers, and each cursor's block then stays
 /// decoded while the merge is elsewhere.
+///
+/// A buffer may hold only part of its block: the grains a lend from the
+/// cache checked and copied in ([`ScanBlock::valid`], ADR-0035). Every
+/// parser reads a buffer through a [`Gate`], so it never acts on a byte
+/// that was not checked.
 struct Blocks<'d, const BLOCK: usize> {
     /// A block as stored, before it is inflated into a buffer; also the
     /// scratch for range-tombstone probes. Dead between block reads.
@@ -225,6 +358,16 @@ struct Blocks<'d, const BLOCK: usize> {
     /// The buffer the parsers read: 0 is `own`, `i + 1` is `pool[i]`.
     cur: usize,
     tick: u64,
+}
+
+/// What one lend of a block from the cache came to.
+enum Lend<R> {
+    /// A hit: the parse ran over checked bytes, with this answer.
+    Done(R),
+    /// Not cached, or a check failed: read the device.
+    Miss,
+    /// The cache does not lend its images.
+    Unlent,
 }
 
 impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
@@ -240,11 +383,11 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
 
     /// The decoded block the last [`find`](Self::find) or
     /// [`loaded`](Self::loaded) settled on.
-    fn current(&self) -> &[u8; BLOCK] {
+    fn current(&self) -> &ScanBlock<BLOCK> {
         self.cur
             .checked_sub(1)
             .and_then(|i| self.pool.get(i))
-            .map_or(&self.own.data, |lent| &lent.data)
+            .unwrap_or(&self.own)
     }
 
     fn slot_mut(&mut self, at: usize) -> &mut ScanBlock<BLOCK> {
@@ -252,6 +395,15 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             Some(lent) => lent,
             None => &mut self.own,
         }
+    }
+
+    /// The read scratch and the current buffer, borrowed apart.
+    fn split(&mut self) -> (&mut [u8; BLOCK], &mut ScanBlock<BLOCK>) {
+        let block = match self.cur.checked_sub(1).and_then(|i| self.pool.get_mut(i)) {
+            Some(lent) => lent,
+            None => &mut self.own,
+        };
+        (&mut self.raw, block)
     }
 
     /// Makes the buffer holding block `id` current, if one does.
@@ -278,7 +430,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
     /// else the least recently used), makes it current and empties it.
     /// Returns the read buffer and that buffer. Call
     /// [`loaded`](Self::loaded) once the block is in it.
-    fn victim(&mut self) -> (&mut [u8; BLOCK], &mut [u8; BLOCK]) {
+    fn victim(&mut self) -> (&mut [u8; BLOCK], &mut ScanBlock<BLOCK>) {
         let age = |b: &ScanBlock<BLOCK>| b.id.map_or(0, |_| b.used + 1);
         let mut at = 0;
         let mut oldest = age(&self.own);
@@ -289,40 +441,427 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             }
         }
         self.cur = at;
-        let block = match at.checked_sub(1).and_then(|i| self.pool.get_mut(i)) {
-            Some(lent) => lent,
-            None => &mut self.own,
-        };
+        let (raw, block) = self.split();
         // Until `loaded`, the buffer holds no block: a failed read must
-        // not leave the old tag on new bytes.
+        // not leave the old tag on new bytes, nor its grains.
         block.id = None;
-        (&mut self.raw, &mut block.data)
+        block.valid = 0;
+        // Debug builds fill it, so that a parser reading a byte no gate
+        // let it read fails ordinary tests, not only the bit-flip ones.
+        if cfg!(debug_assertions) {
+            block.data.fill(0xA5);
+        }
+        (raw, block)
     }
 
-    /// Records that the current buffer now holds block `id`.
-    fn loaded(&mut self, id: u64) {
+    /// Records that the current buffer now holds the grains `valid` of
+    /// block `id`.
+    fn loaded(&mut self, id: u64, valid: u64) {
         self.tick += 1;
         let tick = self.tick;
         let block = self.slot_mut(self.cur);
         block.id = Some(id);
         block.used = tick;
+        block.valid = valid;
     }
 
     /// Forgets every decoded block (a re-seek starts from scratch).
     fn forget(&mut self) {
         self.own.id = None;
+        self.own.valid = 0;
         for lent in self.pool.iter_mut() {
             lent.id = None;
+            lent.valid = 0;
         }
     }
 
     /// Takes `pool` as extra buffers, in place of any lent before.
     fn lend(&mut self, pool: &'d mut [ScanBlock<BLOCK>]) {
-        self.own.id = None;
         self.cur = 0;
         self.pool = pool;
         self.forget();
     }
+
+    /// Runs the parse `f` over data block `bid` of table `table_id` and
+    /// returns its answer, having let it act only on checked bytes.
+    ///
+    /// - A buffer that holds the block is parsed through a [`Gated`]
+    ///   gate. If the parse reaches a grain the buffer lacks, or fails
+    ///   while the buffer lacks any, the rest of the block is taken
+    ///   ([`complete`](Self::complete)) and the parse runs again over
+    ///   the whole block.
+    /// - Otherwise a cache that lends has the block parsed where it lies
+    ///   ([`lend_into`](Self::lend_into)); the grains the parse checked
+    ///   are copied into a buffer as it goes. `whole` takes the whole
+    ///   block instead, for a cursor about to read it through.
+    /// - Otherwise, and on a miss or a failed check, the block is read
+    ///   from the device ([`sstable::read_data_block`]) whole, and parsed
+    ///   there.
+    ///
+    /// An error is believed only from bytes that all passed a check, so
+    /// that a change in the cache's RAM is a miss read from the device,
+    /// and only damage the CRC let through is [`Error::CorruptBlock`].
+    #[allow(clippy::too_many_arguments)] // the scan's source, split for the borrow
+    async fn load_with<D: BlockDevice, R>(
+        &mut self,
+        device: &D,
+        cache: Option<&dyn CachePort<BLOCK>>,
+        table_id: u32,
+        bid: u64,
+        whole: bool,
+        f: &mut impl FnMut(&[u8; BLOCK], &mut dyn Gate) -> Result<R, Error<D::Error>>,
+    ) -> Result<R, Error<D::Error>> {
+        if self.find(bid) {
+            let block = self.current();
+            let mut gate = Gated::<BLOCK> {
+                valid: block.valid,
+                missed: false,
+            };
+            let answer = f(&block.data, &mut gate);
+            if !gate.missed && (answer.is_ok() || block.valid == full::<BLOCK>()) {
+                return answer;
+            }
+            self.complete(device, cache, table_id, bid).await?;
+            return f(&self.current().data, &mut Open::<BLOCK>);
+        }
+        let mut missed = false;
+        if let Some(c) = cache {
+            match self.lend_into(c, table_id, bid, whole, f) {
+                Lend::Done(answer) => return answer,
+                Lend::Miss => missed = true,
+                Lend::Unlent => {}
+            }
+        }
+        let (raw, block) = self.victim();
+        sstable::read_data_block(device, cache, table_id, bid, raw, &mut block.data, missed)
+            .await?;
+        self.loaded(bid, full::<BLOCK>());
+        f(&self.current().data, &mut Open::<BLOCK>)
+    }
+
+    /// Copies the value of the entry at `(table_id, bid, off, end)` (a
+    /// cursor's head: its table, block, offset and the block's entries
+    /// end) into `out`, and returns its length.
+    async fn value_into<D: BlockDevice>(
+        &mut self,
+        device: &D,
+        cache: Option<&dyn CachePort<BLOCK>>,
+        (table_id, bid, off, end): (u32, u64, usize, usize),
+        out: &mut [u8],
+    ) -> Result<usize, Error<D::Error>> {
+        self.load_with(device, cache, table_id, bid, false, &mut |b, g| {
+            value_at(b, off, end, bid, g, out)
+        })
+        .await
+    }
+
+    /// One lend of block `bid` from `cache`, parsed by `f` into a fresh
+    /// buffer (see [`load_with`](Self::load_with)). A raw block is parsed
+    /// in the image through a [`CopyIn`] gate when the cache checks
+    /// ranges and `whole` is not asked for; otherwise it is checked and
+    /// copied whole. A compressed block has its flag and stream checked
+    /// and is inflated whole. A parse or inflate that fails has the whole
+    /// image checked before its error is believed (ADR-0031). The buffer
+    /// keeps what was copied only when the lend held.
+    fn lend_into<E, R>(
+        &mut self,
+        cache: &dyn CachePort<BLOCK>,
+        table_id: u32,
+        bid: u64,
+        whole: bool,
+        f: &mut impl FnMut(&[u8; BLOCK], &mut dyn Gate) -> Result<R, Error<E>>,
+    ) -> Lend<Result<R, Error<E>>> {
+        let ranged = !whole && cache.checks_ranges();
+        let body_end = BLOCK - sstable::CRC_LEN;
+        let (_, block) = self.victim();
+        let data = &mut block.data;
+        let mut valid = 0u64;
+        let mut answer = None;
+        let lent = cache.with_checked(table_id, bid, &mut |image, check| {
+            let (Ok(image), Some(at)) = (<&[u8; BLOCK]>::try_from(image), body_end.checked_sub(2))
+            else {
+                return;
+            };
+            if !check(at, body_end) {
+                return;
+            }
+            let flag = u16::from_le_bytes([image[at], image[at + 1]]);
+            if flag & 0x8000 != 0 {
+                let clen = usize::from(flag & 0x7FFF);
+                let inflated = clen < body_end
+                    && check(0, clen)
+                    && crate::compress::decompress(&image[..clen], &mut data[..body_end]).is_ok();
+                if inflated {
+                    valid = full::<BLOCK>();
+                    answer = Some(f(data, &mut Open::<BLOCK>));
+                } else if check(0, BLOCK) {
+                    answer = Some(Err(Error::CorruptBlock { id: bid }));
+                }
+                return;
+            }
+            if !ranged {
+                if check(0, BLOCK) {
+                    data.copy_from_slice(image);
+                    valid = full::<BLOCK>();
+                    answer = Some(f(data, &mut Open::<BLOCK>));
+                }
+                return;
+            }
+            let mut gate = CopyIn {
+                image,
+                data,
+                valid: 0,
+                check,
+            };
+            let parsed = f(image, &mut gate);
+            if parsed.is_err() {
+                let _ = (gate.check)(0, BLOCK);
+            }
+            valid = gate.valid;
+            answer = Some(parsed);
+        });
+        match (lent, answer) {
+            (None, _) => Lend::Unlent,
+            (Some(true), Some(answer)) => {
+                if valid != 0 {
+                    self.loaded(bid, valid);
+                }
+                Lend::Done(answer)
+            }
+            (Some(_), _) => Lend::Miss,
+        }
+    }
+
+    /// Takes the grains of block `bid` the current buffer (which holds
+    /// part of it) lacks: one lend that checks and copies each, kept only
+    /// if the lend held; otherwise the block is read from the device and
+    /// replaces the buffer whole. Nothing already in the buffer is
+    /// re-vouched by a check of the cache's image.
+    async fn complete<D: BlockDevice>(
+        &mut self,
+        device: &D,
+        cache: Option<&dyn CachePort<BLOCK>>,
+        table_id: u32,
+        bid: u64,
+    ) -> Result<(), Error<D::Error>> {
+        let missed = if let Some(c) = cache {
+            let (_, block) = self.split();
+            let mut valid = block.valid;
+            let data = &mut block.data;
+            let g = grain::<BLOCK>();
+            let lent = c.with_checked(table_id, bid, &mut |image, check| {
+                if image.len() != BLOCK {
+                    return;
+                }
+                for i in 0..grains::<BLOCK>() {
+                    if valid & (1u64 << i) == 0 {
+                        let (lo, hi) = (i * g, ((i + 1) * g).min(BLOCK));
+                        if !check(lo, hi) {
+                            return;
+                        }
+                        data[lo..hi].copy_from_slice(&image[lo..hi]);
+                        valid |= 1u64 << i;
+                    }
+                }
+            });
+            if lent == Some(true) && valid == full::<BLOCK>() {
+                block.valid = valid;
+                return Ok(());
+            }
+            lent.is_some()
+        } else {
+            false
+        };
+        let (raw, block) = self.split();
+        block.id = None;
+        block.valid = 0;
+        sstable::read_data_block(device, cache, table_id, bid, raw, &mut block.data, missed)
+            .await?;
+        self.loaded(bid, full::<BLOCK>());
+        Ok(())
+    }
+}
+
+/// A table cursor's head entry, as a block parse found it.
+#[derive(Clone, Copy)]
+struct Head<const KEY_MAX: usize> {
+    key: [u8; KEY_MAX],
+    key_len: usize,
+    seq: u64,
+    tombstone: bool,
+    val_len: usize,
+    expire_at: u64,
+    /// The entry's offset in its block.
+    off: usize,
+    /// The offset just past it.
+    next: usize,
+}
+
+impl<const KEY_MAX: usize> Head<KEY_MAX> {
+    /// The head for entry `e` at `off`; `None` when its key is longer
+    /// than `KEY_MAX` (a block no `Db` of this shape wrote).
+    fn of(e: &sstable::ParsedDataEntry<'_>, off: usize) -> Option<Self> {
+        let mut key = [0u8; KEY_MAX];
+        key.get_mut(..e.key.len())?.copy_from_slice(e.key);
+        Some(Self {
+            key,
+            key_len: e.key.len(),
+            seq: e.seq,
+            tombstone: e.tombstone,
+            val_len: e.val.len(),
+            expire_at: e.expire_at,
+            off,
+            next: e.next,
+        })
+    }
+}
+
+/// The entries end of data block `b` (see [`sstable::data_entries_end`]),
+/// with its count word checked first. A block always holds an entry.
+fn entries_end<E, const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<usize, Error<E>> {
+    let body_end = BLOCK - sstable::CRC_LEN;
+    let at = body_end.checked_sub(2).filter(|&at| g.check(at, body_end));
+    match at.map(|_| sstable::data_entries_end::<E, BLOCK>(b, bid)) {
+        Some(Ok(end)) if end > 0 => Ok(end),
+        _ => Err(Error::CorruptBlock { id: bid }),
+    }
+}
+
+/// Restart `i` of data block `b` whose entries end at `end`: the entry
+/// offset it points at, or `None` when there is no such restart or it
+/// points into the trailer. The caller has checked the restart array.
+fn restart_at<const BLOCK: usize>(b: &[u8; BLOCK], end: usize, i: usize) -> Option<usize> {
+    let at = end.checked_add(i.checked_mul(2)?)?;
+    if at.checked_add(2)? > BLOCK - sstable::CRC_LEN - 2 {
+        return None;
+    }
+    let roff = usize::from(u16::from_le_bytes([*b.get(at)?, *b.get(at + 1)?]));
+    (roff < end).then_some(roff)
+}
+
+/// The entry at `off`, checked whole before anything of it is used.
+fn entry_checked<'b, E, const BLOCK: usize>(
+    b: &'b [u8; BLOCK],
+    off: usize,
+    end: usize,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<sstable::ParsedDataEntry<'b>, Error<E>> {
+    let e = sstable::parse_data_entry::<E, BLOCK>(b, off, end, bid)?;
+    if g.check(off, e.next) {
+        Ok(e)
+    } else {
+        Err(Error::CorruptBlock { id: bid })
+    }
+}
+
+/// Names the entry at `off`, if one parses there, as the next to be
+/// read (see [`Gate::ahead`]). A parse that fails is left for the step
+/// that reaches it to report.
+fn look_ahead<const BLOCK: usize>(b: &[u8; BLOCK], off: usize, end: usize, g: &mut dyn Gate) {
+    if off < end
+        && let Ok(n) = sstable::parse_data_entry::<(), BLOCK>(b, off, end, 0)
+    {
+        g.ahead(off, n.next);
+    }
+}
+
+/// The first entry at or after offset `off` in data block `b` (entries
+/// ending at `end`) with `seq <= max_seq` and, with a `floor`, a key at
+/// or above it; `None` when the block has no more. The entry after it is
+/// named as the next to read. Genuine zero padding ends the entries; any
+/// other entry that does not parse is [`Error::CorruptBlock`]: a scan
+/// must never silently skip entries.
+fn park_in<E, const BLOCK: usize, const KEY_MAX: usize>(
+    b: &[u8; BLOCK],
+    mut off: usize,
+    end: usize,
+    floor: Option<&[u8]>,
+    max_seq: u64,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<Option<Head<KEY_MAX>>, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: bid };
+    loop {
+        if off >= end {
+            return Ok(None);
+        }
+        let Ok(e) = sstable::parse_data_entry::<E, BLOCK>(b, off, end, bid) else {
+            let padding = g.check(off, end) && b.get(off..end).is_some_and(sstable::all_zero);
+            return if padding { Ok(None) } else { Err(corrupt()) };
+        };
+        if !g.check(off, e.next) {
+            return Err(corrupt());
+        }
+        if e.seq <= max_seq && floor.is_none_or(|f| e.key >= f) {
+            let head = Head::of(&e, off).ok_or_else(corrupt)?;
+            look_ahead(b, e.next, end, g);
+            return Ok(Some(head));
+        }
+        off = e.next;
+    }
+}
+
+/// Positions in data block `b`: its entries end, and the first entry
+/// with a key at or above `start` and `seq <= max_seq` (`None`: the
+/// block has none). A binary search over the block's restarts finds the
+/// region to walk from, so only the trailer, the probed restarts, the
+/// run walked and the entry after the head are read, each checked first.
+fn seek_block<E, const BLOCK: usize, const KEY_MAX: usize>(
+    b: &[u8; BLOCK],
+    start: &[u8],
+    max_seq: u64,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<(usize, Option<Head<KEY_MAX>>), Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: bid };
+    let end = entries_end::<E, BLOCK>(b, bid, g)?;
+    let body_end = BLOCK - sstable::CRC_LEN;
+    if !g.check(end, body_end) {
+        return Err(corrupt());
+    }
+    let rcount = (body_end - 2 - end) / 2;
+    // The first restart whose key sorts at or above `start`; entries of
+    // the region before it may too, and nothing earlier can.
+    let (mut lo, mut hi) = (0usize, if start.is_empty() { 0 } else { rcount });
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let roff = restart_at(b, end, mid).ok_or_else(corrupt)?;
+        if entry_checked::<E, BLOCK>(b, roff, end, bid, g)?.key < start {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let from = match lo.checked_sub(1) {
+        Some(r) => restart_at(b, end, r).ok_or_else(corrupt)?,
+        None => 0,
+    };
+    Ok((end, park_in(b, from, end, Some(start), max_seq, bid, g)?))
+}
+
+/// Copies the value of the entry at `off` in data block `b` (entries
+/// ending at `end`) into `out`, after checking the entry, and names the
+/// entry after it as the next to read.
+fn value_at<E, const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    off: usize,
+    end: usize,
+    bid: u64,
+    g: &mut dyn Gate,
+    out: &mut [u8],
+) -> Result<usize, Error<E>> {
+    let e = entry_checked::<E, BLOCK>(b, off, end, bid, g)
+        .map_err(|_| Error::CorruptBlock { id: bid })?;
+    out.get_mut(..e.val.len())
+        .ok_or(Error::CorruptBlock { id: bid })?
+        .copy_from_slice(e.val);
+    look_ahead(b, e.next, end, g);
+    Ok(e.val.len())
 }
 
 /// One table's position in a scan. The head entry is cached so the merge
@@ -363,6 +902,19 @@ struct ScanCursor<const KEY_MAX: usize> {
 }
 
 impl<const KEY_MAX: usize> ScanCursor<KEY_MAX> {
+    /// Parks the cursor on `h`, in its current block.
+    const fn set_head(&mut self, h: &Head<KEY_MAX>) {
+        self.key = h.key;
+        self.key_len = h.key_len;
+        self.seq = h.seq;
+        self.tombstone = h.tombstone;
+        self.val_len = h.val_len;
+        self.expire_at = h.expire_at;
+        self.off = h.off;
+        self.next = h.next;
+        self.live = true;
+    }
+
     /// A `const` item can't use generic params in const operations on
     /// stable, hence a `const fn` instead of an associated constant.
     const fn empty() -> Self {
@@ -829,16 +1381,13 @@ impl<
             if winner_src == 0 {
                 val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
             } else {
-                self.ensure_block(winner_table, winner_bid).await?;
-                let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
-                    self.blocks.current(),
-                    winner_off,
-                    winner_end,
-                    winner_bid,
-                )
-                .map_err(|_| Error::CorruptBlock { id: winner_bid })?;
-                debug_assert_eq!(entry.val.len(), winner_val_len);
-                val_buf[..entry.val.len()].copy_from_slice(entry.val);
+                let db = self.src;
+                let at = (winner_table, winner_bid, winner_off, winner_end);
+                let copied = self
+                    .blocks
+                    .value_into(db.device, db.cache, at, val_buf)
+                    .await?;
+                debug_assert_eq!(copied, winner_val_len);
             }
             // Advance every head sitting on the minimum key — the winner
             // included. Compare against the copy in `key_buf`: the heads
@@ -880,31 +1429,6 @@ impl<
             }
         }
         Ok(())
-    }
-
-    /// Reads and CRC-verifies block `id` into the shared buffer, inflating
-    /// it when the compression flag is set. Afterwards `self.block` holds
-    /// the logical block; every parser reads from there. For data blocks.
-    async fn read_verify(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.src;
-        let (raw, block) = self.blocks.victim();
-        // Cold insert: a scan streams each data block once with no reuse,
-        // so scan blocks must not displace the point-read hot set.
-        let inflated =
-            sstable::read_data_block(db.device, db.cache, table_id, id, raw, block, false).await?;
-        if !inflated {
-            block.copy_from_slice(raw);
-        }
-        self.blocks.loaded(id);
-        Ok(())
-    }
-
-    /// Ensures the shared buffer holds block `id` (verified on load).
-    async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        if self.blocks.find(id) {
-            return Ok(());
-        }
-        self.read_verify(table_id, id).await
     }
 
     /// Adds a cursor over `tref`, parked at the first entry `>= start` with
@@ -1028,12 +1552,16 @@ impl<
             .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
             })?;
-        self.read_verify(tref.id, bid).await?;
-        let end = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), bid)?;
-        if end == 0 {
-            // A data block always carries at least one entry.
-            return Err(Error::CorruptBlock { id: bid });
-        }
+        // Only what the seek reads of the block is taken: its trailer,
+        // the restarts it probes, the run it walks and the entry after
+        // the head (ADR-0035).
+        let max_seq = self.max_seq;
+        let (end, head) = self
+            .blocks
+            .load_with(db.device, db.cache, tref.id, bid, false, &mut |b, g| {
+                seek_block::<D::Error, BLOCK, KEY_MAX>(b, start, max_seq, bid, g)
+            })
+            .await?;
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
         let slot = self
@@ -1051,7 +1579,7 @@ impl<
             block_id: bid,
             expire_at: 0,
             off: 0,
-            next: 0,
+            next: end,
             end,
             live: true,
             pending: false,
@@ -1061,7 +1589,12 @@ impl<
             tombstone: false,
             val_len: 0,
         };
-        self.park_cursor(li, ti, Some(start)).await
+        let Some(h) = head else {
+            // Nothing in this block: the park crosses to the next.
+            return self.park_cursor(li, ti, Some(start)).await;
+        };
+        slot.set_head(&h);
+        Ok(())
     }
 
     /// Parks cursor `(li, ti)` at the next entry at/after its current `next`
@@ -1092,54 +1625,15 @@ impl<
                     c.data_blocks,
                 )
             };
-            self.ensure_block(tid, bid).await?;
-            let mut off = off;
-            // Scan this block's entries for the next visible one.
-            let parked = loop {
-                let Ok(entry) = sstable::parse_data_entry::<D::Error, BLOCK>(
-                    self.blocks.current(),
-                    off,
-                    end,
-                    bid,
-                ) else {
-                    // Genuine zero padding marks end-of-entries; any
-                    // other unparseable structure is corruption.
-                    if sstable::all_zero(&self.blocks.current()[off..end]) {
-                        break None;
-                    }
-                    return Err(Error::CorruptBlock { id: bid });
-                };
-                let next = entry.next;
-                let visible = entry.seq <= max_seq && floor.is_none_or(|f| entry.key >= f);
-                if visible {
-                    // Copy the head out: the borrow of `self.block` must end
-                    // before the cursor is mutated.
-                    let mut key = [0u8; KEY_MAX];
-                    key[..entry.key.len()].copy_from_slice(entry.key);
-                    break Some((
-                        key,
-                        entry.key.len(),
-                        entry.seq,
-                        entry.tombstone,
-                        entry.val.len(),
-                        entry.expire_at,
-                        off,
-                        next,
-                    ));
-                }
-                off = next;
-            };
-            if let Some((key, klen, seq, tomb, vlen, exp, eoff, next)) = parked {
-                let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
-                c.key = key;
-                c.key_len = klen;
-                c.seq = seq;
-                c.tombstone = tomb;
-                c.val_len = vlen;
-                c.expire_at = exp;
-                c.off = eoff;
-                c.next = next;
-                c.live = true;
+            let db = self.src;
+            let parked = self
+                .blocks
+                .load_with(db.device, db.cache, tid, bid, false, &mut |b, g| {
+                    park_in::<D::Error, BLOCK, KEY_MAX>(b, off, end, floor, max_seq, bid, g)
+                })
+                .await?;
+            if let Some(h) = parked {
+                self.cursors.as_flattened_mut()[self.level_base[li] + ti].set_head(&h);
                 return Ok(());
             }
             // Block exhausted: move to the next data block, if any.
@@ -1150,11 +1644,14 @@ impl<
             let nid = first
                 .checked_add(idx + 1)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            self.read_verify(tid, nid).await?;
-            let nend = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), nid)?;
-            if nend == 0 {
-                return Err(Error::CorruptBlock { id: nid });
-            }
+            // A cursor that crosses into a block reads it through: it is
+            // taken whole, in one lookup.
+            let nend = self
+                .blocks
+                .load_with(db.device, db.cache, tid, nid, true, &mut |b, g| {
+                    entries_end::<D::Error, BLOCK>(b, nid, g)
+                })
+                .await?;
             let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
             c.block_id = nid;
             c.block_idx = idx + 1;
@@ -1763,16 +2260,13 @@ impl<
             if winner_src == 0 {
                 val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
             } else {
-                self.ensure_block(winner_table, winner_bid).await?;
-                let entry = sstable::parse_data_entry::<D::Error, BLOCK>(
-                    self.blocks.current(),
-                    winner_off,
-                    winner_end,
-                    winner_bid,
-                )
-                .map_err(|_| Error::CorruptBlock { id: winner_bid })?;
-                debug_assert_eq!(entry.val.len(), winner_val_len);
-                val_buf[..entry.val.len()].copy_from_slice(entry.val);
+                let db = self.src;
+                let at = (winner_table, winner_bid, winner_off, winner_end);
+                let copied = self
+                    .blocks
+                    .value_into(db.device, db.cache, at, val_buf)
+                    .await?;
+                debug_assert_eq!(copied, winner_val_len);
             }
             // Advance every head sitting on the maximum key — the winner
             // included. Compare against the copy in `key_buf`: the heads
@@ -1845,31 +2339,6 @@ impl<
         Ok(())
     }
 
-    /// Reads and CRC-verifies block `id` into the shared buffer, inflating
-    /// it when the compression flag is set. Afterwards `self.block` holds
-    /// the logical block; every parser reads from there. For data blocks.
-    async fn read_verify(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.src;
-        let (raw, block) = self.blocks.victim();
-        // Cold insert: a scan streams each data block once with no reuse,
-        // so scan blocks must not displace the point-read hot set.
-        let inflated =
-            sstable::read_data_block(db.device, db.cache, table_id, id, raw, block, false).await?;
-        if !inflated {
-            block.copy_from_slice(raw);
-        }
-        self.blocks.loaded(id);
-        Ok(())
-    }
-
-    /// Ensures the shared buffer holds block `id` (verified on load).
-    async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        if self.blocks.find(id) {
-            return Ok(());
-        }
-        self.read_verify(table_id, id).await
-    }
-
     /// Adds a cursor over `tref`, parked at the greatest entry `<= from`
     /// with `seq <= max_seq` (`from` empty: the table's last entry). The
     /// caller key-range prunes; this resolves the table's block index to
@@ -1930,12 +2399,6 @@ impl<
             .ok_or(Error::CorruptBlock {
                 id: tref.first_block,
             })?;
-        self.read_verify(tref.id, bid).await?;
-        let end = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), bid)?;
-        if end == 0 {
-            // A data block always carries at least one entry.
-            return Err(Error::CorruptBlock { id: bid });
-        }
         let ti = self.cursor_counts[li];
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
@@ -1952,7 +2415,8 @@ impl<
             block_idx,
             block_id: bid,
             off: 0,
-            end,
+            // The park reads the block, and with it the entries end.
+            end: 0,
             live: true,
             key: [0u8; KEY_MAX],
             key_len: 0,
@@ -2005,58 +2469,75 @@ impl<
         let bincl = bound.is_some_and(|(_, incl)| incl);
         let bound_copy: Option<(&[u8], bool)> = bound.map(|_| (&bkey[..blen], bincl));
         let max_seq = self.max_seq;
+        // The cursor's own block is searched for what the search reads;
+        // a block it steps back into is taken whole (ADR-0035).
+        let mut whole = false;
         loop {
-            let (tid, bid, end, idx, first) = {
+            let (tid, bid, idx, first) = {
                 let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
                 if !c.live {
                     return Ok(());
                 }
-                (c.table_id, c.block_id, c.end, c.block_idx, c.first_block)
+                (c.table_id, c.block_id, c.block_idx, c.first_block)
             };
-            self.ensure_block(tid, bid).await?;
-            if let Some((key, klen, seq, tomb, vlen, exp, off)) =
-                self.search_block_rev(bid, end, bound_copy, max_seq)?
-            {
-                // A version run can straddle data blocks: when the
-                // candidate is the block's first key, newer versions may
-                // live in earlier blocks (a block can seal mid-run, so the
-                // run's first block need not share the first key).
-                // Following the run is what keeps a backward walker from
-                // settling on a stale version it met first.
-                // Below the table's live lower bound every entry is dead (a
-                // compaction already merged them into a newer table), and
-                // a backward walk only goes lower: the cursor is done.
-                let db = self.src;
-                if db
-                    .manifest
-                    .find_table(tid)
-                    .is_some_and(|t| key[..klen] < *t.first_key.as_slice())
-                {
-                    self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
-                    return Ok(());
-                }
-                let fkey = self.block_first_key(end, bid)?;
-                let (key, klen, seq, tomb, vlen, exp, off, bid, end, idx) =
-                    if idx > 0 && key[..klen] == *fkey {
+            let db = self.src;
+            // Below the table's live lower bound every entry is dead (a
+            // compaction already merged them into a newer table), and a
+            // backward walk only goes lower.
+            let lower = db.manifest.find_table(tid).map(|t| t.first_key);
+            let (end, found) = self
+                .blocks
+                .load_with(db.device, db.cache, tid, bid, whole, &mut |b, g| {
+                    let (end, hit) = search_block_rev::<D::Error, BLOCK, KEY_MAX>(
+                        b, bound_copy, max_seq, bid, g,
+                    )?;
+                    let Some(h) = hit else {
+                        return Ok((end, RevFound::Nothing));
+                    };
+                    if lower.is_some_and(|l| h.0[..h.1] < *l.as_slice()) {
+                        return Ok((end, RevFound::Dead));
+                    }
+                    // A version run can straddle data blocks: when the
+                    // candidate is the block's first key, newer versions
+                    // may live in earlier blocks.
+                    let at_first = idx > 0
+                        && entry_key_at::<D::Error, BLOCK>(b, 0, end, bid, g)? == &h.0[..h.1];
+                    Ok((end, RevFound::Head(h, at_first)))
+                })
+                .await?;
+            match found {
+                RevFound::Head(h, at_first) => {
+                    // A block can seal mid-run, so the run's first block
+                    // need not share the first key. Following the run is
+                    // what keeps a backward walker from settling on a
+                    // stale version it met first.
+                    let (key, klen, seq, tomb, vlen, exp, off) = h;
+                    let (key, klen, seq, tomb, vlen, exp, off, bid, end, idx) = if at_first {
                         self.resolve_run(tid, first, idx, &key[..klen], max_seq)
                             .await?
                             .unwrap_or((key, klen, seq, tomb, vlen, exp, off, bid, end, idx))
                     } else {
                         (key, klen, seq, tomb, vlen, exp, off, bid, end, idx)
                     };
-                let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
-                c.key = key;
-                c.key_len = klen;
-                c.seq = seq;
-                c.tombstone = tomb;
-                c.val_len = vlen;
-                c.expire_at = exp;
-                c.off = off;
-                c.block_id = bid;
-                c.end = end;
-                c.block_idx = idx;
-                c.live = true;
-                return Ok(());
+                    let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
+                    c.key = key;
+                    c.key_len = klen;
+                    c.seq = seq;
+                    c.tombstone = tomb;
+                    c.val_len = vlen;
+                    c.expire_at = exp;
+                    c.off = off;
+                    c.block_id = bid;
+                    c.end = end;
+                    c.block_idx = idx;
+                    c.live = true;
+                    return Ok(());
+                }
+                RevFound::Dead => {
+                    self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
+                    return Ok(());
+                }
+                RevFound::Nothing => {}
             }
             // Block yielded nothing: step to the previous data block, if
             // any.
@@ -2067,15 +2548,11 @@ impl<
             let nid = first
                 .checked_add(idx - 1)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            self.read_verify(tid, nid).await?;
-            let nend = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), nid)?;
-            if nend == 0 {
-                return Err(Error::CorruptBlock { id: nid });
-            }
             let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
             c.block_id = nid;
             c.block_idx = idx - 1;
-            c.end = nend;
+            c.end = end;
+            whole = true;
         }
     }
 
@@ -2101,6 +2578,7 @@ impl<
         let mut kk = [0u8; KEY_MAX];
         kk[..key.len()].copy_from_slice(key);
         let klen = key.len();
+        let kk = &kk[..klen];
         let mut best: Option<RevHeadAt<KEY_MAX>> = None;
         let mut pidx = idx;
         while pidx > 0 {
@@ -2108,245 +2586,41 @@ impl<
             let pbid = first
                 .checked_add(pidx)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            self.read_verify(table_id, pbid).await?;
-            let pend = sstable::data_entries_end::<D::Error, BLOCK>(self.blocks.current(), pbid)?;
-            if pend == 0 {
-                return Err(Error::CorruptBlock { id: pbid });
-            }
-            match self.search_block_rev(pbid, pend, Some((&kk[..klen], true)), max_seq)? {
-                // A single binding avoids clippy's similar-names lint; the
-                // tuple fields are (key, key_len, seq, tombstone, val_len,
-                // expire_at, offset) per `RevHead`.
-                Some(hit) if hit.0[..hit.1] == kk[..klen] => {
-                    best = Some((
-                        hit.0, hit.1, hit.2, hit.3, hit.4, hit.5, hit.6, pbid, pend, pidx,
-                    ));
-                    // The run can only straddle further while it starts at
-                    // this block's first key.
-                    if hit.0[..hit.1] != *self.block_first_key(pend, pbid)? {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        Ok(best)
-    }
-
-    /// First key of the loaded block (`bid`, entries ending at `end`).
-    /// Restart 0 is always offset 0, so this is the entry at offset 0.
-    fn block_first_key(&self, end: usize, bid: u64) -> Result<&[u8], Error<D::Error>> {
-        self.entry_key_at(0, end, bid)
-    }
-
-    /// Searches the loaded block (`bid`, entries ending at `end`) for the
-    /// greatest entry satisfying `bound` with `seq <= max_seq`. Returns
-    /// the entry's key bytes, key length, seq, tombstone flag, value
-    /// length, expiry tick, and offset — or `None` when the block holds
-    /// no qualifying entry.
-    ///
-    /// Positioning binary-searches the restart points for the last
-    /// restart that can lead to a qualifying entry, then walks regions
-    /// backward. A key's versions are stored newest-first, so the walk
-    /// meets a straddling run's older versions first: within a region the
-    /// strictly-greatest key wins, and across regions a tie keeps the
-    /// earlier region's (newer) version — a version run straddling
-    /// restarts still resolves to the newest visible version. The walk breaks out early once the next
-    /// region's first key drops below the best key found: everything
-    /// further back is smaller and cannot tie or beat it.
-    fn search_block_rev(
-        &self,
-        bid: u64,
-        end: usize,
-        bound: Option<(&[u8], bool)>,
-        max_seq: u64,
-    ) -> Result<Option<RevHead<KEY_MAX>>, Error<D::Error>> {
-        let body_end = BLOCK - sstable::CRC_LEN;
-        let rcount = usize::from(u16::from_le_bytes(
-            self.blocks.current()[body_end - 2..body_end]
-                .try_into()
-                .map_err(|_| Error::CorruptBlock { id: bid })?,
-        ));
-        if rcount == 0 {
-            // A data block always carries at least one entry, hence at
-            // least one restart point.
-            return Err(Error::CorruptBlock { id: bid });
-        }
-        let Some(rstart) = self.last_qualifying_restart(bid, end, rcount, bound)? else {
-            // Every restart sorts above the bound: no entry in this block
-            // can qualify.
-            return Ok(None);
-        };
-        self.walk_regions_rev(bid, end, rcount, rstart, bound, max_seq)
-    }
-
-    /// Binary search: the last restart whose key can lead to a qualifying
-    /// entry — `bound_ok` over the restart keys, taking the upper bound.
-    /// `None` when every restart sorts above the bound.
-    fn last_qualifying_restart(
-        &self,
-        bid: u64,
-        end: usize,
-        rcount: usize,
-        bound: Option<(&[u8], bool)>,
-    ) -> Result<Option<usize>, Error<D::Error>> {
-        let bound_ok = |key: &[u8]| -> bool {
-            match bound {
-                None => true,
-                Some((bk, inclusive)) => key < bk || (inclusive && key == bk),
-            }
-        };
-        let mut lo = 0usize;
-        let mut hi = rcount;
-        let mut r: Option<usize> = None;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let roff = self
-                .restart_off(mid, end, rcount)
-                .ok_or(Error::CorruptBlock { id: bid })?;
-            let key = self.entry_key_at(roff, end, bid)?;
-            if bound_ok(key) {
-                r = Some(mid);
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        Ok(r)
-    }
-
-    /// Region walk, backward from region `rstart`: returns the greatest
-    /// entry satisfying `bound` with `seq <= max_seq`, newest visible
-    /// version winning ties — or `None` when the block holds no
-    /// qualifying entry.
-    fn walk_regions_rev(
-        &self,
-        bid: u64,
-        end: usize,
-        rcount: usize,
-        rstart: usize,
-        bound: Option<(&[u8], bool)>,
-        max_seq: u64,
-    ) -> Result<Option<RevHead<KEY_MAX>>, Error<D::Error>> {
-        let mut best: Option<RevHead<KEY_MAX>> = None;
-        let mut j = rstart;
-        loop {
-            // Early break: region `j`'s keys are all at/below the next
-            // region's first key; once that drops below the best key
-            // found, nothing further back can tie or beat it.
-            if j < rstart
-                && let Some(b) = best.as_ref()
-            {
-                let nroff = self
-                    .restart_off(j + 1, end, rcount)
-                    .ok_or(Error::CorruptBlock { id: bid })?;
-                let nkey = self.entry_key_at(nroff, end, bid)?;
-                if nkey < &b.0[..b.1] {
-                    break;
-                }
-            }
-            let rs = self
-                .restart_off(j, end, rcount)
-                .ok_or(Error::CorruptBlock { id: bid })?;
-            let limit = if j == rstart {
-                end
-            } else {
-                self.restart_off(j + 1, end, rcount)
-                    .ok_or(Error::CorruptBlock { id: bid })?
-            };
-            // Region-best: the strictly-greatest qualifying key in this
-            // region (newest visible version on ties, since the region
-            // runs newest-first).
-            let mut rbest: Option<RevHead<KEY_MAX>> = None;
-            let mut off = rs;
-            while off < limit {
-                let Ok(entry) = sstable::parse_data_entry::<D::Error, BLOCK>(
-                    self.blocks.current(),
-                    off,
-                    end,
-                    bid,
-                ) else {
-                    // Genuine zero padding marks end-of-entries, but
-                    // only in the top region (padding lives after the
-                    // last entry); anywhere else an unparseable entry
-                    // is corruption.
-                    if j == rstart && sstable::all_zero(&self.blocks.current()[off..end]) {
-                        break;
-                    }
-                    return Err(Error::CorruptBlock { id: bid });
-                };
-                let next = entry.next;
-                // Entries ascend: past the bound, nothing later in the
-                // region can qualify.
-                let dominated = match bound {
-                    None => false,
-                    Some((bk, inclusive)) => {
-                        if inclusive {
-                            entry.key > bk
-                        } else {
-                            entry.key >= bk
+            let db = self.src;
+            // Each earlier block of the run is read through: whole.
+            let found = self
+                .blocks
+                .load_with(db.device, db.cache, table_id, pbid, true, &mut |b, g| {
+                    let (pend, hit) = search_block_rev::<D::Error, BLOCK, KEY_MAX>(
+                        b,
+                        Some((kk, true)),
+                        max_seq,
+                        pbid,
+                        g,
+                    )?;
+                    match hit {
+                        Some(h) if h.0[..h.1] == *kk => {
+                            let at_first =
+                                entry_key_at::<D::Error, BLOCK>(b, 0, pend, pbid, g)? == kk;
+                            Ok(Some((h, pend, at_first)))
                         }
+                        _ => Ok(None),
                     }
-                };
-                if dominated {
-                    break;
-                }
-                if entry.seq <= max_seq {
-                    let better = rbest.as_ref().is_none_or(|rb| entry.key > &rb.0[..rb.1]);
-                    if better {
-                        let mut kb = [0u8; KEY_MAX];
-                        kb[..entry.key.len()].copy_from_slice(entry.key);
-                        rbest = Some((
-                            kb,
-                            entry.key.len(),
-                            entry.seq,
-                            entry.tombstone,
-                            entry.val.len(),
-                            entry.expire_at,
-                            off,
-                        ));
-                    }
-                }
-                off = next;
-            }
-            // Merge: a tie keeps the earlier region's (newer) version.
-            if let Some(rb) = rbest {
-                let replace = best.as_ref().is_none_or(|b| rb.0[..rb.1] >= b.0[..b.1]);
-                if replace {
-                    best = Some(rb);
-                }
-            }
-            if j == 0 {
+                })
+                .await?;
+            let Some((hit, pend, at_first)) = found else {
+                break;
+            };
+            best = Some((
+                hit.0, hit.1, hit.2, hit.3, hit.4, hit.5, hit.6, pbid, pend, pidx,
+            ));
+            // The run can only straddle further while it starts at this
+            // block's first key.
+            if !at_first {
                 break;
             }
-            j -= 1;
         }
         Ok(best)
-    }
-
-    /// Restart offset `i` in the loaded block: the entry offset it points
-    /// at. `None` when `i` is out of range or the offset points into the
-    /// restart trailer (corrupt); the caller surfaces those as
-    /// [`Error::CorruptBlock`].
-    fn restart_off(&self, i: usize, end: usize, rcount: usize) -> Option<usize> {
-        if i >= rcount {
-            return None;
-        }
-        let off = end.checked_add(i.checked_mul(2)?)?;
-        if off.checked_add(2)? > BLOCK - sstable::CRC_LEN {
-            return None;
-        }
-        let roff = usize::from(u16::from_le_bytes([
-            self.blocks.current()[off],
-            self.blocks.current()[off + 1],
-        ]));
-        (roff < end).then_some(roff)
-    }
-
-    /// Entry key at `off` in the loaded block.
-    fn entry_key_at(&self, off: usize, end: usize, bid: u64) -> Result<&[u8], Error<D::Error>> {
-        sstable::parse_data_entry::<D::Error, BLOCK>(self.blocks.current(), off, end, bid)
-            .map(|e| e.key)
     }
 
     /// Parks the memtable head on the greatest key at/below `mem_idx` that
@@ -2491,5 +2765,585 @@ impl<
             let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
             Version::table(c.node_id, c.seal_wall, c.seq)
         }
+    }
+}
+
+/// What a reverse park found in one block.
+enum RevFound<const KEY_MAX: usize> {
+    /// No entry satisfies the bound: step to the previous block.
+    Nothing,
+    /// The best entry sorts below the table's live lower bound.
+    Dead,
+    /// The best entry, and whether it is the block's first key.
+    Head(RevHead<KEY_MAX>, bool),
+}
+
+/// The key of the entry at `off`, checked whole before it is used.
+fn entry_key_at<'b, E, const BLOCK: usize>(
+    b: &'b [u8; BLOCK],
+    off: usize,
+    end: usize,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<&'b [u8], Error<E>> {
+    entry_checked::<E, BLOCK>(b, off, end, bid, g).map(|e| e.key)
+}
+
+/// Searches data block `b` for the greatest entry satisfying `bound`
+/// with `seq <= max_seq`. Returns the block's entries end, and the
+/// entry's key bytes, key length, seq, tombstone flag, value length,
+/// expiry tick, and offset — or `None` when the block holds no
+/// qualifying entry. Every byte it acts on is checked first.
+///
+/// Positioning binary-searches the restart points for the last restart
+/// that can lead to a qualifying entry, then walks regions backward. A
+/// key's versions are stored newest-first, so the walk meets a
+/// straddling run's older versions first: within a region the
+/// strictly-greatest key wins, and across regions a tie keeps the
+/// earlier region's (newer) version — a version run straddling restarts
+/// still resolves to the newest visible version. The walk breaks out
+/// early once the next region's first key drops below the best key
+/// found: everything further back is smaller and cannot tie or beat it.
+fn search_block_rev<E, const BLOCK: usize, const KEY_MAX: usize>(
+    b: &[u8; BLOCK],
+    bound: Option<(&[u8], bool)>,
+    max_seq: u64,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<(usize, Option<RevHead<KEY_MAX>>), Error<E>> {
+    let end = entries_end::<E, BLOCK>(b, bid, g)?;
+    let body_end = BLOCK - sstable::CRC_LEN;
+    let rcount = (body_end - 2 - end) / 2;
+    // A data block always carries at least one entry, hence at least
+    // one restart point.
+    if rcount == 0 || !g.check(end, body_end) {
+        return Err(Error::CorruptBlock { id: bid });
+    }
+    let Some(rstart) = last_qualifying_restart::<E, BLOCK>(b, end, rcount, bound, bid, g)? else {
+        // Every restart sorts above the bound: no entry in this block
+        // can qualify.
+        return Ok((end, None));
+    };
+    let best = walk_regions_rev::<E, BLOCK, KEY_MAX>(b, end, rstart, bound, max_seq, bid, g)?;
+    Ok((end, best))
+}
+
+/// Binary search: the last restart whose key can lead to a qualifying
+/// entry — `bound_ok` over the restart keys, taking the upper bound.
+/// `None` when every restart sorts above the bound.
+fn last_qualifying_restart<E, const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    end: usize,
+    rcount: usize,
+    bound: Option<(&[u8], bool)>,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<Option<usize>, Error<E>> {
+    let bound_ok = |key: &[u8]| -> bool {
+        match bound {
+            None => true,
+            Some((bk, inclusive)) => key < bk || (inclusive && key == bk),
+        }
+    };
+    let mut lo = 0usize;
+    let mut hi = rcount;
+    let mut r: Option<usize> = None;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let roff = restart_at(b, end, mid).ok_or(Error::CorruptBlock { id: bid })?;
+        if bound_ok(entry_key_at::<E, BLOCK>(b, roff, end, bid, g)?) {
+            r = Some(mid);
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(r)
+}
+
+/// Region walk, backward from region `rstart`: returns the greatest
+/// entry satisfying `bound` with `seq <= max_seq`, newest visible
+/// version winning ties — or `None` when the block holds no qualifying
+/// entry.
+fn walk_regions_rev<E, const BLOCK: usize, const KEY_MAX: usize>(
+    b: &[u8; BLOCK],
+    end: usize,
+    rstart: usize,
+    bound: Option<(&[u8], bool)>,
+    max_seq: u64,
+    bid: u64,
+    g: &mut dyn Gate,
+) -> Result<Option<RevHead<KEY_MAX>>, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: bid };
+    let mut best: Option<RevHead<KEY_MAX>> = None;
+    let mut j = rstart;
+    loop {
+        // Early break: region `j`'s keys are all at/below the next
+        // region's first key; once that drops below the best key found,
+        // nothing further back can tie or beat it.
+        if j < rstart
+            && let Some(bk) = best.as_ref()
+        {
+            let nroff = restart_at(b, end, j + 1).ok_or_else(corrupt)?;
+            if entry_key_at::<E, BLOCK>(b, nroff, end, bid, g)? < &bk.0[..bk.1] {
+                break;
+            }
+        }
+        let rs = restart_at(b, end, j).ok_or_else(corrupt)?;
+        let limit = if j == rstart {
+            end
+        } else {
+            restart_at(b, end, j + 1).ok_or_else(corrupt)?
+        };
+        // Region-best: the strictly-greatest qualifying key in this
+        // region (newest visible version on ties, since the region runs
+        // newest-first).
+        let mut rbest: Option<RevHead<KEY_MAX>> = None;
+        let mut off = rs;
+        while off < limit {
+            let Ok(entry) = sstable::parse_data_entry::<E, BLOCK>(b, off, end, bid) else {
+                // Genuine zero padding marks end-of-entries, but only in
+                // the top region (padding lives after the last entry);
+                // anywhere else an unparseable entry is corruption.
+                if j == rstart
+                    && g.check(off, end)
+                    && b.get(off..end).is_some_and(sstable::all_zero)
+                {
+                    break;
+                }
+                return Err(corrupt());
+            };
+            if !g.check(off, entry.next) {
+                return Err(corrupt());
+            }
+            let next = entry.next;
+            // Entries ascend: past the bound, nothing later in the region
+            // can qualify.
+            let dominated = match bound {
+                None => false,
+                Some((bk, inclusive)) => {
+                    if inclusive {
+                        entry.key > bk
+                    } else {
+                        entry.key >= bk
+                    }
+                }
+            };
+            if dominated {
+                break;
+            }
+            if entry.seq <= max_seq {
+                let better = rbest.as_ref().is_none_or(|rb| entry.key > &rb.0[..rb.1]);
+                if better {
+                    let mut kb = [0u8; KEY_MAX];
+                    kb.get_mut(..entry.key.len())
+                        .ok_or_else(corrupt)?
+                        .copy_from_slice(entry.key);
+                    rbest = Some((
+                        kb,
+                        entry.key.len(),
+                        entry.seq,
+                        entry.tombstone,
+                        entry.val.len(),
+                        entry.expire_at,
+                        off,
+                    ));
+                }
+            }
+            off = next;
+        }
+        // Merge: a tie keeps the earlier region's (newer) version.
+        if let Some(rb) = rbest {
+            let replace = best.as_ref().is_none_or(|bb| rb.0[..rb.1] >= bb.0[..bb.1]);
+            if replace {
+                best = Some(rb);
+            }
+        }
+        if j == 0 {
+            break;
+        }
+        j -= 1;
+    }
+    Ok(best)
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::range_plus_one,
+    reason = "random test blocks: truncated randomness is still random, and `0..1 + n` reads as one or more"
+)]
+mod tests {
+    //! The block parsers act only on bytes their gate let through: what a
+    //! parse took from a lent image is all a later parse of the buffer
+    //! needs, or the later parse says it missed (ADR-0035).
+    extern crate std;
+    use super::{
+        CopyIn, Gate, Gated, Head, Open, RevHead, entries_end, full, grain, grains, mask, park_in,
+        search_block_rev, seek_block, value_at,
+    };
+    use crate::error::Error;
+    use crate::sstable::CRC_LEN;
+    use std::vec::Vec;
+
+    type R<T> = Result<T, Error<()>>;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// One entry as a block stores it: key, seq, op byte, value, expiry.
+    type Entry = (Vec<u8>, u64, u8, Vec<u8>, u64);
+
+    /// A raw data block of `entries` (sorted by key, newest version
+    /// first), a restart every `every` entries, zero padding after them.
+    fn block<const B: usize>(entries: &[Entry], every: usize) -> [u8; B] {
+        let mut b = [0u8; B];
+        let mut off = 0;
+        let mut restarts = Vec::new();
+        for (i, (k, seq, op, v, exp)) in entries.iter().enumerate() {
+            if i % every == 0 {
+                restarts.push(u16::try_from(off).unwrap());
+            }
+            let vl = if *op == 2 { 0 } else { v.len() };
+            b[off..off + 2].copy_from_slice(&u16::try_from(k.len()).unwrap().to_le_bytes());
+            b[off + 2..off + 4].copy_from_slice(&u16::try_from(vl).unwrap().to_le_bytes());
+            b[off + 4..off + 12].copy_from_slice(&seq.to_le_bytes());
+            b[off + 12] = *op;
+            off += 13;
+            b[off..off + k.len()].copy_from_slice(k);
+            off += k.len();
+            b[off..off + vl].copy_from_slice(&v[..vl]);
+            off += vl;
+            if *op == 4 {
+                b[off..off + 8].copy_from_slice(&exp.to_le_bytes());
+                off += 8;
+            }
+        }
+        let body_end = B - CRC_LEN;
+        let end = body_end - 2 - 2 * restarts.len();
+        assert!(off <= end, "entries overflow the block");
+        for (i, r) in restarts.iter().enumerate() {
+            b[end + 2 * i..end + 2 * i + 2].copy_from_slice(&r.to_le_bytes());
+        }
+        b[body_end - 2..body_end]
+            .copy_from_slice(&u16::try_from(restarts.len()).unwrap().to_le_bytes());
+        b
+    }
+
+    /// Random entries that fit a `B`-byte block: keys from a small
+    /// alphabet so that runs of versions occur, some tombstones and TTL
+    /// puts.
+    fn entries<const B: usize>(rng: &mut Rng, every: usize) -> Vec<Entry> {
+        let room = B - CRC_LEN - 2;
+        let mut keys: Vec<Vec<u8>> = (0..1 + rng.below(60))
+            .map(|_| {
+                let n = 1 + rng.below(12);
+                (0..n).map(|_| b'a' + rng.below(6) as u8).collect()
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let mut out = Vec::new();
+        let mut used = 0;
+        'keys: for k in keys {
+            let mut seq = 1 + rng.below(40) as u64 * 3;
+            for _ in 0..1 + rng.below(4) {
+                let op = [1u8, 1, 1, 2, 4][rng.below(5)];
+                let v: Vec<u8> = (0..rng.below(40)).map(|_| rng.next() as u8).collect();
+                let len =
+                    13 + k.len() + if op == 2 { 0 } else { v.len() } + if op == 4 { 8 } else { 0 };
+                let restarts = (out.len() + 1).div_ceil(every);
+                if used + len + 2 * restarts > room {
+                    break 'keys;
+                }
+                used += len;
+                out.push((k.clone(), seq, op, v, 9));
+                seq = seq.saturating_sub(1 + rng.below(3) as u64).max(1);
+            }
+        }
+        if out.is_empty() {
+            out.push((b"k".to_vec(), 1, 1, b"v".to_vec(), 0));
+        }
+        out
+    }
+
+    /// Runs `f` over `image` as a lend would: through a [`CopyIn`] gate
+    /// whose cache check always holds and is counted. Returns the answer,
+    /// the buffer it filled (the rest poisoned with `poison`) and its
+    /// grains.
+    fn lend<const B: usize, T>(
+        image: &[u8; B],
+        poison: &mut Rng,
+        f: &mut dyn FnMut(&[u8; B], &mut dyn Gate) -> T,
+    ) -> (T, [u8; B], u64) {
+        let mut data = [0u8; B];
+        let mut check = |_: usize, _: usize| true;
+        let mut gate = CopyIn {
+            image,
+            data: &mut data,
+            valid: 0,
+            check: &mut check,
+        };
+        let answer = f(image, &mut gate);
+        let valid = gate.valid;
+        let g = grain::<B>();
+        for i in 0..grains::<B>() {
+            if valid & (1 << i) == 0 {
+                for byte in &mut data[i * g..((i + 1) * g).min(B)] {
+                    *byte = poison.next() as u8;
+                }
+            }
+        }
+        (answer, data, valid)
+    }
+
+    fn key_of<const K: usize>(h: &Head<K>) -> &[u8] {
+        &h.key[..h.key_len]
+    }
+
+    /// The first entry at or after `start` with `seq <= max_seq`, the
+    /// slow way: every entry from the first.
+    fn oracle_seek<const B: usize>(
+        b: &[u8; B],
+        start: &[u8],
+        max_seq: u64,
+    ) -> (usize, Option<Head<64>>) {
+        let end = entries_end::<(), B>(b, 1, &mut Open::<B>).unwrap();
+        let head =
+            park_in::<(), B, 64>(b, 0, end, Some(start), max_seq, 1, &mut Open::<B>).unwrap();
+        (end, head)
+    }
+
+    fn seek_parse_holds<const B: usize>(seed: u64) {
+        let mut rng = Rng(seed);
+        for _ in 0..300 {
+            let every = 1 + rng.below(20);
+            let es = entries::<B>(&mut rng, every);
+            let image = block::<B>(&es, every);
+            for _ in 0..8 {
+                let start: Vec<u8> = (0..rng.below(13))
+                    .map(|_| b'a' + rng.below(7) as u8)
+                    .collect();
+                let max_seq = if rng.below(3) == 0 {
+                    1 + rng.below(120) as u64
+                } else {
+                    u64::MAX
+                };
+                let want = oracle_seek(&image, &start, max_seq);
+                let mut poison = Rng(rng.next() | 1);
+                let (got, data, valid): (R<(usize, Option<Head<64>>)>, _, _) =
+                    lend(&image, &mut poison, &mut |b, g| {
+                        seek_block::<(), B, 64>(b, &start, max_seq, 1, g)
+                    });
+                let (end, head) = got.unwrap();
+                assert_eq!(end, want.0);
+                assert_eq!(
+                    head.map(|h| (h.off, h.next)),
+                    want.1.map(|h| (h.off, h.next))
+                );
+                assert_eq!(head.as_ref().map(key_of), want.1.as_ref().map(key_of));
+                // The same seek over the buffer finds all it reads there.
+                let mut gate = Gated::<B> {
+                    valid,
+                    missed: false,
+                };
+                let again = seek_block::<(), B, 64>(&data, &start, max_seq, 1, &mut gate).unwrap();
+                assert!(!gate.missed);
+                assert_eq!(
+                    again.1.map(|h| (h.off, h.next)),
+                    want.1.map(|h| (h.off, h.next))
+                );
+                let Some(h) = head else { continue };
+                // The head's value and the step past it come from the
+                // buffer, through its grains: no miss, the same answers.
+                let mut gate = Gated::<B> {
+                    valid,
+                    missed: false,
+                };
+                let mut out = [0u8; 64];
+                let n = value_at::<(), B>(&data, h.off, end, 1, &mut gate, &mut out).unwrap();
+                assert!(!gate.missed);
+                assert_eq!(n, h.val_len);
+                let next = park_in::<(), B, 64>(&data, h.next, end, None, max_seq, 1, &mut gate);
+                let truth =
+                    park_in::<(), B, 64>(&image, h.next, end, None, max_seq, 1, &mut Open::<B>);
+                if !gate.missed
+                    && let Ok(n) = next
+                {
+                    let t = truth.unwrap();
+                    assert_eq!(n.map(|h| (h.off, h.next)), t.map(|h| (h.off, h.next)));
+                }
+                // Further on, the buffer either answers truly or misses.
+                let mut gate = Gated::<B> {
+                    valid,
+                    missed: false,
+                };
+                let mut off = h.next;
+                for _ in 0..17 {
+                    let n = park_in::<(), B, 64>(&data, off, end, None, max_seq, 1, &mut gate);
+                    let t =
+                        park_in::<(), B, 64>(&image, off, end, None, max_seq, 1, &mut Open::<B>);
+                    let (false, Ok(n)) = (gate.missed, n) else {
+                        break;
+                    };
+                    let t = t.unwrap();
+                    assert_eq!(
+                        n.map(|h| (h.off, h.next, h.seq)),
+                        t.map(|h| (h.off, h.next, h.seq))
+                    );
+                    let Some(n) = n else { break };
+                    off = n.next;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_seek_answers_from_the_bytes_it_checked() {
+        seek_parse_holds::<512>(0x5EE1);
+        seek_parse_holds::<1000>(0x5EE2);
+        seek_parse_holds::<4096>(0x5EE3);
+    }
+
+    fn rev_key<const K: usize>(h: &RevHead<K>) -> (&[u8], u64, usize) {
+        (&h.0[..h.1], h.2, h.6)
+    }
+
+    fn rev_parse_holds<const B: usize>(seed: u64) {
+        let mut rng = Rng(seed);
+        for _ in 0..300 {
+            let every = 1 + rng.below(20);
+            let es = entries::<B>(&mut rng, every);
+            let image = block::<B>(&es, every);
+            for _ in 0..8 {
+                let bk: Vec<u8> = (0..1 + rng.below(12))
+                    .map(|_| b'a' + rng.below(7) as u8)
+                    .collect();
+                let bound = match rng.below(3) {
+                    0 => None,
+                    1 => Some((bk.as_slice(), true)),
+                    _ => Some((bk.as_slice(), false)),
+                };
+                let max_seq = if rng.below(3) == 0 {
+                    1 + rng.below(120) as u64
+                } else {
+                    u64::MAX
+                };
+                let want = search_block_rev::<(), B, 64>(&image, bound, max_seq, 1, &mut Open::<B>)
+                    .unwrap();
+                let mut poison = Rng(rng.next() | 1);
+                let (got, data, valid): (R<(usize, Option<RevHead<64>>)>, _, _) =
+                    lend(&image, &mut poison, &mut |b, g| {
+                        search_block_rev::<(), B, 64>(b, bound, max_seq, 1, g)
+                    });
+                let got = got.unwrap();
+                assert_eq!(got.0, want.0);
+                assert_eq!(got.1.as_ref().map(rev_key), want.1.as_ref().map(rev_key));
+                // The same search over the buffer needs nothing more.
+                let mut gate = Gated::<B> {
+                    valid,
+                    missed: false,
+                };
+                let again =
+                    search_block_rev::<(), B, 64>(&data, bound, max_seq, 1, &mut gate).unwrap();
+                assert!(!gate.missed);
+                assert_eq!(again.1.as_ref().map(rev_key), want.1.as_ref().map(rev_key));
+                // The step below the head answers truly or misses.
+                let Some(h) = got.1 else { continue };
+                let below = Some((&h.0[..h.1], false));
+                let mut gate = Gated::<B> {
+                    valid,
+                    missed: false,
+                };
+                let n = search_block_rev::<(), B, 64>(&data, below, max_seq, 1, &mut gate);
+                let t = search_block_rev::<(), B, 64>(&image, below, max_seq, 1, &mut Open::<B>);
+                // An error from a buffer that lacks grains is not
+                // believed (`Blocks::load_with` takes the rest): a miss.
+                if !gate.missed
+                    && let Ok(n) = n
+                {
+                    assert_eq!(
+                        n.1.as_ref().map(rev_key),
+                        t.unwrap().1.as_ref().map(rev_key)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_reverse_search_answers_from_the_bytes_it_checked() {
+        rev_parse_holds::<512>(0x4E51);
+        rev_parse_holds::<1000>(0x4E52);
+        rev_parse_holds::<4096>(0x4E53);
+    }
+
+    /// A block whose padding holds a stray byte is corrupt. A buffer that
+    /// lacks that grain must not call it padding: its own bytes there are
+    /// not the block's.
+    #[test]
+    fn padding_is_believed_only_where_it_was_checked() {
+        let es: Vec<Entry> = (0..3u8)
+            .map(|i| (std::vec![b'a' + i], 5, 1, std::vec![7; 3], 0))
+            .collect();
+        let mut image = block::<4096>(&es, 16);
+        let end = entries_end::<(), 4096>(&image, 1, &mut Open::<4096>).unwrap();
+        image[end - 1] = 1;
+        let tail = 3 * (13 + 1 + 3);
+        let whole =
+            park_in::<(), 4096, 64>(&image, tail, end, None, u64::MAX, 1, &mut Open::<4096>);
+        assert!(whole.is_err(), "a stray byte in the padding is corruption");
+        // A buffer holding the entries' grains, zeros elsewhere: the
+        // padding check misses rather than finding zeros.
+        let mut data = image;
+        data[end - 1] = 0;
+        let mut gate = Gated::<4096> {
+            valid: mask::<4096>(0, tail),
+            missed: false,
+        };
+        let r = park_in::<(), 4096, 64>(&data, tail, end, None, u64::MAX, 1, &mut gate);
+        assert!(gate.missed && r.is_err());
+    }
+
+    #[test]
+    fn grains_cover_the_block() {
+        fn holds<const B: usize>() {
+            let g = grain::<B>();
+            assert!(grains::<B>() <= 64 && g * grains::<B>() >= B);
+            assert_eq!(mask::<B>(0, B), full::<B>());
+            assert_eq!(mask::<B>(0, 1), 1);
+            assert_eq!(mask::<B>(B - 1, B), 1 << (grains::<B>() - 1));
+            assert_eq!(mask::<B>(g - 1, g + 1), 0b11);
+            let mut gate = Gated::<B> {
+                valid: mask::<B>(g, 2 * g),
+                missed: false,
+            };
+            assert!(gate.check(g, 2 * g) && gate.check(5, 5) && !gate.missed);
+            assert!(!gate.check(g - 1, g + 1) && gate.missed);
+            assert!(
+                !Gated::<B> {
+                    valid: full::<B>(),
+                    missed: false
+                }
+                .check(0, B + 1)
+            );
+        }
+        holds::<512>();
+        holds::<1000>();
+        holds::<4096>();
+        holds::<16384>();
+        holds::<64>();
     }
 }
