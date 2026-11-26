@@ -197,7 +197,9 @@ unchanged.
 > the acknowledged prefix. `tests/drainer.rs` covers the batch+flush+
 > durable flow, idle/fence behavior, flush-error poisoning, memtable-full
 > stalling with retry, malformed-payload poisoning, the pending-flush
-> ordering regression, and the dropped-observer guarantee.
+> ordering regression, and the dropped-observer guarantee. Since
+> ADR-0036 it also covers WAL-full stalling, compaction through the
+> drainer, and `resume` after a device error.
 >
 > *Supersedes the 2026-09-26 WAL-owning note: the drainer no longer owns a
 > `WalWriter`; it owns the `Db`, which assigns WAL/database sequence
@@ -209,11 +211,19 @@ unchanged.
   ticket (`drainer::is_ticket_durable`).
 - **O1 — acked ⇒ durable.** The watermark advances only via
   `compare_exchange` **after the WAL batch's flush is acknowledged**
-  (`append_batch` returns; the drainer advances over exactly
-  `report.durable`). A put MUST NOT complete before its entry's WAL unit
-  is flush-acknowledged. On batch error the drainer advances `durable`
-  over exactly the durable prefix, burns `consumed` seqnums, and poisons
-  itself (returns the error; the host fails outstanding writers).
+  (`Db::write` returns; the drainer advances over the whole batch). A
+  put MUST NOT complete before its entry's WAL unit is
+  flush-acknowledged. On a write error `durable` does not move, and the
+  drainer poisons itself and returns the error. The host calls
+  `Drainer::resume` or fails the outstanding writers, not both.
+- **Errors a flush answers stall** (ADR-0036, issue #47). `TableFull`,
+  `ArenaFull` and `WalFull` give `SweepOutcome::Stalled` and keep the
+  pending tickets. The host calls `Drainer::flush`, and
+  `Drainer::compact_step` when the flush returns `NeedsCompaction`.
+  After poison, the pending tickets stay. `Drainer::resume` clears the
+  poison, and the next sweep writes them again. Do not rebuild the
+  drainer on the same ring and `durable`: `into_db` drops the pending
+  tickets, and `durable` stops at the first of them.
 - **O2 — drainer is sole device writer.** Holds by ownership: the
   `WalWriter` (and through it the `Device`) is moved to and exclusively
   owned by the drainer. No `&WalWriter` is ever shared. (The full `Db`
@@ -276,8 +286,9 @@ unchanged.
 > `publish` → `Fenced` transparently re-claims a fresh ticket (silent
 > re-claim; §16 Q4). `Put` polls the `durable` watermark and returns
 > `Pending` post-acceptance only, per the rule above; dropping it
-> abandons observation, not the write. If the drainer is poisoned the
-> watermark never advances and the host owns failing abandoned puts.
+> abandons observation, not the write. While the drainer is poisoned,
+> the watermark does not move. The host calls `Drainer::resume`, or
+> fails the abandoned puts.
 
 ## 9. Snapshots and reads
 
