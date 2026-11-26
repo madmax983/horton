@@ -34,7 +34,11 @@ written into levels 0 and 1 stopped compressing
 overwrites 16% to 43% faster, point reads 5% to 8% and seeks about 40%.
 And a point read served from the cache came to check only the bytes it
 reads ([step 22](#then-a-cached-point-read-checks-what-it-reads)):
-10% to 15% faster when the cache holds the keys read.
+10% to 15% faster when the cache holds the keys read. Then the index
+block came to end in restart offsets, so its search binary-searches
+and checks only what it reads, as a data block's does
+([step 23](#then-an-index-search-that-reads-only-what-it-needs)):
+point reads 14% to 41% faster, seeks 19% to 75%.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1263,10 +1267,79 @@ The time saved is larger than the instructions: summing a 16 KiB image
 also pulled it through the CPU's caches. Where a read goes to the
 device (the full key range at 1 M keys), the hit it saves on is about
 one read in eight, and the difference is inside run-to-run spread.
-The index block is still summed whole on every read: an index search
-parses every entry to count them, so it reads the whole block. That is
-now 25% to 31% of a read served from the cache
-([Levers not pulled](#levers-not-pulled)).
+The index block was still summed whole on every read: an index search
+parsed every entry to count them, so it read the whole block. That was
+then 25% to 31% of a read served from the cache. Step 23 took it out.
+
+### Then: an index search that reads only what it needs
+
+Step 23 (ADR-0034). The index block named one data block per entry,
+variable-length, with no offsets: a search parsed every entry to count
+them, so a point read's cache hit summed all 64 chunks of it, and a
+seek copied each index block out of the cache, summed whole. Now the
+block ends in a trailer: the offset of every 16th entry and the entry
+count, 2 bytes per 16 entries and 2 more. A search binary-searches the
+offsets and scans at most 16 entries, and the cache lends the image
+with a check, as step 22 lends a data block: the search checks the
+trailer, each offset it reads and each entry it parses before it acts
+on it. Point reads and both seek directions use it. The format changed
+(`hrtsst05`, manifest `hrtman11`); older images are rejected.
+
+Measured as step 22 was, except that the two builds cannot share
+tables: each filled its own store (one thread) with its own build.
+Both 1 M stores came out with tables per level [3, 2, 1, 17] and the
+same bloom blocks, and cache hits and misses per read differ by under
+1% between them; the 300 K stores are identical in shape.
+
+Instructions per op (callgrind, one reader, a second pass over a warm
+cache; 100 K reads or 20 K seeks):
+
+| store, workload | before | after | |
+|---|---:|---:|---:|
+| 300 K keys, `readrandom` hot | 50,067 | 20,888 | −58.3% |
+| 300 K keys, `readrandom` full | 103,834 | 74,533 | −28.2% |
+| 1 M keys, `readrandom` hot | 82,927 | 54,843 | −33.9% |
+| 1 M keys, `readrandom` full | 144,267 | 113,603 | −21.3% |
+| 300 K keys, `seekrandom` hot | 728,947 | 466,036 | −36.1% |
+| 300 K keys, `seekrandom` full | 800,470 | 542,462 | −32.2% |
+| 1 M keys, `seekrandom` hot | 554,251 | 361,122 | −34.8% |
+| 1 M keys, `seekrandom` full | 715,443 | 482,705 | −32.5% |
+
+An index search sums about 8.5 of the index block's 64 chunks instead
+of all of them (300 K hot: 63.7 before, 8.5 after; 1 M full: 65.2 and
+8.7). A seek searched about 7 index blocks, each copied out and summed
+whole, 447 chunks at 300 K keys; it now checks 27 to 33 chunks in all.
+
+Wall clock at 1 M keys, ops/s, interleaved pairs, each run from a fresh
+copy of its build's store (means of the runs no other process
+disturbed; each run reads the keys twice, both passes shown):
+
+| | before | after | |
+|---|---:|---:|---:|
+| `readrandom` hot, 1 reader (5 pairs) | 121.2 K / 117.8 K | 161.8 K / 165.7 K | +34%, +41% |
+| `readrandom` hot, 4 readers (5 pairs) | 457.9 K / 455.3 K | 605.5 K / 622.2 K | +32%, +37% |
+| `readrandom` full, 1 reader (5 pairs) | 58.3 K / 58.3 K | 69.7 K / 69.3 K | +19%, +19% |
+| `readrandom` full, 4 readers (5 pairs) | 215.2 K / 218.7 K | 244.5 K / 249.4 K | +14%, +14% |
+| `seekrandom` hot, 1 reader (3 pairs, idle) | 25.3 K / 25.5 K | 44.2 K / 43.2 K | +75%, +69% |
+| `seekrandom` hot, 4 readers (3 pairs, idle) | 96.1 K / 100.6 K | 153.8 K / 158.8 K | +60%, +58% |
+| `seekrandom` full, 1 reader, cold (3 fresh fills each) | 19.5 K | 23.2 K | +19% |
+| `readseq`, `fillrandom` | | | level |
+
+Unlike step 22's, the gain reaches reads that go to the device: a
+read's index block is a cache hit even when its data block is not. On
+the full key range seeks gained 30% to 50% on the main pair of stores,
+but that store pair needed 13% fewer device reads per seek after than
+before, which moves from fill to fill in either build (1.43 to 1.68);
+the cold runs over six fresh fills are the fairer figure. The machine
+was slower than in step 22 (the same `main` build read 121 K hot
+against 172 K there, at the same instructions per read), so compare
+within the table only. What a seek still sums whole is its data
+blocks, 321 to 450 chunks, now 20% to 25% of its instructions.
+
+The trailer costs index room: a table's index of `n` entries of keys
+`k` bytes long needs `n × (18 + k) + 2 + 2⌈n/16⌉` bytes of the block's
+`BLOCK − 4`. The host store's index of 16-byte keys holds 479 data
+blocks instead of 481.
 
 ## What the remaining gap is made of
 
@@ -1280,11 +1353,11 @@ before; the read rows carry the tables the fills left, as
 | `fillseq` | 1.1–1.3× | one writer at a time commits in about 4 µs; little to compact when keys arrive in order |
 | `fillrandom` | 1.0–1.2× | each 16 KiB block compaction writes is about 80 µs of one core, and each entry is written to a table some eleven times (11.2 at 1 M keys, flush included, at 4,096 entries); two jobs run at once, where RocksDB's cost less each |
 | `overwrite` | 1.2–1.3× | the same work; RocksDB's own rate falls by a fifth from `fillrandom` to here, and horton's by a tenth or less |
-| `readrandom` | 0.86× | a read is 19 µs of one core: an index block summed whole, a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
+| `readrandom` | 0.86× | a read is 19 µs of one core: an index block summed whole (step 23 checks only what it reads), a data block summed and inflated, and for a block that misses the cache a 16 KiB software CRC |
 | `readmissing` | 1.2–1.8× | no gap: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
 | `readseq` | 0.4–0.6× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
 | `readreverse` | 0.3–0.5× | the same, and stepping backwards through a block's version runs costs more than forwards |
-| `seekrandom` | 0.3–0.5× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each costs a whole index block and an inflated data block |
+| `seekrandom` | 0.3–0.5× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each cost a whole index block (since step 23, a few chunks of it) and an inflated data block |
 | `readwhilewriting` | 0.8× | `readrandom`'s 19 µs, on four cores shared with a writer and two merges; and every table compaction writes is new to the cache |
 | `deleterandom` | 0.6× | as `fillrandom` |
 | `fillrandom`, every write synced (100 K keys) | 1.38× | no gap: both wait for the same `fdatasync`, and horton's queue puts 2.5 writes behind each |
@@ -1339,8 +1412,8 @@ block, CRCs it in software (8.3 µs before step 16, about 3 µs since;
 before step 16, which made it 1.4 times faster). RocksDB reads 4 KiB, checks it with a
 hardware CRC32C or XXH3 and caches the block uncompressed. horton's
 cache holds the compressed image, so even a hit inflates the block
-again, after summing it (no longer copying it), and the whole index
-block is summed for every lookup that passes the filter.
+again, after summing it (no longer copying it). Until step 23 the
+whole index block was summed for every lookup that passed the filter.
 
 **A scan's merge is linear in its cursors.** Each `next` compares the
 head of every table cursor, one per table in range, where a heap or
@@ -1368,13 +1441,13 @@ Measured or scoped while doing this, and left:
   and not summing a block's padding, would cheapen the deeper levels'.
   Packing a block by its compressed size would make compression save
   blocks at all (a format change).
-- **An index search that reads only what it needs.** Step 22 checks
-  only the bytes of a data block a point read reads; the index block
-  is still summed whole, 64 chunks and about 16 K instructions a read,
-  25% to 31% of a read served from the cache. The search parses every
-  entry to count them (the count bounds the walk across blocks), so it
-  reads the whole block. An entry count and offsets in the index block
-  would let it binary-search and check a few chunks (a format change).
+- **A seek that checks only the data bytes it reads.** Since step 23
+  a seek checks a few chunks of each index block, but it still lends
+  each data block whole through `with_range`: 321 to 450 chunks a seek,
+  20% to 25% of its instructions. Positioning a cursor reads only the
+  restart trailer and a run of entries, so a checked lend would serve
+  it as it serves a point read; the scan that follows reads on through
+  the block and would check as it goes.
 - **Range-tombstone probes through the checked lend.** A point read in
   a table that holds range tombstones copies their block out of the
   cache and sums it whole. It could search it where it lies and check
@@ -1433,9 +1506,12 @@ Measured or scoped while doing this, and left:
 - **A memtable of 8,192 entries in the kvstore.** Done in step 20.
 - **Inflating a data block only up to the key.** Done in step 17
   (ADR-0027).
-- **Index blocks verified by the entry.** Needs checksums inside the
-  index block, which costs index capacity, and a table's index is one
-  block (ADR-0017).
+- **Index blocks verified by the entry.** Done in step 23 (ADR-0034),
+  with the cache's RAM checksums rather than checksums in the block:
+  an entry count and restart offsets, 2 bytes per 16 entries, let the
+  search find and check only the entries it reads.
+- **An index search that reads only what it needs.** Done in step 23
+  (ADR-0034).
 - **LZ77 with skip acceleration and word-wide match counting.** Done
   in step 16.
 - **A check that a detached reader's tables are still its own.** The

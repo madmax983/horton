@@ -1,4 +1,4 @@
-# ADR-0034: The drainer stalls on `WalFull` and recovers in place
+# ADR-0035: The drainer stalls on `WalFull` and recovers in place
 
 Status: Accepted (unreleased, 2026-11-26)
 

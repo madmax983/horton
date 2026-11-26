@@ -25,6 +25,7 @@ The bloom probe already pays for only the chunks it reads
 (`read_range_verified`, ADR-0017). The index search cannot: it parses
 every entry of the index block to count them (`index_partition`), so
 it reads the whole block anyway, and it keeps the whole-image check.
+(Done since: ADR-0034.)
 
 ## Decision
 
@@ -82,6 +83,7 @@ read again.
   on every point read, 25% to 31% of a read served from the cache.
   Searching it a range at a time would need its entries counted and
   located without parsing them all: a format change, left as a lever.
+  (Done since: ADR-0034.)
 - **A fault can stay longer.** A flip in a chunk no lookup reads is no
   longer found and dropped by the next hit on the block; it is found by
   the first read that touches that chunk (a point read whose search

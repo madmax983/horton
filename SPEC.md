@@ -241,8 +241,16 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   entry 10 bits (ADR-0020). Advisory: a bad CRC disables the filter
   for the keys whose bucket is in that block.
 - **Index block:** per data block `first_key_len u16 | first_key |
-  block_id u64 | max_seq u64`.
-- **Footer:** `magic u64 = "hrtsst04" | index_block u64 | bloom_block u64
+  block_id u64 | max_seq u64`, then zero padding, then a trailer that
+  ends at the CRC: the `u16` offset of every 16th entry (the first is
+  0), then the entry count as a `u16` (ADR-0034). A search
+  binary-searches the offsets and scans at most 16 entries; it reads
+  neither the entries it does not need nor the padding. A table's
+  index is one block, so a table of `n` data blocks with keys of `k`
+  bytes needs `n × (18 + k) + 2 + 2⌈n/16⌉ ≤ BLOCK − 4`; a `Db` shape
+  whose index could not hold one key's run of versions (compaction
+  never splits a key) fails to compile.
+- **Footer:** `magic u64 = "hrtsst05" | index_block u64 | bloom_block u64
   | entry_count u64 | k u8 | rdel_blocks u32 | min_seq u64 |
   bloom_len u32`. The bloom section is `[bloom_block, index_block)`,
   and must be exactly the blocks `bloom_len` bytes of filter fill.
@@ -281,13 +289,13 @@ shared by the levels. L0 holds at most `TABLES` refs, oldest first;
 deeper levels hold disjoint runs sorted by first key, in any share of
 the pool.
 
-Storage (format `hrtman10`, ADR-0011): two or more **copies**
+Storage (format `hrtman11`, ADR-0011): two or more **copies**
 (`ManifestLayout::pair` or `ManifestLayout::ring`), each
 `Manifest::max_blocks::<BLOCK>()` blocks long, the compile-time worst
 case. Block layout:
 
 ```
-magic: u64 = "hrtman10" | seq: u64 | index: u16 | count: u16 | len: u32
+magic: u64 = "hrtman11" | seq: u64 | index: u16 | count: u16 | len: u32
 | body chunk[len] | crc32: u32
 ```
 

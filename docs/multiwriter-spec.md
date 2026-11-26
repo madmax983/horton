@@ -214,7 +214,7 @@ unchanged.
   is flush-acknowledged. On batch error the drainer advances `durable`
   over exactly the durable prefix, burns `consumed` seqnums, and poisons
   itself (returns the error; the host fails outstanding writers).
-- **Errors a flush answers stall** (ADR-0034, issue #47). `TableFull`,
+- **Errors a flush answers stall** (ADR-0035, issue #47). `TableFull`,
   `ArenaFull` and `WalFull` give `SweepOutcome::Stalled` and keep the
   pending tickets. The host calls `Drainer::flush`, and
   `Drainer::compact_step` when the flush returns `NeedsCompaction`.
