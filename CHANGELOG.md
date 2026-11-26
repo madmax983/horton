@@ -37,6 +37,11 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`Drainer::compact_step`, `Drainer::request_compaction`,
+  `Drainer::compaction_pending` and `Drainer::resume`** (`multiwriter`,
+  ADR-0035). The host compacts, and retries after poison, without
+  `into_db`. `resume` clears the poison, so the next sweep writes the
+  pending tickets again.
 - **`sstable::index_tail`** (ADR-0034): the bytes of trailer an index
   block of `n` entries ends with, `2 + 2⌈n/16⌉`, for sizing a table's
   index.
@@ -179,6 +184,10 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **`SweepOutcome::Stalled` also means "WAL full"** (`multiwriter`,
+  ADR-0035). The remedy is the same: `Drainer::flush`, then sweep
+  again. A host that counts stalls as memtable flushes now also counts
+  WAL wraps.
 - **An index block ends in restart offsets, and its search checks only
   the cached bytes it reads** (ADR-0034). The block now ends in the
   offset of every 16th entry and the entry count; a search
@@ -380,16 +389,6 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Fixed
 
-- **The `multiwriter` drainer stalls on `WalFull`** (ADR-0035, issue
-  #47). One write a sweep used one WAL block, and the drainer poisoned
-  itself when the WAL ran out (write 78 on the README quickstart
-  shape). `sweep` now returns `SweepOutcome::Stalled`, as for a full
-  memtable, and keeps the tickets; `Drainer::flush` wraps the WAL.
-  `Stalled` now also means "WAL full". New: `Drainer::compact_step`,
-  for a flush that returns `NeedsCompaction`, and `Drainer::resume`,
-  which clears the poison and writes the pending tickets again. Use
-  these, not `into_db` and a new drainer: `into_db` drops the pending
-  tickets, and `durable` then stops at the first of them.
 - **The host store has one opener at a time.** Two processes could open
   one `examples/kvstore` store and write over each other's WAL: a `put`
   gave exit status 0 and its value was lost. `Store::open` now locks
@@ -406,6 +405,14 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   range (`start > end`) in `delete_range`, `scan` or `range` gives
   `StoreError::InvertedRange`; an empty range is not an error. A huge
   `--size-mb` is an error, not an overflow.
+- **The `multiwriter` drainer stalls on `WalFull`** (ADR-0035, issue
+  #47). Each sweep of one write used one WAL block, and the drainer
+  poisoned itself when the WAL was full (the 79th write on the README
+  quickstart shape). `sweep` now returns `SweepOutcome::Stalled`, as
+  for a full memtable, and keeps the tickets. `Drainer::flush` wraps
+  the WAL. Do not use `into_db` and a new drainer to recover:
+  `into_db` drops the pending tickets, and `durable` then stops at the
+  first of them.
 - **An image of another format version is rejected even when one of its
   manifest copies is blank.** Such a copy read as damaged, and beside a
   blank one the device read as fresh: the WAL replayed over tables the

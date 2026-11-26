@@ -125,6 +125,11 @@ impl<D> FailFlushNTimes<D> {
             failures,
         }
     }
+
+    /// Returns the inner device, for a reopen.
+    fn into_inner(self) -> D {
+        self.inner
+    }
 }
 
 impl<D: BlockDevice<Error = core::convert::Infallible>> BlockDevice for FailFlushNTimes<D> {
@@ -1609,55 +1614,204 @@ type QuickDrainer<'r> = Drainer<
     8,
 >;
 
-fn quick_drainer<'r>(ring: &'r Ring<8>, durable: &'r AtomicU32) -> QuickDrainer<'r> {
+/// The scratch for [`TestDrainer`]'s geometry.
+type TestCompaction = horton::Compaction<512, 32, 32, 64>;
+
+/// Returns a drainer on the quickstart shape and its WAL block count.
+fn quick_drainer<'r>(ring: &'r Ring<8>, durable: &'r AtomicU32) -> (QuickDrainer<'r>, u32) {
     let mut db = QuickDb::new(MemDevice::<4096>::new(), horton::Config::whole_device(512));
     block_on(db.open()).expect("db open must succeed");
-    Drainer::new(ring, db, durable)
+    let cfg = db.config();
+    let wal = u32::try_from(cfg.wal_end - cfg.wal_start).expect("small WAL");
+    // One flush at write CAP (64) must come before the WAL is full.
+    assert!(wal > 64 && wal < 128, "geometry: {wal} WAL blocks");
+    (Drainer::new(ring, db, durable), wal)
 }
 
-/// Sweeps until `Swept`. On `Stalled` the host flushes, and compacts
-/// when the flush asks for it.
-fn sweep_until_swept(drainer: &mut QuickDrainer<'_>, scratch: &mut QuickCompaction) -> usize {
-    let mut stalls = 0;
-    loop {
+/// What [`settle`] did.
+#[derive(Default)]
+struct Settled {
+    stalls: usize,
+    compactions: usize,
+}
+
+/// Sweeps until `Swept`. On `Stalled` it flushes. If the flush returns
+/// `NeedsCompaction`, it compacts, then flushes again. Every loop has a
+/// limit, so a bug fails the test and does not hang it.
+fn settle<
+    D,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+    const BLOOM_BYTES: usize,
+    const N: usize,
+    const W: usize,
+>(
+    drainer: &mut Drainer<
+        '_,
+        D,
+        BLOCK,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        LEVELS,
+        TABLES,
+        BLOOM_BYTES,
+        0,
+        N,
+        W,
+    >,
+    scratch: &mut horton::Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+) -> Settled
+where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+{
+    let mut done = Settled::default();
+    for _ in 0..16 {
         match block_on(drainer.sweep()).expect("a capacity error must not poison") {
-            SweepOutcome::Swept { .. } => return stalls,
+            SweepOutcome::Swept { .. } => return done,
             SweepOutcome::Stalled => {
-                stalls += 1;
-                loop {
-                    match block_on(drainer.flush()) {
-                        Ok(()) => break,
-                        Err(horton::Error::NeedsCompaction) => {
-                            while block_on(drainer.compact_step(scratch)).expect("compact ok")
-                                != horton::Progress::Done
-                            {}
-                        }
-                        Err(e) => panic!("flush failed: {e:?}"),
-                    }
-                }
+                done.stalls += 1;
+                flush_or_compact(drainer, scratch, &mut done.compactions);
             }
-            SweepOutcome::Idle => {}
+            SweepOutcome::Idle => panic!("Idle with a published ticket"),
         }
     }
+    panic!("no Swept after 16 sweeps");
+}
+
+/// Flushes. On `NeedsCompaction` it compacts to `Done` and flushes again.
+fn flush_or_compact<
+    D,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+    const BLOOM_BYTES: usize,
+    const N: usize,
+    const W: usize,
+>(
+    drainer: &mut Drainer<
+        '_,
+        D,
+        BLOCK,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        LEVELS,
+        TABLES,
+        BLOOM_BYTES,
+        0,
+        N,
+        W,
+    >,
+    scratch: &mut horton::Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    compactions: &mut usize,
+) where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+{
+    for _ in 0..8 {
+        match block_on(drainer.flush()) {
+            Ok(()) => return,
+            Err(horton::Error::NeedsCompaction) => {
+                *compactions += 1;
+                compact_to_done(drainer, scratch);
+            }
+            Err(e) => panic!("flush failed: {e:?}"),
+        }
+    }
+    panic!("no flush after 8 compactions");
+}
+
+/// Runs `compact_step` until `Done`.
+fn compact_to_done<
+    D,
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const CAP: usize,
+    const ARENA: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+    const BLOOM_BYTES: usize,
+    const N: usize,
+    const W: usize,
+>(
+    drainer: &mut Drainer<
+        '_,
+        D,
+        BLOCK,
+        KEY_MAX,
+        VAL_MAX,
+        CAP,
+        ARENA,
+        LEVELS,
+        TABLES,
+        BLOOM_BYTES,
+        0,
+        N,
+        W,
+    >,
+    scratch: &mut horton::Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+) where
+    D: BlockDevice,
+    D::Error: core::fmt::Debug,
+{
+    for _ in 0..10_000 {
+        if block_on(drainer.compact_step(scratch)).expect("compact ok") == horton::Progress::Done {
+            return;
+        }
+    }
+    panic!("no Done after 10,000 compaction steps");
+}
+
+/// Writes `count` puts `sensor/NNNN`, one write in each sweep.
+fn trickle(
+    drainer: &mut QuickDrainer<'_>,
+    ring: &Ring<8>,
+    durable: &AtomicU32,
+    scratch: &mut QuickCompaction,
+    from: u32,
+    count: u32,
+) -> Settled {
+    let mut all = Settled::default();
+    for i in from..from + count {
+        let p = put_payload(format!("sensor/{i:04}").as_bytes(), b"21.5C");
+        let put = horton::writer::put(ring, durable, &p).expect("ring has space");
+        let done = settle(drainer, scratch);
+        all.stalls += done.stalls;
+        all.compactions += done.compactions;
+        assert!(is_ticket_durable(durable, put.ticket()), "write {i}");
+    }
+    all
 }
 
 #[test]
 fn wal_full_stalls_and_keeps_tickets() {
-    // One write a sweep takes one WAL block. The flush at write 64 does
-    // not wrap the WAL, so the 78 blocks run out at write 78 (from 0),
-    // with 14 entries in the memtable: `WalFull`.
+    // Each sweep writes one put to one WAL block. The memtable fills at
+    // write 64. That flush does not wrap the WAL. The next write after
+    // the last WAL block gets `WalFull`.
     let ring = Ring::<8>::new();
     let durable = AtomicU32::new(0);
-    let mut drainer = quick_drainer(&ring, &durable);
+    let (mut drainer, wal) = quick_drainer(&ring, &durable);
     let mut scratch = QuickCompaction::new();
-    for i in 0..78u32 {
-        let p = put_payload(format!("sensor/{i:04}").as_bytes(), b"21.5C");
-        let _put = horton::writer::put(&ring, &durable, &p).expect("ring has space");
-        sweep_until_swept(&mut drainer, &mut scratch);
-    }
-    assert_eq!(durable.load(Ordering::Acquire), 78);
+    trickle(&mut drainer, &ring, &durable, &mut scratch, 0, wal);
+    assert_eq!(durable.load(Ordering::Acquire), wal);
+    assert_eq!(drainer.durable_seqnum(), u64::from(wal));
 
-    let p = put_payload(b"sensor/0078", b"21.5C");
+    let key = format!("sensor/{wal:04}");
+    let p = put_payload(key.as_bytes(), b"21.5C");
     let put = horton::writer::put(&ring, &durable, &p).expect("ring has space");
     assert_eq!(
         block_on(drainer.sweep()).expect("WalFull must not poison"),
@@ -1666,40 +1820,129 @@ fn wal_full_stalls_and_keeps_tickets() {
     assert!(!drainer.is_poisoned());
     assert_eq!(drainer.pending(), 1, "the ticket stays buffered");
     assert!(!is_ticket_durable(&durable, put.ticket()));
+    assert_eq!(drainer.durable_seqnum(), u64::from(wal), "no seqnum used");
 
-    // The documented remedy: flush (it wraps the WAL), then re-sweep.
+    // Flush, then sweep again. The flush wraps the WAL.
     block_on(drainer.flush()).expect("flush ok");
     assert_eq!(
         block_on(drainer.sweep()).expect("sweep ok"),
         SweepOutcome::Swept { tickets: 1 }
     );
     assert!(is_ticket_durable(&durable, put.ticket()));
-    assert_eq!(durable.load(Ordering::Acquire), 79);
+    assert_eq!(durable.load(Ordering::Acquire), wal + 1);
+    assert_eq!(drainer.durable_seqnum(), u64::from(wal) + 1);
 
     let db = drainer.into_db();
     let mut buf = [0u8; 256];
-    let len = block_on(db.get(b"sensor/0078", &mut buf))
+    let len = block_on(db.get(key.as_bytes(), &mut buf))
         .expect("get ok")
         .expect("key present");
     assert_eq!(&buf[..len], b"21.5C");
 }
 
 #[test]
-fn one_write_per_sweep_runs_on() {
-    // Issue #47's repro: 1000 trickled writes. Before the fix, write 78
-    // poisoned the drainer with `WalFull`.
+fn wal_full_keeps_a_batch_with_a_fenced_ticket() {
+    // A WAL-full stall keeps all tickets of the batch, also a fenced
+    // one. The fenced ticket takes no seqnum.
     let ring = Ring::<8>::new();
     let durable = AtomicU32::new(0);
-    let mut drainer = quick_drainer(&ring, &durable);
+    let (mut drainer, wal) = quick_drainer(&ring, &durable);
     let mut scratch = QuickCompaction::new();
-    let mut stalls = 0;
-    for i in 0..1000u32 {
-        let p = put_payload(format!("sensor/{i:04}").as_bytes(), b"21.5C");
-        let put = horton::writer::put(&ring, &durable, &p).expect("ring has space");
-        stalls += sweep_until_swept(&mut drainer, &mut scratch);
-        assert!(is_ticket_durable(&durable, put.ticket()), "write {i}");
+    trickle(&mut drainer, &ring, &durable, &mut scratch, 0, wal);
+
+    let a = publish(&ring, b"a", b"1");
+    let f = ring.try_claim().expect("ring has space");
+    assert_eq!(ring.force_release_slot(f), ForceReleaseOutcome::Released);
+    let b = publish(&ring, b"b", b"2");
+    for _ in 0..2 {
+        assert_eq!(
+            block_on(drainer.sweep()).expect("sweep ok"),
+            SweepOutcome::Stalled,
+            "a stalled sweep stays stalled until a flush"
+        );
+        assert_eq!(drainer.pending(), 3);
+        assert_eq!(durable.load(Ordering::Acquire), wal);
+        assert_eq!(drainer.durable_seqnum(), u64::from(wal));
     }
-    assert!(stalls > 0, "the run must reach a capacity stall");
+
+    block_on(drainer.flush()).expect("flush ok");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 3 }
+    );
+    assert!(is_ticket_durable(&durable, a));
+    assert!(is_ticket_durable(&durable, f));
+    assert!(is_ticket_durable(&durable, b));
+    assert_eq!(durable.load(Ordering::Acquire), wal + 3);
+    assert_eq!(drainer.durable_seqnum(), u64::from(wal) + 2);
+}
+
+#[test]
+fn wal_full_stalls_a_batch_of_two_blocks() {
+    // A batch of 16 puts takes two WAL blocks. When one block is left,
+    // `WalFull` comes with a memtable that has space, and the flush
+    // wraps the WAL. The run overwrites 16 keys, so the table region
+    // does not fill.
+    let ring = Ring::<32>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<32, 16>(&ring, &durable);
+    let mut scratch = TestCompaction::new();
+    // One batch of one block first, so the block count is odd.
+    publish_n(&ring, &[(b"odd".as_slice(), b"x".as_slice())]);
+    settle(&mut drainer, &mut scratch);
+    let mut total = 1u32;
+    let mut wal_stalls = 0;
+    for r in 0..80u32 {
+        let vals: Vec<(String, String)> = (0..16u32)
+            .map(|j| (format!("j{j:02}-padpadpadpadpad"), format!("r{r:03}v")))
+            .collect();
+        let ops: Vec<(&[u8], &[u8])> = vals
+            .iter()
+            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+            .collect();
+        publish_n(&ring, &ops);
+        let done = settle(&mut drainer, &mut scratch);
+        // CAP is 16: after a flush, 16 puts fit the memtable. A second
+        // stall in one round is a WAL-full stall.
+        if done.stalls >= 2 {
+            wal_stalls += 1;
+        }
+        total += 16;
+        assert_eq!(durable.load(Ordering::Acquire), total, "round {r}");
+    }
+    assert!(wal_stalls > 0, "the run must reach a WAL-full stall");
+
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    let len = block_on(db.get(b"j07-padpadpadpadpad", &mut buf))
+        .expect("get ok")
+        .expect("key present");
+    assert_eq!(&buf[..len], b"r079v");
+}
+
+/// Claims and publishes one put for each `(key, val)`.
+fn publish_n(ring: &Ring<32>, ops: &[(&[u8], &[u8])]) {
+    for (key, val) in ops {
+        let t = ring.try_claim().expect("ring has space");
+        assert_eq!(
+            ring.publish(t, &put_payload(key, val)),
+            PublishOutcome::Published
+        );
+    }
+}
+
+#[test]
+fn one_write_per_sweep_runs_on() {
+    // This is the issue #47 case: 1000 writes, one write in each sweep.
+    // Before the fix, write 78 poisoned the drainer with `WalFull`.
+    let ring = Ring::<8>::new();
+    let durable = AtomicU32::new(0);
+    let (mut drainer, wal) = quick_drainer(&ring, &durable);
+    let mut scratch = QuickCompaction::new();
+    let done = trickle(&mut drainer, &ring, &durable, &mut scratch, 0, 1000);
+    // A WAL wrap or a memtable flush, at least once for each WAL pass.
+    assert!(done.stalls >= 1000 / usize::try_from(wal).expect("small"));
+    assert!(done.compactions > 0, "the run must reach NeedsCompaction");
     assert_eq!(durable.load(Ordering::Acquire), 1000);
 
     let db = drainer.into_db();
@@ -1715,49 +1958,87 @@ fn one_write_per_sweep_runs_on() {
 
 #[test]
 fn compact_step_answers_needs_compaction_in_place() {
-    // A flush that asks for compaction gets it through the drainer. The
-    // stalled tickets stay buffered, so no rebuild drops them.
+    // When a flush returns `NeedsCompaction`, the host calls
+    // `Drainer::compact_step`. The stalled ticket stays in the drainer.
     let ring = Ring::<8>::new();
     let durable = AtomicU32::new(0);
-    let mut drainer = quick_drainer(&ring, &durable);
+    let (mut drainer, _) = quick_drainer(&ring, &durable);
     let mut scratch = QuickCompaction::new();
-    let mut asked = false;
-    let mut i = 0u32;
-    while !asked {
+    for i in 0..2000u32 {
         let p = put_payload(format!("sensor/{i:04}").as_bytes(), b"21.5C");
         let put = horton::writer::put(&ring, &durable, &p).expect("ring has space");
-        i += 1;
-        loop {
-            match block_on(drainer.sweep()).expect("sweep ok") {
-                SweepOutcome::Swept { .. } => break,
-                SweepOutcome::Stalled => match block_on(drainer.flush()) {
-                    Ok(()) => {}
-                    Err(horton::Error::NeedsCompaction) => {
-                        asked = true;
-                        assert_eq!(drainer.pending(), 1);
-                        assert!(!is_ticket_durable(&durable, put.ticket()));
-                        while block_on(drainer.compact_step(&mut scratch)).expect("compact ok")
-                            != horton::Progress::Done
-                        {}
-                        block_on(drainer.flush()).expect("flush ok after compaction");
-                    }
-                    Err(e) => panic!("flush failed: {e:?}"),
-                },
-                SweepOutcome::Idle => {}
-            }
+        match block_on(drainer.sweep()).expect("sweep ok") {
+            SweepOutcome::Swept { .. } => continue,
+            SweepOutcome::Stalled => {}
+            SweepOutcome::Idle => panic!("Idle with a published ticket"),
         }
-        assert!(is_ticket_durable(&durable, put.ticket()));
-        assert!(i < 2000, "the run must reach NeedsCompaction");
+        match block_on(drainer.flush()) {
+            Ok(()) => {
+                assert_eq!(
+                    block_on(drainer.sweep()).expect("sweep ok"),
+                    SweepOutcome::Swept { tickets: 1 }
+                );
+            }
+            Err(horton::Error::NeedsCompaction) => {
+                assert!(drainer.compaction_pending());
+                assert_eq!(drainer.pending(), 1);
+                assert!(!is_ticket_durable(&durable, put.ticket()));
+                compact_to_done(&mut drainer, &mut scratch);
+                block_on(drainer.flush()).expect("flush ok after compaction");
+                assert_eq!(
+                    block_on(drainer.sweep()).expect("sweep ok"),
+                    SweepOutcome::Swept { tickets: 1 }
+                );
+                assert!(is_ticket_durable(&durable, put.ticket()));
+                assert!(!drainer.is_poisoned());
+                assert_eq!(durable.load(Ordering::Acquire), i + 1);
+                let db = drainer.into_db();
+                let mut buf = [0u8; 256];
+                for k in [0, i] {
+                    let key = format!("sensor/{k:04}");
+                    let len = block_on(db.get(key.as_bytes(), &mut buf))
+                        .expect("get ok")
+                        .unwrap_or_else(|| panic!("{key} present"));
+                    assert_eq!(&buf[..len], b"21.5C");
+                }
+                return;
+            }
+            Err(e) => panic!("flush failed: {e:?}"),
+        }
     }
+    panic!("the run must reach NeedsCompaction");
+}
+
+#[test]
+fn request_compaction_runs_through_the_drainer() {
+    // `request_compaction` and `compaction_pending` reach the owned `Db`.
+    let (ring, durable) = setup::<8>();
+    let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+    let mut scratch = TestCompaction::new();
+    let t0 = publish(&ring, b"k0", b"v0");
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 1 }
+    );
+    block_on(drainer.flush()).expect("flush ok");
+    assert!(!drainer.compaction_pending());
+    assert_eq!(
+        drainer.request_compaction(9),
+        Err(horton::Error::BadLevel { level: 9 })
+    );
+    drainer.request_compaction(0).expect("request ok");
+    assert!(drainer.compaction_pending());
+    compact_to_done(&mut drainer, &mut scratch);
+    assert!(!drainer.compaction_pending());
     assert!(!drainer.is_poisoned());
-    assert_eq!(durable.load(Ordering::Acquire), i);
+    assert!(is_ticket_durable(&durable, t0));
 }
 
 #[test]
 fn resume_retries_the_batch_after_a_device_error() {
-    // A device error poisons. Once the cause is gone, `resume` lets the
-    // next sweep write the same batch, and `durable` moves on: the
-    // ticket is not lost and the watermark does not wedge.
+    // A device error poisons the drainer. The host removes the cause and
+    // calls `resume`. The next sweep writes the same batch. `durable`
+    // moves on, and no ticket is lost.
     let (ring, durable) = setup::<8>();
     let device = FailFlushNTimes::new(MemDevice::<512>::new(), 0, 1);
     let mut db = horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0>::new(device, test_config());
@@ -1772,6 +2053,10 @@ fn resume_retries_the_batch_after_a_device_error() {
     assert!(drainer.is_poisoned());
     assert_eq!(drainer.pending(), 2, "the batch stays buffered");
     assert_eq!(durable.load(Ordering::Acquire), 0);
+    assert_eq!(
+        block_on(drainer.sweep()).expect("poisoned sweep is idle"),
+        SweepOutcome::Idle
+    );
 
     drainer.resume();
     assert!(!drainer.is_poisoned());
@@ -1779,37 +2064,103 @@ fn resume_retries_the_batch_after_a_device_error() {
     assert_eq!(
         block_on(drainer.sweep()).expect("retry ok"),
         SweepOutcome::Swept { tickets: 2 },
-        "the retry writes the buffered batch first, and only it"
+        "the retry writes only the buffered batch"
     );
     assert!(is_ticket_durable(&durable, t0));
     assert!(is_ticket_durable(&durable, t1));
     assert!(!is_ticket_durable(&durable, t2));
+    // The failed batch used seqnums 1 and 2; the retry takes 3 and 4.
+    assert_eq!(drainer.durable_seqnum(), 4);
+
+    // Later writes change k0 and add and delete k2.
+    publish(&ring, b"k0", b"v9");
+    let p = payload::encode_delete(b"k2").expect("delete payload");
+    publish_raw(&ring, &p);
     assert_eq!(
         block_on(drainer.sweep()).expect("sweep ok"),
-        SweepOutcome::Swept { tickets: 1 }
+        SweepOutcome::Swept { tickets: 3 }
     );
     assert!(is_ticket_durable(&durable, t2));
 
-    let db = drainer.into_db();
+    // Reopen: the failed batch can replay, but the result is the same.
+    let device = drainer.into_db().into_device().into_inner();
+    let mut db = horton::Db::<_, 512, 32, 32, 16, 1024, 2, 4, 64, 0>::new(device, test_config());
+    block_on(db.open()).expect("reopen ok");
     let mut buf = [0u8; 32];
-    for (key, val) in [(b"k0", b"v0"), (b"k1", b"v1"), (b"k2", b"v2")] {
-        let len = block_on(db.get(key, &mut buf))
-            .expect("get ok")
-            .expect("key present");
-        assert_eq!(&buf[..len], val);
-    }
+    let len = block_on(db.get(b"k0", &mut buf))
+        .expect("get ok")
+        .expect("k0 present");
+    assert_eq!(&buf[..len], b"v9");
+    let len = block_on(db.get(b"k1", &mut buf))
+        .expect("get ok")
+        .expect("k1 present");
+    assert_eq!(&buf[..len], b"v1");
+    assert_eq!(block_on(db.get(b"k2", &mut buf)).expect("get ok"), None);
 }
 
 #[test]
-fn resume_without_poison_changes_nothing() {
+fn resume_after_bad_payload_poisons_again() {
+    // An error that comes from a ticket comes back after `resume`.
     let (ring, durable) = setup::<8>();
     let mut drainer = make_drainer::<8, 8>(&ring, &durable);
+    publish(&ring, b"k0", b"v0");
+    let mut bad = [0u8; 32];
+    bad[0] = 0xEE;
+    publish_raw(&ring, &bad);
+    assert_eq!(
+        block_on(drainer.sweep()).expect_err("bad payload"),
+        horton::Error::BadPayload
+    );
+    assert_eq!(drainer.pending(), 2);
+    drainer.resume();
+    assert_eq!(
+        block_on(drainer.sweep()).expect_err("bad payload again"),
+        horton::Error::BadPayload
+    );
+    assert!(drainer.is_poisoned());
+    assert_eq!(drainer.pending(), 2);
+    assert_eq!(durable.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn resume_while_stalled_changes_nothing() {
+    // Without poison, `resume` keeps the stalled tickets and acks none.
+    let ring = Ring::<32>::new();
+    let durable = AtomicU32::new(0);
+    let mut drainer = make_drainer::<32, 8>(&ring, &durable);
+    for i in 0..16u8 {
+        let t = ring.try_claim().expect("ring has space");
+        let p = put_payload(&[b'k', i], &[b'v', i]);
+        assert_eq!(ring.publish(t, &p), PublishOutcome::Published);
+    }
+    for _ in 0..2 {
+        assert_eq!(
+            block_on(drainer.sweep()).expect("sweep ok"),
+            SweepOutcome::Swept { tickets: 8 }
+        );
+    }
+    let t = ring.try_claim().expect("ring has space");
+    assert_eq!(
+        ring.publish(t, &put_payload(b"x", b"y")),
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+
     drainer.resume();
     assert!(!drainer.is_poisoned());
-    let t0 = publish(&ring, b"k0", b"v0");
+    assert_eq!(drainer.pending(), 1);
+    assert!(!is_ticket_durable(&durable, t));
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Stalled
+    );
+    block_on(drainer.flush()).expect("flush ok");
     assert_eq!(
         block_on(drainer.sweep()).expect("sweep ok"),
         SweepOutcome::Swept { tickets: 1 }
     );
-    assert!(is_ticket_durable(&durable, t0));
+    assert!(is_ticket_durable(&durable, t));
 }
