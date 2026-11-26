@@ -163,7 +163,7 @@ struct Done {
 pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
     let p = parse(args)?;
     let path = common.db.with_file_name("bench.db");
-    let _ = std::fs::remove_file(&path);
+    Store::destroy(&path).map_err(|e| e.to_string())?;
     let common = Common {
         db: path,
         size_mb: common.size_mb.max(256),
@@ -225,7 +225,7 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
     print_stats(&store)?;
     drop(store);
     // Leave no 256 MiB file behind (it is sparse, but still).
-    let _ = std::fs::remove_file(&common.db);
+    Store::destroy(&common.db).map_err(|e| e.to_string())?;
     Ok(())
 }
 

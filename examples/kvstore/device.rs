@@ -16,7 +16,8 @@
 //! number of threads share for the table phase of point reads (horton's
 //! detached reads, ADR-0018). Both go through the operating system's
 //! page cache, so a block the database has written is what a reader
-//! gets, synced or not.
+//! gets, synced or not. [`StoreLock`] keeps a second opener out
+//! (ADR-0032).
 
 use core::cell::Cell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -125,6 +126,83 @@ impl FileDevice {
             })
         }
     }
+}
+
+/// An exclusive hold on a store: one opener at a time (ADR-0032).
+///
+/// It locks the file `<store>.lock` beside the store, not the store
+/// file. On Windows a lock is mandatory: a lock on the store file stops
+/// the reads and writes of the store's other handles. Drop unlocks it.
+/// If the process stops, the operating system unlocks it. Do not delete
+/// the lock file: then two openers can lock two different files.
+pub struct StoreLock {
+    file: File,
+}
+
+impl Drop for StoreLock {
+    /// Unlocks now. On Windows, a lock that only the close releases can
+    /// stay for a short time after the close.
+    #[allow(
+        clippy::incompatible_msrv,
+        reason = "the MSRV (1.88) is the library's; examples build on the pinned toolchain"
+    )]
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl StoreLock {
+    /// Locks the store at `path`, and creates it empty if it does not
+    /// exist. Call it before [`FileDevice::open`] sets the size.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::WouldBlock`] if another opener holds the store,
+    /// or the I/O error of the open or the lock.
+    #[allow(
+        clippy::incompatible_msrv,
+        reason = "the MSRV (1.88) is the library's; examples build on the pinned toolchain"
+    )]
+    pub fn acquire(path: &Path) -> io::Result<Self> {
+        // Create the store file: `canonicalize` needs a file that exists.
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let lock = lock_path(&std::fs::canonicalize(path)?)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "the store is open already, in this process or another ({} is locked)",
+                    lock.display()
+                ),
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+}
+
+/// The lock file of the store at `path`: `<path>.lock`.
+///
+/// # Errors
+///
+/// [`io::ErrorKind::InvalidInput`] if `path` has no file name.
+pub fn lock_path(path: &Path) -> io::Result<std::path::PathBuf> {
+    let mut name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the path has no file name"))?
+        .to_os_string();
+    name.push(".lock");
+    Ok(path.with_file_name(name))
 }
 
 /// A read-only handle to a store's file, shared by reader threads.

@@ -357,6 +357,13 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Fixed
 
+- **The host store has one opener at a time.** Two processes could open
+  one `examples/kvstore` store and write over each other's WAL: a `put`
+  gave exit status 0 and its value was lost. `Store::open` now locks
+  `<store>.lock` first. A second opener gets `StoreError::Locked`, with
+  a message that starts "the store is open already". `Store::destroy`
+  deletes a closed store under its lock; `demo`, `bench` and `crash` use
+  it (ADR-0032, issue #44).
 - **An image of another format version is rejected even when one of its
   manifest copies is blank.** Such a copy read as damaged, and beside a
   blank one the device read as fresh: the WAL replayed over tables the

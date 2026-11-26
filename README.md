@@ -565,8 +565,10 @@ cargo run --release --example kvstore -- crash 25          # kill -9 a writer 25
 ```
 
 The store is `target/kvstore/kv.db` (`--db`), created sparse at 256 MiB
-(`--size-mb`). `--no-sync` skips `fdatasync`, as LevelDB does by default:
-a write then survives a process crash but not power loss. Its shape:
+(`--size-mb`). One process at a time opens a store: `Store::open` locks
+`kv.db.lock`, and a second opener gets `StoreError::Locked` (ADR-0032).
+`--no-sync` skips `fdatasync`, as LevelDB does by default: a write then
+survives a process crash but not power loss. Its shape:
 16 KiB blocks, 128-byte keys, 4 KiB values, an 8,192-entry memtable in a
 1 MiB arena, 4 × 7 tables, and its own 16 MiB block cache.
 
