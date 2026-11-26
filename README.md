@@ -568,9 +568,9 @@ The store is `target/kvstore/kv.db` (`--db`), created sparse at 256 MiB
 (`--size-mb`). One process at a time opens a store: `Store::open` locks
 `kv.db.lock`, and a second opener gets `StoreError::Locked` (ADR-0032).
 Bad input fails before the store writes: a size too small for the shape
-gives `StoreError::TooSmall`, a range with `start > end` gives
-`StoreError::InvertedRange`, and a usage error opens no store
-(ADR-0033).
+gives `StoreError::TooSmall` and the file is not sized, a range with
+`start > end` gives `StoreError::InvertedRange`, and a CLI usage error
+opens no store (ADR-0033).
 `--no-sync` skips `fdatasync`, as LevelDB does by default: a write then
 survives a process crash but not power loss. Its shape:
 16 KiB blocks, 128-byte keys, 4 KiB values, an 8,192-entry memtable in a

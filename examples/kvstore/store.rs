@@ -202,9 +202,10 @@ pub enum StoreError {
     /// closes.
     Locked(String),
     /// The file is too small for the store's shape (ADR-0033). `blocks`
-    /// is its size, or the size a new file gets; `existing` is `true`
-    /// for a file that had a size before the open. A new file is not
-    /// sized. Open with more blocks; delete an existing file first.
+    /// is the size of the file, or of a new file. `existing` is `true`
+    /// if the file had a size before the open. The open does not size a
+    /// new file. Remedy: open with more blocks. For an existing file,
+    /// use another path or delete the file.
     TooSmall {
         path: std::path::PathBuf,
         blocks: u64,
@@ -231,19 +232,19 @@ impl core::fmt::Display for StoreError {
                 existing,
             } => {
                 let path = path.display();
-                let mib = min_mib(*min);
+                let mib = mib_for(*min);
                 if *existing {
                     write!(
                         f,
                         "open: {path}: the file holds {blocks} blocks; this shape needs at least \
-                         {min} ({mib} MiB). A store keeps its size: delete the file, or use \
-                         another path"
+                         {min} blocks ({mib} MiB). A store keeps its size: use another path, or \
+                         delete the file"
                     )
                 } else {
                     write!(
                         f,
-                        "open: {path}: {blocks} blocks is too small for a new store; this shape \
-                         needs at least {min} ({mib} MiB). The file is not sized"
+                        "open: {path}: a new store of {blocks} blocks is too small; this shape \
+                         needs at least {min} blocks ({mib} MiB). The file is not sized"
                     )
                 }
             }
@@ -257,8 +258,8 @@ impl std::error::Error for StoreError {}
 
 /// The mebibytes that hold `blocks` blocks, rounded up.
 #[must_use]
-pub const fn min_mib(blocks: u64) -> u64 {
-    (blocks * BLOCK as u64).div_ceil(1 << 20)
+pub const fn mib_for(blocks: u64) -> u64 {
+    blocks.saturating_mul(BLOCK as u64).div_ceil(1 << 20)
 }
 
 impl From<DbError> for StoreError {
@@ -430,7 +431,7 @@ const fn check_key(key: &[u8]) -> Result<(), DbError> {
 
 /// Refuses a range that starts after it ends (ADR-0033). An open end
 /// (`None`) is the last key.
-fn check_order(start: &[u8], end: Option<&[u8]>) -> Result<(), StoreError> {
+pub fn check_order(start: &[u8], end: Option<&[u8]>) -> Result<(), StoreError> {
     match end {
         Some(end) if start > end => Err(StoreError::InvertedRange),
         _ => Ok(()),
@@ -1534,11 +1535,15 @@ impl Store {
 }
 
 /// Refuses a file too small for the shape (ADR-0033). A file of zero
-/// bytes is new: it gets `create_blocks` blocks.
+/// bytes is new: it gets `create_blocks` blocks. A file of part blocks
+/// is not a store: [`FileDevice::open`] refuses it.
 fn check_size(path: &Path, create_blocks: u64) -> Result<(), StoreError> {
     let len = std::fs::metadata(path)
         .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?
         .len();
+    if len % BLOCK as u64 != 0 {
+        return Ok(());
+    }
     let blocks = if len == 0 {
         create_blocks
     } else {
@@ -1592,7 +1597,7 @@ impl Handle {
 
     /// Deletes every key in `[start, end)` with one range tombstone, like
     /// `RocksDB`'s `DeleteRange`.
-    /// A range that starts after it ends is [`StoreError::InvertedRange`].
+    /// A range that starts after it ends gives [`StoreError::InvertedRange`].
     pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), StoreError> {
         check_key(start)?;
         check_key(end)?;
@@ -1633,7 +1638,7 @@ impl Handle {
     /// Up to `limit` entries of `[start, end)` (an empty `start` is the
     /// first key, `end = None` the last), ascending or, with `reverse`,
     /// descending, as of `snapshot` (or now). A range that starts after
-    /// it ends is [`StoreError::InvertedRange`].
+    /// it ends gives [`StoreError::InvertedRange`].
     pub fn scan(
         &self,
         start: &[u8],
@@ -1663,7 +1668,7 @@ impl Handle {
 
     /// Iterates `[start, end)` in order (or in reverse) over a snapshot
     /// it takes now, fetching [`PAGE`] entries at a time. A range that
-    /// starts after it ends is [`StoreError::InvertedRange`].
+    /// starts after it ends gives [`StoreError::InvertedRange`].
     pub fn range(
         &self,
         start: &[u8],
@@ -2958,8 +2963,47 @@ mod tests {
         let refused = Store::open(&path, huge).err();
         let len = std::fs::metadata(&path).map_or(0, |m| m.len());
         remove_store(&path);
-        assert!(matches!(refused, Some(StoreError::Open(_))), "{refused:?}");
+        let Some(StoreError::Open(e)) = refused else {
+            panic!("wrong result: {refused:?}");
+        };
+        assert!(e.contains("is too large"), "{e}");
         assert_eq!(len, 0, "the refused open sized the file");
+    }
+
+    /// A file that is not a whole number of blocks is not a store. The
+    /// error says so, and does not tell the user to delete the file.
+    #[test]
+    fn a_file_of_part_blocks_is_not_a_store() {
+        let path = temp_path("part-block");
+        std::fs::write(&path, [0; 100]).expect("write");
+        let refused = Store::open(&path, TempStore::options()).err();
+        remove_store(&path);
+        let Some(StoreError::Open(e)) = refused else {
+            panic!("wrong result: {refused:?}");
+        };
+        assert!(e.contains("not a store"), "{e}");
+    }
+
+    /// The minimum size opens, for a new file and for an existing one.
+    #[test]
+    fn a_store_of_exactly_the_minimum_size_opens() {
+        let min = KvDb::<FileDevice>::MIN_DEVICE_BLOCKS;
+        let exact = Options {
+            create_blocks: min,
+            sync: false,
+        };
+        let path = temp_path("exact-min");
+        let new = Store::open(&path, exact).map(drop);
+        let len = std::fs::metadata(&path).map(|m| m.len());
+        remove_store(&path);
+        std::fs::File::create(&path)
+            .and_then(|f| f.set_len(min * BLOCK as u64))
+            .expect("create");
+        let existing = Store::open(&path, TempStore::options()).map(drop);
+        remove_store(&path);
+        assert_eq!(new, Ok(()));
+        assert_eq!(len.ok(), Some(min * BLOCK as u64));
+        assert_eq!(existing, Ok(()));
     }
 
     /// Issue #46, item 1: an existing file that is too small gives an
@@ -2989,7 +3033,7 @@ mod tests {
         );
         let text = e.to_string();
         assert!(text.contains("delete the file"), "{text}");
-        assert!(text.contains(&format!("{} MiB", min_mib(min))), "{text}");
+        assert!(text.contains(&format!("{} MiB", mib_for(min))), "{text}");
         assert_eq!(len.ok(), Some(blocks * BLOCK as u64), "the file changed");
     }
 

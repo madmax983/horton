@@ -156,8 +156,8 @@ impl Common {
             .map(|(s, _)| s)
             .map_err(|e| match e {
                 StoreError::TooSmall { min, .. } => format!(
-                    "{e}. Give a new store --size-mb {} or more",
-                    store::min_mib(min)
+                    "{e}. For a new store, use --size-mb {} or more",
+                    store::mib_for(min)
                 ),
                 e => e.to_string(),
             })
@@ -257,14 +257,15 @@ enum Cmd<'a> {
     Stats,
 }
 
-/// Parses a command and its arguments. It touches no file.
+/// Parses a command and its arguments. It does not open a file.
 ///
 /// # Errors
 ///
-/// A usage error: an unknown command, or the wrong arguments.
+/// A usage error (an unknown command, or the wrong arguments), or an
+/// inverted range.
 fn parse<'a>(cmd: &str, args: &'a [String]) -> Result<Cmd<'a>, String> {
     let b = String::as_bytes;
-    Ok(match (cmd, args) {
+    let cmd = match (cmd, args) {
         ("put", [k, v]) => Cmd::Put(b(k), b(v)),
         ("get", [k]) => Cmd::Get(b(k)),
         ("del", [k]) => Cmd::Del(b(k)),
@@ -276,7 +277,19 @@ fn parse<'a>(cmd: &str, args: &'a [String]) -> Result<Cmd<'a>, String> {
             return Err(format!("usage {cmd} has the wrong number of arguments"));
         }
         (other, _) => return Err(format!("usage unknown command {other}")),
-    })
+    };
+    match cmd {
+        Cmd::DelRange(start, end)
+        | Cmd::Scan {
+            start,
+            end: Some(end),
+            ..
+        } => {
+            store::check_order(start, Some(end)).map_err(|e| e.to_string())?;
+        }
+        _ => {}
+    }
+    Ok(cmd)
 }
 
 /// Parses `scan [START [END]] [--reverse] [--limit N]`.
@@ -559,18 +572,35 @@ fn demo_reads(store: &Store) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// A store path in the temporary directory that does not exist.
-    fn temp_common(name: &str, size_mb: u64) -> Common {
+    /// Options for a store path in the temporary directory that does not
+    /// exist. Drop deletes the store, also after a panic.
+    struct TempCommon(Common);
+
+    impl core::ops::Deref for TempCommon {
+        type Target = Common;
+        fn deref(&self) -> &Common {
+            &self.0
+        }
+    }
+
+    impl Drop for TempCommon {
+        fn drop(&mut self) {
+            remove(&self.0);
+        }
+    }
+
+    fn temp_common(name: &str, size_mb: u64) -> TempCommon {
         let db = std::env::temp_dir().join(format!(
             "horton-kvstore-cli-{}-{name}.db",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&db);
-        Common {
+        let common = Common {
             db,
             size_mb,
             sync: false,
-        }
+        };
+        remove(&common);
+        TempCommon(common)
     }
 
     /// Deletes a test store and its lock file.
@@ -626,7 +656,7 @@ mod tests {
         let len = std::fs::metadata(&common.db).map_or(0, |m| m.len());
         remove(&common);
         let min = KvDb::<device::FileDevice>::MIN_DEVICE_BLOCKS;
-        let want = format!("--size-mb {}", store::min_mib(min));
+        let want = format!("--size-mb {}", store::mib_for(min));
         assert!(e.as_deref().is_some_and(|e| e.contains(&want)), "{e:?}");
         assert_eq!(len, 0, "the refused open sized the file");
     }
@@ -638,15 +668,69 @@ mod tests {
         assert_eq!(common.options().create_blocks, u64::MAX);
     }
 
-    /// Issue #46, item 3: the CLI reports an inverted range.
+    /// Issue #46, item 3: the CLI refuses an inverted range before it
+    /// opens the store.
     #[test]
     fn the_cli_refuses_an_inverted_range() {
         let common = temp_common("inverted", 128);
         let del = cli(&common, "delrange", &strings(&["z", "a"])).err();
-        let scan = cli(&common, "scan", &strings(&["z", "a"])).err();
+        let scan = cli(&common, "scan", &strings(&["z", "a", "--reverse"])).err();
+        let created = common.db.exists();
         remove(&common);
         let want = Some(StoreError::InvertedRange.to_string());
         assert_eq!(del, want);
         assert_eq!(scan, want);
+        assert!(!created, "an inverted range created the store");
+    }
+
+    /// `parse` accepts each command line that it accepted before.
+    #[test]
+    fn parse_reads_each_command_line() {
+        let scan = |start: &'static [u8], end, reverse, limit| Cmd::Scan {
+            start,
+            end,
+            reverse,
+            limit,
+        };
+        let cases: &[(&str, &[&str], Cmd<'_>)] = &[
+            ("put", &["k", "v"], Cmd::Put(b"k", b"v")),
+            ("get", &["k"], Cmd::Get(b"k")),
+            ("del", &["k"], Cmd::Del(b"k")),
+            ("delrange", &["a", "b"], Cmd::DelRange(b"a", b"b")),
+            ("delrange", &["a", "a"], Cmd::DelRange(b"a", b"a")),
+            ("compact", &[], Cmd::Compact),
+            ("stats", &[], Cmd::Stats),
+            ("scan", &[], scan(b"", None, false, usize::MAX)),
+            ("scan", &["a"], scan(b"a", None, false, usize::MAX)),
+            (
+                "scan",
+                &["a", "c"],
+                scan(b"a", Some(&b"c"[..]), false, usize::MAX),
+            ),
+            (
+                "scan",
+                &["a", "--reverse", "c"],
+                scan(b"a", Some(&b"c"[..]), true, usize::MAX),
+            ),
+            (
+                "scan",
+                &["--limit", "1", "a", "b"],
+                scan(b"a", Some(&b"b"[..]), false, 1),
+            ),
+            (
+                "scan",
+                &["--reverse", "--limit", "0"],
+                scan(b"", None, true, 0),
+            ),
+            (
+                "scan",
+                &["b", "b"],
+                scan(b"b", Some(&b"b"[..]), false, usize::MAX),
+            ),
+        ];
+        for (cmd, args, want) in cases {
+            let args = strings(args);
+            assert_eq!(parse(cmd, &args).as_ref(), Ok(want), "{cmd} {args:?}");
+        }
     }
 }

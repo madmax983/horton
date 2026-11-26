@@ -81,7 +81,7 @@ impl FileDevice {
             len = create_blocks.checked_mul(block).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("{create_blocks} blocks is too large for a file"),
+                    format!("a file of {create_blocks} blocks is too large"),
                 )
             })?;
             file.set_len(len)?;

@@ -25,13 +25,14 @@ This record is about `examples/kvstore`, not the library. A test session
   before `FileDevice::open`. A file of zero bytes is new, and gets
   `Options::create_blocks`. If that is fewer than
   `MIN_DEVICE_BLOCKS`, the open fails with `StoreError::TooSmall`, and
-  the file is not sized. The next open makes the store. An existing
-  file that is too small also gives `TooSmall`. Its message tells you
-  to delete the file or to use another path. The CLI adds the
-  `--size-mb` value to use.
+  the file is not sized. The next open with enough blocks makes the
+  store. An existing file that is too small also gives `TooSmall`. Its
+  message gives the remedy: use another path, or delete the file. The
+  CLI adds the `--size-mb` value to use. A file of part blocks is not a
+  store, and gives that error, not `TooSmall`.
 - **Parse first.** `cli()` parses all of its arguments into a `Cmd`,
-  then opens the store. A usage error opens nothing. Too many
-  arguments is also a usage error.
+  then opens the store. A usage error or an inverted range opens
+  nothing. Too many arguments is also a usage error.
 - **Order first.** `delete_range`, `scan` and `range` refuse
   `start > end` with `StoreError::InvertedRange`. An empty range
   (`start == end`) is not an error.
@@ -42,14 +43,15 @@ Not done:
 
 - **The library does not change.** `Db::delete_range` keeps its
   documented contract: an inverted range is a no-op. Firmware callers
-  and their tests use it.
-- **No empty file is deleted.** `StoreLock::acquire` creates the store
-  file, because a canonical path needs a file that exists (ADR-0032).
-  A refused open can leave a file of zero bytes. The next open treats
-  it as new. A lock path that does not resolve symbolic links can give
-  two openers two locks (issue #44).
-- **No file is resized.** A file that is too small can hold a store of
-  an older shape. The store does not change it.
+  and their tests use this behavior.
+- **The open does not delete an empty file.** `StoreLock::acquire`
+  creates the store file, because `canonicalize` needs a file that
+  exists (ADR-0032). A refused open can leave a file of zero bytes.
+  This is safe: the next open treats it as new. A lock path that does
+  not resolve symbolic links can give two openers two locks (issue
+  #44).
+- **The store does not resize a file.** A file that is too small can
+  hold a store of an older shape.
 
 ## Consequences
 
@@ -61,7 +63,7 @@ Not done:
 ## References
 
 - Issue #46: the session report.
-- `examples/kvstore/store.rs` (`check_size`, `check_order`,
+- `examples/kvstore/store.rs` (`check_size`, `check_order`, `mib_for`,
   `StoreError::TooSmall`, `StoreError::InvertedRange`), `main.rs`
   (`parse`, `Cmd`, `Common::open`), `device.rs` (`FileDevice::open`).
 - ADR-0013 (capacity errors name their remedy), ADR-0032 (one opener).

@@ -368,7 +368,8 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   issue #46). An open with too few blocks for the shape does not size
   the file, and gives `StoreError::TooSmall`. Its message names the
   remedy, and the CLI gives the `--size-mb` to use. A CLI usage error
-  opens no store, and too many arguments is a usage error. An inverted
+  or inverted range opens no store, and too many arguments is a usage
+  error. An inverted
   range (`start > end`) in `delete_range`, `scan` or `range` gives
   `StoreError::InvertedRange`; an empty range is not an error. A huge
   `--size-mb` is an error, not an overflow.
