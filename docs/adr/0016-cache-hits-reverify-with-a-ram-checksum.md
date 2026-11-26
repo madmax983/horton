@@ -49,7 +49,9 @@ and checks only the chunks the range touches. A reader that needs 45
 bytes of a footer or 64 bytes of a bloom block pays for one chunk, not
 the block (ADR-0017 uses this). Since ADR-0031 a point read's data
 block is lent with a check instead, and the search checks each range
-just before it acts on it: what it never reads, it never checks.
+just before it acts on it: what it never reads, it never checks. Since
+ADR-0034 the index block of a point read or a seek is lent the same
+way.
 
 **The sum is four multiply-rotate lanes** (xxHash's round): 64-bit
 lanes on 64-bit targets, 32-bit lanes elsewhere, because an ESP32's

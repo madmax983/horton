@@ -899,18 +899,6 @@ impl<
         Ok(())
     }
 
-    /// Reads and CRC-verifies block `id` into the shared buffer with no
-    /// inflation. For index blocks, which are never compressed (their
-    /// tail bytes are index payload, not a restart count — running them
-    /// through the flag check would misread a coincidental bit).
-    async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.src;
-        let (_, block) = self.blocks.victim();
-        sstable::read_block_verified(db.device, db.cache, table_id, id, block, true).await?;
-        self.blocks.loaded(id);
-        Ok(())
-    }
-
     /// Ensures the shared buffer holds block `id` (verified on load).
     async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         if self.blocks.find(id) {
@@ -1011,13 +999,16 @@ impl<
         let data_blocks = Self::data_blocks_of(tref)?;
         // The manifest names the index block: no footer is read.
         let index_id = tref.index_block().ok_or(Error::CorruptManifest)?;
-        self.read_verify_index(tref.id, index_id).await?;
-        let payload_end = BLOCK - sstable::CRC_LEN;
-        let data_id = sstable::index_lookup::<D::Error>(
-            &self.blocks.current()[..payload_end],
-            start,
+        let db = self.src;
+        let data_id = sstable::search_verified(
+            db.device,
+            db.cache,
+            tref.id,
             index_id,
-        )?;
+            &mut self.blocks.raw,
+            |payload, check| sstable::index_lookup::<D::Error>(payload, start, index_id, check),
+        )
+        .await?;
         // `None`: `start` sorts before every block — begin at block 0.
         // (The walk budget in the tuple's second half is for point
         // lookups; the scan cursor walks blocks on its own.)
@@ -1871,18 +1862,6 @@ impl<
         Ok(())
     }
 
-    /// Reads and CRC-verifies block `id` into the shared buffer with no
-    /// inflation. For index blocks, which are never compressed (their
-    /// tail bytes are index payload, not a restart count — running them
-    /// through the flag check would misread a coincidental bit).
-    async fn read_verify_index(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
-        let db = self.src;
-        let (_, block) = self.blocks.victim();
-        sstable::read_block_verified(db.device, db.cache, table_id, id, block, true).await?;
-        self.blocks.loaded(id);
-        Ok(())
-    }
-
     /// Ensures the shared buffer holds block `id` (verified on load).
     async fn ensure_block(&mut self, table_id: u32, id: u64) -> Result<(), Error<D::Error>> {
         if self.blocks.find(id) {
@@ -1917,18 +1896,24 @@ impl<
         }
         // The manifest names the index block: no footer is read.
         let index_id = tref.index_block().ok_or(Error::CorruptManifest)?;
-        self.read_verify_index(tref.id, index_id).await?;
-        let payload_end = BLOCK - sstable::CRC_LEN;
         // Last data block whose first key sorts at/before `from`; empty
         // `from` starts at the table's last data block.
         let block_idx = if from.is_empty() {
             data_blocks - 1
         } else {
-            match sstable::index_last_le_block::<D::Error>(
-                &self.blocks.current()[..payload_end],
-                from,
+            let db = self.src;
+            match sstable::search_verified(
+                db.device,
+                db.cache,
+                tref.id,
                 index_id,
-            )? {
+                &mut self.blocks.raw,
+                |payload, check| {
+                    sstable::index_last_le_block::<D::Error>(payload, from, index_id, check)
+                },
+            )
+            .await?
+            {
                 Some(id) => id
                     .checked_sub(data_first)
                     .ok_or(Error::CorruptBlock { id })?,

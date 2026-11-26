@@ -421,8 +421,9 @@ impl<const BLOCK: usize, const SLOTS: usize> BlockCache<BLOCK, SLOTS> {
     /// The chunks the range touches are checked against their sums
     /// first, as [`get_range_into`](Self::get_range_into) checks them; a
     /// chunk that fails drops the slot and `read` is not called. A
-    /// reader that parses a block once (an index search, an inflate)
-    /// saves the copy it would otherwise parse.
+    /// reader that parses a block once (an inflate) saves the copy it
+    /// would otherwise parse; a search that reads part of a block uses
+    /// [`with_checked`](Self::with_checked) instead.
     pub fn with_range(
         &mut self,
         table_id: u32,

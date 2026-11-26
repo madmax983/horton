@@ -13,7 +13,7 @@
 //! Block layout (all little-endian):
 //!
 //! ```text
-//! magic: u64 = "hrtman10" | seq: u64 | index: u16 | count: u16
+//! magic: u64 = "hrtman11" | seq: u64 | index: u16 | count: u16
 //!     | len: u32 | body[len] | crc32: u32
 //! ```
 //!
@@ -40,7 +40,7 @@ use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 
-/// Manifest block magic: ASCII "hrtman10".
+/// Manifest block magic: ASCII "hrtman11".
 ///
 /// The magic changes whenever the layout changes (pre-1.0 format policy:
 /// no compatibility across minor versions). "hrtman01" was the v0.4.0
@@ -62,11 +62,14 @@ use crate::error::Error;
 /// reader takes a `SPAN` or `CONT` record for a torn tail, so it would
 /// drop a spanning group and every write after it and write over them;
 /// it must not open the image, and this one must not open an older
-/// image's. A foreign
+/// image's. "hrtman11" (v0.20) names tables in the `hrtsst05` format,
+/// whose index blocks end in a trailer of restart offsets (ADR-0034): a
+/// `Db` reads no footer, so the manifest's magic is what keeps an image
+/// of `hrtsst04` tables from being searched by the new rule. A foreign
 /// magic decodes
 /// as [`Error::CorruptManifest`] — old bytes are rejected, never
 /// misparsed.
-pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman10");
+pub const MANIFEST_MAGIC: u64 = u64::from_le_bytes(*b"hrtman11");
 
 /// Bytes of block header before a body chunk: magic, seq, index, count,
 /// len.
