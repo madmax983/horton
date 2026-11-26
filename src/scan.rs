@@ -560,9 +560,11 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
     /// in the image through a [`CopyIn`] gate when the cache checks
     /// ranges and `whole` is not asked for; otherwise it is checked and
     /// copied whole. A compressed block has its flag and stream checked
-    /// and is inflated whole. A parse or inflate that fails has the whole
-    /// image checked before its error is believed (ADR-0031). The buffer
-    /// keeps what was copied only when the lend held.
+    /// and is inflated whole; a parse of what it inflates to rests on
+    /// checked bytes, and its error stands. A parse of a raw image, or an
+    /// inflate, that fails has the whole image checked before its error
+    /// is believed (ADR-0031). The buffer keeps what was copied only when
+    /// the lend held.
     fn lend_into<E, R>(
         &mut self,
         cache: &dyn CachePort<BLOCK>,
@@ -1609,22 +1611,26 @@ impl<
         floor: Option<&[u8]>,
     ) -> Result<(), Error<D::Error>> {
         let max_seq = self.max_seq;
+        let (tid, mut bid, mut off, mut end, mut idx, first, nblocks) = {
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            if !c.live {
+                return Ok(());
+            }
+            (
+                c.table_id,
+                c.block_id,
+                c.next,
+                c.end,
+                c.block_idx,
+                c.first_block,
+                c.data_blocks,
+            )
+        };
+        // The cursor keeps its head, and the block it lies in, until the
+        // park has found the next one: a read that fails on the way
+        // leaves the cursor where it was, so a retried `next` sees it
+        // unchanged.
         loop {
-            let (tid, bid, off, end, idx, first, nblocks) = {
-                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
-                if !c.live {
-                    return Ok(());
-                }
-                (
-                    c.table_id,
-                    c.block_id,
-                    c.next,
-                    c.end,
-                    c.block_idx,
-                    c.first_block,
-                    c.data_blocks,
-                )
-            };
             let db = self.src;
             let parked = self
                 .blocks
@@ -1633,7 +1639,11 @@ impl<
                 })
                 .await?;
             if let Some(h) = parked {
-                self.cursors.as_flattened_mut()[self.level_base[li] + ti].set_head(&h);
+                let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
+                c.block_id = bid;
+                c.block_idx = idx;
+                c.end = end;
+                c.set_head(&h);
                 return Ok(());
             }
             // Block exhausted: move to the next data block, if any.
@@ -1646,17 +1656,15 @@ impl<
                 .ok_or(Error::CorruptBlock { id: first })?;
             // A cursor that crosses into a block reads it through: it is
             // taken whole, in one lookup.
-            let nend = self
+            end = self
                 .blocks
                 .load_with(db.device, db.cache, tid, nid, true, &mut |b, g| {
                     entries_end::<D::Error, BLOCK>(b, nid, g)
                 })
                 .await?;
-            let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
-            c.block_id = nid;
-            c.block_idx = idx + 1;
-            c.end = nend;
-            c.next = 0;
+            bid = nid;
+            idx += 1;
+            off = 0;
         }
     }
 
@@ -2472,14 +2480,18 @@ impl<
         // The cursor's own block is searched for what the search reads;
         // a block it steps back into is taken whole (ADR-0035).
         let mut whole = false;
+        let (tid, first, mut bid, mut idx) = {
+            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            if !c.live {
+                return Ok(());
+            }
+            (c.table_id, c.first_block, c.block_id, c.block_idx)
+        };
+        // The cursor keeps its head, and the block it lies in, until the
+        // park has found the next one: a block it steps back into is
+        // read before the cursor moves, so a read that fails leaves the
+        // cursor where it was, and a retried `prev` sees it unchanged.
         loop {
-            let (tid, bid, idx, first) = {
-                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
-                if !c.live {
-                    return Ok(());
-                }
-                (c.table_id, c.block_id, c.block_idx, c.first_block)
-            };
             let db = self.src;
             // Below the table's live lower bound every entry is dead (a
             // compaction already merged them into a newer table), and a
@@ -2545,13 +2557,10 @@ impl<
                 self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                 return Ok(());
             }
-            let nid = first
-                .checked_add(idx - 1)
+            idx -= 1;
+            bid = first
+                .checked_add(idx)
                 .ok_or(Error::CorruptBlock { id: first })?;
-            let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
-            c.block_id = nid;
-            c.block_idx = idx - 1;
-            c.end = end;
             whole = true;
         }
     }

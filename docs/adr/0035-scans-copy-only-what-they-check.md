@@ -195,6 +195,26 @@ does compaction, which reads past the cache.
     - `complete` committing on a failed lend: a failed check ends the
       copy loop before the map is full.
 
+- **Review.** An adversarial review checked the gates byte by byte, the
+  rule for believing an error, the `id` and `valid` bookkeeping, the
+  compressed branch, `resolve_run`, the panics and caches that lie. It
+  found one defect and reproduced it.
+  - The rewritten reverse park moved its cursor to the earlier block
+    before reading it. A device read of that block that failed left the
+    cursor's head in one block and its block id in another, so a
+    retried `prev` copied another entry's value.
+  - The forward park had the same flaw, from before this change, when
+    one park crossed two blocks: its first had no entry visible at the
+    snapshot.
+  - Both parks now keep the block they walk in locals, and write the
+    cursor only when they have found its entry or its end.
+  - `tests/scan_retry.rs` fails each device read of a clean scan in
+    turn, forward and reverse, with and without a cache and a pool, at
+    every entry visible and at a snapshot that hides whole blocks. Every
+    retried scan must yield exactly the clean one. It fails on the code
+    before the fix, both cases, and the forward case fails on `main`
+    too.
+
 ## References
 
 - [ADR-0016](0016-cache-hits-reverify-with-a-ram-checksum.md) (RAM
