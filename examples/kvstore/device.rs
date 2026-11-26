@@ -219,6 +219,9 @@ pub struct ReadDevice {
     file: File,
     blocks: u64,
     reads: AtomicU64,
+    /// Tests only: the read this many reads from now fails (0: none).
+    #[cfg(test)]
+    fail_in: AtomicU64,
 }
 
 impl ReadDevice {
@@ -230,7 +233,16 @@ impl ReadDevice {
             file,
             blocks,
             reads: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_in: AtomicU64::new(0),
         })
+    }
+
+    /// Tests only: makes the `n`th read from now fail with an I/O error
+    /// (`0`: no read fails).
+    #[cfg(test)]
+    pub fn fail_read_in(&self, n: u64) {
+        self.fail_in.store(n, Ordering::SeqCst);
     }
 
     /// Blocks read through this handle.
@@ -250,6 +262,18 @@ impl BlockDevice for ReadDevice {
         buf: &mut [u8],
     ) -> Poll<Result<(), IoError>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if self
+            .fail_in
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            == Ok(1)
+        {
+            return Poll::Ready(Err(IoError {
+                op: "read",
+                block: id,
+                kind: io::ErrorKind::Other,
+            }));
+        }
         let read = if id < self.blocks {
             read_at(&self.file, buf, id * BLOCK as u64).map_err(|e| e.kind())
         } else {

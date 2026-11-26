@@ -4448,7 +4448,8 @@ mod tests {
     /// A reader thread keeps one forward and one reverse scan state from
     /// page to page (ADR-0037). Pages of every size, both ways, between
     /// writes, flushes and compactions that replace the tables under
-    /// them, and after a page that failed, each yield exactly what the
+    /// them, after a page whose seek failed part-way at a device read,
+    /// and after one refused at its bounds, each yield exactly what the
     /// store holds; the states are built once.
     #[test]
     fn a_reader_thread_keeps_its_scan_state_from_page_to_page() {
@@ -4467,6 +4468,7 @@ mod tests {
             (fwd, rev)
         };
         let mut kept = None;
+        let mut failed = 0;
         for round in 0..12 {
             for _ in 0..400 {
                 let k = key(next(2000));
@@ -4505,7 +4507,30 @@ mod tests {
                 };
                 assert_eq!(got, want, "round {round} from {lo:?} reverse {reverse}");
             }
-            // A page that fails leaves the states fit for the next.
+            // A page whose seek fails part-way, at its first, second or
+            // third read of a block from the device (the cache emptied,
+            // so that it reads them there), leaves the states fit for
+            // the next page.
+            for (n, reverse) in [(1, false), (2, true), (3, false), (2, false), (3, true)] {
+                let lo = key(next(2000));
+                store.handle.shared.cache.clear();
+                store.handle.shared.read_device.fail_read_in(n);
+                failed += usize::from(store.scan(&lo, None, reverse, 17, None).is_err());
+                store.handle.shared.read_device.fail_read_in(0);
+                let got = store.scan(&lo, None, reverse, 17, None).expect("scan");
+                let range: Vec<_> = if reverse {
+                    model.range(lo.clone()..).rev().take(17).collect()
+                } else {
+                    model.range(lo.clone()..).take(17).collect()
+                };
+                let want: Entries = range
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                assert_eq!(got, want, "after a failed read: round {round} from {lo:?}");
+            }
+            // So does a page refused at its bounds, before its seek
+            // touches anything.
             let long = vec![b'k'; KEY_MAX + 1];
             assert!(store.scan(&long, None, false, 3, None).is_err());
             // A reverse page starts from its end bound.
@@ -4517,6 +4542,7 @@ mod tests {
                 Some(k) => assert_eq!(k, (fwd, rev), "the states were built again"),
             }
         }
+        assert!(failed > 10, "only {failed} pages failed part-way");
     }
 
     /// A reader thread's kept scan state never answers from a block a

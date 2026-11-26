@@ -85,7 +85,7 @@ fails, or panics, leaves the state as fit as any other.
   wall clock, four-thread seeks about 6%. Scans and point reads do not
   move.
 - **RAM.**
-  - The host store keeps 44,000 + 43,552 bytes per reader thread,
+  - The host store keeps 43,872 + 43,552 bytes per reader thread,
     beside its 512 KiB pool of lent block buffers.
   - A scan built in a kept state is still `size_of::<Scan>()`
     (`Held` is as large as `Own`), so it is built where it is used.

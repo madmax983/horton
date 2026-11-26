@@ -257,13 +257,18 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const LEVELS: usize, const TABL
 ///
 /// A caller that scans often, over a source that changes each time,
 /// builds and zeroes them once instead of for every scan: a block
-/// buffer and a read scratch of `BLOCK` bytes each, three key buffers
-/// and the cursors (44,000 bytes at the host store's shape of 16 KiB
-/// blocks, 128-byte keys and 4 KiB values). A state holds nothing a scan reads from. What decides
-/// whether a scan reads a byte of it (key lengths, cursor counts, the
+/// buffer and a read scratch of `BLOCK` bytes each, two key buffers, a
+/// value buffer and the cursors (43,872 bytes at the host store's shape
+/// of 16 KiB blocks, 128-byte keys and 4 KiB values).
+///
+/// A scan reads nothing of a state before it has written it. What
+/// decides whether it reads a byte (key lengths, cursor counts, the
 /// memtable head, which block a buffer holds and which of its grains
 /// were checked) lives in the scan and starts fresh with it, so a scan
-/// over a kept state starts as a new scan does (ADR-0037).
+/// over a kept state starts as a new scan does (ADR-0037). A state, like
+/// a lent block pool, may serve scans of any store. A block cache may
+/// not: it keys a block by its table and block id, which another store
+/// reuses.
 pub struct ScanState<
     const BLOCK: usize,
     const KEY_MAX: usize,
