@@ -608,7 +608,7 @@ thread_local! {
     /// Every thread that scans keeps one forward and one reverse scan's
     /// buffers and cursors (some 44 KiB each), built the first time it
     /// scans that way, so that a page does not build and zero them: a
-    /// fifth of a cached seek did that (ADR-0036).
+    /// fifth of a cached seek did that (ADR-0037).
     static SCAN_STATE: RefCell<Option<Box<KvScanState>>> = const { RefCell::new(None) };
     static REV_SCAN_STATE: RefCell<Option<Box<KvRevScanState>>> = const { RefCell::new(None) };
 }
@@ -4446,7 +4446,7 @@ mod tests {
     }
 
     /// A reader thread keeps one forward and one reverse scan state from
-    /// page to page (ADR-0036). Pages of every size, both ways, between
+    /// page to page (ADR-0037). Pages of every size, both ways, between
     /// writes, flushes and compactions that replace the tables under
     /// them, and after a page that failed, each yield exactly what the
     /// store holds; the states are built once.
@@ -4523,7 +4523,7 @@ mod tests {
     /// compaction freed: each round rewrites every key, and its tables
     /// land in blocks earlier rounds' tables held, which this thread's
     /// buffers last held, with other bytes. Every scan yields this round's
-    /// values (ADR-0036; found in review: the test above passes with every
+    /// values (ADR-0037; found in review: the test above passes with every
     /// block-forget guard removed, this one does not).
     #[test]
     fn a_kept_scan_state_reads_no_block_a_compaction_freed() {

@@ -202,7 +202,7 @@ fn run<D: BlockDevice>(
     r: Run<'_>,
 ) -> Result<Entries, Error<D::Error>> {
     // A kept pair of states, when the test set one: every scan of the
-    // run is built in it (ADR-0036).
+    // run is built in it (ADR-0037).
     let mut kept = KEPT.with(|k| k.borrow_mut().take());
     if let Some((fwd, rev)) = kept.as_mut() {
         TWIN.with(|t| {
@@ -419,7 +419,7 @@ fn a_lend_that_ends_false_is_discarded_even_when_its_checks_held() {
 /// scan of a twin store through them: so each starts in buffers that
 /// hold blocks of the same ids with other bytes, and grains an earlier
 /// scan's lends checked. None of them is trusted, and no flip the
-/// earlier scans saw or missed changes an answer (ADR-0035, ADR-0036).
+/// earlier scans saw or missed changes an answer (ADR-0035, ADR-0037).
 #[test]
 fn a_kept_scan_state_trusts_no_grain_an_earlier_scan_checked() {
     KEPT.with(|k| *k.borrow_mut() = Some((Box::new(State::new()), Box::new(RevState::new()))));

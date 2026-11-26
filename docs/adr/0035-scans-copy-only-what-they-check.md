@@ -158,7 +158,7 @@ does compaction, which reads past the cache.
   `Scan::next` futures grew by 312 bytes (to 1,224 and 1,368), and
   `RevScan`'s by 176 and 192 (to 1,464 and 1,472), in the first build.
   The synchronous step over a held block brought them back down (1,208
-  and 1,352, 1,392 and 1,400, as measured when ADR-0036 landed). The
+  and 1,352, 1,392 and 1,400, as measured when ADR-0037 landed). The
   profile's peak stayed at 114,208 bytes, set by `archive_commit`
   (`BUDGET.md`).
 - **Less corruption found by a seek.** A seek used to parse every entry

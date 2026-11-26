@@ -1078,7 +1078,7 @@ fn step_after<E: core::fmt::Debug>(
 /// A seek that fails part-way over a kept state, then a step without a
 /// new seek, does what it does on a fresh scan: no cursor an earlier
 /// scan left in the state is counted, so the step cannot yield that
-/// scan's head. Found in review of ADR-0036: a forward seek counted a
+/// scan's head. Found in review of ADR-0037: a forward seek counted a
 /// table's cursor slot before reading it into place.
 #[test]
 fn a_failed_seek_over_a_kept_state_yields_what_a_fresh_one_does() {

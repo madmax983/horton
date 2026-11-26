@@ -1,4 +1,4 @@
-# ADR-0036: A scan can be built in a state its caller keeps
+# ADR-0037: A scan can be built in a state its caller keeps
 
 Status: Accepted (unreleased, 2026-11-26)
 

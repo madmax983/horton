@@ -1421,7 +1421,7 @@ On the full key range a device read's CRC adds 19%.
 
 ### Then: a scan the host store keeps
 
-Step 25 (ADR-0036). After step 24 a fifth of a cached seek at 1 M keys,
+Step 25 (ADR-0037). After step 24 a fifth of a cached seek at 1 M keys,
 and over a third at 300 K, was `memset`. The host store built a fresh
 scan for every page, and building one zeroes its buffers: 44,000 bytes
 at this shape. The library now lets a caller keep a scan's buffers and
@@ -1645,7 +1645,7 @@ Measured or scoped while doing this, and left:
   search find and check only the entries it reads.
 - **An index search that reads only what it needs.** Done in step 23
   (ADR-0034).
-- **A scan the host store keeps.** Done in step 25 (ADR-0036), as a
+- **A scan the host store keeps.** Done in step 25 (ADR-0037), as a
   state the scan is built in rather than a scan kept whole: a scan
   borrows its page.
 - **A seek that checks only the data bytes it reads.** Done in step 24

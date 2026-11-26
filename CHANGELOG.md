@@ -38,7 +38,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 ### Added
 
 - **`ScanState`, `RevScanState`, `Scan::detached_in` and
-  `RevScan::detached_in`** (ADR-0036): a detached scan built in buffers
+  `RevScan::detached_in`** (ADR-0037): a detached scan built in buffers
   and cursors its caller keeps between scans, so that building one
   zeroes nothing. A scan in a kept state yields what a new one yields.
   `db_types!` takes `ScanState` and `RevScanState` alias kinds.
@@ -191,7 +191,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
-- **The host store keeps a scan state per reader thread** (ADR-0036). A
+- **The host store keeps a scan state per reader thread** (ADR-0037). A
   page used to build a fresh scan, zeroing some 44 KiB; each thread now
   keeps one forward and one reverse state and builds its pages' scans
   in them. A seek takes 39,400 fewer instructions (−38% at 300 K keys,
@@ -427,7 +427,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   so a seek that failed there (a device error on the index block) left
   an earlier seek's cursor counted, and a `next` without a new seek
   could yield its head. The slot is now emptied first (found in the
-  review of ADR-0036, where a kept state made it reachable across
+  review of ADR-0037, where a kept state made it reachable across
   scans).
 - **A scan that retries after a failed device read gets the right
   value.** A forward cursor that crossed two blocks in one step (the

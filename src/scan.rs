@@ -263,7 +263,7 @@ impl<const KEY_MAX: usize, const VAL_MAX: usize, const LEVELS: usize, const TABL
 /// whether a scan reads a byte of it (key lengths, cursor counts, the
 /// memtable head, which block a buffer holds and which of its grains
 /// were checked) lives in the scan and starts fresh with it, so a scan
-/// over a kept state starts as a new scan does (ADR-0036).
+/// over a kept state starts as a new scan does (ADR-0037).
 pub struct ScanState<
     const BLOCK: usize,
     const KEY_MAX: usize,
@@ -3778,7 +3778,7 @@ mod tests {
 
     /// Blocks over a kept set of buffers forget the block an earlier
     /// scan left in them: a scan over a kept `ScanState` never answers
-    /// from it, whatever its tag and grains say (ADR-0036).
+    /// from it, whatever its tag and grains say (ADR-0037).
     #[test]
     fn blocks_over_kept_buffers_forget_what_they_held() {
         use super::{BlockBufs, Blocks, Held};
