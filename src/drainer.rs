@@ -32,25 +32,38 @@
 //!
 //! # Failure policy
 //!
-//! `Db::write` is atomic: on success all ops are durable; on error none
-//! are. On a write error the drainer:
+//! `Db::write` is atomic. On success, all ops are durable. On error, no
+//! op is applied, but after a device error the next open can replay the
+//! whole batch. On a write error the drainer:
 //!
-//! 1. if the error is `TableFull`/`ArenaFull`, buffers the pending
-//!    tickets and returns [`SweepOutcome::Stalled`] — the host flushes
-//!    the memtable (via [`Drainer::flush`]) and re-sweeps; no tickets
-//!    are lost and `durable` does not advance;
-//! 2. otherwise poisons: the error is returned from `sweep` and the
-//!    drainer stops. The host owns failing outstanding writers —
-//!    `durable` tells it exactly which tickets completed.
+//! 1. on `TableFull`, `ArenaFull` or `WalFull`, keeps the pending
+//!    tickets and returns [`SweepOutcome::Stalled`]. The host calls
+//!    [`Drainer::flush`] and sweeps again. If the flush returns
+//!    `NeedsCompaction`, the host calls [`Drainer::compact_step`] until
+//!    `Progress::Done`, then flushes again. No ticket is lost, and
+//!    `durable` does not move.
+//! 2. on all other errors, poisons itself. `sweep` returns the error.
+//!    Later sweeps return `Idle` and do nothing. The pending tickets
+//!    stay in the drainer.
 //!
-//! The drainer stops on error (it does not retry a poisoned device). The
-//! host observes the error as the `Err` from `sweep` (and
-//! [`Drainer::is_poisoned`]) and is responsible for failing outstanding
-//! writers.
+//! After poison, the host does one of two things:
+//!
+//! - It removes the cause (for example, a device fault) and calls
+//!   [`Drainer::resume`]. The next sweep writes the pending tickets
+//!   again.
+//! - It fails the outstanding writers. `durable` shows which tickets
+//!   completed. It does not call `resume` after this: the failed writes
+//!   then complete.
+//!
+//! To continue on the same ring and `durable`, keep the drainer.
+//! [`Drainer::into_db`] drops the pending tickets. A new drainer does
+//! not have them, so `durable` stops at the first of them, and no later
+//! ticket completes (issue #47, ADR-0036).
 
 #![forbid(unsafe_code)]
 
 use crate::batch::WriteBatch;
+use crate::compact::{Compaction, Progress};
 use crate::db::Db;
 use crate::ring::{DrainPoll, FenceOutcome, Ring, TICKET_MASK};
 use crate::{BlockDevice, Error};
@@ -361,10 +374,11 @@ pub enum SweepOutcome {
     /// The ring held no published tickets. The drainer may have fenced a
     /// stalled cursor ticket; re-poll to make progress.
     Idle,
-    /// The Db's memtable is full (`TableFull`/`ArenaFull`): the pending
-    /// tickets are buffered in the drainer, `durable` did not advance,
-    /// and no tickets were lost. The host should flush the memtable via
-    /// [`Drainer::flush`] and re-sweep.
+    /// The `Db` refused the batch with an error that a flush answers:
+    /// `TableFull` or `ArenaFull` (the memtable is full), or `WalFull`
+    /// (the WAL region is full). The pending tickets stay in the
+    /// drainer, and `durable` does not move. The host calls
+    /// [`Drainer::flush`] and sweeps again.
     Stalled,
 }
 
@@ -376,7 +390,7 @@ pub enum SweepOutcome {
 /// All batch scratch is caller-sized (`MAX_WRITES`); no allocation, no
 /// unsafe.
 ///
-/// Tickets drained but not yet applied (because the memtable was full)
+/// Tickets drained but not yet applied (after `Stalled` or poison)
 /// are buffered in the drainer — `durable` does not advance until the
 /// `Db::write` succeeds, so the watermark is always the contiguous
 /// durable prefix.
@@ -398,8 +412,9 @@ pub struct Drainer<
     ring: &'r Ring<N>,
     db: Db<D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES, BLOOM_BYTES, CACHE>,
     durable: &'r AtomicU32,
-    /// Tickets drained but not yet Db-durable (memtable was full on the
-    /// last sweep). In drain order; `pending_len` entries are valid.
+    /// Tickets drained but not yet Db-durable (the last sweep stalled,
+    /// or poisoned the drainer). In drain order; `pending_len` entries
+    /// are valid.
     pending_tickets: [u32; MAX_WRITES],
     /// Payloads for the pending tickets. Only valid where
     /// `pending_has_data` is set; fenced/skipped tickets have no payload.
@@ -412,9 +427,9 @@ pub struct Drainer<
     /// nothing published.
     stall_budget: u32,
     stall_polls: u32,
-    /// Set on the first non-capacity write error; the drainer stops
-    /// afterwards. The error itself is returned from [`Drainer::sweep`] —
-    /// the host owns propagating it to the writers.
+    /// Set on the first write error that a flush does not answer. The
+    /// drainer stops until [`Drainer::resume`]. [`Drainer::sweep`]
+    /// returns the error itself.
     poisoned: bool,
     /// Highest Db sequence number covered by the acknowledged ticket
     /// prefix (SPEC §13). Tickets and Db seqnums are independent counters;
@@ -494,14 +509,32 @@ impl<
         self.stall_budget = budget;
     }
 
-    /// The first write error observed, if the drainer is poisoned.
+    /// Returns `true` when a write error stopped the drainer.
     #[must_use]
     pub const fn is_poisoned(&self) -> bool {
         self.poisoned
     }
 
-    /// Number of tickets currently buffered (drained but not yet
-    /// Db-durable because the memtable was full).
+    /// Clears the poison. The pending tickets stay, and the next
+    /// [`sweep`](Drainer::sweep) writes them before it drains new
+    /// tickets. While poisoned, `sweep` returns `Idle`. Without poison,
+    /// this does nothing.
+    ///
+    /// Call this only when the cause of the error is gone, for example
+    /// after a device fault is repaired. If the error came from a ticket
+    /// (a bad payload, or a key or value that is too large), the next
+    /// sweep poisons the drainer again. Do not call this after the host
+    /// failed the outstanding writers: their writes then complete.
+    ///
+    /// The retry is safe after a device error: the failed batch was not
+    /// applied. If its blocks replay at the next open, the retry has the
+    /// same operations in the same order, so the result is the same.
+    pub const fn resume(&mut self) {
+        self.poisoned = false;
+    }
+
+    /// Returns the number of drained tickets that are not yet in the
+    /// `Db`. Tickets stay pending after `Stalled` and after poison.
     #[must_use]
     pub const fn pending(&self) -> usize {
         self.pending_len
@@ -545,6 +578,15 @@ impl<
     }
 
     /// Consumes the drainer and returns the owned [`Db`].
+    ///
+    /// This drops the pending tickets (see [`pending`](Drainer::pending)).
+    /// Their writes are not in the memtable, and their writers do not
+    /// complete. After a device error, the next open can replay them.
+    /// A new drainer on the same ring and `durable` stops at the first
+    /// dropped ticket. To continue, keep this drainer: use
+    /// [`flush`](Drainer::flush), [`compact_step`](Drainer::compact_step),
+    /// [`request_compaction`](Drainer::request_compaction) and
+    /// [`resume`](Drainer::resume).
     #[must_use]
     pub fn into_db(
         self,
@@ -555,14 +597,49 @@ impl<
     /// Flushes the memtable to an `SSTable` (via the owned `Db`). The host
     /// calls this when [`sweep`](Drainer::sweep) returns
     /// [`SweepOutcome::Stalled`], then re-sweeps to apply the buffered
-    /// tickets.
+    /// tickets. If the WAL region is full, the flush wraps it.
     ///
     /// # Errors
     ///
-    /// Propagates the `Db` flush error; the drainer is not poisoned (a
-    /// flush failure is independent of the pending write batch).
+    /// Returns the error of [`Db::flush`]. The drainer does not poison
+    /// itself. On [`Error::NeedsCompaction`], call
+    /// [`compact_step`](Drainer::compact_step) until
+    /// [`Progress::Done`], then flush again.
     pub async fn flush(&mut self) -> Result<(), Error<D::Error>> {
         self.db.flush().await
+    }
+
+    /// Runs one bounded compaction step on the owned `Db`
+    /// ([`Db::compact_step`]). The pending tickets stay in the drainer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`Db::compact_step`]. The drainer does not
+    /// poison itself.
+    pub async fn compact_step(
+        &mut self,
+        scratch: &mut Compaction<BLOCK, KEY_MAX, VAL_MAX, BLOOM_BYTES>,
+    ) -> Result<Progress, Error<D::Error>> {
+        self.db.compact_step(scratch).await
+    }
+
+    /// Returns `true` when [`compact_step`](Drainer::compact_step) has
+    /// work ([`Db::compaction_pending`]).
+    #[must_use]
+    pub fn compaction_pending(&self) -> bool {
+        self.db.compaction_pending()
+    }
+
+    /// Requests a compaction from `level` to the bottom level
+    /// ([`Db::request_compaction`]). This is part of the remedy for
+    /// [`Error::RegionFull`]. The pending tickets stay in the drainer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of [`Db::request_compaction`]. The drainer
+    /// does not poison itself.
+    pub fn request_compaction(&mut self, level: usize) -> Result<(), Error<D::Error>> {
+        self.db.request_compaction(level)
     }
 
     /// Advance the `durable` watermark past `ticket` via
@@ -589,9 +666,9 @@ impl<
     /// One drain-batch-flush-advance cycle.
     ///
     /// Drains up to `MAX_WRITES` published tickets in ticket order into
-    /// the pending buffer (unless a previous sweep left pending tickets
-    /// from a full memtable — those are retried first and no new tickets
-    /// are drained). Builds a [`WriteBatch`]
+    /// the pending buffer. If an earlier sweep left pending tickets
+    /// (after `Stalled` or `resume`), this sweep writes them and drains
+    /// no new tickets. Builds a [`WriteBatch`]
     /// from the WAL-bearing payloads and applies it via `Db::write` (one
     /// WAL flush, memtable updated atomically), then advances `durable`
     /// over the entire contiguous resolved prefix — WAL-bearing,
@@ -602,18 +679,20 @@ impl<
     ///
     /// # Errors
     ///
-    /// On `TableFull`/`ArenaFull` the pending tickets are kept and
-    /// [`SweepOutcome::Stalled`] is returned (the host flushes and
-    /// re-sweeps). On any other write error the drainer is poisoned:
-    /// `durable` covers exactly the previously acked prefix and the
-    /// error is returned. The host owns propagating it to the writers.
+    /// Returns the `Db` write error, or the error of a ticket
+    /// ([`Error::BadPayload`], a key or value that is too large). The
+    /// drainer then poisons itself. `durable` covers only the tickets
+    /// acknowledged before, and the pending tickets stay (see
+    /// [`resume`](Drainer::resume)). `TableFull`, `ArenaFull` and
+    /// `WalFull` are not errors here: `sweep` returns
+    /// `Ok(SweepOutcome::Stalled)`.
     pub async fn sweep(&mut self) -> Result<SweepOutcome, Error<D::Error>> {
         if self.poisoned {
             // The write error was already reported; stay stopped.
             return Ok(SweepOutcome::Idle);
         }
 
-        // --- Drain phase (unless retrying pending from a full memtable).
+        // --- Drain phase (unless tickets are pending).
         if self.pending_len == 0 {
             while self.pending_len < MAX_WRITES {
                 match self.ring.poll_drain() {
@@ -740,14 +819,14 @@ impl<
                 self.ack_pending();
                 Ok(SweepOutcome::Swept { tickets })
             }
-            Err(Error::TableFull | Error::ArenaFull) => {
-                // Memtable full: keep the pending tickets buffered,
-                // `durable` does not advance, nothing is lost. The host
-                // flushes via `Drainer::flush` and re-sweeps.
+            Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
+                // A flush answers these. `Db::write` refused the batch
+                // before any I/O, so keep the pending tickets: `durable`
+                // does not move and nothing is lost (issue #47).
                 Ok(SweepOutcome::Stalled)
             }
             Err(e) => {
-                // Poisoned: the host must fail the outstanding writers.
+                // Poisoned. The pending tickets stay for `resume`.
                 // `durable` covers exactly the previously acked prefix.
                 self.poisoned = true;
                 Err(e)

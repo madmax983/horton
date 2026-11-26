@@ -21,8 +21,9 @@ use core::task::{Context, Poll};
 ///
 /// Resolves to the ticket once it is WAL-durable. Polls the shared
 /// `durable` watermark; returns [`Poll::Pending`] until the drainer
-/// advances past the ticket. If the drainer is poisoned the watermark
-/// never advances — the host owns failing abandoned puts (SPEC §7).
+/// advances past the ticket. While the drainer is poisoned, the
+/// watermark does not move. The host calls `Drainer::resume`, or fails
+/// the abandoned puts (SPEC §7).
 pub struct Put<'r, const N: usize> {
     durable: &'r AtomicU32,
     ticket: u32,

@@ -685,7 +685,10 @@ deterministic instruction-count harnesses for valgrind:
   front of the single-threaded core. Writers on many tasks or cores
   submit 32-byte payloads (at most 29 bytes of key and value); one
   poll-based `Drainer` owns the `Db` and commits each sweep as one batch;
-  a writer's future resolves once its write is durable. Tickets are
+  a writer's future resolves once its write is durable. When the `Db`
+  refuses a sweep with `TableFull`, `ArenaFull` or `WalFull`, `sweep`
+  returns `Stalled`: call `Drainer::flush` (and `Drainer::compact_step`
+  on `NeedsCompaction`), then sweep again. Tickets are
   31 bits in an `AtomicU32`, so it needs no 64-bit atomics, but it does
   need 32-bit atomic compare-and-swap, which Cortex-M0/M0+ (`thumbv6m`)
   lacks. It is built and tested on the host only. It does not change the
