@@ -364,6 +364,14 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   a message that starts "the store is open already". `Store::destroy`
   deletes a closed store under its lock; `demo`, `bench` and `crash` use
   it (ADR-0032, issue #44).
+- **The host store refuses bad input before it writes** (ADR-0033,
+  issue #46). An open with too few blocks for the shape does not size
+  the file, and gives `StoreError::TooSmall`. Its message names the
+  remedy, and the CLI gives the `--size-mb` to use. A CLI usage error
+  opens no store, and too many arguments is a usage error. An inverted
+  range (`start > end`) in `delete_range`, `scan` or `range` gives
+  `StoreError::InvertedRange`; an empty range is not an error. A huge
+  `--size-mb` is an error, not an overflow.
 - **An image of another format version is rejected even when one of its
   manifest copies is blank.** Such a copy read as damaged, and beside a
   blank one the device read as fresh: the WAL replayed over tables the

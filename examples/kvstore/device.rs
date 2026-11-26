@@ -78,7 +78,12 @@ impl FileDevice {
         let block = BLOCK as u64;
         let mut len = file.metadata()?.len();
         if len == 0 {
-            len = create_blocks * block;
+            len = create_blocks.checked_mul(block).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{create_blocks} blocks is too large for a file"),
+                )
+            })?;
             file.set_len(len)?;
             file.sync_all()?;
         }

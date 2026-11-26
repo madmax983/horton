@@ -136,7 +136,8 @@ impl Common {
     #[must_use]
     pub const fn options(&self) -> Options {
         Options {
-            create_blocks: self.size_mb * 1024 * 1024 / BLOCK as u64,
+            // Saturates: a size too large to make fails at the open.
+            create_blocks: self.size_mb.saturating_mul((1 << 20) / BLOCK as u64),
             sync: self.sync,
         }
     }
@@ -145,14 +146,21 @@ impl Common {
     ///
     /// # Errors
     ///
-    /// The directory or the store cannot be opened.
+    /// The directory or the store cannot be opened. A file too small for
+    /// the shape gives the `--size-mb` to use.
     pub fn open(&self) -> Result<Store, String> {
         if let Some(dir) = self.db.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         Store::open(&self.db, self.options())
             .map(|(s, _)| s)
-            .map_err(|e| e.to_string())
+            .map_err(|e| match e {
+                StoreError::TooSmall { min, .. } => format!(
+                    "{e}. Give a new store --size-mb {} or more",
+                    store::min_mib(min)
+                ),
+                e => e.to_string(),
+            })
     }
 }
 
@@ -232,53 +240,98 @@ fn main() {
     }
 }
 
-/// The `ldb`-style commands: one operation on the store at `--db`.
-fn cli(common: &Common, cmd: &str, args: &[String]) -> Result<(), String> {
-    let arg = |i: usize| -> Result<&[u8], String> {
-        args.get(i)
-            .map(String::as_bytes)
-            .ok_or_else(|| format!("usage {cmd} is missing an argument"))
+/// One `ldb`-style command, parsed before the store opens.
+#[derive(Debug, PartialEq, Eq)]
+enum Cmd<'a> {
+    Put(&'a [u8], &'a [u8]),
+    Get(&'a [u8]),
+    Del(&'a [u8]),
+    DelRange(&'a [u8], &'a [u8]),
+    Scan {
+        start: &'a [u8],
+        end: Option<&'a [u8]>,
+        reverse: bool,
+        limit: usize,
+    },
+    Compact,
+    Stats,
+}
+
+/// Parses a command and its arguments. It touches no file.
+///
+/// # Errors
+///
+/// A usage error: an unknown command, or the wrong arguments.
+fn parse<'a>(cmd: &str, args: &'a [String]) -> Result<Cmd<'a>, String> {
+    let b = String::as_bytes;
+    Ok(match (cmd, args) {
+        ("put", [k, v]) => Cmd::Put(b(k), b(v)),
+        ("get", [k]) => Cmd::Get(b(k)),
+        ("del", [k]) => Cmd::Del(b(k)),
+        ("delrange", [start, end]) => Cmd::DelRange(b(start), b(end)),
+        ("compact", []) => Cmd::Compact,
+        ("stats", []) => Cmd::Stats,
+        ("scan", _) => parse_scan(args)?,
+        ("put" | "get" | "del" | "delrange" | "compact" | "stats", _) => {
+            return Err(format!("usage {cmd} has the wrong number of arguments"));
+        }
+        (other, _) => return Err(format!("usage unknown command {other}")),
+    })
+}
+
+/// Parses `scan [START [END]] [--reverse] [--limit N]`.
+fn parse_scan(args: &[String]) -> Result<Cmd<'_>, String> {
+    let mut bounds = Vec::new();
+    let mut reverse = false;
+    let mut limit = usize::MAX;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--reverse" => reverse = true,
+            "--limit" => {
+                limit = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("usage --limit needs a number")?;
+            }
+            _ => bounds.push(a.as_bytes()),
+        }
+    }
+    let (start, end) = match bounds[..] {
+        [] => (&b""[..], None),
+        [start] => (start, None),
+        [start, end] => (start, Some(end)),
+        _ => return Err("usage scan has more than two bounds".into()),
     };
+    Ok(Cmd::Scan {
+        start,
+        end,
+        reverse,
+        limit,
+    })
+}
+
+/// The `ldb`-style commands: one operation on the store at `--db`. The
+/// arguments are parsed first: a usage error opens no store.
+fn cli(common: &Common, cmd: &str, args: &[String]) -> Result<(), String> {
+    let cmd = parse(cmd, args)?;
+    let store = common.open()?;
     let err = |e: StoreError| e.to_string();
     match cmd {
-        "put" => {
-            let store = common.open()?;
-            store.put(arg(0)?, arg(1)?).map_err(err)
-        }
-        "get" => {
-            let store = common.open()?;
-            let v = store.get(arg(0)?).map_err(err)?.ok_or("not found")?;
+        Cmd::Put(k, v) => store.put(k, v).map_err(err),
+        Cmd::Get(k) => {
+            let v = store.get(k).map_err(err)?.ok_or("not found")?;
             println!("{}", String::from_utf8_lossy(&v));
             Ok(())
         }
-        "del" => {
-            let store = common.open()?;
-            store.delete(arg(0)?).map_err(err)
-        }
-        "delrange" => {
-            let store = common.open()?;
-            store.delete_range(arg(0)?, arg(1)?).map_err(err)
-        }
-        "scan" => {
-            let mut bounds = Vec::new();
-            let mut reverse = false;
-            let mut limit = usize::MAX;
-            let mut it = args.iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--reverse" => reverse = true,
-                    "--limit" => {
-                        limit = it
-                            .next()
-                            .and_then(|s| s.parse().ok())
-                            .ok_or("usage --limit needs a number")?;
-                    }
-                    _ => bounds.push(a.as_bytes()),
-                }
-            }
-            let store = common.open()?;
-            let start = bounds.first().copied().unwrap_or_default();
-            let end = bounds.get(1).copied();
+        Cmd::Del(k) => store.delete(k).map_err(err),
+        Cmd::DelRange(start, end) => store.delete_range(start, end).map_err(err),
+        Cmd::Scan {
+            start,
+            end,
+            reverse,
+            limit,
+        } => {
             for kv in store.range(start, end, reverse).map_err(err)?.take(limit) {
                 let (k, v) = kv.map_err(err)?;
                 println!(
@@ -289,15 +342,13 @@ fn cli(common: &Common, cmd: &str, args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        "compact" => {
-            let store = common.open()?;
+        Cmd::Compact => {
             let t = Instant::now();
             store.compact().map_err(err)?;
             println!("compacted in {:.2?}", t.elapsed());
             print_stats(&store)
         }
-        "stats" => print_stats(&common.open()?.handle()),
-        other => Err(format!("usage unknown command {other}")),
+        Cmd::Stats => print_stats(&store),
     }
 }
 
@@ -502,4 +553,100 @@ fn demo_reads(store: &Store) -> Result<(), String> {
         count(store, b"user/", b"user0")? == 3499,
         "user/2 is gone: 3499 users left",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store path in the temporary directory that does not exist.
+    fn temp_common(name: &str, size_mb: u64) -> Common {
+        let db = std::env::temp_dir().join(format!(
+            "horton-kvstore-cli-{}-{name}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        Common {
+            db,
+            size_mb,
+            sync: false,
+        }
+    }
+
+    /// Deletes a test store and its lock file.
+    fn remove(common: &Common) {
+        let _ = Store::destroy(&common.db);
+        if let Ok(lock) = device::lock_path(&common.db) {
+            let _ = std::fs::remove_file(lock);
+        }
+    }
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|&a| a.to_string()).collect()
+    }
+
+    /// Issue #46, item 2: a usage error opens nothing, so it creates no
+    /// file.
+    #[test]
+    fn a_usage_error_opens_nothing() {
+        let common = temp_common("usage", 256);
+        let cases: &[(&str, &[&str])] = &[
+            ("get", &[]),
+            ("get", &["a", "b"]),
+            ("put", &["a"]),
+            ("put", &["a", "b", "c"]),
+            ("del", &[]),
+            ("delrange", &["a"]),
+            ("delrange", &["a", "b", "c"]),
+            ("scan", &["a", "b", "c"]),
+            ("scan", &["--limit"]),
+            ("scan", &["--limit", "-1"]),
+            ("compact", &["a"]),
+            ("stats", &["a"]),
+            ("nope", &[]),
+        ];
+        for (cmd, args) in cases {
+            let e = cli(&common, cmd, &strings(args)).err();
+            let created = common.db.exists();
+            remove(&common);
+            assert!(
+                e.as_deref().is_some_and(|e| e.starts_with("usage")),
+                "{cmd} {args:?}: {e:?}"
+            );
+            assert!(!created, "{cmd} {args:?} created the store");
+        }
+    }
+
+    /// Issue #46, item 1: a size too small for the shape names the
+    /// `--size-mb` to use, and leaves no sized file.
+    #[test]
+    fn a_small_size_names_the_size_to_use() {
+        let common = temp_common("small", 8);
+        let e = cli(&common, "put", &strings(&["a", "b"])).err();
+        let len = std::fs::metadata(&common.db).map_or(0, |m| m.len());
+        remove(&common);
+        let min = KvDb::<device::FileDevice>::MIN_DEVICE_BLOCKS;
+        let want = format!("--size-mb {}", store::min_mib(min));
+        assert!(e.as_deref().is_some_and(|e| e.contains(&want)), "{e:?}");
+        assert_eq!(len, 0, "the refused open sized the file");
+    }
+
+    /// A size in MiB too large for a block count does not overflow.
+    #[test]
+    fn a_huge_size_does_not_overflow() {
+        let common = temp_common("huge", u64::MAX);
+        assert_eq!(common.options().create_blocks, u64::MAX);
+    }
+
+    /// Issue #46, item 3: the CLI reports an inverted range.
+    #[test]
+    fn the_cli_refuses_an_inverted_range() {
+        let common = temp_common("inverted", 128);
+        let del = cli(&common, "delrange", &strings(&["z", "a"])).err();
+        let scan = cli(&common, "scan", &strings(&["z", "a"])).err();
+        remove(&common);
+        let want = Some(StoreError::InvertedRange.to_string());
+        assert_eq!(del, want);
+        assert_eq!(scan, want);
+    }
 }
