@@ -250,22 +250,48 @@ const fn mask<const BLOCK: usize>(from: usize, to: usize) -> u64 {
 /// [`Error::CorruptBlock`], which its driver then judges (see
 /// [`Blocks::load_with`]). `ahead` names bytes the next step will
 /// likely read, for a lend to take while it can (ADR-0035).
-trait Gate {
-    /// Whether bytes `from..to` may be acted on.
-    fn check(&mut self, from: usize, to: usize) -> bool;
-    /// Bytes `from..to` the scan's next step will likely read.
-    fn ahead(&mut self, from: usize, to: usize);
+///
+/// An enum rather than a trait object: a scan checks every entry it
+/// steps over, and over a whole buffer (`Open`, the common case) a check
+/// is then one predictable branch, not a call.
+enum Gate<'a, 'c, const BLOCK: usize> {
+    /// A whole verified block: every range inside it holds.
+    Open,
+    /// A scan buffer holding part of its block.
+    Held(Gated<BLOCK>),
+    /// A cache's lent image, taken into a buffer as it is checked.
+    Lent(CopyIn<'a, 'c, BLOCK>),
 }
 
-/// A gate over a whole verified block: every range inside it holds.
-struct Open<const BLOCK: usize>;
-
-impl<const BLOCK: usize> Gate for Open<BLOCK> {
+impl<const BLOCK: usize> Gate<'_, '_, BLOCK> {
+    /// Whether bytes `from..to` may be acted on.
+    #[inline]
     fn check(&mut self, from: usize, to: usize) -> bool {
-        to <= from || to <= BLOCK
+        match self {
+            Self::Open => to <= from || to <= BLOCK,
+            Self::Held(g) => g.check(from, to),
+            Self::Lent(c) => c.check(from, to),
+        }
     }
 
-    fn ahead(&mut self, _from: usize, _to: usize) {}
+    /// Whether `ahead` does anything: only a lend takes bytes ahead.
+    const fn takes_ahead(&self) -> bool {
+        matches!(self, Self::Lent(_))
+    }
+
+    /// Bytes `from..to` the scan's next step will likely read.
+    fn ahead(&mut self, from: usize, to: usize) {
+        if let Self::Lent(c) = self {
+            // A failed check is sticky: the lend becomes a miss.
+            let _ = c.check(from, to);
+        }
+    }
+
+    /// Whether a check over a buffer found a grain it lacks.
+    #[cfg(test)]
+    const fn missed(&self) -> bool {
+        matches!(self, Self::Held(Gated { missed: true, .. }))
+    }
 }
 
 /// A gate over a scan buffer: a range holds when every grain it touches
@@ -276,8 +302,8 @@ struct Gated<const BLOCK: usize> {
     missed: bool,
 }
 
-impl<const BLOCK: usize> Gate for Gated<BLOCK> {
-    fn check(&mut self, from: usize, to: usize) -> bool {
+impl<const BLOCK: usize> Gated<BLOCK> {
+    const fn check(&mut self, from: usize, to: usize) -> bool {
         if to <= from {
             return true;
         }
@@ -290,8 +316,6 @@ impl<const BLOCK: usize> Gate for Gated<BLOCK> {
         self.missed |= !held;
         held
     }
-
-    fn ahead(&mut self, _from: usize, _to: usize) {}
 }
 
 /// A gate over a cache's lent image: a range not yet taken is checked
@@ -306,7 +330,7 @@ struct CopyIn<'a, 'c, const BLOCK: usize> {
     check: &'a mut (dyn FnMut(usize, usize) -> bool + 'c),
 }
 
-impl<const BLOCK: usize> Gate for CopyIn<'_, '_, BLOCK> {
+impl<const BLOCK: usize> CopyIn<'_, '_, BLOCK> {
     fn check(&mut self, from: usize, to: usize) -> bool {
         if to <= from {
             return true;
@@ -327,11 +351,6 @@ impl<const BLOCK: usize> Gate for CopyIn<'_, '_, BLOCK> {
         self.data[lo..hi].copy_from_slice(&self.image[lo..hi]);
         self.valid |= m;
         true
-    }
-
-    fn ahead(&mut self, from: usize, to: usize) {
-        // A failed check is sticky: the lend becomes a miss.
-        let _ = self.check(from, to);
     }
 }
 
@@ -509,25 +528,26 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         table_id: u32,
         bid: u64,
         whole: bool,
-        f: &mut impl FnMut(&[u8; BLOCK], &mut dyn Gate) -> Result<R, Error<D::Error>>,
+        f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<D::Error>>,
     ) -> Result<R, Error<D::Error>> {
         if self.find(bid) {
             let block = self.current();
             if block.valid == full::<BLOCK>() {
                 // Every byte is in, checked: nothing to gate, and an
                 // error stands.
-                return f(&block.data, &mut Open::<BLOCK>);
+                return f(&block.data, &mut Gate::Open);
             }
-            let mut gate = Gated::<BLOCK> {
+            let mut gate = Gate::Held(Gated::<BLOCK> {
                 valid: block.valid,
                 missed: false,
-            };
+            });
             let answer = f(&block.data, &mut gate);
-            if !gate.missed && (answer.is_ok() || block.valid == full::<BLOCK>()) {
+            let missed = matches!(gate, Gate::Held(Gated { missed: true, .. }));
+            if !missed && (answer.is_ok() || block.valid == full::<BLOCK>()) {
                 return answer;
             }
             self.complete(device, cache, table_id, bid).await?;
-            return f(&self.current().data, &mut Open::<BLOCK>);
+            return f(&self.current().data, &mut Gate::Open);
         }
         let mut missed = false;
         if let Some(c) = cache {
@@ -541,7 +561,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         sstable::read_data_block(device, cache, table_id, bid, raw, &mut block.data, missed)
             .await?;
         self.loaded(bid, full::<BLOCK>());
-        f(&self.current().data, &mut Open::<BLOCK>)
+        f(&self.current().data, &mut Gate::Open)
     }
 
     /// Copies the value of the entry at `(table_id, bid, off, end)` (a
@@ -576,7 +596,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         table_id: u32,
         bid: u64,
         whole: bool,
-        f: &mut impl FnMut(&[u8; BLOCK], &mut dyn Gate) -> Result<R, Error<E>>,
+        f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
     ) -> Lend<Result<R, Error<E>>> {
         let ranged = !whole && cache.checks_ranges();
         let body_end = BLOCK - sstable::CRC_LEN;
@@ -600,7 +620,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
                     && crate::compress::decompress(&image[..clen], &mut data[..body_end]).is_ok();
                 if inflated {
                     valid = full::<BLOCK>();
-                    answer = Some(f(data, &mut Open::<BLOCK>));
+                    answer = Some(f(data, &mut Gate::Open));
                 } else if check(0, BLOCK) {
                     answer = Some(Err(Error::CorruptBlock { id: bid }));
                 }
@@ -610,21 +630,23 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
                 if check(0, BLOCK) {
                     data.copy_from_slice(image);
                     valid = full::<BLOCK>();
-                    answer = Some(f(data, &mut Open::<BLOCK>));
+                    answer = Some(f(data, &mut Gate::Open));
                 }
                 return;
             }
-            let mut gate = CopyIn {
+            let mut gate = Gate::Lent(CopyIn {
                 image,
                 data,
                 valid: 0,
                 check,
-            };
+            });
             let parsed = f(image, &mut gate);
-            if parsed.is_err() {
-                let _ = (gate.check)(0, BLOCK);
+            if let Gate::Lent(c) = gate {
+                if parsed.is_err() {
+                    let _ = (c.check)(0, BLOCK);
+                }
+                valid = c.valid;
             }
-            valid = gate.valid;
             answer = Some(parsed);
         });
         match (lent, answer) {
@@ -728,7 +750,7 @@ impl<const KEY_MAX: usize> Head<KEY_MAX> {
 fn entries_end<E, const BLOCK: usize>(
     b: &[u8; BLOCK],
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<usize, Error<E>> {
     let body_end = BLOCK - sstable::CRC_LEN;
     let at = body_end.checked_sub(2).filter(|&at| g.check(at, body_end));
@@ -756,7 +778,7 @@ fn entry_checked<'b, E, const BLOCK: usize>(
     off: usize,
     end: usize,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<sstable::ParsedDataEntry<'b>, Error<E>> {
     let e = sstable::parse_data_entry::<E, BLOCK>(b, off, end, bid)?;
     if g.check(off, e.next) {
@@ -771,8 +793,13 @@ fn entry_checked<'b, E, const BLOCK: usize>(
 /// padding, names the padding, which the next step checks before it
 /// believes the block is done. A parse that fails on anything else is
 /// left for the step that reaches it to report.
-fn look_ahead<const BLOCK: usize>(b: &[u8; BLOCK], off: usize, end: usize, g: &mut dyn Gate) {
-    if off >= end {
+fn look_ahead<const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    off: usize,
+    end: usize,
+    g: &mut Gate<'_, '_, BLOCK>,
+) {
+    if off >= end || !g.takes_ahead() {
         return;
     }
     match sstable::parse_data_entry::<(), BLOCK>(b, off, end, 0) {
@@ -795,7 +822,7 @@ fn park_in<E, const BLOCK: usize, const KEY_MAX: usize>(
     floor: Option<&[u8]>,
     max_seq: u64,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<Option<Head<KEY_MAX>>, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: bid };
     loop {
@@ -828,7 +855,7 @@ fn seek_block<E, const BLOCK: usize, const KEY_MAX: usize>(
     start: &[u8],
     max_seq: u64,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<(usize, Option<Head<KEY_MAX>>), Error<E>> {
     let corrupt = || Error::CorruptBlock { id: bid };
     let end = entries_end::<E, BLOCK>(b, bid, g)?;
@@ -864,7 +891,7 @@ fn value_at<E, const BLOCK: usize>(
     off: usize,
     end: usize,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
     out: &mut [u8],
 ) -> Result<usize, Error<E>> {
     let e = entry_checked::<E, BLOCK>(b, off, end, bid, g)
@@ -2803,7 +2830,7 @@ fn entry_key_at<'b, E, const BLOCK: usize>(
     off: usize,
     end: usize,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<&'b [u8], Error<E>> {
     entry_checked::<E, BLOCK>(b, off, end, bid, g).map(|e| e.key)
 }
@@ -2828,7 +2855,7 @@ fn search_block_rev<E, const BLOCK: usize, const KEY_MAX: usize>(
     bound: Option<(&[u8], bool)>,
     max_seq: u64,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<(usize, Option<RevHead<KEY_MAX>>), Error<E>> {
     let end = entries_end::<E, BLOCK>(b, bid, g)?;
     let body_end = BLOCK - sstable::CRC_LEN;
@@ -2856,7 +2883,7 @@ fn last_qualifying_restart<E, const BLOCK: usize>(
     rcount: usize,
     bound: Option<(&[u8], bool)>,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<Option<usize>, Error<E>> {
     let bound_ok = |key: &[u8]| -> bool {
         match bound {
@@ -2891,7 +2918,7 @@ fn walk_regions_rev<E, const BLOCK: usize, const KEY_MAX: usize>(
     bound: Option<(&[u8], bool)>,
     max_seq: u64,
     bid: u64,
-    g: &mut dyn Gate,
+    g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<Option<RevHead<KEY_MAX>>, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: bid };
     let mut best: Option<RevHead<KEY_MAX>> = None;
@@ -2998,7 +3025,7 @@ mod tests {
     //! needs, or the later parse says it missed (ADR-0035).
     extern crate std;
     use super::{
-        CopyIn, Gate, Gated, Head, Open, RevHead, entries_end, full, grain, grains, mask, park_in,
+        CopyIn, Gate, Gated, Head, RevHead, entries_end, full, grain, grains, mask, park_in,
         search_block_rev, seek_block, value_at,
     };
     use crate::error::Error;
@@ -3105,18 +3132,20 @@ mod tests {
     fn lend<const B: usize, T>(
         image: &[u8; B],
         poison: &mut Rng,
-        f: &mut dyn FnMut(&[u8; B], &mut dyn Gate) -> T,
+        f: &mut dyn FnMut(&[u8; B], &mut Gate<'_, '_, B>) -> T,
     ) -> (T, [u8; B], u64) {
         let mut data = [0u8; B];
         let mut check = |_: usize, _: usize| true;
-        let mut gate = CopyIn {
+        let mut gate = Gate::Lent(CopyIn {
             image,
             data: &mut data,
             valid: 0,
             check: &mut check,
-        };
+        });
         let answer = f(image, &mut gate);
-        let valid = gate.valid;
+        let Gate::Lent(CopyIn { valid, .. }) = gate else {
+            unreachable!("the gate is a lend's")
+        };
         let g = grain::<B>();
         for i in 0..grains::<B>() {
             if valid & (1 << i) == 0 {
@@ -3139,9 +3168,9 @@ mod tests {
         start: &[u8],
         max_seq: u64,
     ) -> (usize, Option<Head<64>>) {
-        let end = entries_end::<(), B>(b, 1, &mut Open::<B>).unwrap();
+        let end = entries_end::<(), B>(b, 1, &mut Gate::Open).unwrap();
         let head =
-            park_in::<(), B, 64>(b, 0, end, Some(start), max_seq, 1, &mut Open::<B>).unwrap();
+            park_in::<(), B, 64>(b, 0, end, Some(start), max_seq, 1, &mut Gate::Open).unwrap();
         (end, head)
     }
 
@@ -3174,12 +3203,12 @@ mod tests {
                 );
                 assert_eq!(head.as_ref().map(key_of), want.1.as_ref().map(key_of));
                 // The same seek over the buffer finds all it reads there.
-                let mut gate = Gated::<B> {
+                let mut gate = Gate::Held(Gated::<B> {
                     valid,
                     missed: false,
-                };
+                });
                 let again = seek_block::<(), B, 64>(&data, &start, max_seq, 1, &mut gate).unwrap();
-                assert!(!gate.missed);
+                assert!(!gate.missed());
                 assert_eq!(
                     again.1.map(|h| (h.off, h.next)),
                     want.1.map(|h| (h.off, h.next))
@@ -3187,34 +3216,34 @@ mod tests {
                 let Some(h) = head else { continue };
                 // The head's value and the step past it come from the
                 // buffer, through its grains: no miss, the same answers.
-                let mut gate = Gated::<B> {
+                let mut gate = Gate::Held(Gated::<B> {
                     valid,
                     missed: false,
-                };
+                });
                 let mut out = [0u8; 64];
                 let n = value_at::<(), B>(&data, h.off, end, 1, &mut gate, &mut out).unwrap();
-                assert!(!gate.missed);
+                assert!(!gate.missed());
                 assert_eq!(n, h.val_len);
                 let next = park_in::<(), B, 64>(&data, h.next, end, None, max_seq, 1, &mut gate);
                 let truth =
-                    park_in::<(), B, 64>(&image, h.next, end, None, max_seq, 1, &mut Open::<B>);
-                if !gate.missed
+                    park_in::<(), B, 64>(&image, h.next, end, None, max_seq, 1, &mut Gate::Open);
+                if !gate.missed()
                     && let Ok(n) = next
                 {
                     let t = truth.unwrap();
                     assert_eq!(n.map(|h| (h.off, h.next)), t.map(|h| (h.off, h.next)));
                 }
                 // Further on, the buffer either answers truly or misses.
-                let mut gate = Gated::<B> {
+                let mut gate = Gate::Held(Gated::<B> {
                     valid,
                     missed: false,
-                };
+                });
                 let mut off = h.next;
                 for _ in 0..17 {
                     let n = park_in::<(), B, 64>(&data, off, end, None, max_seq, 1, &mut gate);
                     let t =
-                        park_in::<(), B, 64>(&image, off, end, None, max_seq, 1, &mut Open::<B>);
-                    let (false, Ok(n)) = (gate.missed, n) else {
+                        park_in::<(), B, 64>(&image, off, end, None, max_seq, 1, &mut Gate::Open);
+                    let (false, Ok(n)) = (gate.missed(), n) else {
                         break;
                     };
                     let t = t.unwrap();
@@ -3260,8 +3289,9 @@ mod tests {
                 } else {
                     u64::MAX
                 };
-                let want = search_block_rev::<(), B, 64>(&image, bound, max_seq, 1, &mut Open::<B>)
-                    .unwrap();
+                let want =
+                    search_block_rev::<(), B, 64>(&image, bound, max_seq, 1, &mut Gate::Open)
+                        .unwrap();
                 let mut poison = Rng(rng.next() | 1);
                 let (got, data, valid): (R<(usize, Option<RevHead<64>>)>, _, _) =
                     lend(&image, &mut poison, &mut |b, g| {
@@ -3271,26 +3301,26 @@ mod tests {
                 assert_eq!(got.0, want.0);
                 assert_eq!(got.1.as_ref().map(rev_key), want.1.as_ref().map(rev_key));
                 // The same search over the buffer needs nothing more.
-                let mut gate = Gated::<B> {
+                let mut gate = Gate::Held(Gated::<B> {
                     valid,
                     missed: false,
-                };
+                });
                 let again =
                     search_block_rev::<(), B, 64>(&data, bound, max_seq, 1, &mut gate).unwrap();
-                assert!(!gate.missed);
+                assert!(!gate.missed());
                 assert_eq!(again.1.as_ref().map(rev_key), want.1.as_ref().map(rev_key));
                 // The step below the head answers truly or misses.
                 let Some(h) = got.1 else { continue };
                 let below = Some((&h.0[..h.1], false));
-                let mut gate = Gated::<B> {
+                let mut gate = Gate::Held(Gated::<B> {
                     valid,
                     missed: false,
-                };
+                });
                 let n = search_block_rev::<(), B, 64>(&data, below, max_seq, 1, &mut gate);
-                let t = search_block_rev::<(), B, 64>(&image, below, max_seq, 1, &mut Open::<B>);
+                let t = search_block_rev::<(), B, 64>(&image, below, max_seq, 1, &mut Gate::Open);
                 // An error from a buffer that lacks grains is not
                 // believed (`Blocks::load_with` takes the rest): a miss.
-                if !gate.missed
+                if !gate.missed()
                     && let Ok(n) = n
                 {
                     assert_eq!(
@@ -3318,22 +3348,21 @@ mod tests {
             .map(|i| (std::vec![b'a' + i], 5, 1, std::vec![7; 3], 0))
             .collect();
         let mut image = block::<4096>(&es, 16);
-        let end = entries_end::<(), 4096>(&image, 1, &mut Open::<4096>).unwrap();
+        let end = entries_end::<(), 4096>(&image, 1, &mut Gate::Open).unwrap();
         image[end - 1] = 1;
         let tail = 3 * (13 + 1 + 3);
-        let whole =
-            park_in::<(), 4096, 64>(&image, tail, end, None, u64::MAX, 1, &mut Open::<4096>);
+        let whole = park_in::<(), 4096, 64>(&image, tail, end, None, u64::MAX, 1, &mut Gate::Open);
         assert!(whole.is_err(), "a stray byte in the padding is corruption");
         // A buffer holding the entries' grains, zeros elsewhere: the
         // padding check misses rather than finding zeros.
         let mut data = image;
         data[end - 1] = 0;
-        let mut gate = Gated::<4096> {
+        let mut gate = Gate::Held(Gated::<4096> {
             valid: mask::<4096>(0, tail),
             missed: false,
-        };
+        });
         let r = park_in::<(), 4096, 64>(&data, tail, end, None, u64::MAX, 1, &mut gate);
-        assert!(gate.missed && r.is_err());
+        assert!(gate.missed() && r.is_err());
     }
 
     #[test]
@@ -3345,12 +3374,12 @@ mod tests {
             assert_eq!(mask::<B>(0, 1), 1);
             assert_eq!(mask::<B>(B - 1, B), 1 << (grains::<B>() - 1));
             assert_eq!(mask::<B>(g - 1, g + 1), 0b11);
-            let mut gate = Gated::<B> {
+            let mut gate = Gate::Held(Gated::<B> {
                 valid: mask::<B>(g, 2 * g),
                 missed: false,
-            };
-            assert!(gate.check(g, 2 * g) && gate.check(5, 5) && !gate.missed);
-            assert!(!gate.check(g - 1, g + 1) && gate.missed);
+            });
+            assert!(gate.check(g, 2 * g) && gate.check(5, 5) && !gate.missed());
+            assert!(!gate.check(g - 1, g + 1) && gate.missed());
             assert!(
                 !Gated::<B> {
                     valid: full::<B>(),
