@@ -45,6 +45,7 @@ history keeps it); its §9 milestone log now lives in
 | [0031](0031-point-reads-check-what-they-read.md) | A point read searches a cached data block where it lies and checks against the RAM checksums only the ranges it acts on (`CachePort::with_checked`); a search that fails on unchecked bytes checks the whole image, so a RAM fault is a miss, never `CorruptBlock` |
 | [0032](0032-one-opener-per-host-store.md) | The host store locks `<store>.lock` before it opens the store: a second opener gets `StoreError::Locked`, not a WAL that two processes write over |
 | [0033](0033-host-store-refuses-bad-input-first.md) | The host store checks its input before it writes: a size too small for the shape gives `StoreError::TooSmall` and leaves the file unsized; a CLI usage error or inverted range creates no file; `delete_range` and scans refuse `start > end` |
+| [0034](0034-drainer-stalls-on-wal-full.md) | The `multiwriter` drainer stalls on `WalFull`, as on a full memtable; `Drainer::compact_step` and `Drainer::resume` let the host recover in place, because a rebuild after `into_db` stops `durable` |
 
 ## Adding a record
 

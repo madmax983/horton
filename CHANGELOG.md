@@ -357,6 +357,16 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Fixed
 
+- **The `multiwriter` drainer stalls on `WalFull`** (ADR-0034, issue
+  #47). One write a sweep used one WAL block, and the drainer poisoned
+  itself when the WAL ran out (write 78 on the README quickstart
+  shape). `sweep` now returns `SweepOutcome::Stalled`, as for a full
+  memtable, and keeps the tickets; `Drainer::flush` wraps the WAL.
+  `Stalled` now also means "WAL full". New: `Drainer::compact_step`,
+  for a flush that returns `NeedsCompaction`, and `Drainer::resume`,
+  which clears the poison and writes the pending tickets again. Use
+  these, not `into_db` and a new drainer: `into_db` drops the pending
+  tickets, and `durable` then stops at the first of them.
 - **The host store has one opener at a time.** Two processes could open
   one `examples/kvstore` store and write over each other's WAL: a `put`
   gave exit status 0 and its value was lost. `Store::open` now locks

@@ -214,6 +214,14 @@ unchanged.
   is flush-acknowledged. On batch error the drainer advances `durable`
   over exactly the durable prefix, burns `consumed` seqnums, and poisons
   itself (returns the error; the host fails outstanding writers).
+- **Errors a flush answers stall** (ADR-0034, issue #47). `TableFull`,
+  `ArenaFull` and `WalFull` give `SweepOutcome::Stalled` and keep the
+  pending tickets. The host calls `Drainer::flush`, and
+  `Drainer::compact_step` when the flush returns `NeedsCompaction`.
+  After poison, the pending tickets stay; `Drainer::resume` writes them
+  again. Do not rebuild the drainer on the same ring and `durable`:
+  `into_db` drops the pending tickets, and `durable` stops at the first
+  of them.
 - **O2 — drainer is sole device writer.** Holds by ownership: the
   `WalWriter` (and through it the `Device`) is moved to and exclusively
   owned by the drainer. No `&WalWriter` is ever shared. (The full `Db`
