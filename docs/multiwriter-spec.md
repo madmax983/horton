@@ -198,7 +198,7 @@ unchanged.
 > durable flow, idle/fence behavior, flush-error poisoning, memtable-full
 > stalling with retry, malformed-payload poisoning, the pending-flush
 > ordering regression, and the dropped-observer guarantee. Since
-> ADR-0035 it also covers WAL-full stalling, compaction through the
+> ADR-0036 it also covers WAL-full stalling, compaction through the
 > drainer, and `resume` after a device error.
 >
 > *Supersedes the 2026-09-26 WAL-owning note: the drainer no longer owns a
@@ -216,7 +216,7 @@ unchanged.
   flush-acknowledged. On a write error `durable` does not move, and the
   drainer poisons itself and returns the error. The host calls
   `Drainer::resume` or fails the outstanding writers, not both.
-- **Errors a flush answers stall** (ADR-0035, issue #47). `TableFull`,
+- **Errors a flush answers stall** (ADR-0036, issue #47). `TableFull`,
   `ArenaFull` and `WalFull` give `SweepOutcome::Stalled` and keep the
   pending tickets. The host calls `Drainer::flush`, and
   `Drainer::compact_step` when the flush returns `NeedsCompaction`.

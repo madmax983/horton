@@ -58,7 +58,7 @@
 //! To continue on the same ring and `durable`, keep the drainer.
 //! [`Drainer::into_db`] drops the pending tickets. A new drainer does
 //! not have them, so `durable` stops at the first of them, and no later
-//! ticket completes (issue #47, ADR-0035).
+//! ticket completes (issue #47, ADR-0036).
 
 #![forbid(unsafe_code)]
 

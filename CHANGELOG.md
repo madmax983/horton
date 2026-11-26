@@ -37,9 +37,15 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`CachePort::checks_ranges`** (ADR-0035): whether `with_checked`
+  checks only the ranges it is asked about. A scan then takes from a
+  lent block only what it reads, and otherwise takes each block whole
+  in one lend. The provided method answers `false`; `BlockCache` (with
+  slots) and the host store's cache answer `true`. It is advice: a wrong
+  answer costs time, never a byte.
 - **`Drainer::compact_step`, `Drainer::request_compaction`,
   `Drainer::compaction_pending` and `Drainer::resume`** (`multiwriter`,
-  ADR-0035). The host compacts, and retries after poison, without
+  ADR-0036). The host compacts, and retries after poison, without
   `into_db`. `resume` clears the poison, so the next sweep writes the
   pending tickets again.
 - **`sstable::index_tail`** (ADR-0034): the bytes of trailer an index
@@ -184,8 +190,27 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **A scan copies from a cached data block only what it checks**
+  (ADR-0035). It used to sum a block's RAM checksums whole, copy it
+  twice, and walk it from its first entry to the seek key.
+  - Each scan buffer now keeps a map of the 64 grains it has checked.
+    A lend from the cache checks and copies a grain at a time, just
+    before the scan acts on it.
+  - A buffer that lacks a grain the scan reads takes the rest of the
+    block before an answer, or an error, is believed. So a fault in
+    RAM is a miss and a device read, never `CorruptBlock`. A clean
+    refill cannot vouch for a byte copied unchecked.
+  - A forward seek positions by the block's restarts. Every block
+    arrives in one copy.
+  - In the host store a seek takes 58% to 70% fewer instructions, and
+    at 1 M keys runs 80% to 86% faster on the hot range and about 50%
+    on the full range. Point reads and forward scans are level, reverse
+    scans within 3% (docs/THROUGHPUT.md, step 24).
+  - `ScanBlock`, `Scan` and `RevScan` grow by 8 bytes. On the ESP32-S3
+    profile scan futures grow by 176 to 312 bytes, and the peak is
+    unchanged (`BUDGET.md`).
 - **`SweepOutcome::Stalled` also means "WAL full"** (`multiwriter`,
-  ADR-0035). The remedy is the same: `Drainer::flush`, then sweep
+  ADR-0036). The remedy is the same: `Drainer::flush`, then sweep
   again. A host that counts stalls as memtable flushes now also counts
   WAL wraps.
 - **An index block ends in restart offsets, and its search checks only
@@ -389,6 +414,14 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Fixed
 
+- **A scan that retries after a failed device read gets the right
+  value.** A forward cursor that crossed two blocks in one step (the
+  first with nothing visible at the scan's snapshot) was moved to the
+  first before the second was read. If that read failed, a retried
+  `next` yielded the cursor's key with a value parsed from the wrong
+  block. Cursors now move only once their step has found its entry
+  (`tests/scan_retry.rs`; found in the review of ADR-0035, which had
+  introduced the same flaw into reverse scans before it was fixed).
 - **The host store has one opener at a time.** Two processes could open
   one `examples/kvstore` store and write over each other's WAL: a `put`
   gave exit status 0 and its value was lost. `Store::open` now locks
@@ -405,7 +438,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   range (`start > end`) in `delete_range`, `scan` or `range` gives
   `StoreError::InvertedRange`; an empty range is not an error. A huge
   `--size-mb` is an error, not an overflow.
-- **The `multiwriter` drainer stalls on `WalFull`** (ADR-0035, issue
+- **The `multiwriter` drainer stalls on `WalFull`** (ADR-0036, issue
   #47). Each sweep of one write used one WAL block, and the drainer
   poisoned itself when the WAL was full (the 79th write on the README
   quickstart shape). `sweep` now returns `SweepOutcome::Stalled`, as

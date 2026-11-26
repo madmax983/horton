@@ -46,7 +46,8 @@ history keeps it); its §9 milestone log now lives in
 | [0032](0032-one-opener-per-host-store.md) | The host store locks `<store>.lock` before it opens the store: a second opener gets `StoreError::Locked`, not a WAL that two processes write over |
 | [0033](0033-host-store-refuses-bad-input-first.md) | The host store checks its input before it writes: a size too small for the shape gives `StoreError::TooSmall` and leaves the file unsized; a CLI usage error or inverted range creates no file; `delete_range` and scans refuse `start > end` |
 | [0034](0034-index-blocks-end-in-restart-offsets.md) | An index block ends in a trailer, the offset of every 16th entry and the count (`hrtsst05`, manifest `hrtman11`): a search binary-searches it and checks only the cached bytes it reads, for point reads and seeks; a shape whose index cannot hold one key's run of versions no longer builds |
-| [0035](0035-drainer-stalls-on-wal-full.md) | The `multiwriter` drainer stalls on `WalFull`, as on a full memtable; `Drainer::compact_step` and `Drainer::resume` let the host recover in place, because a rebuild after `into_db` stops `durable` |
+| [0035](0035-scans-copy-only-what-they-check.md) | A scan keeps a map of the grains of each block buffer it has checked, copies from a cached data block only what it checks as it reads it (`CopyIn`), and takes the rest only when it reads further; a forward seek positions by the block's restarts; `CachePort::checks_ranges` |
+| [0036](0036-drainer-stalls-on-wal-full.md) | The `multiwriter` drainer stalls on `WalFull`, as on a full memtable; `Drainer::compact_step` and `Drainer::resume` let the host recover in place, because a rebuild after `into_db` stops `durable` |
 
 ## Adding a record
 

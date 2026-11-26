@@ -38,7 +38,10 @@ reads ([step 22](#then-a-cached-point-read-checks-what-it-reads)):
 block came to end in restart offsets, so its search binary-searches
 and checks only what it reads, as a data block's does
 ([step 23](#then-an-index-search-that-reads-only-what-it-needs)):
-point reads 14% to 41% faster, seeks 19% to 75%.
+point reads 14% to 41% faster, seeks 19% to 75%. And a seek came to
+check and copy only the bytes of a data block it reads
+([step 24](#then-a-seek-that-copies-only-what-it-checks)): 58% to 70%
+fewer instructions, and 49% to 86% faster at 1 M keys.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1341,6 +1344,78 @@ The trailer costs index room: a table's index of `n` entries of keys
 `BLOCK − 4`. The host store's index of 16-byte keys holds 479 data
 blocks instead of 481.
 
+### Then: a seek that copies only what it checks
+
+Step 24 (ADR-0035). Step 23 left a seek checking a few chunks of each
+index block. Each data block it positioned in was still summed whole
+(`with_range(0, BLOCK)`), copied out of the cache, and copied again
+into the scan's buffer, and the cursor was parked by parsing the block
+from its first entry. Now each scan buffer keeps a map of the 64
+grains of its block it has checked. A seek binary-searches the block's
+restarts in the image the cache lends, and copies each grain it reads
+into its buffer right after that grain's check holds. A scan that reads
+further takes the rest of the block in one more lend. A cursor that
+crosses into a block it will read through takes it whole, in one copy.
+The format did not change, so both builds read the same stores: one
+fill per size with the new build, tables per level [4, 4, 0, 0] at
+300 K keys (every block raw) and [6, 5, 6, 1] at 1 M.
+
+Instructions per op (callgrind, one reader, a second pass over a warm
+cache; 20 K seeks, 100 K reads, scans read every key):
+
+| store, workload | before | after | |
+|---|---:|---:|---:|
+| 300 K keys, `seekrandom` hot | 346,568 | 103,273 | −70.2% |
+| 300 K keys, `seekrandom` full | 380,692 | 153,334 | −59.7% |
+| 1 M keys, `seekrandom` hot | 537,282 | 182,422 | −66.0% |
+| 1 M keys, `seekrandom` full | 570,050 | 238,222 | −58.2% |
+| 1 M keys, `readrandom` hot | 39,865 | 38,724 | −2.9% |
+| 1 M keys, `readrandom` full | 69,845 | 69,182 | −0.9% |
+| 1 M keys, `readseq` | 7,225 | 7,172 | −0.7% |
+| 1 M keys, `readreverse` | 11,577 | 10,992 | −5.0% |
+
+Before, 44% to 48% of a seek's instructions were `memcpy`, two 16 KiB
+copies per data block, and 19% to 24% were whole-block sums. After,
+`memcpy` is 9.6 K of a seek's 182 K. Cache lookups per seek did not
+change (10.0 at 300 K keys, 15.2 to 16.0 at 1 M), and nothing was
+rejected. The point-read rows are a control: they share no code with
+this change. Their 1 M difference is in calls to `memcpy` inside the
+inflate, which looks like code layout.
+
+Wall clock at 1 M keys, one reader, ops/s, medians of interleaved
+pairs (6 for seeks and reads, 8 for scans), each run from a fresh copy
+of the store; each run reads twice, and both passes are shown:
+
+| | before | after | |
+|---|---:|---:|---:|
+| `seekrandom` hot | 45.2 K / 43.2 K | 81.5 K / 80.3 K | +80%, +86% |
+| `seekrandom` full | 31.9 K / 32.9 K | 47.9 K / 49.1 K | +50%, +49% |
+| `readrandom` full | 128.6 K / 132.2 K | 129.0 K / 133.9 K | level |
+| `readseq` | 2.02 M | 2.01 M | −0.4% |
+| `readreverse` | 1.28 M | 1.24 M | −3.2% |
+
+The scans came out of it level, but not on the first try. The first
+build parsed every entry through the buffer's gate, a call through a
+trait object, and every step went through the async block load. Full
+scans ran 5% to 9% slower in wall clock, with flat instructions and
+fewer simulated cache misses. Branch simulation showed eight times the
+mispredicted indirect branches. Turning the gate into an enum, and
+giving a step over a block the scan holds a synchronous path that
+builds no future, brought `readseq` level and `readreverse` to 3%,
+which is about the spread of its runs.
+
+What a seek's instructions are now, at 1 M keys on the hot range
+(182 K):
+- the cache checking chunks, 25%;
+- inflating the one compressed data block a seek reads in a deep
+  level, 21%;
+- `memset`, 20%: the host store zeroes a fresh scan, four buffers of
+  16 KiB and more, for every seek (`Box::new(KvScan::detached)` in
+  `merge_fwd`), as it did before;
+- parsing and comparing the rest.
+
+On the full key range a device read's CRC adds 19%.
+
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
@@ -1357,7 +1432,7 @@ before; the read rows carry the tables the fills left, as
 | `readmissing` | 1.2–1.8× | no gap: 0.87 µs on one thread, one bloom bucket per table in range, and nothing shared is written, so four threads do four times one's |
 | `readseq` | 0.4–0.6× | 0.52 µs an entry on one thread: the merge compares every cursor's head for each entry, every entry is copied out, and every block is inflated |
 | `readreverse` | 0.3–0.5× | the same, and stepping backwards through a block's version runs costs more than forwards |
-| `seekrandom` | 0.3–0.5× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each cost a whole index block (since step 23, a few chunks of it) and an inflated data block |
+| `seekrandom` | 0.3–0.5× | a seek still positions a cursor in every table that could hold the key (each level-0 table, one per deeper level), and each cost a whole index block and a whole data block, summed and copied twice (since steps 23 and 24, the few chunks of each it reads) |
 | `readwhilewriting` | 0.8× | `readrandom`'s 19 µs, on four cores shared with a writer and two merges; and every table compaction writes is new to the cache |
 | `deleterandom` | 0.6× | as `fillrandom` |
 | `fillrandom`, every write synced (100 K keys) | 1.38× | no gap: both wait for the same `fdatasync`, and horton's queue puts 2.5 writes behind each |
@@ -1441,13 +1516,20 @@ Measured or scoped while doing this, and left:
   and not summing a block's padding, would cheapen the deeper levels'.
   Packing a block by its compressed size would make compression save
   blocks at all (a format change).
-- **A seek that checks only the data bytes it reads.** Since step 23
-  a seek checks a few chunks of each index block, but it still lends
-  each data block whole through `with_range`: 321 to 450 chunks a seek,
-  20% to 25% of its instructions. Positioning a cursor reads only the
-  restart trailer and a run of entries, so a checked lend would serve
-  it as it serves a point read; the scan that follows reads on through
-  the block and would check as it goes.
+- **A scan the host store keeps.** Since step 24 a fifth of a cached
+  seek's instructions are `memset`: the host store builds a fresh scan
+  for every page, about 37 KiB of buffers zeroed, and lends it its
+  pool. A scan kept per reader thread and re-seeked would skip that.
+- **Inflating a seek's block only to the head.** A seek into a
+  compressed block (levels 2 and down) inflates it whole: 21% of a
+  cached seek at 1 M keys. A point read inflates only to its key
+  (step 17), and a seek could too, resuming the decoder as the scan
+  reads on. That would be the first place a stream is used before it
+  is checked whole.
+- **Device misses straight into the scan's buffer.** A block a scan
+  misses is read into scratch, checked, and then copied or inflated
+  into the buffer. Reading a raw block into the buffer directly would
+  save the copy.
 - **Range-tombstone probes through the checked lend.** A point read in
   a table that holds range tombstones copies their block out of the
   cache and sums it whole. It could search it where it lies and check
@@ -1512,6 +1594,9 @@ Measured or scoped while doing this, and left:
   search find and check only the entries it reads.
 - **An index search that reads only what it needs.** Done in step 23
   (ADR-0034).
+- **A seek that checks only the data bytes it reads.** Done in step 24
+  (ADR-0035), as a map of the grains a scan's buffer has checked; a
+  scan that reads on completes its block in one more lend.
 - **LZ77 with skip acceleration and word-wide match counting.** Done
   in step 16.
 - **A check that a detached reader's tables are still its own.** The
