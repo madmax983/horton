@@ -2308,8 +2308,8 @@ fn split_burst_keeps_ticket_order() {
 
 #[test]
 fn good_tickets_before_a_bad_ticket_complete() {
-    // Issue #48 next charter 2 and the issue #52 digest: one oversized
-    // key stopped the valid writer in the same sweep.
+    // Issues #48 (item 2) and #52: one oversized key stopped the valid
+    // writer in the same sweep.
     let ring = Ring::<16>::new();
     let durable = AtomicU32::new(0);
     let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
@@ -2486,7 +2486,7 @@ fn plain_put_refuses_a_payload_that_does_not_decode() {
 
 #[test]
 fn ttl_payload_at_the_codec_limit_lands() {
-    // Issue #48 "not toured": 8 + key + value = 29 fits; 30 does not.
+    // Issue #48 did not test this: 8 + key + value = 29 fits; 30 does not.
     let (ring, durable) = setup::<8>();
     let mut drainer = make_drainer::<8, 8>(&ring, &durable);
     let edge = payload::encode_put_ttl(&[b'k'; 10], &[b'v'; 11], 100).expect("29 fits");

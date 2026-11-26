@@ -1,4 +1,4 @@
-//! The drainer against a model (issue #48, next charter 1).
+//! The drainer against a model (issue #48, item 1).
 //!
 //! Writers publish trickles and bursts of puts, TTL puts, deletes and
 //! range deletes. The host sweeps, flushes on `Stalled` and compacts on

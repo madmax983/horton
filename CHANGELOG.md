@@ -45,8 +45,8 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   answer costs time, never a byte.
 - **`Drainer::writer`, `writer::Writer`, `payload::check` and
   `Drainer::bad_ticket`** (`multiwriter`, ADR-0037, issue #48).
-  `Writer::put` refuses a payload that the `Db`'s `KEY_MAX` or
-  `VAL_MAX` cannot hold, before it claims a ticket. `bad_ticket` names
+  `Writer::put` refuses a payload that the `Db` cannot hold
+  (`payload::check`), before it claims a ticket. `bad_ticket` names
   the ticket that poisoned the drainer.
 - **`Drainer::compact_step`, `Drainer::request_compaction`,
   `Drainer::compaction_pending` and `Drainer::resume`** (`multiwriter`,
@@ -214,6 +214,9 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   - `ScanBlock`, `Scan` and `RevScan` grow by 8 bytes. On the ESP32-S3
     profile scan futures grow by 176 to 312 bytes, and the peak is
     unchanged (`BUDGET.md`).
+- **`BLOCK` must fit `key_max + val_max + 31`, not `+ 23`.** The
+  largest WAL record is a TTL put, with an 8-byte expiry. A shape at the
+  old limit no longer builds.
 - **`writer::put` refuses a payload that does not decode**
   (`multiwriter`, ADR-0037). It returns `BadPayload` before it claims a
   ticket. Before, the drainer poisoned itself.
@@ -448,10 +451,14 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   range (`start > end`) in `delete_range`, `scan` or `range` gives
   `StoreError::InvertedRange`; an empty range is not an error. A huge
   `--size-mb` is an error, not an overflow.
+- **A maximal TTL put fits every shape that builds.** `Db::new` took a
+  block 8 bytes too small for one. `put_with_ttl` and a batch with
+  `put_ttl` then failed with `BatchTooLarge` (found in the review of
+  issue #48).
 - **A burst of valid writes no longer poisons the `multiwriter`
   drainer** (ADR-0037, issue #48). With `MAX_WRITES` over `CAP`, or ops
   over `ARENA` bytes, `Db::write` gave `BatchTooLarge`, and `resume`
-  gave it again. The sweep now writes half the prefix.
+  gave it again. The sweep now tries again with half of the tickets.
 - **A bad ticket no longer stops the good tickets before it**
   (`multiwriter`, ADR-0037, issues #48 and #52). The sweep writes them,
   and poisons the drainer only when it gets to the bad ticket.

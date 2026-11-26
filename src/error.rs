@@ -156,8 +156,10 @@ pub enum Error<E> {
     /// (it frees slots as it drains), then retry.
     RingFull,
     /// A multiwriter ring payload did not decode: it was not built by one
-    /// of the `drainer::payload::encode_*` constructors. The drainer is
-    /// poisoned and nothing was written.
+    /// of the `drainer::payload::encode_*` constructors. `writer::put`
+    /// and `Writer::put` return it and claim no ticket. The drainer
+    /// returns it and poisons itself when a sweep starts at that ticket;
+    /// it wrote the tickets before it.
     BadPayload,
     /// The underlying block device reported an error.
     Device(E),

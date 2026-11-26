@@ -267,7 +267,7 @@ those names.
 
 | Parameter | What it is | How to choose | Default |
 |---|---|---|---|
-| `block` (`BLOCK`) | Bytes per device read or write | The erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and at least `key_max + val_max + 23` | required |
+| `block` (`BLOCK`) | Bytes per device read or write | The erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and at least `key_max + val_max + 31` | required |
 | `key_max` (`KEY_MAX`) | Longest key, in bytes (1 to 65,535) | RAM buffers are sized for it, so do not round up much | required |
 | `val_max` (`VAL_MAX`) | Longest value, in bytes (up to 65,535) | As for keys | required |
 | `memtable_entries` (`CAP`) | Writes held in RAM until a flush | More means fewer flushes and less flash wear, and more RAM | 64 |

@@ -42,8 +42,8 @@
 //!    `NeedsCompaction`, the host calls [`Drainer::compact_step`] until
 //!    `Progress::Done`, then flushes again. No ticket is lost, and
 //!    `durable` does not move.
-//! 2. on `BatchTooLarge` with more than one op, writes half the
-//!    prefix. The rest stays pending (ADR-0037).
+//! 2. on `BatchTooLarge` with more than one op, tries again with half
+//!    of the tickets. The other tickets stay pending (ADR-0037).
 //! 3. on all other errors, poisons itself. `sweep` returns the error.
 //!    Later sweeps return `Idle` and do nothing. The pending tickets
 //!    stay in the drainer.
@@ -323,7 +323,7 @@ pub mod payload {
     }
 
     /// Checks that a `Db` with these `KEY_MAX` and `VAL_MAX` can take
-    /// `p`. The drainer refuses exactly the payloads that this refuses,
+    /// `p`. The drainer refuses a ticket when this refuses its payload,
     /// with the same error. An inverted range delete is a no-op, so it
     /// passes.
     ///
@@ -577,10 +577,11 @@ impl<
     /// Returns the ticket that poisoned the drainer, when the error came
     /// from that ticket: a payload that does not decode, or an op that
     /// this `Db` cannot hold. It is the first pending ticket. Returns
-    /// `None` for all other errors, and after [`resume`](Drainer::resume).
+    /// `None` when the drainer is not poisoned, after other errors, and
+    /// after [`resume`](Drainer::resume).
     ///
-    /// The tickets before it are written. The pipeline stops at it: the
-    /// host fails its writer and the writers after it (issue #48).
+    /// The drainer wrote the tickets before this ticket. No later ticket
+    /// completes. Fail this ticket's writer and all later writers.
     #[must_use]
     pub const fn bad_ticket(&self) -> Option<u32> {
         self.bad_ticket
@@ -770,8 +771,8 @@ impl<
             match queued {
                 Ok(true) => n_ops += 1,
                 Ok(false) => {}
-                // A key or value too large for this `Db`. `BatchFull`
-                // cannot occur: `take <= MAX_WRITES`.
+                // A ticket that the `Db` cannot hold. `BatchFull` cannot
+                // occur: `take <= MAX_WRITES`.
                 Err(e) => return (i, n_ops, Some(e)),
             }
         }
@@ -784,10 +785,10 @@ impl<
     /// the pending buffer. If an earlier sweep left pending tickets,
     /// this sweep writes them and drains no new tickets. Builds a
     /// [`WriteBatch`] from the longest pending prefix that the `Db`
-    /// takes and applies it via `Db::write` (one WAL flush, memtable
-    /// updated atomically), then advances `durable` over that prefix —
-    /// WAL-bearing, fenced, and skipped tickets alike. The rest stays
-    /// pending (ADR-0037). When the ring holds nothing
+    /// takes. Applies it with one `Db::write` (one WAL flush; the
+    /// memtable changes atomically). Then advances `durable` over that
+    /// prefix: WAL-bearing, fenced, and skipped tickets alike. The other
+    /// tickets stay pending (ADR-0037). When the ring holds nothing
     /// published, the stall budget counts up and the drainer fences the
     /// cursor; a fence that wins returns [`SweepOutcome::Idle`] so the
     /// host re-polls.
@@ -797,7 +798,7 @@ impl<
     /// Returns the `Db` write error, or the error of the first pending
     /// ticket ([`Error::BadPayload`], a key or value that is too large).
     /// The drainer then poisons
-    /// itself, and [`bad_ticket`](Drainer::bad_ticket) names a bad
+    /// itself, and [`bad_ticket`](Drainer::bad_ticket) names the
     /// ticket. `durable` covers only the tickets
     /// acknowledged before, and the pending tickets stay (see
     /// [`resume`](Drainer::resume)). `TableFull`, `ArenaFull` and
@@ -899,8 +900,8 @@ impl<
                     // Even an empty memtable cannot hold this many ops, or
                     // the WAL group is too long. `Db::write` refused it
                     // before any I/O. Write half (issue #48). `n_ops > 1`,
-                    // so `take >= 2` and the half is not empty. One op
-                    // always fits: `Db::new` asserts it.
+                    // so `take >= 2` and the half is not empty. One ring
+                    // op always fits an empty memtable (ADR-0037).
                     take /= 2;
                 }
                 Err(e) => {

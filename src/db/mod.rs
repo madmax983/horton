@@ -328,7 +328,7 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 /// | Parameter | Meaning | Checked at compile time |
 /// |---|---|---|
 /// | `D` | the [`BlockDevice`] | `D::BLOCK == BLOCK` |
-/// | `BLOCK` | device block size in bytes | fits the largest WAL record, range tombstone, and bloom filter; exceeds the 28-byte manifest block frame |
+/// | `BLOCK` | device block size in bytes | fits the largest WAL record (a TTL put, `31 + KEY_MAX + VAL_MAX`), range tombstone, and bloom filter; exceeds the 28-byte manifest block frame |
 /// | `KEY_MAX` | longest key | `1..=65535` |
 /// | `VAL_MAX` | longest value | `..=65535` |
 /// | `CAP` | memtable entry slots | |
@@ -366,6 +366,30 @@ pub(crate) const MAX_SNAPSHOTS: usize = 8;
 ///     type Db = TooSmallArena;
 /// }
 /// let _db = TooSmallArena::new(Dev, horton::Config::whole_device(512));
+/// ```
+///
+/// A block must hold the largest WAL record: a TTL put, 31 bytes plus
+/// the key and value. Here 31 + 8 + 481 = 520 bytes do not fit 512:
+///
+/// ```compile_fail
+/// # struct Dev;
+/// # impl horton::BlockDevice for Dev {
+/// #     type Error = ();
+/// #     const BLOCK: usize = 512;
+/// #     fn poll_read_block(&self, _: &mut core::task::Context<'_>, _: u64, _: &mut [u8])
+/// #         -> core::task::Poll<Result<(), ()>> { core::task::Poll::Ready(Ok(())) }
+/// #     fn poll_write_block(&mut self, _: &mut core::task::Context<'_>, _: u64, _: &[u8])
+/// #         -> core::task::Poll<Result<(), ()>> { core::task::Poll::Ready(Ok(())) }
+/// #     fn poll_flush(&mut self, _: &mut core::task::Context<'_>)
+/// #         -> core::task::Poll<Result<(), ()>> { core::task::Poll::Ready(Ok(())) }
+/// # }
+/// horton::db_types! {
+///     block: 512,
+///     key_max: 8,
+///     val_max: 481; // 23 + 8 + 481 = 512: a plain put fits, a TTL put does not
+///     type Db = NoRoomForTtl;
+/// }
+/// let _db = NoRoomForTtl::new(Dev, horton::Config::whole_device(64));
 /// ```
 pub struct Db<
     D: BlockDevice,
@@ -553,9 +577,11 @@ impl<
         "ARENA must hold one largest entry (KEY_MAX + VAL_MAX bytes), or a maximal \
          write fails with ArenaFull even into an empty memtable"
     );
+    // The largest WAL record is a TTL put: the record overhead, an
+    // 8-byte expiry, the key and the value.
     const ASSERT_REC: () = assert!(
-        BLOCK >= 23 + KEY_MAX + VAL_MAX,
-        "BLOCK must fit the largest WAL record"
+        BLOCK >= WAL_RECORD_OVERHEAD + 8 + KEY_MAX + VAL_MAX,
+        "BLOCK must fit the largest WAL record (a TTL put: 31 + KEY_MAX + VAL_MAX bytes)"
     );
     const ASSERT_BLOOM: () = assert!(
         BLOOM_BYTES >= 1 && (BLOOM_BYTES + 4 <= BLOCK || BLOCK >= 68),

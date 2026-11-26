@@ -359,7 +359,7 @@ fn delta_key_names_the_differing_key() {
     assert_eq!(d.key(), b"z");
 }
 
-// ── Issue #48 next charter 3: one replica purges, one does not ─────────
+// ── Issue #48, item 3: one replica purges, one does not ───────────────
 
 /// A TTL put that flushes and retries when the memtable or WAL is full.
 fn put_ttl(db: &mut TestDb<MemDevice<4096>>, k: &[u8], v: &[u8], expire_at: u64) {
@@ -409,8 +409,8 @@ fn fp_at(db: &TestDb<MemDevice<4096>>, now: u64) -> ([Fingerprint; 4], Fingerpri
 fn purged_and_unpurged_replicas_agree_at_the_same_now() {
     // Replica A purges with `purge_before <= now`; B never purges. Read
     // at the same `now`, they hold the same visible pairs, so the
-    // fingerprints are equal and `Diff` finds nothing (issue #52 toured
-    // this; here it stays).
+    // fingerprints are equal and `Diff` finds nothing (issue #52 checked
+    // this by hand; this test keeps it).
     const FLOOR: u64 = 500;
     const NOW: u64 = 600;
     let mut differ_at_zero = 0;

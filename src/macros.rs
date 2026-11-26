@@ -31,7 +31,7 @@
 ///
 /// | Parameter | What it is | How to choose | Default |
 /// |---|---|---|---|
-/// | `block` | Bytes the device reads or writes at once. | Your [`BlockDevice::BLOCK`](crate::BlockDevice::BLOCK): the erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and `key_max + val_max + 23` must fit. | required |
+/// | `block` | Bytes the device reads or writes at once. | Your [`BlockDevice::BLOCK`](crate::BlockDevice::BLOCK): the erase sector on NOR flash (usually 4096), 512 on SD cards. At least 512, and `key_max + val_max + 31` must fit (a TTL put). | required |
 /// | `key_max` | Longest key, in bytes. | Longer keys fail with `KeyTooLarge`. RAM buffers are sized for it, so do not round up much. | required |
 /// | `val_max` | Longest value, in bytes. | Longer values fail with `ValueTooLarge`. | required |
 /// | `memtable_entries` | Writes held in RAM before they must be flushed. Every `put` or `delete` takes one until the next flush. | More means fewer flushes and less flash wear, but more RAM. When full, writes fail with `TableFull`: call `flush()`. | 64 |

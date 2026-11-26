@@ -2,11 +2,10 @@
 //!
 //! [`Writer::put`] and [`put`] claim a ring ticket, publish the 32-byte
 //! payload, and return a [`Put`] future that resolves when the drainer
-//! advances the `durable` watermark past the ticket. Dropping the future
-//! abandons *observation*, not the write — the entry was accepted and
-//! will be drained and made durable.
+//! advances the `durable` watermark past the ticket. If you drop the
+//! future, the drainer still writes the entry. Only the wait stops.
 //!
-//! Use [`Writer`] (from `Drainer::writer`). It knows the `Db`'s key and
+//! Use [`Writer`] (from [`Drainer::writer`](crate::drainer::Drainer::writer)). It knows the `Db`'s key and
 //! value limits and refuses a payload that the `Db` cannot hold before it
 //! claims a ticket. A refused payload stops no other writer (issue #48).
 
@@ -57,7 +56,7 @@ impl<const N: usize> Future for Put<'_, N> {
 
 /// A writer's handle to one drainer's ring and `durable` watermark.
 ///
-/// Get it from `Drainer::writer`. It is `Copy`: give one to each writer.
+/// Get it from [`Drainer::writer`](crate::drainer::Drainer::writer). It is `Copy`: give one to each writer.
 /// `KEY_MAX` and `VAL_MAX` are the drainer's `Db` limits.
 #[derive(Clone, Copy)]
 pub struct Writer<'r, const N: usize, const KEY_MAX: usize, const VAL_MAX: usize> {
@@ -77,7 +76,7 @@ impl<'r, const N: usize, const KEY_MAX: usize, const VAL_MAX: usize>
     ///
     /// # Errors
     ///
-    /// The error of [`payload::check`], before any ticket is claimed.
+    /// The error of [`payload::check`]; then no ticket is claimed.
     /// [`Error::RingFull`] when the ring is full at claim time.
     pub fn put(&self, payload: &[u8; 32]) -> Result<Put<'r, N>, Error<Infallible>> {
         payload::check::<KEY_MAX, VAL_MAX>(payload)?;
@@ -93,7 +92,6 @@ impl<'r, const N: usize, const KEY_MAX: usize, const VAL_MAX: usize>
 ///
 /// - A payload that does not decode → [`Error::BadPayload`]
 ///   immediately: no ticket consumed.
-///
 /// - Ring full at claim time → [`Error::RingFull`] immediately: no ticket
 ///   consumed, no sequence number consumed, safe to retry (SPEC §8).
 /// - `publish` returns `Fenced` → the ticket died while claimed (the
