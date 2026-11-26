@@ -584,6 +584,12 @@ impl CachePort<BLOCK> for SharedCache {
         }))
     }
 
+    /// `with_checked` sums only the chunks it is asked about, so a scan
+    /// takes just the ranges it reads from a lent block (ADR-0035).
+    fn checks_ranges(&self) -> bool {
+        true
+    }
+
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool) {
         self.insert(table_id, block_id, block, hot);
     }
@@ -1027,6 +1033,13 @@ mod tests {
         assert!(lend(3, 990, 1010).is_none(), "the damaged chunk");
         let s = cache.stats();
         assert_eq!((s.rejected, s.len), (1, 1));
+    }
+
+    /// The cache checks a lent image a range at a time, and says so: a
+    /// scan then takes only the ranges it reads (ADR-0035).
+    #[test]
+    fn a_checked_lend_checks_ranges() {
+        assert!(SharedCache::new().checks_ranges());
     }
 
     /// Two caches never answer for each other, even from one thread and

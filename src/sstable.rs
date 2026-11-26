@@ -2857,29 +2857,28 @@ async fn fetch_block<D: BlockDevice, const BLOCK: usize>(
     Ok(())
 }
 
-/// The funnel for whole data-block reads, shared by both scan directions
-/// and compaction (a point lookup has its own, `lookup_data_block`, which
-/// inflates only as far as its answer: ADR-0027): reads block `block_id`
-/// into `raw`
-/// (through the cache when given; `hot` inserts it as a point read
-/// would), verifies its CRC, and inflates it into `logical` when its
-/// compression flag is set. Returns `true` when `logical` holds the
-/// inflated block, `false` when `raw` holds the logical block as stored
-/// (callers that need it in `logical` copy it).
+/// The funnel for whole data-block reads from the device, shared by
+/// both scan directions and compaction (a point lookup has its own,
+/// `lookup_data_block`, which inflates only as far as its answer:
+/// ADR-0027): reads block `block_id`, verifies its CRC, and leaves the
+/// logical block in `logical`, inflated when its compression flag is set
+/// and copied as stored otherwise. `raw` is scratch, dead on return.
+///
+/// With a cache, a block it holds is copied out of it
+/// ([`CachePort::get_into`], checked whole), and a block read from the
+/// device is inserted cold: a scan streams each block once and must not
+/// displace the point-read hot set. A caller that has just asked the
+/// cache for the block and missed (`missed`) goes straight to the
+/// device, so one block read is one lookup and
+/// [`CacheStats`](crate::CacheStats) counts it once. A scan whose cache
+/// lends its images reads them in place instead and comes here only on a
+/// miss (`scan::Blocks`, ADR-0035).
 ///
 /// A committed table's blocks were durable before the manifest made them
 /// visible, so a bad CRC is media corruption, never a torn write: it is
 /// [`Error::CorruptBlock`] everywhere — reporting "absent" instead would
 /// let an older version in a deeper table win (a silent stale read). A
 /// flag or decoding failure is `CorruptBlock` too.
-///
-/// A cache that lends its images ([`CachePort::with_range`]) is asked
-/// once: the block is checked whole against its RAM checksums and, if
-/// compressed, inflated where it lies, with no copy; a block stored raw
-/// is copied into `raw`. A miss goes straight to the device. Either way
-/// one block read is one lookup, so [`CacheStats`](crate::CacheStats)
-/// counts it once. When the inflate succeeds, `raw` holds nothing of the
-/// block; no caller reads `raw` after a `true` return.
 ///
 /// # Errors
 ///
@@ -2891,86 +2890,17 @@ pub(crate) async fn read_data_block<D: BlockDevice, const BLOCK: usize>(
     block_id: u64,
     raw: &mut [u8; BLOCK],
     logical: &mut [u8; BLOCK],
-    hot: bool,
-) -> Result<bool, Error<D::Error>> {
-    if let Some(c) = cache {
-        match inflate_lent::<D::Error, BLOCK>(c, table_id, block_id, raw, logical) {
-            Lent::Done(inflated) => return inflated,
-            Lent::Miss => {
-                // Not cached: to the device, without asking the cache a
-                // second time.
-                fetch_block(device, cache, table_id, block_id, raw, hot).await?;
-                return inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id);
-            }
-            Lent::Copy => {}
-        }
+    missed: bool,
+) -> Result<(), Error<D::Error>> {
+    if missed {
+        fetch_block(device, cache, table_id, block_id, raw, false).await?;
+    } else {
+        read_block_verified(device, cache, table_id, block_id, raw, false).await?;
     }
-    read_block_verified(device, cache, table_id, block_id, raw, hot).await?;
-    inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)
-}
-
-/// What [`inflate_lent`] made of one lookup.
-enum Lent<E> {
-    /// A hit: the block was inflated into `logical` (`Ok(true)`), copied
-    /// into `raw` as stored (`Ok(false)`), or failed to decode.
-    Done(Result<bool, Error<E>>),
-    /// Not cached, or rejected by its checksums: read the device.
-    Miss,
-    /// The cache does not lend its images: copy one out instead.
-    Copy,
-}
-
-/// The hit path of [`read_data_block`] for a cache that lends: one
-/// lookup of the whole image, which is inflated where it lies (or, when
-/// stored raw, copied into `raw`).
-fn inflate_lent<E, const BLOCK: usize>(
-    cache: &dyn CachePort<BLOCK>,
-    table_id: u32,
-    block_id: u64,
-    raw: &mut [u8; BLOCK],
-    logical: &mut [u8; BLOCK],
-) -> Lent<E> {
-    let mut done = None;
-    let lent = cache.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
-        done = Some(inflate_image::<E, BLOCK>(image, raw, logical, block_id));
-    });
-    match (lent, done) {
-        (Some(true), Some(result)) => Lent::Done(result),
-        (Some(_), _) => Lent::Miss,
-        (None, _) => Lent::Copy,
+    if !inflate_data_block::<D::Error, BLOCK>(raw, logical, block_id)? {
+        logical.copy_from_slice(raw);
     }
-}
-
-/// [`inflate_data_block`] over a lent image: a compressed block inflates
-/// from `image` into `logical` (`true`); a raw one is copied into `raw`
-/// (`false`).
-fn inflate_image<E, const BLOCK: usize>(
-    image: &[u8],
-    raw: &mut [u8; BLOCK],
-    logical: &mut [u8; BLOCK],
-    block_id: u64,
-) -> Result<bool, Error<E>> {
-    let corrupt = || Error::CorruptBlock { id: block_id };
-    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
-    let flag = image
-        .get(body_end.wrapping_sub(2)..body_end)
-        .and_then(|b| b.try_into().ok())
-        .map(u16::from_le_bytes)
-        .ok_or_else(corrupt)?;
-    if flag & 0x8000 == 0 {
-        if image.len() != BLOCK {
-            return Err(corrupt());
-        }
-        raw.copy_from_slice(image);
-        return Ok(false);
-    }
-    let clen = usize::from(flag & 0x7FFF);
-    let stream = image
-        .get(..clen)
-        .filter(|_| clen < body_end)
-        .ok_or_else(corrupt)?;
-    decompress(stream, &mut logical[..body_end]).map_err(|_| corrupt())?;
-    Ok(true)
+    Ok(())
 }
 
 /// Runs `search` over the body of index block `block_id`'s verified
