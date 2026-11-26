@@ -31,9 +31,11 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use horton::OpenReport;
+
 use crate::Common;
 use crate::bench::Rng;
-use crate::store::{Batch, BatchOp, Handle, Store};
+use crate::store::{Batch, BatchOp, Handle, Store, StoreError};
 
 /// The child's command name.
 pub const CHILD: &str = "crash-child";
@@ -266,6 +268,21 @@ fn run_child(common: &Common, starts: &[u64], kill_after: Duration) -> Result<Ve
     Ok(lines)
 }
 
+/// Opens the store that a killed child held. On Windows, the lock of a
+/// killed process can stay for a short time (ADR-0032): try again for
+/// up to 5 s.
+fn open_after_kill(common: &Common) -> Result<(Store, OpenReport), StoreError> {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Store::open(&common.db, common.options()) {
+            Err(StoreError::Locked(_)) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            opened => return opened,
+        }
+    }
+}
+
 /// The parent's view: what every thread has had acknowledged.
 struct Acked {
     model: Model,
@@ -371,7 +388,7 @@ fn diff(want: &Model, got: &Model) -> String {
 pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
     let p = parse(common, args)?;
     let path = common.db.with_file_name("crash.db");
-    let _ = std::fs::remove_file(&path);
+    Store::destroy(&path).map_err(|e| e.to_string())?;
     let common = Common {
         db: path,
         size_mb: 128,
@@ -408,7 +425,7 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
         writes += this_cycle;
 
         let (store, report) =
-            Store::open(&common.db, common.options()).map_err(|e| format!("cycle {cycle}: {e}"))?;
+            open_after_kill(&common).map_err(|e| format!("cycle {cycle}: {e}"))?;
         replayed += report.recovered_records;
         let (actual, l) = acked
             .verify(&store)
@@ -450,6 +467,6 @@ pub fn run(common: &Common, args: &[String]) -> Result<(), String> {
     println!("after compacting       {} keys, unchanged", actual.len());
     println!("time                   {:.1?}", started.elapsed());
     drop(store);
-    Store::destroy(&common.db);
+    Store::destroy(&common.db).map_err(|e| e.to_string())?;
     Ok(())
 }

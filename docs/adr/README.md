@@ -27,7 +27,6 @@ history keeps it); its §9 milestone log now lives in
 | [0013](0013-capacity-errors-name-their-remedy.md) | `NoSpace` split into errors that each name their remedy |
 | [0014](0014-cache-hits-reverify-crc.md) | Block-cache hits re-verify the CRC; no skip-on-hit, correctness over speed (superseded by 0016) |
 | [0015](0015-tight-jobs-and-requested-compaction.md) | Tight jobs run at the reserve and never grow the region; `request_compaction` compacts below the triggers |
-
 | [0016](0016-cache-hits-reverify-with-a-ram-checksum.md) | Only CRC-verified blocks are cached; hits re-verify against a per-chunk RAM checksum, not CRC-32 |
 | [0017](0017-bucketed-bloom-and-ranged-reads.md) | Bloom probes stay in one 64-byte bucket; point reads fetch ranges of the footer and bloom blocks (`hrtsst03`; extended by 0020) |
 | [0018](0018-detached-point-reads.md) | A point read is a memtable probe plus a table phase that runs without the `Db`; the caller keeps table writes away from detached readers |
@@ -44,7 +43,7 @@ history keeps it); its §9 milestone log now lives in
 | [0029](0029-atomic-batches-across-wal-blocks.md) | An atomic batch may span up to 16 WAL blocks: `SPAN` and `CONT` op-byte flags and consecutive sequence numbers tie its blocks together, recovery replays it only when all are intact, open's scrub reaches 16 blocks past where recovery stopped; manifest `hrtman10` |
 | [0030](0030-no-compression-in-shallow-levels.md) | Tables written into levels 0 and 1 store their data blocks raw (`Config::compression_from_level`, default 2): a table's blocks are packed by raw size, so compression saved no blocks there and cost a pass to write and to read |
 | [0031](0031-point-reads-check-what-they-read.md) | A point read searches a cached data block where it lies and checks against the RAM checksums only the ranges it acts on (`CachePort::with_checked`); a search that fails on unchecked bytes checks the whole image, so a RAM fault is a miss, never `CorruptBlock` |
-| [0032](0032-one-opener-per-host-store.md) | The host store locks `<store>.lock` before it opens the store: a second opener gets `StoreError::Open`, not a WAL that two processes write over |
+| [0032](0032-one-opener-per-host-store.md) | The host store locks `<store>.lock` before it opens the store: a second opener gets `StoreError::Locked`, not a WAL that two processes write over |
 
 ## Adding a record
 

@@ -198,6 +198,9 @@ pub enum StoreError {
     Db(DbError),
     /// The store could not be opened.
     Open(String),
+    /// Another opener holds the store (ADR-0032). Try again when it
+    /// closes.
+    Locked(String),
     /// The store was closed (its [`Store`] was dropped), or a thread
     /// panicked while it held the engine.
     Closed,
@@ -207,7 +210,7 @@ impl core::fmt::Display for StoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Db(e) => write!(f, "{e:?}"),
-            Self::Open(e) => write!(f, "open: {e}"),
+            Self::Open(e) | Self::Locked(e) => write!(f, "open: {e}"),
             Self::Closed => write!(f, "the store is closed"),
         }
     }
@@ -1332,8 +1335,8 @@ pub struct Handle {
 pub struct Store {
     handle: Handle,
     threads: Vec<JoinHandle<()>>,
-    /// Released after [`Drop`] has closed the store: fields drop after
-    /// `drop` returns.
+    /// The lock. It drops after `Drop::drop` returns, thus after the
+    /// store closes.
     _lock: StoreLock,
 }
 
@@ -1379,11 +1382,11 @@ impl Drop for Store {
 
 impl Store {
     /// Opens (or creates) the store in the file at `path`, recovering it
-    /// if the last process died mid-write.
+    /// if the last process died mid-write. If another opener holds the
+    /// store, it returns [`StoreError::Locked`].
     pub fn open(path: &Path, options: Options) -> Result<(Self, OpenReport), StoreError> {
         // Lock first: two openers must not both set a new file's size.
-        let lock = StoreLock::acquire(path)
-            .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
+        let lock = lock_store(path)?;
         let device = FileDevice::open(path, options.create_blocks, options.sync)
             .map_err(|e| StoreError::Open(format!("{}: {e}", path.display())))?;
         // The database is built on the stack before it is boxed, and it
@@ -1452,20 +1455,41 @@ impl Store {
         Ok((store, report))
     }
 
-    /// Deletes the files of the store at `path`: the store and its lock
-    /// file. Call it only when no process has the store open. Errors are
-    /// ignored: a file that is not there is already deleted.
-    pub fn destroy(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        if let Ok(lock) = crate::device::lock_path(path) {
-            let _ = std::fs::remove_file(lock);
+    /// Deletes the store at `path`, under its lock. The lock file stays
+    /// (ADR-0032). A store that is not there is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Locked`] if another opener holds the store, or
+    /// [`StoreError::Open`] if the lock or the delete fails.
+    pub fn destroy(path: &Path) -> Result<(), StoreError> {
+        if !path.try_exists().unwrap_or(true) {
+            return Ok(());
         }
+        let _lock = lock_store(path)?;
+        // Delete the store, not a link to it.
+        std::fs::canonicalize(path)
+            .and_then(std::fs::remove_file)
+            .map_err(|e| StoreError::Open(format!("{}: delete: {e}", path.display())))
     }
 
     /// A handle for another thread.
     pub fn handle(&self) -> Handle {
         self.handle.clone()
     }
+}
+
+/// Locks the store at `path` (ADR-0032).
+fn lock_store(path: &Path) -> Result<StoreLock, StoreError> {
+    StoreLock::acquire(path).map_err(|e| {
+        let locked = e.kind() == std::io::ErrorKind::WouldBlock;
+        let e = format!("{}: {e}", path.display());
+        if locked {
+            StoreError::Locked(e)
+        } else {
+            StoreError::Open(e)
+        }
+    })
 }
 
 impl Handle {
@@ -2382,7 +2406,37 @@ mod tests {
     impl Drop for TempStore {
         fn drop(&mut self) {
             drop(self.store.take());
-            Store::destroy(&self.path);
+            remove_store(&self.path);
+        }
+    }
+
+    /// Deletes a test store and its lock file. Only for tests: in a
+    /// test, no other opener can use the lock file (ADR-0032).
+    fn remove_store(path: &Path) {
+        let _ = Store::destroy(path);
+        if let Ok(lock) = crate::device::lock_path(path) {
+            let _ = std::fs::remove_file(lock);
+        }
+    }
+
+    /// A path in the temporary directory, for a test that does not use
+    /// [`TempStore`].
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("horton-kvstore-{}-{name}.db", std::process::id()));
+        remove_store(&path);
+        path
+    }
+
+    /// The text of a [`StoreError::Locked`], or a panic.
+    fn locked(e: Option<StoreError>) -> String {
+        match e {
+            Some(StoreError::Locked(e)) => {
+                assert!(e.contains("open already"), "{e}");
+                e
+            }
+            Some(e) => panic!("wrong error: {e}"),
+            None => panic!("the call succeeded on a locked store"),
         }
     }
 
@@ -2699,7 +2753,8 @@ mod tests {
     }
 
     /// Dropping the `Store` closes it. Handles that outlive it fail
-    /// cleanly, and the file is free to be opened again at once.
+    /// cleanly, and the file is free to be opened again at once: a
+    /// `Handle` holds no lock (ADR-0032).
     #[test]
     fn a_closed_store_refuses_calls_and_frees_its_file() {
         let mut store = TempStore::new("closed");
@@ -2726,11 +2781,7 @@ mod tests {
     fn a_second_open_of_an_open_store_is_refused() {
         let store = TempStore::new("open-twice");
         store.put(b"a", b"1").expect("put");
-        match Store::open(&store.path, TempStore::options()).err() {
-            Some(StoreError::Open(e)) => assert!(e.contains("open already"), "{e}"),
-            Some(e) => panic!("wrong error: {e}"),
-            None => panic!("a second open of an open store succeeded"),
-        }
+        locked(Store::open(&store.path, TempStore::options()).err());
         store.put(b"b", b"2").expect("put");
         assert_eq!(store.get(b"a").expect("get"), Some(b"1".to_vec()));
         assert_eq!(store.get(b"b").expect("get"), Some(b"2".to_vec()));
@@ -2741,32 +2792,74 @@ mod tests {
     /// opener creates.
     #[test]
     fn a_refused_open_does_not_size_a_new_file() {
-        let path = std::env::temp_dir().join(format!(
-            "horton-kvstore-{}-refused-new.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let path = temp_path("refused-new");
         let held = StoreLock::acquire(&path).expect("lock");
         let second = Store::open(&path, TempStore::options()).err();
-        let len = std::fs::metadata(&path).expect("metadata").len();
+        let len = std::fs::metadata(&path).map(|m| m.len());
         drop(held);
-        Store::destroy(&path);
-        assert!(matches!(second, Some(StoreError::Open(_))), "{second:?}");
-        assert_eq!(len, 0);
+        remove_store(&path);
+        locked(second);
+        assert_eq!(len.expect("metadata"), 0);
     }
 
     /// A symbolic link to an open store is the same store: its open
-    /// fails too.
+    /// fails too. After the close, the link opens the store.
     #[cfg(unix)]
     #[test]
     fn a_link_to_an_open_store_is_refused() {
-        let store = TempStore::new("open-via-link");
+        let mut store = TempStore::new("open-via-link");
+        store.put(b"k", b"v").expect("put");
         let link = store.path.with_extension("link");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&store.path, &link).expect("symlink");
         let second = Store::open(&link, TempStore::options()).err();
+        drop(store.store.take());
+        let reopened = Store::open(&link, TempStore::options())
+            .map(|(s, _)| s.get(b"k"))
+            .map_err(|e| e.to_string());
         let _ = std::fs::remove_file(&link);
-        assert!(matches!(second, Some(StoreError::Open(_))), "{second:?}");
+        locked(second);
+        assert_eq!(reopened, Ok(Ok(Some(b"v".to_vec()))));
+    }
+
+    /// An open that fails after it takes the lock releases the lock.
+    #[test]
+    fn a_failed_open_releases_the_lock() {
+        let path = temp_path("too-small");
+        std::fs::write(&path, vec![0; BLOCK]).expect("write");
+        let opened = Store::open(&path, TempStore::options()).err();
+        let relocked = StoreLock::acquire(&path).map(drop).map_err(|e| e.kind());
+        remove_store(&path);
+        assert!(matches!(opened, Some(StoreError::Open(_))), "{opened:?}");
+        assert_eq!(relocked, Ok(()));
+    }
+
+    /// `destroy` deletes the store and keeps the lock file. It refuses
+    /// an open store, and a store that is not there is not an error.
+    #[test]
+    fn destroy_deletes_a_closed_store_only() {
+        let mut store = TempStore::new("destroy");
+        let path = store.path.clone();
+        let lock = crate::device::lock_path(&path).expect("lock path");
+        let refused = Store::destroy(&path).err();
+        let kept = path.exists();
+        drop(store.store.take());
+        let destroyed = Store::destroy(&path);
+        let (gone, lock_kept) = (!path.exists(), lock.exists());
+        let again = Store::destroy(&path);
+        locked(refused);
+        assert!(kept, "destroy deleted an open store");
+        assert_eq!(destroyed, Ok(()));
+        assert!(gone, "destroy left the store");
+        assert!(lock_kept, "destroy deleted the lock file");
+        assert_eq!(again, Ok(()));
+    }
+
+    /// A path with no file name has no lock file.
+    #[test]
+    fn a_path_with_no_file_name_has_no_lock_path() {
+        let e = crate::device::lock_path(Path::new("/")).map_err(|e| e.kind());
+        assert_eq!(e, Err(std::io::ErrorKind::InvalidInput));
     }
 
     /// Reads, writes, scans and a forced compaction from many threads at

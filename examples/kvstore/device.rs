@@ -132,12 +132,23 @@ impl FileDevice {
 ///
 /// It locks the file `<store>.lock` beside the store, not the store
 /// file. On Windows a lock is mandatory: a lock on the store file stops
-/// the reads and writes of the store's other handles. The operating
-/// system releases the lock when the handle closes or the process
-/// stops. The lock file stays: a deleted lock file lets two openers
-/// lock two different files.
+/// the reads and writes of the store's other handles. Drop unlocks it.
+/// If the process stops, the operating system unlocks it. Do not delete
+/// the lock file: then two openers can lock two different files.
 pub struct StoreLock {
-    _file: File,
+    file: File,
+}
+
+impl Drop for StoreLock {
+    /// Unlocks now. On Windows, a lock that only the close releases can
+    /// stay for a short time after the close.
+    #[allow(
+        clippy::incompatible_msrv,
+        reason = "the MSRV (1.88) is the library's; examples build on the pinned toolchain"
+    )]
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl StoreLock {
@@ -153,7 +164,7 @@ impl StoreLock {
         reason = "the MSRV (1.88) is the library's; examples build on the pinned toolchain"
     )]
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        // Create the store file, so that a link to it resolves.
+        // Create the store file: `canonicalize` needs a file that exists.
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -167,7 +178,7 @@ impl StoreLock {
             .truncate(false)
             .open(&lock)?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
+            Ok(()) => Ok(Self { file }),
             Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 format!(
