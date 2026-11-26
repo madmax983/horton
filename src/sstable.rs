@@ -2227,15 +2227,24 @@ enum BlockOutcome {
 /// Searches one data block: restart-point binary search, then a linear scan.
 /// Selects the newest version with `seq <= max_seq`, reporting [`BlockOutcome`]
 /// so the caller can continue a version run into the next data block.
+///
+/// `check(from, to)` is called on every byte range of `payload` before
+/// the search acts on it (the restart trailer, each entry it parses, a
+/// run of padding); `false` ends the search with `CorruptBlock`. A cache
+/// that lends an image unchecked (`CachePort::with_checked`) verifies
+/// only those ranges against its RAM checksums: a lookup reads a few
+/// entries of a 16 KiB block. Over bytes already verified, `check`
+/// always holds.
 fn data_lookup<E>(
     payload: &[u8],
     key: &[u8],
     val_buf: &mut [u8],
     block_id: u64,
     max_seq: u64,
+    check: &mut impl FnMut(usize, usize) -> bool,
 ) -> Result<BlockOutcome, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: block_id };
-    if payload.len() < 6 {
+    if payload.len() < 6 || !check(payload.len() - 2, payload.len()) {
         return Err(corrupt());
     }
     let rcount = usize::from(u16::from_le_bytes(
@@ -2247,6 +2256,9 @@ fn data_lookup<E>(
         .len()
         .checked_sub(2 + rcount.checked_mul(2).ok_or_else(corrupt)?)
         .ok_or_else(corrupt)?;
+    if !check(rstart, payload.len()) {
+        return Err(corrupt());
+    }
     let restart_at = |i: usize| {
         let off = rstart.checked_add(i.checked_mul(2)?)?;
         let bytes: [u8; 2] = payload.get(off..off + 2)?.try_into().ok()?;
@@ -2262,7 +2274,10 @@ fn data_lookup<E>(
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let roff = restart_at(mid).ok_or_else(corrupt)?;
-        let (entry, _) = data_entry_parse(payload, roff).map_err(|()| corrupt())?;
+        let (entry, next) = data_entry_parse(payload, roff).map_err(|()| corrupt())?;
+        if !check(roff, next) {
+            return Err(corrupt());
+        }
         if entry.key < key {
             lo = mid + 1;
         } else {
@@ -2281,12 +2296,15 @@ fn data_lookup<E>(
         // `Truncated`, not `Absent`. Any other unparseable structure is
         // corruption, not padding.
         let Ok((entry, next)) = data_entry_parse(payload, off) else {
-            return if all_zero(&payload[off..rstart]) {
+            return if check(off, rstart) && all_zero(&payload[off..rstart]) {
                 Ok(BlockOutcome::Truncated)
             } else {
                 Err(corrupt())
             };
         };
+        if !check(off, next) {
+            return Err(corrupt());
+        }
         match entry.key.cmp(key) {
             core::cmp::Ordering::Less => off = next,
             core::cmp::Ordering::Equal => {
@@ -2306,12 +2324,15 @@ fn data_lookup<E>(
                         return Ok(BlockOutcome::Truncated);
                     }
                     let Ok((e, n)) = data_entry_parse(payload, off) else {
-                        return if all_zero(&payload[off..rstart]) {
+                        return if check(off, rstart) && all_zero(&payload[off..rstart]) {
                             Ok(BlockOutcome::Truncated)
                         } else {
                             Err(corrupt())
                         };
                     };
+                    if !check(off, n) {
+                        return Err(corrupt());
+                    }
                     if e.key != key {
                         return Ok(BlockOutcome::Absent);
                     }
@@ -2421,7 +2442,7 @@ fn data_lookup_inflating<E, const BLOCK: usize>(
     if !ready(&mut inflate, out, body_end)? {
         return Err(corrupt());
     }
-    data_lookup(out, key, val_buf, block_id, max_seq)
+    data_lookup(out, key, val_buf, block_id, max_seq, &mut |_, _| true)
 }
 
 /// [`data_lookup`] over a verified block image as stored: in place when
@@ -2434,20 +2455,43 @@ fn lookup_image<E, const BLOCK: usize>(
     block_id: u64,
     max_seq: u64,
 ) -> Result<BlockOutcome, Error<E>> {
+    lookup_image_checked(
+        image,
+        logical,
+        key,
+        val_buf,
+        block_id,
+        max_seq,
+        &mut |_, _| true,
+    )
+}
+
+/// [`lookup_image`] over an image whose bytes `check` verifies a range
+/// at a time (see [`data_lookup`]): the flag, then for a raw block the
+/// ranges the search reads, for a compressed one its whole stream.
+fn lookup_image_checked<E, const BLOCK: usize>(
+    image: &[u8],
+    logical: &mut [u8; BLOCK],
+    key: &[u8],
+    val_buf: &mut [u8],
+    block_id: u64,
+    max_seq: u64,
+    check: &mut impl FnMut(usize, usize) -> bool,
+) -> Result<BlockOutcome, Error<E>> {
     let corrupt = || Error::CorruptBlock { id: block_id };
     let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
     let body = image
         .get(..body_end)
-        .filter(|_| image.len() == BLOCK && body_end >= 2)
+        .filter(|_| image.len() == BLOCK && body_end >= 2 && check(body_end - 2, body_end))
         .ok_or_else(corrupt)?;
     let flag = u16::from_le_bytes([body[body_end - 2], body[body_end - 1]]);
     if flag & 0x8000 == 0 {
-        return data_lookup(body, key, val_buf, block_id, max_seq);
+        return data_lookup(body, key, val_buf, block_id, max_seq, check);
     }
     let clen = usize::from(flag & 0x7FFF);
     let stream = body
         .get(..clen)
-        .filter(|_| clen < body_end)
+        .filter(|_| clen < body_end && check(0, clen))
         .ok_or_else(corrupt)?;
     data_lookup_inflating(stream, logical, key, val_buf, block_id, max_seq)
 }
@@ -2472,10 +2516,28 @@ async fn lookup_data_block<D: BlockDevice, const BLOCK: usize>(
 ) -> Result<BlockOutcome, Error<D::Error>> {
     if let Some(c) = cache {
         let mut found = None;
-        let lent = c.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
-            found = Some(lookup_image::<D::Error, BLOCK>(
-                image, logical, key, val_buf, block_id, max_seq,
-            ));
+        // Only the bytes the search reads are checked against the
+        // cache's RAM checksums: a raw block's trailer and the few
+        // entries the search parses, not all 16 KiB. A check that fails
+        // makes the lookup a miss, and `found` is not used.
+        // An error may come from bytes the search read before it could
+        // check them (an entry that does not parse): the whole image is
+        // checked then, so that a change in RAM is a miss and only
+        // damage on the device is `CorruptBlock`.
+        let lent = c.with_checked(table_id, block_id, &mut |image, check| {
+            let outcome = lookup_image_checked::<D::Error, BLOCK>(
+                image,
+                logical,
+                key,
+                val_buf,
+                block_id,
+                max_seq,
+                &mut |from, to| check(from, to),
+            );
+            if outcome.is_err() {
+                check(0, BLOCK);
+            }
+            found = Some(outcome);
         });
         match (lent, found) {
             (Some(true), Some(outcome)) => return outcome,
@@ -3635,9 +3697,10 @@ mod partial_inflate_tests {
     extern crate std;
 
     use super::{
-        BlockOutcome, CRC_LEN, DataHit, SstEntry, TableWriter, data_lookup, inflate_data_block,
-        lookup_image,
+        BlockOutcome, CRC_LEN, CachePort, DataHit, SstEntry, TableWriter, data_lookup,
+        inflate_data_block, lookup_data_block, lookup_image, lookup_image_checked,
     };
+    use crate::Error;
     use crate::compress::CompressScratch;
     use crate::device::BlockDevice;
     use core::future::Future;
@@ -3758,6 +3821,188 @@ mod partial_inflate_tests {
         (dev, done.data_blocks)
     }
 
+    /// A bit flipped in the RAM copy of a cached data block never changes
+    /// what a point lookup of that block answers (ADR-0031): either the
+    /// search never acts on the byte, or a check over it fails, the entry
+    /// is dropped, and the block is read from the device again. Every
+    /// byte of every data block, one bit each, against the keys the block
+    /// holds and the absent keys between them, at two read sequence
+    /// numbers. In a raw block one lookup misses most flips (it checks
+    /// the few chunks it reads); a compressed block's stream is checked
+    /// whole.
+    #[test]
+    fn a_flipped_bit_in_a_cached_data_block_never_changes_a_lookup() {
+        use crate::cache::BlockCache;
+        use core::cell::RefCell;
+
+        let table_id = 7;
+        let mut val = std::vec![0u8; 4096];
+        for compressible in [false, true] {
+            let (dev, blocks) = table(40, compressible);
+            let cache = RefCell::new(BlockCache::<BLOCK, 4>::new());
+            let (mut raw, mut logical) = ([0u8; BLOCK], [0u8; BLOCK]);
+            let mut answer = |cache: Option<&RefCell<BlockCache<BLOCK, 4>>>,
+                              b: u64,
+                              key: &[u8],
+                              max_seq: u64| {
+                let cache = cache.map(|c| c as &dyn CachePort<BLOCK>);
+                let r = block_on(lookup_data_block(
+                    &dev,
+                    cache,
+                    table_id,
+                    b,
+                    &mut raw,
+                    &mut logical,
+                    key,
+                    &mut val,
+                    max_seq,
+                ));
+                shape(&r, &val)
+            };
+            let (mut unnoticed, mut caught) = (0u32, 0u32);
+            for b in 0..blocks {
+                // The keys the block holds, and the absent ones around
+                // them; and what an uncached lookup answers for each.
+                let keys: Vec<Vec<u8>> = (0..40 * 3 + 2)
+                    .map(|k| format!("key{k:05}").into_bytes())
+                    .collect();
+                let held: Vec<bool> = keys
+                    .iter()
+                    .map(|k| {
+                        let a = answer(None, b, k, u64::MAX);
+                        a.starts_with("value") || a.starts_with("tombstone")
+                    })
+                    .collect();
+                let mut probes = Vec::new();
+                for (i, key) in keys.iter().enumerate() {
+                    let near = held[i.saturating_sub(1)..(i + 2).min(keys.len())]
+                        .iter()
+                        .any(|&h| h);
+                    if near {
+                        for s in [u64::MAX, 9_800] {
+                            probes.push((key.clone(), s, answer(None, b, key, s)));
+                        }
+                    }
+                }
+                assert!(probes.len() >= 8, "block {b}: {} probes", probes.len());
+                let image = dev.0[usize::try_from(b).unwrap()];
+                for at in 0..BLOCK {
+                    let damaged = || {
+                        cache.borrow_mut().put(table_id, b, &image, true);
+                        assert!(cache.borrow_mut().damage(table_id, b, at, 1 << (at % 8)));
+                        cache.borrow().stats().rejected
+                    };
+                    // One lookup alone: did it notice the flip?
+                    let rejected = damaged();
+                    let (key, s, want) = &probes[at % probes.len()];
+                    assert_eq!(&answer(Some(&cache), b, key, *s), want, "byte {at}");
+                    if cache.borrow().stats().rejected > rejected {
+                        caught += 1;
+                    } else {
+                        unnoticed += 1;
+                    }
+                    // Every lookup of the block, over the same flip: at
+                    // every byte in a release build, every third in a
+                    // debug one (CI runs both).
+                    if cfg!(debug_assertions) && at % 3 != 0 {
+                        continue;
+                    }
+                    damaged();
+                    for (key, s, want) in &probes {
+                        let got = answer(Some(&cache), b, key, *s);
+                        assert_eq!(&got, want, "block {b}, byte {at}, max_seq {s}");
+                    }
+                }
+            }
+            assert!(caught > 0, "no flip was ever read");
+            if !compressible {
+                assert!(
+                    unnoticed > caught,
+                    "a raw block checked whole: one lookup missed {unnoticed} flips, noticed {caught}"
+                );
+            }
+        }
+    }
+
+    /// A lookup checked a range at a time, as a lending cache checks it
+    /// (`CachePort::with_checked`), answers as the whole-block search
+    /// does; a raw block's search asks about a few of its chunks, not
+    /// all of them; and a check that fails on any of them ends the
+    /// search with `CorruptBlock`.
+    #[test]
+    fn a_checked_lookup_answers_alike_and_checks_what_it_reads() {
+        for compressible in [true, false] {
+            let (dev, blocks) = table(700, compressible);
+            for b in 0..usize::try_from(blocks).unwrap() {
+                let image = dev.0[b];
+                let mut whole = [0u8; BLOCK];
+                let inflated =
+                    inflate_data_block::<(), BLOCK>(&image, &mut whole, b as u64).unwrap();
+                let body: &[u8] = if inflated {
+                    &whole[..BLOCK - CRC_LEN]
+                } else {
+                    &image[..BLOCK - CRC_LEN]
+                };
+                for k in 0..(700 * 3 + 5) {
+                    let key = format!("key{k:05}").into_bytes();
+                    for max_seq in [u64::MAX, 10_000 - 3_000 - 1, 5_000, 0] {
+                        let cap = 4096;
+                        let mut want_val = std::vec![0u8; cap];
+                        let want = data_lookup::<()>(
+                            body,
+                            &key,
+                            &mut want_val,
+                            b as u64,
+                            max_seq,
+                            &mut |_, _| true,
+                        );
+                        let mut touched = [false; BLOCK / 256];
+                        let mut checked_val = std::vec![0u8; cap];
+                        let mut scratch = [0xEEu8; BLOCK];
+                        let checked = lookup_image_checked::<(), BLOCK>(
+                            &image,
+                            &mut scratch,
+                            &key,
+                            &mut checked_val,
+                            b as u64,
+                            max_seq,
+                            &mut |from, to| {
+                                if to > from {
+                                    for c in &mut touched[from / 256..=(to - 1) / 256] {
+                                        *c = true;
+                                    }
+                                }
+                                true
+                            },
+                        );
+                        assert_eq!(shape(&checked, &checked_val), shape(&want, &want_val));
+                        let n = touched.iter().filter(|&&t| t).count();
+                        if !inflated {
+                            assert!(n <= 16, "block {b}, key {k}: {n} chunks checked");
+                        }
+                        let Some(c) = touched.iter().rposition(|&t| t) else {
+                            continue;
+                        };
+                        let mut scratch = [0xEEu8; BLOCK];
+                        let failed = lookup_image_checked::<(), BLOCK>(
+                            &image,
+                            &mut scratch,
+                            &key,
+                            &mut checked_val,
+                            b as u64,
+                            max_seq,
+                            &mut |from, to| to <= from || (to - 1) / 256 < c || from / 256 > c,
+                        );
+                        assert!(
+                            matches!(failed, Err(Error::CorruptBlock { .. })),
+                            "block {b}, key {k}: a failed check was ignored"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn partial_inflate_answers_as_the_whole_block_does() {
         for compressible in [true, false] {
@@ -3780,8 +4025,14 @@ mod partial_inflate_tests {
                     for max_seq in [u64::MAX, 10_000 - 3_000 - 1, 10_000 - 3_000 - 2, 5_000, 0] {
                         for cap in [4096usize, 30] {
                             let mut want_val = std::vec![0u8; cap];
-                            let want =
-                                data_lookup::<()>(body, &key, &mut want_val, b as u64, max_seq);
+                            let want = data_lookup::<()>(
+                                body,
+                                &key,
+                                &mut want_val,
+                                b as u64,
+                                max_seq,
+                                &mut |_, _| true,
+                            );
                             let mut got_val = std::vec![0u8; cap];
                             let mut scratch = [0xEEu8; BLOCK];
                             let got = lookup_image::<(), BLOCK>(

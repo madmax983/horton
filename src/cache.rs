@@ -196,6 +196,9 @@ pub fn image_sum(data: &[u8]) -> u64 {
 /// a block.
 pub const SUM_CHUNKS: usize = 16;
 
+// `BlockCache::with_checked` marks the chunks it has summed in a `u32`.
+const _: () = assert!(SUM_CHUNKS <= u32::BITS as usize);
+
 /// The bytes of chunk `c` in a `block`-byte image: sixteen equal chunks,
 /// the last one taking the remainder.
 const fn chunk_bounds(block: usize, c: usize) -> (usize, usize) {
@@ -448,6 +451,61 @@ impl<const BLOCK: usize, const SLOTS: usize> BlockCache<BLOCK, SLOTS> {
         self.settle(i, ok)
     }
 
+    /// Looks `(table_id, block_id)` up and hands its whole image to
+    /// `read` where it lies, unchecked, with a `check(from, to)` that
+    /// sums the chunks overlapping `from..to` (each at most once) and
+    /// says whether they still match. `read` calls `check` on the bytes
+    /// it is about to act on, and only on those: a point lookup in a raw
+    /// block sums the chunk of its trailer, one per restart its binary
+    /// search parses and those of the run it scans, not every chunk
+    /// (ADR-0031).
+    ///
+    /// Returns `true` on a hit whose every check held. A miss, or a
+    /// check that failed, returns `false`: the slot is dropped as
+    /// [`with_range`](Self::with_range) drops it, and whatever `read`
+    /// made of the image must be discarded. An empty range checks
+    /// nothing and holds; a range past the image fails, and once one
+    /// check has failed every later one does. `read` must not call back
+    /// into the cache, and `check` is valid only while `read` runs.
+    pub fn with_checked(
+        &mut self,
+        table_id: u32,
+        block_id: u64,
+        read: &mut CheckedRead<'_>,
+    ) -> bool {
+        let Some(i) = self.find(table_id, block_id) else {
+            return false;
+        };
+        let image = &self.images[i];
+        let sums = &self.sums[i];
+        let mut ok = true;
+        let mut done = 0u32;
+        read(image, &mut |from, to| {
+            if to <= from {
+                return ok;
+            }
+            if to > BLOCK {
+                ok = false;
+            }
+            if !ok {
+                return false;
+            }
+            let (first, last) = (chunk_of(BLOCK, from), chunk_of(BLOCK, to - 1));
+            for (c, sum) in sums.iter().enumerate().take(last + 1).skip(first) {
+                if done & (1 << c) == 0 {
+                    let (lo, hi) = chunk_bounds(BLOCK, c);
+                    if image_sum(&image[lo..hi]) != *sum {
+                        ok = false;
+                        return false;
+                    }
+                    done |= 1 << c;
+                }
+            }
+            true
+        });
+        self.settle(i, ok)
+    }
+
     /// The slot holding `(table_id, block_id)`. A lookup that finds none
     /// is counted as a miss here.
     fn find(&mut self, table_id: u32, block_id: u64) -> Option<usize> {
@@ -567,6 +625,21 @@ impl<const BLOCK: usize, const SLOTS: usize> BlockCache<BLOCK, SLOTS> {
             capacity: SLOTS,
         }
     }
+
+    /// Test hook: XORs `mask` into byte `at` of the cached image of
+    /// `(table_id, block_id)`, as a fault in RAM would, and leaves its
+    /// sums as they were. `false` when the block is not cached. Counts
+    /// nothing.
+    #[cfg(test)]
+    pub(crate) fn damage(&mut self, table_id: u32, block_id: u64, at: usize, mask: u8) -> bool {
+        match self.locate(table_id, block_id) {
+            Some(i) => {
+                self.images[i][at] ^= mask;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl<const BLOCK: usize, const SLOTS: usize> Default for BlockCache<BLOCK, SLOTS> {
@@ -574,6 +647,11 @@ impl<const BLOCK: usize, const SLOTS: usize> Default for BlockCache<BLOCK, SLOTS
         Self::new()
     }
 }
+
+/// What [`CachePort::with_checked`] hands a cached image to: the image,
+/// and a `check(from, to)` that says whether its bytes `from..to` still
+/// match their RAM checksums.
+pub type CheckedRead<'a> = dyn FnMut(&[u8], &mut dyn FnMut(usize, usize) -> bool) + 'a;
 
 /// The read path's view of a cache: synchronous block-image operations
 /// behind `&self`, so `TableReader` and the scans can hold it without
@@ -614,6 +692,29 @@ pub trait CachePort<const BLOCK: usize> {
         let _ = (table_id, block_id, from, to, read);
         None
     }
+    /// Hand the whole cached image to `read` in place, unchecked, with a
+    /// `check(from, to)` that `read` calls on the bytes it is about to
+    /// act on (see [`BlockCache::with_checked`]). `Some(true)` on a hit
+    /// whose every check held; `Some(false)` on a miss, and on a check
+    /// that failed, in which case the entry is dropped and whatever
+    /// `read` made of the image must be discarded. `read` must not call
+    /// back into the cache, and `check` is valid only while `read` runs.
+    ///
+    /// For a cache that lends whole images but cannot check them a
+    /// range at a time, this provided method checks the whole image up
+    /// front ([`with_range`](Self::with_range)) and hands `read` a
+    /// `check` that holds for every range inside the image (and fails
+    /// one past it). `None`: the cache does not lend.
+    fn with_checked(
+        &self,
+        table_id: u32,
+        block_id: u64,
+        read: &mut CheckedRead<'_>,
+    ) -> Option<bool> {
+        self.with_range(table_id, block_id, 0, BLOCK, &mut |image| {
+            read(image, &mut |from, to| to <= from || to <= BLOCK);
+        })
+    }
     /// Insert a verified image; `hot` sets the CLOCK reference bit.
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool);
     /// Drop every entry for `table_id`.
@@ -646,6 +747,18 @@ impl<const BLOCK: usize, const SLOTS: usize> CachePort<BLOCK>
         Some(
             self.try_borrow_mut()
                 .is_ok_and(|mut c| c.with_range(table_id, block_id, from, to, read)),
+        )
+    }
+
+    fn with_checked(
+        &self,
+        table_id: u32,
+        block_id: u64,
+        read: &mut CheckedRead<'_>,
+    ) -> Option<bool> {
+        Some(
+            self.try_borrow_mut()
+                .is_ok_and(|mut c| c.with_checked(table_id, block_id, read)),
         )
     }
 
@@ -979,6 +1092,46 @@ mod tests {
         }
     }
 
+    /// `with_checked`: a check over a flipped bit fails, the slot is
+    /// dropped and the lookup is a miss; checks clear of it hold and the
+    /// lookup is a hit. Each chunk is summed once however often it is
+    /// asked about.
+    #[test]
+    fn a_checked_lend_fails_only_where_it_looks() {
+        let good = block::<4096>(83);
+        let flipped = 9 * 256 + 3;
+        for (ranges, touches) in [
+            (&[(0usize, 16usize), (4000, 4096)][..], false),
+            (&[(0, 9 * 256), (10 * 256, 4096)][..], false),
+            (&[(0, 16), (flipped, flipped + 1)][..], true),
+            (&[(8 * 256, 11 * 256)][..], true),
+            (&[(5, 5), (4096, 4097)][..], true),
+        ] {
+            let mut c = BlockCache::<4096, 1>::new();
+            c.put(1, 1, &good, true);
+            c.images[0][flipped] ^= 0x80;
+            let mut all_held = true;
+            let served = c.with_checked(1, 1, &mut |image, check| {
+                assert_eq!(image.len(), 4096);
+                for &(from, to) in ranges {
+                    all_held &= check(from, to);
+                }
+            });
+            assert_eq!(served, !touches, "{ranges:?}");
+            assert_eq!(all_held, !touches, "{ranges:?}");
+            let s = c.stats();
+            if touches {
+                assert_eq!((s.rejected, s.misses, s.len), (1, 1, 0));
+            } else {
+                assert_eq!((s.hits, s.len), (1, 1));
+            }
+        }
+        let mut c = BlockCache::<4096, 1>::new();
+        let mut calls = 0;
+        assert!(!c.with_checked(1, 1, &mut |_, _| calls += 1), "a miss");
+        assert_eq!(calls, 0);
+    }
+
     /// Through the trait: a `RefCell` cache lends (never `None`), and a
     /// cache that is already borrowed answers a miss, not a panic.
     #[test]
@@ -993,6 +1146,70 @@ mod tests {
         let _busy = c.borrow_mut();
         assert_eq!(c.with_range(7, 7, 0, 16, &mut |_| n = 0), Some(false));
         assert_eq!(n, 16);
+    }
+
+    /// The provided `with_checked`, for a cache that lends only whole
+    /// images: the image is checked whole before `read` runs, so a flip
+    /// anywhere is a miss and `read` never sees it; on a hit, `check`
+    /// holds inside the image and fails past it.
+    #[test]
+    fn the_provided_checked_lend_checks_the_whole_image_first() {
+        use super::{CachePort, CacheStats};
+        use core::cell::RefCell;
+
+        /// Lends through `with_range` only.
+        struct WholeOnly(RefCell<BlockCache<4096, 1>>);
+        impl CachePort<4096> for WholeOnly {
+            fn get_into(&self, t: u32, b: u64, out: &mut [u8; 4096]) -> bool {
+                self.0.get_into(t, b, out)
+            }
+            fn get_range_into(&self, t: u32, b: u64, at: usize, out: &mut [u8]) -> bool {
+                self.0.get_range_into(t, b, at, out)
+            }
+            fn with_range(
+                &self,
+                t: u32,
+                b: u64,
+                from: usize,
+                to: usize,
+                read: &mut dyn FnMut(&[u8]),
+            ) -> Option<bool> {
+                self.0.with_range(t, b, from, to, read)
+            }
+            fn put(&self, t: u32, b: u64, block: &[u8; 4096], hot: bool) {
+                CachePort::put(&self.0, t, b, block, hot);
+            }
+            fn invalidate_table(&self, t: u32) {
+                CachePort::invalidate_table(&self.0, t);
+            }
+            fn stats(&self) -> CacheStats {
+                CachePort::stats(&self.0)
+            }
+        }
+
+        let good = block::<4096>(97);
+        let c = WholeOnly(RefCell::new(BlockCache::new()));
+        c.put(3, 3, &good, true);
+        let mut answers = [false; 4];
+        let hit = c.with_checked(3, 3, &mut |image, check| {
+            assert_eq!(image, &good[..]);
+            answers = [
+                check(0, 16),
+                check(4000, 4096),
+                check(9, 9),
+                check(4090, 4097),
+            ];
+        });
+        assert_eq!(hit, Some(true));
+        assert_eq!(answers, [true, true, true, false]);
+
+        // A flip far from any range `read` would check is still a miss.
+        assert!(c.0.borrow_mut().damage(3, 3, 3000, 0x04));
+        let mut called = false;
+        assert_eq!(c.with_checked(3, 3, &mut |_, _| called = true), Some(false));
+        assert!(!called, "read ran over a damaged image");
+        let s = c.stats();
+        assert_eq!((s.hits, s.rejected, s.len), (1, 1, 0));
     }
 
     #[test]

@@ -34,7 +34,9 @@
 //! horton's rule for cached blocks (ADR-0016) holds unchanged: only
 //! verified images are inserted (the read path does that), and every hit
 //! is checked against a RAM checksum of the image before its bytes are
-//! used. The checksum here is kept per [`SUM_BYTES`] bytes, finer than
+//! used. A point read's data block is lent with a check instead
+//! ([`SharedCache::with_checked`], ADR-0031): the search checks each
+//! range it reads before it acts on it, and only those. The checksum here is kept per [`SUM_BYTES`] bytes, finer than
 //! the library's sixteenth of a block, so the 64 bytes of a bloom bucket
 //! cost the summing of 256 bytes and not of a kilobyte.
 //!
@@ -51,7 +53,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use horton::cache::image_sum;
+use horton::cache::{CheckedRead, image_sum};
 use horton::{CachePort, CacheStats};
 
 use crate::BLOCK;
@@ -540,6 +542,48 @@ impl CachePort<BLOCK> for SharedCache {
         }))
     }
 
+    /// Lends the whole image unchecked, with a `check` that sums only
+    /// the chunks `read` asks about, each once (ADR-0031). A point lookup
+    /// in a raw block asks about its trailer, the restarts its binary
+    /// search parses and the run it scans: about 8 of the 64 chunks
+    /// (docs/THROUGHPUT.md, step 22), where a whole-image check sums all
+    /// of them.
+    fn with_checked(
+        &self,
+        table_id: u32,
+        block_id: u64,
+        read: &mut CheckedRead<'_>,
+    ) -> Option<bool> {
+        Some(self.lookup(table_id, block_id, |entry| {
+            let mut ok = true;
+            let mut done = [false; SUMS];
+            read(&entry.image, &mut |from, to| {
+                if to <= from {
+                    return ok;
+                }
+                if to > BLOCK {
+                    ok = false;
+                }
+                if !ok {
+                    return false;
+                }
+                let (first, last) = (from / SUM_BYTES, (to - 1) / SUM_BYTES);
+                let chunks = entry.image.chunks(SUM_BYTES).zip(&entry.sums);
+                for (seen, (chunk, sum)) in done.iter_mut().zip(chunks).take(last + 1).skip(first) {
+                    if !*seen {
+                        if image_sum(chunk) != *sum {
+                            ok = false;
+                            return false;
+                        }
+                        *seen = true;
+                    }
+                }
+                true
+            });
+            ok
+        }))
+    }
+
     fn put(&self, table_id: u32, block_id: u64, block: &[u8; BLOCK], hot: bool) {
         self.insert(table_id, block_id, block, hot);
     }
@@ -922,6 +966,37 @@ mod tests {
         assert_eq!(cache.stats().rejected, 2);
         cache.put(4, 1, &img, true);
         assert_eq!(whole(&cache, 4, 1), Some(img));
+    }
+
+    /// A checked lend sums only the chunks asked about: a check clear of
+    /// the damage holds and the lookup is a hit; one over it fails, and
+    /// the entry is dropped as a copying read drops it.
+    #[test]
+    fn a_checked_lend_fails_only_where_it_looks() {
+        let cache = SharedCache::new();
+        let img = image(6, 2);
+        let lend = |b: u64, ranges: &[(usize, usize)]| {
+            let mut answers = Vec::new();
+            let hit = cache.with_checked(6, b, &mut |image, check| {
+                assert_eq!(image.len(), BLOCK);
+                answers.extend(ranges.iter().map(|&(from, to)| check(from, to)));
+            });
+            (hit, answers)
+        };
+        assert_eq!(lend(2, &[(0, 8)]), (Some(false), vec![]), "a miss");
+        cache.put_damaged(6, 3, &img, 1000);
+        assert_eq!(
+            lend(3, &[(0, 700), (BLOCK - 10, BLOCK)]),
+            (Some(true), vec![true, true]),
+            "clear of the damage"
+        );
+        assert_eq!(
+            lend(3, &[(0, 16), (999, 1001)]),
+            (Some(false), vec![true, false]),
+            "over it"
+        );
+        assert_eq!(cache.stats().rejected, 1);
+        assert_eq!(lend(3, &[(0, 16)]), (Some(false), vec![]), "dropped");
     }
 
     /// A lent range is the entry's own bytes, checked: the bytes of the

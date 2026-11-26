@@ -32,6 +32,9 @@ and the host store's memtable grew to fill its arena
 written into levels 0 and 1 stopped compressing
 ([step 21](#then-no-compression-in-levels-0-and-1)): fills and
 overwrites 16% to 43% faster, point reads 5% to 8% and seeks about 40%.
+And a point read served from the cache came to check only the bytes it
+reads ([step 22](#then-a-cached-point-read-checks-what-it-reads)):
+10% to 15% faster when the cache holds the keys read.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1207,6 +1210,64 @@ Against RocksDB with the same memory, in the same session: `fillseq`
 1.33× and 1.43×, `fillrandom` 1.20× and 1.40×, `overwrite` 1.51× and
 1.44×, `readrandom` 0.88× and 0.87×, `seekrandom` 0.34× and 0.42×.
 
+### Then: a cached point read checks what it reads
+
+Step 22 (ADR-0031). A point read whose data block was cached summed the
+whole image against its RAM checksums before the search began: 64
+chunks of 256 bytes in the host store, about 16 K instructions. The
+search reads a fraction of it. Now the cache lends the image with a
+`check(from, to)` (`CachePort::with_checked`), and the search checks
+each range just before it acts on it: the restart trailer, each entry
+it parses, a run of padding. A raw data block's hit summed 8.4 chunks
+on average instead of 64 (the trailer, one per restart the binary
+search parses, and the run it scans); a compressed one checks its
+whole stream before it inflates, about half the block. A search that
+fails on a byte it had not yet checked has the whole image checked, so
+a flip in RAM is a miss and a device read, never `CorruptBlock`. A test
+flips every bit of every data block of a table in the cache, one at a
+time, and every lookup answers as if it had not.
+
+Measured on identical tables (filled once, one thread, copied for each
+run), `--no-sync`, release builds of `main` and of the change side by
+side, the default cache of 1,024 slots. "Hot" reads draw from the
+first 60,000 keys, all cache hits; "full" is the bench's own uniform
+key range, where at 1 M keys about 95% of reads go to the device.
+
+Instructions per point read (callgrind, one reader, a second pass over
+a warm cache):
+
+| store, keys read | before | after | |
+|---|---:|---:|---:|
+| 300 K keys (all tables raw), hot | 62,370 | 50,067 | −19.7% |
+| 300 K keys, full | 108,646 | 103,834 | −4.4% |
+| 1 M keys (levels 2 and 3 compressed), hot | 89,260 | 82,032 | −8.1% |
+| 1 M keys, full | 143,443 | 142,561 | −0.6% |
+
+Chunks summed per read, at 300 K keys hot: 134.8 before (64 for the
+index block, 64 for the data block, 6.8 for bloom buckets), 79.0 after
+(63.7, 8.4 and 6.8). Cache hits, misses and device reads per read were
+the same in both builds in every configuration.
+
+Wall clock at 1 M keys, ops/s, interleaved pairs (each run reads the
+keys twice; both passes shown):
+
+| | before | after | |
+|---|---:|---:|---:|
+| hot, 1 reader (3 pairs, idle) | 155.7 K / 151.3 K | 171.8 K / 171.3 K | +10%, +13% |
+| hot, 4 readers (3 pairs, idle) | 569.5 K / 566.9 K | 653.6 K / 635.3 K | +15%, +12% |
+| full, 1 reader (6 pairs, idle) | 79.3 K / 78.4 K | 78.4 K / 78.7 K | level |
+| full, 4 readers (4 pairs) | 258.6 K / 272.9 K | 270.4 K / 273.6 K | level |
+| `seekrandom`, `readseq` | | | level |
+
+The time saved is larger than the instructions: summing a 16 KiB image
+also pulled it through the CPU's caches. Where a read goes to the
+device (the full key range at 1 M keys), the hit it saves on is about
+one read in eight, and the difference is inside run-to-run spread.
+The index block is still summed whole on every read: an index search
+parses every entry to count them, so it reads the whole block. That is
+now 25% to 31% of a read served from the cache
+([Levers not pulled](#levers-not-pulled)).
+
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
@@ -1307,12 +1368,18 @@ Measured or scoped while doing this, and left:
   and not summing a block's padding, would cheapen the deeper levels'.
   Packing a block by its compressed size would make compression save
   blocks at all (a format change).
-- **A cache hit that checks only what a point read reads.** A hit
-  checks the whole 16 KiB image's RAM checksums, about 16.8 K
-  instructions; a lookup reads a fraction of it. Checking only the
-  chunks the search touches measured 8.5% fewer instructions per read
-  at 300 K keys and 1.3% at 1 M (step 21's profile), behind a new
-  `CachePort` method. Not done.
+- **An index search that reads only what it needs.** Step 22 checks
+  only the bytes of a data block a point read reads; the index block
+  is still summed whole, 64 chunks and about 16 K instructions a read,
+  25% to 31% of a read served from the cache. The search parses every
+  entry to count them (the count bounds the walk across blocks), so it
+  reads the whole block. An entry count and offsets in the index block
+  would let it binary-search and check a few chunks (a format change).
+- **Range-tombstone probes through the checked lend.** A point read in
+  a table that holds range tombstones copies their block out of the
+  cache and sums it whole. It could search it where it lies and check
+  what it reads, as a data block is now. Not measured: tables with
+  range tombstones are rare in these workloads.
 - **Waiting writers that do not wake each other.** A writer waiting for
   compaction parks with a timeout, and a commit that finds the stall
   wakes the next one at once: 7 to 23 million wake-ups per million

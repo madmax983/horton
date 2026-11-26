@@ -47,7 +47,9 @@ not run on a hit.
 (`SUM_CHUNKS`). `get_range_into` copies a byte range of a cached block
 and checks only the chunks the range touches. A reader that needs 45
 bytes of a footer or 64 bytes of a bloom block pays for one chunk, not
-the block (ADR-0017 uses this).
+the block (ADR-0017 uses this). Since ADR-0031 a point read's data
+block is lent with a check instead, and the search checks each range
+just before it acts on it: what it never reads, it never checks.
 
 **The sum is four multiply-rotate lanes** (xxHash's round): 64-bit
 lanes on 64-bit targets, 32-bit lanes elsewhere, because an ESP32's

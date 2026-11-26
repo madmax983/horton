@@ -462,7 +462,9 @@ an open request has work.
   again: each slot keeps a RAM checksum of its image in 16 chunks, and
   a hit must match it or it is dropped and read from the device again
   (ADR-0016). A point read asks for one bloom bucket as a byte range
-  and pays for the chunk it lies in. Above 8 slots a block's
+  and pays for the chunk it lies in, and searches a data block where
+  it lies in the cache, checking each range of it before it acts on
+  it: a check that fails is a miss (ADR-0031). Above 8 slots a block's
   slot is one of 8 chosen by hashing its key, so lookups do not grow
   with the cache.
 
