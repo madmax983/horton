@@ -2192,8 +2192,8 @@ fn publish16(ring: &Ring<16>, p: &[u8; 32]) -> u32 {
     t
 }
 
-/// Sweeps until the drainer has no pending ticket. Flushes on `Stalled`.
-/// Returns the `Swept` ticket counts in order.
+/// Sweeps until the drainer has no pending ticket. Flushes on `Stalled`
+/// (pushed as `0`). Returns the `Swept` ticket counts in order.
 fn sweep_all<const KEY_MAX: usize, const VAL_MAX: usize, const CAP: usize, const ARENA: usize>(
     drainer: &mut Drainer<
         '_,
@@ -2215,7 +2215,10 @@ fn sweep_all<const KEY_MAX: usize, const VAL_MAX: usize, const CAP: usize, const
     for _ in 0..64 {
         match block_on(drainer.sweep()).expect("valid writes must not poison") {
             SweepOutcome::Swept { tickets } => swept.push(tickets),
-            SweepOutcome::Stalled => block_on(drainer.flush()).expect("flush ok"),
+            SweepOutcome::Stalled => {
+                swept.push(0);
+                block_on(drainer.flush()).expect("flush ok");
+            }
             SweepOutcome::Idle if drainer.pending() == 0 => return swept,
             SweepOutcome::Idle => panic!("Idle with pending tickets"),
         }
@@ -2247,12 +2250,8 @@ fn burst_larger_than_the_memtable_does_not_poison() {
     for i in 0..8u8 {
         publish16(&ring, &put_payload(&[b'k', i], &[b'v', i]));
     }
-    let swept = sweep_all(&mut drainer);
-    assert_eq!(swept.iter().sum::<usize>(), 8);
-    assert!(
-        swept.iter().all(|&n| n <= 4),
-        "no sweep is over CAP: {swept:?}"
-    );
+    // Half of 8 fits the empty memtable. The other 4 stall until a flush.
+    assert_eq!(sweep_all(&mut drainer), [4, 0, 4]);
     assert!(!drainer.is_poisoned());
     assert_eq!(durable.load(Ordering::Acquire), 8);
     let db = drainer.into_db();
@@ -2274,6 +2273,7 @@ fn burst_larger_than_the_arena_does_not_poison() {
     }
     let swept = sweep_all(&mut drainer);
     assert_eq!(swept.iter().sum::<usize>(), 8);
+    assert!(swept.iter().filter(|&&n| n > 0).count() > 1, "{swept:?}");
     assert!(!drainer.is_poisoned());
     assert_eq!(durable.load(Ordering::Acquire), 8);
     let db = drainer.into_db();
@@ -2443,13 +2443,18 @@ fn writer_check_matches_the_drainer() {
     // refuses with the same error.
     let mut lcg = common::Lcg::new(48);
     let mut passed = 0;
+    let mut seen = std::collections::BTreeSet::new();
     for _ in 0..4000 {
         let mut p = [0u8; 32];
-        p[0] = u8::try_from(1 + lcg.next_bounded(4)).expect("small");
+        p[0] = u8::try_from(lcg.next_bounded(6)).expect("small");
         p[1] = u8::try_from(lcg.next_bounded(24)).expect("small");
         p[2] = u8::try_from(lcg.next_bounded(24)).expect("small");
         for b in &mut p[3..] {
             *b = b'a' + u8::try_from(lcg.next_bounded(3)).expect("small");
+        }
+        if lcg.next_bounded(4) == 0 {
+            // A TTL payload with no expiry.
+            p[3..11].fill(0);
         }
         let ring = Ring::<16>::new();
         let durable = AtomicU32::new(0);
@@ -2464,8 +2469,14 @@ fn writer_check_matches_the_drainer() {
                 passed += 1;
                 assert_eq!(swept, Ok(SweepOutcome::Swept { tickets: 1 }), "{p:?}");
             }
-            Err(e) => assert_eq!(swept, Err(e.widen()), "{p:?}"),
+            Err(e) => {
+                seen.insert(format!("{e:?}").split([' ', '{']).next().map(str::to_owned));
+                assert_eq!(swept, Err(e.widen()), "{p:?}");
+            }
         }
+    }
+    for want in ["BadPayload", "KeyTooLarge", "ValueTooLarge"] {
+        assert!(seen.contains(&Some(want.to_owned())), "no {want}: {seen:?}");
     }
     assert!(passed > 400, "the mix must test both sides: {passed}");
 }
@@ -2516,4 +2527,166 @@ fn ttl_payload_at_the_codec_limit_lands() {
             None
         );
     }
+}
+
+/// A drainer with a memtable of 4 whose `Db` takes keys of at most 8 bytes.
+type SmallCapShortKeyDrainer<'r> =
+    Drainer<'r, MemDevice<512>, 512, 8, 16, 4, 1024, 2, 4, 64, 0, 16, 8>;
+
+#[test]
+fn bad_ticket_after_a_split_burst() {
+    // Six good tickets, one bad, one good. The split writes the six, then
+    // the drainer poisons on the bad ticket.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: SmallCapShortKeyDrainer<'_> = Drainer::new(&ring, db, &durable);
+    for i in 0..6u8 {
+        publish16(&ring, &put_payload(&[b'k', i], b"v"));
+    }
+    let bad = publish16(&ring, &put_payload(b"0123456789", b"x"));
+    publish16(&ring, &put_payload(b"z", b"v"));
+    let mut swept = Vec::new();
+    let err = loop {
+        match block_on(drainer.sweep()) {
+            Ok(SweepOutcome::Swept { tickets }) => swept.push(tickets),
+            Ok(SweepOutcome::Stalled) => block_on(drainer.flush()).expect("flush ok"),
+            Ok(SweepOutcome::Idle) => panic!("Idle with pending tickets"),
+            Err(e) => break e,
+        }
+        assert!(swept.len() < 8, "no poison: {swept:?}");
+    };
+    assert_eq!(swept, [3, 3]);
+    assert_eq!(err, horton::Error::KeyTooLarge { len: 10, max: 8 });
+    assert_eq!(drainer.bad_ticket(), Some(bad));
+    assert_eq!(drainer.pending(), 2);
+    assert_eq!(durable.load(Ordering::Acquire), 6);
+}
+
+#[test]
+fn device_error_in_a_split_write_keeps_every_ticket() {
+    // The split's first write fails at the device. Nothing is acked, and
+    // `resume` then writes all eight tickets in order.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let device = FailFlushNTimes::new(MemDevice::<512>::new(), 0, 1);
+    let mut db = horton::Db::<_, 512, 32, 32, 4, 1024, 2, 4, 64, 0>::new(device, test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer =
+        Drainer::<_, 512, 32, 32, 4, 1024, 2, 4, 64, 0, 16, 8>::new(&ring, db, &durable);
+    for i in 0..8u8 {
+        publish16(&ring, &put_payload(b"k", &[b'v', i]));
+    }
+    assert_eq!(
+        block_on(drainer.sweep()).expect_err("flush failure must error"),
+        horton::Error::Device(TestError)
+    );
+    assert_eq!(drainer.pending(), 8);
+    assert_eq!(drainer.bad_ticket(), None);
+    assert_eq!(durable.load(Ordering::Acquire), 0);
+
+    drainer.resume();
+    let mut swept = Vec::new();
+    while drainer.pending() > 0 {
+        match block_on(drainer.sweep()).expect("retry ok") {
+            SweepOutcome::Swept { tickets } => swept.push(tickets),
+            SweepOutcome::Stalled => block_on(drainer.flush()).expect("flush ok"),
+            SweepOutcome::Idle => panic!("Idle with pending tickets"),
+        }
+        assert!(swept.len() < 8, "no progress: {swept:?}");
+    }
+    assert_eq!(swept, [4, 4]);
+    assert_eq!(durable.load(Ordering::Acquire), 8);
+    let db = drainer.into_db();
+    let mut buf = [0u8; 32];
+    let n = block_on(db.get(b"k", &mut buf))
+        .expect("get ok")
+        .expect("k present");
+    assert_eq!(&buf[..n], &[b'v', 7], "the last write wins");
+}
+
+#[test]
+fn fenced_tickets_alone_in_a_split_prefix_take_no_seqnum() {
+    // Four fenced tickets, then eight puts, on a memtable of four. The
+    // first half holds no op: it resolves with no `Db::write`.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer: SmallCapDrainer<'_> = Drainer::new(&ring, db, &durable);
+    for _ in 0..4 {
+        let t = ring.try_claim().expect("ring has space");
+        assert_eq!(ring.force_release_slot(t), ForceReleaseOutcome::Released);
+    }
+    for i in 0..4u8 {
+        publish16(&ring, &put_payload(&[b'k', i], b"v"));
+    }
+    let seq = drainer.durable_seqnum();
+    assert_eq!(
+        block_on(drainer.sweep()).expect("sweep ok"),
+        SweepOutcome::Swept { tickets: 8 },
+        "four ops fit the memtable"
+    );
+    assert_eq!(drainer.durable_seqnum(), seq + 4);
+    for i in 4..12u8 {
+        publish16(&ring, &put_payload(&[b'k', i], b"v"));
+    }
+    for _ in 0..4 {
+        let t = ring.try_claim().expect("ring has space");
+        assert_eq!(ring.force_release_slot(t), ForceReleaseOutcome::Released);
+    }
+    // Eight puts and four fenced tickets: twelve, over the memtable.
+    let swept = sweep_all(&mut drainer);
+    assert_eq!(swept.iter().sum::<usize>(), 12);
+    assert_eq!(drainer.durable_seqnum(), seq + 12);
+    assert_eq!(durable.load(Ordering::Acquire), 20);
+}
+
+#[test]
+fn writer_on_a_full_ring() {
+    // A full ring gives `RingFull`. A bad payload gives its own error
+    // first: the check comes before the claim.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).expect("db open must succeed");
+    let drainer: ShortKeyDrainer<'_> = Drainer::new(&ring, db, &durable);
+    let writer = drainer.writer();
+    for i in 0..16u8 {
+        writer
+            .put(&put_payload(&[b'k', i], b"v"))
+            .expect("ring has space");
+    }
+    assert_eq!(
+        writer.put(&put_payload(b"a", b"1")).map(|p| p.ticket()),
+        Err(horton::Error::RingFull)
+    );
+    assert_eq!(
+        writer
+            .put(&put_payload(b"0123456789", b"x"))
+            .map(|p| p.ticket()),
+        Err(horton::Error::KeyTooLarge { len: 10, max: 8 })
+    );
+}
+
+#[test]
+fn range_end_over_val_max_is_refused_alike() {
+    // With `VAL_MAX < KEY_MAX`, a range end must also fit `VAL_MAX`.
+    let ring = Ring::<16>::new();
+    let durable = AtomicU32::new(0);
+    let mut db = horton::Db::<_, 512, 16, 8, 16, 1024, 2, 4, 64, 0>::new(
+        MemDevice::<512>::new(),
+        test_config(),
+    );
+    block_on(db.open()).expect("db open must succeed");
+    let mut drainer =
+        Drainer::<_, 512, 16, 8, 16, 1024, 2, 4, 64, 0, 16, 8>::new(&ring, db, &durable);
+    let p = payload::encode_range_delete(b"0", b"a123456789").expect("fits the codec");
+    let want = horton::Error::ValueTooLarge { len: 10, max: 8 };
+    assert_eq!(payload::check::<16, 8>(&p), Err(want));
+    assert_eq!(drainer.writer().put(&p).map(|put| put.ticket()), Err(want));
+    publish16(&ring, &p);
+    assert_eq!(block_on(drainer.sweep()), Err(want));
+    assert_eq!(drainer.bad_ticket(), Some(0));
 }

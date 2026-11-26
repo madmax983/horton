@@ -373,6 +373,19 @@ fn put_ttl(db: &mut TestDb<MemDevice<4096>>, k: &[u8], v: &[u8], expire_at: u64)
     }
 }
 
+/// A range delete that flushes and retries when the memtable or WAL is
+/// full.
+fn range_del(db: &mut TestDb<MemDevice<4096>>, start: &[u8], end: &[u8]) {
+    match block_on(db.delete_range(start, end)) {
+        Ok(_) => {}
+        Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
+            flush(db);
+            block_on(db.delete_range(start, end)).unwrap();
+        }
+        Err(e) => panic!("unexpected delete_range error: {e:?}"),
+    }
+}
+
 /// Flushes, then compacts every level with `purge_before`.
 fn purge(db: &mut TestDb<MemDevice<4096>>, purge_before: u64) {
     flush(db);
@@ -413,7 +426,7 @@ fn purged_and_unpurged_replicas_agree_at_the_same_now() {
     // this by hand; this test keeps it).
     const FLOOR: u64 = 500;
     const NOW: u64 = 600;
-    let mut differ_at_zero = 0;
+    let (mut purged, mut floor_edge) = (0, 0);
     for seed in 1..=20 {
         let mut rng = Lcg::new(seed);
         let (mut a, mut b) = (fresh(), fresh());
@@ -434,6 +447,12 @@ fn purged_and_unpurged_replicas_agree_at_the_same_now() {
                 5 => {
                     del(&mut a, &k);
                     del(&mut b, &k);
+                }
+                6 if rng.next_bounded(3) == 0 => {
+                    // Often across a bucket split (`k00010`, `k00020`, ...).
+                    let end = key(rng.next_bounded(41));
+                    range_del(&mut a, &k, &end);
+                    range_del(&mut b, &k, &end);
                 }
                 6 => {
                     purge(&mut a, FLOOR);
@@ -457,14 +476,22 @@ fn purged_and_unpurged_replicas_agree_at_the_same_now() {
         block_on(sb.seek_with_time(b"", None, u64::MAX, NOW)).unwrap();
         assert_eq!(collect(&mut sa, &mut sb), vec![], "seed {seed}: diff");
 
-        // Harness check: B read with `now = 0` (out of contract) shows
-        // what A purged.
-        if fp_at(&b, 0).1 != wa {
-            differ_at_zero += 1;
+        // At `now = FLOOR` the replicas still agree: the purge removes
+        // only `expire_at <= FLOOR`.
+        assert_eq!(
+            fp_at(&a, FLOOR),
+            fp_at(&b, FLOOR),
+            "seed {seed}: at the floor"
+        );
+        // Harness checks, below the floor (out of contract): A purged
+        // data that B keeps, and `expire_at == FLOOR` is purged too.
+        if fp_at(&a, 0).1 != fp_at(&b, 0).1 {
+            purged += 1;
+        }
+        if fp_at(&a, FLOOR - 1).1 != fp_at(&b, FLOOR - 1).1 {
+            floor_edge += 1;
         }
     }
-    assert!(
-        differ_at_zero > 10,
-        "the purge must remove data: {differ_at_zero}"
-    );
+    assert!(purged > 10, "the purge must remove data: {purged}");
+    assert!(floor_edge > 0, "the purge must remove `expire_at == FLOOR`");
 }
