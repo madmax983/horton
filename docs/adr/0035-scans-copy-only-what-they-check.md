@@ -127,7 +127,15 @@ does compaction, which reads past the cache.
 
 ## Consequences
 
-- **Cheaper seeks.** See `docs/THROUGHPUT.md`, step 24.
+- **Cheaper seeks** (`docs/THROUGHPUT.md`, step 24, both builds on the
+  same stores).
+  - A seek takes 58% to 70% fewer instructions: two 16 KiB copies and
+    a whole-block sum per data block were 63% to 72% of it.
+  - At 1 M keys seeks are 80% to 86% faster on the hot range and about
+    50% on the full range.
+  - Point reads are level. `readseq` is level, and `readreverse` within
+    3%, once the gate became an enum and a step over a held block a
+    synchronous call.
 - **Stats.** One lend is one lookup, as ADR-0031 has it.
   - A seek that yields one entry asks the cache once for the data block
     it lands in (`tests/data_flip_scan.rs` asserts it). It asks twice

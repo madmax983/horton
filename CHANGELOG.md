@@ -197,6 +197,10 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
     refill cannot vouch for a byte copied unchecked.
   - A forward seek positions by the block's restarts. Every block
     arrives in one copy.
+  - In the host store a seek takes 58% to 70% fewer instructions, and
+    at 1 M keys runs 80% to 86% faster on the hot range and about 50%
+    on the full range. Point reads and forward scans are level, reverse
+    scans within 3% (docs/THROUGHPUT.md, step 24).
   - `ScanBlock`, `Scan` and `RevScan` grow by 8 bytes. On the ESP32-S3
     profile scan futures grow by 176 to 312 bytes, and the peak is
     unchanged (`BUDGET.md`).
