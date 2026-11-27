@@ -1510,6 +1510,19 @@ cache; 20 K seeks, 100 K reads, scans read every key):
 (The `readseq` and `readreverse` rows come from this step's harness and
 are not comparable with step 25's.)
 
+Wall clock at 1 M keys, one reader, ops/s, medians of 6 interleaved
+pairs, each run from a fresh copy of the store; each run seeks twice,
+and both passes are shown. This session's machine was slower and
+noisier than step 25's: runs of one build spread ±10%.
+
+| | before | after | |
+|---|---:|---:|---:|
+| `seekrandom` hot, a page of 1 | 67.1 K / 68.9 K | 76.4 K / 72.0 K | +14%, +4% |
+| `seekrandom` full, a page of 1 | 42.3 K / 44.0 K | 44.6 K / 42.1 K | +5%, −4% |
+| `seekrandom` hot, a page of 10 | 52.7 K / 51.5 K | 52.2 K / 52.6 K | −1%, +2% |
+
+The short hot seek gains; the rest are level within the noise.
+
 At a page of one, a seek's inflate falls from 38,400 instructions to
 22,900, and the cache's checks from 46,400 to 44,000. The walk from the
 block's first entry gives back 3,000 of that: the binary search over
