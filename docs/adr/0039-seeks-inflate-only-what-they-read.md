@@ -148,30 +148,63 @@ image whose flag says compressed. The format is unchanged.
       and stops only before a token its prefix cuts off;
     - a decode resumed over another copy of the stream from its
       position makes the same block.
-  - `scan::tests::prefix`, over random blocks of 1,000, 4,096 and
-    16,384 bytes:
+  - `scan::tests::prefix`, over random blocks of 1,000, 4,096, 16,384,
+    65,536 and 65,539 bytes:
     - a partial seek, its value and 17 parks match the whole block,
       through `complete` and `extend`;
-    - every grain a buffer keeps is the block's;
+    - every grain a buffer keeps is the block's, and a partial buffer
+      keeps its decode;
+    - the first step past a clean seek needs no lend;
     - a flip in the stream on the 1st, 2nd or 9th lend is a miss.
+  - Also in `scan::tests::prefix`:
+    - a prefix gate lets a parse act only on final bytes, at every
+      length;
+    - a stream as long as the body is corrupt through both paths;
+    - a seek to a block's first key checks a short prefix of its
+      stream;
+    - a seek's parse reruns from where its walk stopped, a few times a
+      block;
+    - going on with a decode checks only the stream ahead of it;
+    - a raw buffer is never completed from a compressed image;
+    - a block over 64 KiB is marked whole only once inflated;
+    - a trailer is never parsed as an entry.
   - `tests/data_flip_scan.rs`, over compressed tables, in both
     directions, with and without a pool, short and long: flips stuck,
     on the first lend only, on every lend but the first, with checks
     deferred, and in kept states with a twin store. Also lookup counts
-    for short and long seeks.
+    for short and long seeks, and only forward seeks inflating part of
+    a block.
   - `tests/scan_retry.rs` over compressed tables: every read of a scan
     fails once in turn, and the retry yields the same.
-  - Mutants: skipping the stream checks, checking nothing on a resumed
-    lend, believing a prefix parse error, rounding the kept grains up,
-    letting the prefix gate pass bytes past its end, not keeping the
-    decode without the raw-completion guard, and a wrong resume point
-    all fail these tests. Dropping the resumed lend's flag check
-    survives: it backs up a tag that is never reused.
-- **Review.** An adversarial review found two defects; each has a
-  regression test that fails without its fix.
-  - A block over 64 KiB was marked whole with its end not inflated.
-  - A cursor parsed against the provisional end even once its block was
-    in, so a trailer that reads as an entry could be yielded.
+  - Mutants that fail these tests:
+    - skipping the stream checks, or checking nothing on a resumed lend;
+    - believing a prefix parse error;
+    - rounding the kept grains up, or not finishing the last one;
+    - letting the prefix gate pass bytes past its end, even one;
+    - not keeping the decode, with the raw-completion guard also off;
+    - a wrong resume point, or no resume point at all;
+    - steps of 64 or 3,000 bytes;
+    - no stream-length check, no raw-completion guard;
+    - a resumed lend that checks from the stream's start.
+
+    Two survive, both covered by another guard:
+    - dropping the resumed lend's flag check backs up a tag that is
+      never reused;
+    - dropping the full walk's own position updates only costs time,
+      since the stepping part records its floor.
+- **Review.** Two rounds of adversarial review, with two skeptics for
+  each finding. Each defect has a regression test that fails without its
+  fix.
+  - Round 1 found two defects:
+    - a block over 64 KiB was marked whole with its end not inflated;
+    - a cursor parsed against the provisional end even once its block
+      was in, so a trailer that reads as an entry could be yielded.
+  - Round 1 also showed the restart trailer that a partial seek no
+    longer validates (the consequence above), and found ten test gaps,
+    now pinned.
+  - Round 2 found no defect in trust or equivalence. It named
+    `inflate_rest` as a backstop no load reaches, and pinned the 16-bit
+    limit.
 
 ## References
 
