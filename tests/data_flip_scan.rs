@@ -717,3 +717,53 @@ fn rest_in_one_lend(config: Config) {
         }
     }
 }
+
+/// Reverse scans start from the restarts at a block's end, so they take
+/// a compressed block whole; forward seeks take only its start (ADR-0039).
+/// Pins the routing: a reverse scan given the partial path, or a forward
+/// one denied it, fails here.
+#[test]
+fn only_forward_seeks_inflate_part_of_a_block() {
+    let db = build(test_config().with_compression_from_level(0));
+    let manifest = *db.manifest();
+    let device = db.device().clone();
+    let page = Box::new(Page::new());
+    let src = Src {
+        page: &page,
+        manifest: &manifest,
+        device: &device,
+        node: db.node_id(),
+    };
+    for rev in [false, true] {
+        let cache = FlipCache::default();
+        let all = Run {
+            rev,
+            start: b"",
+            limit: None,
+            pool: false,
+        };
+        run(&src, Some(&cache), all).unwrap();
+        let before = cache.partial.get();
+        for i in [3usize, 700, 1500, 2600] {
+            for pool in [false, true] {
+                let k = key(i);
+                let r = Run {
+                    rev,
+                    start: &k,
+                    limit: Some(5),
+                    pool,
+                };
+                assert_eq!(
+                    run(&src, Some(&cache), r).unwrap(),
+                    run(&src, None, r).unwrap()
+                );
+            }
+        }
+        let partial = cache.partial.get() - before;
+        if rev {
+            assert_eq!(partial, 0, "a reverse scan inflated part of a block");
+        } else {
+            assert!(partial > 0, "no forward seek inflated part of a block");
+        }
+    }
+}

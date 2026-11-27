@@ -616,6 +616,7 @@ impl<const BLOCK: usize> Gate<'_, '_, BLOCK> {
     }
 
     /// Bytes `from..to` the scan's next step will likely read.
+    #[inline]
     fn ahead(&mut self, from: usize, to: usize) {
         match self {
             // A failed check is sticky: the lend becomes a miss.
@@ -4810,7 +4811,7 @@ mod tests {
                         Some(h) => (h.next, h.next),
                         None => continue,
                     };
-                    for _ in 0..17 {
+                    for step in 0..17 {
                         let want: Option<super::Head<64>> = park_in::<(), B, 64>(
                             &logical,
                             woff,
@@ -4824,7 +4825,17 @@ mod tests {
                         let mut park = |b: &[u8; B], g: &mut Gate<'_, '_, B>| {
                             park_in::<(), B, 64>(b, off, end, None, max_seq, 7, g)
                         };
-                        let got = if let Some(r) = blocks.held(7, &mut park) {
+                        let in_buffer = blocks.held(7, &mut park);
+                        // The seek took the entry after its head, in
+                        // whole grains: the first step needs no lend.
+                        assert!(
+                            in_buffer.is_some()
+                                || step > 0
+                                || max_seq != u64::MAX
+                                || flip_lends > 0,
+                            "seed {seed}: the step past the head lent the block again"
+                        );
+                        let got = if let Some(r) = in_buffer {
                             r.unwrap()
                         } else if seed.is_multiple_of(2) && blocks.current().resume.clen != 0 {
                             // Going on with the inflate only as far as the
@@ -4888,8 +4899,16 @@ mod tests {
                     super::super::grains_below::<B>(usize::from(block.resume.dp))
                 );
                 let dp = usize::from(block.resume.dp);
+                assert!(dp < body_end, "a decode kept at the block's end");
                 assert_eq!(block.data[..dp], logical[..dp], "the decode's window");
+            } else if block.id.is_some() {
+                assert_eq!(
+                    block.valid,
+                    super::full::<B>(),
+                    "a partial buffer keeps its decode"
+                );
             }
+            assert!(block.resume == super::super::Resume::NONE || block.resume.clen != 0);
         }
 
         #[test]
@@ -5073,6 +5092,232 @@ mod tests {
             let whole = keys_scanned::<B>(&b, None);
             assert!(whole.len() > 10 && whole.iter().all(|k| k[0] == b'a'));
             assert_eq!(keys_scanned::<B>(&b, Some(&image)), whole);
+        }
+
+        /// A clean lend of `image`, compressed from `logical`, through a
+        /// [`One`] whose checks are counted.
+        fn one<const B: usize>(image: &[u8; B]) -> One<B> {
+            One {
+                image: Box::new(*image),
+                bad: 0,
+                flips: Cell::new(0),
+                lends: Cell::new(0),
+                summed: Cell::new(0),
+            }
+        }
+
+        /// A parse lets through only bytes the decode has made final:
+        /// for every length `n`, a parse that checks `0..n` and reads byte
+        /// `n - 1` reads the logical block's. A gate that let one byte
+        /// too many through would hand it a byte not yet written (found
+        /// by mutation in review of ADR-0039: `to <= upto + 1` passed
+        /// every other test).
+        #[test]
+        fn a_prefix_gate_lets_through_only_final_bytes() {
+            const B: usize = 4096;
+            let logical = big_logical::<B>();
+            let image = compressed::<B>(&logical).expect("compresses");
+            for n in 1..B - CRC_LEN {
+                let cache = one(&image);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        if g.check(0, n) {
+                            Ok::<u8, crate::Error<()>>(b[n - 1])
+                        } else {
+                            Err(crate::Error::CorruptBlock { id: 7 })
+                        }
+                    });
+                let Lend::Done(r) = got else {
+                    panic!("a clean lend missed");
+                };
+                assert_eq!(r.unwrap(), logical[n - 1], "byte {}", n - 1);
+            }
+        }
+
+        /// A seek to a block's first key checks and inflates only the
+        /// start of its stream: on 4 KiB blocks well under 60% of it, in
+        /// the median. (Review of ADR-0039: a step of 3,000 bytes, most
+        /// of the saving gone, passed every other test.)
+        #[test]
+        fn a_seek_to_the_first_key_checks_a_short_prefix() {
+            const B: usize = 4096;
+            let g = super::grain::<B>();
+            let mut shares = std::vec::Vec::new();
+            for seed in 1..200 {
+                let mut rng = Rng(seed);
+                let every = 1 + rng.below(20);
+                let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+                let logical: [u8; B] = block::<B>(&es, every);
+                let Some(image) = compressed(&logical) else {
+                    continue;
+                };
+                let flag = u16::from_le_bytes([image[B - CRC_LEN - 2], image[B - CRC_LEN - 1]]);
+                let clen = usize::from(flag & 0x7FFF);
+                if clen < 8 * g {
+                    continue;
+                }
+                let cache = one(&image);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let first = es[0].0.clone();
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, gt| {
+                        seek_block::<(), B, 64>(b, &first, u64::MAX, 7, gt)
+                    });
+                assert!(matches!(got, Lend::Done(Ok(_))));
+                // Grains summed below the flag's, as a share of the stream's.
+                let flag_grains = 1;
+                shares.push((cache.summed.get() - flag_grains) * 100 / clen.div_ceil(g));
+            }
+            shares.sort_unstable();
+            assert!(shares.len() > 50, "{} blocks", shares.len());
+            let median = shares[shares.len() / 2];
+            assert!(
+                median < 60,
+                "a first-key seek checked {median}% of the stream"
+            );
+        }
+
+        /// A seek's parse is run again over a longer prefix from where
+        /// its walk stopped, not from the first entry, and a few times
+        /// a block at most. (Review of ADR-0039: dropping the walk's
+        /// bookkeeping, or a step of 0 or 64 bytes, passed every other
+        /// test: the answers were right, the walk quadratic.)
+        #[test]
+        fn a_seek_reruns_its_walk_from_where_it_stopped() {
+            const B: usize = 16_384;
+            let body_end = B - CRC_LEN;
+            for seed in 1..60 {
+                let mut rng = Rng(seed);
+                let every = 1 + rng.below(20);
+                let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+                let logical: [u8; B] = block::<B>(&es, every);
+                let Some(image) = compressed(&logical) else {
+                    continue;
+                };
+                let cache = one(&image);
+                let last = es[es.len() - 1].0.clone();
+                let mut froms = std::vec::Vec::new();
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        froms.push(g.linear_from());
+                        seek_block::<(), B, 64>(b, &last, u64::MAX, 7, g)
+                    });
+                assert!(matches!(got, Lend::Done(Ok(_))));
+                let walked: std::vec::Vec<usize> = froms.iter().flatten().copied().collect();
+                assert!(walked.windows(2).all(|w| w[0] <= w[1]), "{walked:?}");
+                assert!(
+                    froms.len() <= 2 + body_end / super::super::PREFIX_STEP,
+                    "{} runs",
+                    froms.len()
+                );
+                if walked.len() > 2 {
+                    assert!(
+                        walked[walked.len() - 1] > 0,
+                        "every run walked from the start"
+                    );
+                }
+            }
+        }
+
+        /// The lend that goes on with a kept decode checks the stream
+        /// from where the decode stood, not from its start (review of
+        /// ADR-0039: checking from 0 passed every other test).
+        #[test]
+        fn going_on_with_a_decode_checks_only_the_stream_ahead() {
+            const B: usize = 16_384;
+            let g = super::grain::<B>();
+            let mut seen = 0;
+            for seed in 1..80 {
+                let mut rng = Rng(seed);
+                let every = 1 + rng.below(20);
+                let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+                let logical: [u8; B] = block::<B>(&es, every);
+                let Some(image) = compressed(&logical) else {
+                    continue;
+                };
+                let flag = u16::from_le_bytes([image[B - CRC_LEN - 2], image[B - CRC_LEN - 1]]);
+                let clen = usize::from(flag & 0x7FFF);
+                let cache = one(&image);
+                let mid = es[es.len() / 2].0.clone();
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, gt| {
+                        seek_block::<(), B, 64>(b, &mid, u64::MAX, 7, gt)
+                    });
+                assert!(matches!(got, Lend::Done(Ok(_))));
+                let sp = usize::from(blocks.current().resume.sp);
+                if blocks.current().resume.clen == 0 || sp < 4 * g {
+                    continue;
+                }
+                let before = cache.summed.get();
+                assert_eq!(blocks.inflate_rest(&cache, 1, 7), Some(true));
+                let summed = cache.summed.get() - before;
+                // The stream from `sp`'s grain, and the flag's.
+                assert!(
+                    summed <= (clen - sp / g * g).div_ceil(g) + 2,
+                    "{summed} grains"
+                );
+                assert_eq!(blocks.current().data[..B - CRC_LEN], logical[..B - CRC_LEN]);
+                seen += 1;
+            }
+            assert!(seen > 10, "{seen} blocks");
+        }
+
+        /// A flag naming a stream as long as the body is corrupt through
+        /// a partial inflate as through a whole one (review of ADR-0039:
+        /// without the length check the partial path decoded it).
+        #[test]
+        fn a_stream_as_long_as_the_body_is_corrupt() {
+            const B: usize = 4096;
+            let body_end = B - CRC_LEN;
+            // A block of entries, so that a decode of its real stream
+            // answers a seek.
+            let mut rng = Rng(7);
+            let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, 4);
+            let logical: [u8; B] = block::<B>(&es, 4);
+            let mut image = *compressed::<B>(&logical).expect("compresses");
+            let flag = 0x8000u16 | u16::try_from(body_end).unwrap();
+            image[body_end - 2..body_end].copy_from_slice(&flag.to_le_bytes());
+            for take in [super::super::Take::Ranged, super::super::Take::Prefix] {
+                let cache = one(&image);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got = blocks.lend_into(&cache, 1, 7, take, &mut |b, g| {
+                    seek_block::<(), B, 64>(b, b"", u64::MAX, 7, g)
+                });
+                assert!(
+                    matches!(got, Lend::Done(Err(crate::Error::CorruptBlock { id: 7 }))),
+                    "{take:?}"
+                );
+            }
+        }
+
+        /// A buffer holding part of a raw block is never completed from a
+        /// compressed image under the same tag: the lend refuses it, and
+        /// the block is read from the device (a backstop; tags are not
+        /// reused).
+        #[test]
+        fn a_raw_buffer_is_not_completed_from_a_compressed_image() {
+            const B: usize = 4096;
+            let logical = big_logical::<B>();
+            let mut raw = *logical;
+            raw[B - CRC_LEN - 2..B - CRC_LEN].copy_from_slice(&1u16.to_le_bytes());
+            let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+            let got =
+                blocks.lend_into(&one(&raw), 1, 7, super::super::Take::Ranged, &mut |b, g| {
+                    if g.check(0, 100) {
+                        Ok::<u8, crate::Error<()>>(b[99])
+                    } else {
+                        Err(crate::Error::CorruptBlock { id: 7 })
+                    }
+                });
+            assert!(matches!(got, Lend::Done(Ok(_))));
+            assert_ne!(blocks.current().valid, super::full::<B>());
+            let image = compressed::<B>(&logical).expect("compresses");
+            assert_eq!(blocks.copy_rest(&one(&image), 1, 7), Some(false));
+            assert!(block_on(blocks.complete(&NoDevice, Some(&one(&image)), 1, 7)).is_err());
+            assert_eq!(blocks.current().id, None);
         }
 
         #[test]
