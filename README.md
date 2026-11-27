@@ -281,20 +281,23 @@ those names.
 capacity, chosen where you declare the batch.
 
 After the sizes come the type aliases: `Db`, `Scan`, `RevScan`,
-`Compaction`, `TableView`, `MemProbe` and `ReadScratch`, each optional,
+`Compaction`, `TableView`, `MemProbe`, `ReadScratch`, `ScanState` and
+`RevScanState`, each optional,
 each with optional `pub` and doc comments. An unknown alias kind does not
 compile. The full list of rules is on `Db` in the API docs.
 
 ### RAM
 
 The structs and the futures in flight are the whole bill. Print
-`size_of` of your `Db`, `Scan` and `Compaction` types;
+`size_of` of your `Db`, `Scan` and `Compaction` types (and of a
+`ScanState` you keep for detached scans: it is extra, beside a full-size
+`Scan`);
 `cargo run --example quickstart` does. You need a `Compaction` only while
 compacting.
 
 [`horton::profile`](src/profile.rs) is a measured ESP32-S3 shape: 4 KiB
 blocks, 32-byte keys, 64-byte values, a 16-entry memtable, 4 × 4 tables,
-a 2-block cache. It needs 114,208 bytes: 96,528 of structs, plus the
+a 2-block cache. It needs 114,168 bytes: 96,488 of structs, plus the
 largest future (`archive_commit`, 17,680 bytes). `tests/profile.rs`
 fails the test suite past 114,688 bytes (112 KiB). The breakdown, the futures
 and the history are in [`BUDGET.md`](BUDGET.md).
