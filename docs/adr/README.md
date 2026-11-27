@@ -49,6 +49,7 @@ history keeps it); its §9 milestone log now lives in
 | [0035](0035-scans-copy-only-what-they-check.md) | A scan keeps a map of the grains of each block buffer it has checked, copies from a cached data block only what it checks as it reads it (`CopyIn`), and takes the rest only when it reads further; a forward seek positions by the block's restarts; `CachePort::checks_ranges` |
 | [0036](0036-drainer-stalls-on-wal-full.md) | The `multiwriter` drainer stalls on `WalFull`, as on a full memtable; `Drainer::compact_step` and `Drainer::resume` let the host recover in place, because a rebuild after `into_db` stops `durable` |
 | [0037](0037-scans-over-a-kept-state.md) | A scan can be built in buffers its caller keeps (`ScanState`, `RevScanState`, `Scan::detached_in`): everything that decides whether a byte of them is read stays in the scan and starts fresh; the host store keeps one forward and one reverse state per reader thread, so a page zeroes nothing |
+| [0038](0038-drainer-writes-the-prefix-it-can.md) | The `multiwriter` drainer writes the longest pending prefix that the `Db` takes: a burst over `CAP` or `ARENA` splits, the tickets before a bad ticket complete, `Drainer::bad_ticket` names it, and `Writer::put` checks the `Db`'s limits before the claim |
 
 ## Adding a record
 

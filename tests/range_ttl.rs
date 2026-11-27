@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use common::{Lcg, MemDevice, TestDb, block_on, test_config};
 use horton::model::{VersionTtl, model_visible_value};
-use horton::{Compaction, Progress, RevScan, Scan};
+use horton::{Compaction, Error, Progress, RevScan, Scan};
 
 type TestScan<'d> = Scan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
 type TestRevScan<'d> = RevScan<'d, MemDevice<4096>, 4096, 256, 1024, 64, 4096, 7, 4, 1024, 8>;
@@ -520,4 +520,43 @@ fn range_delete_compaction_keeps_older_overlap_for_snapshot() {
         block_on(db.get_at(b"k", &mut buf, snap)).unwrap().is_none(),
         "snapshot must still see the older range tombstone"
     );
+}
+
+#[test]
+fn ttl_put_at_the_block_limit_lands() {
+    // The largest WAL record is a TTL put: 31 + KEY_MAX + VAL_MAX bytes.
+    // `Db::new` once took a block 8 bytes too small for it, and a
+    // maximal TTL put then failed with `BatchTooLarge`. Here the block
+    // is exactly large enough: 31 + 8 + 473 = 512.
+    type EdgeDb = horton::Db<MemDevice<512>, 512, 8, 473, 16, 8192, 2, 4, 64, 0>;
+    let mut db = EdgeDb::new(MemDevice::<512>::new(), test_config());
+    block_on(db.open()).unwrap();
+    for i in 0..20u8 {
+        match block_on(db.put_with_ttl(&[i; 8], &[i; 473], 1000)) {
+            Ok(_) => {}
+            Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
+                block_on(db.flush()).unwrap();
+                block_on(db.put_with_ttl(&[i; 8], &[i; 473], 1000)).unwrap();
+            }
+            Err(e) => panic!("a maximal TTL put must fit: {e:?}"),
+        }
+    }
+    block_on(db.flush()).unwrap();
+    db.request_compaction(0).unwrap();
+    let mut c = Compaction::<512, 8, 473, 64>::new();
+    while block_on(db.compact_step(&mut c)).unwrap() == Progress::More {}
+    let mut db = EdgeDb::new(db.into_device(), test_config());
+    block_on(db.open()).unwrap();
+    let mut buf = [0u8; 473];
+    for i in 0..20u8 {
+        assert_eq!(
+            block_on(db.get_with_time(&[i; 8], &mut buf, 999)).unwrap(),
+            Some(473)
+        );
+        assert_eq!(buf, [i; 473]);
+        assert_eq!(
+            block_on(db.get_with_time(&[i; 8], &mut buf, 1000)).unwrap(),
+            None
+        );
+    }
 }
