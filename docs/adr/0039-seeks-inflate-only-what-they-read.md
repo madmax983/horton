@@ -84,9 +84,9 @@ gone on twice is reading through it. A lend that misses has the block
 read from the device whole, as before.
 
 **Reverse scans are unchanged.** They start from the restarts at the
-block's end (`Take::Ranged`). A buffer whose partial inflate was not
-gone on with is completed whole by `complete`, from the stream ahead of
-the decode (`inflate_rest`). Completing a raw block's grains refuses an
+block's end (`Take::Ranged`). A load that finds a partial inflate and
+is not a forward scan's would complete it whole from the stream ahead
+of the decode (`inflate_rest`). No load does today; it is a backstop. Completing a raw block's grains refuses an
 image whose flag says compressed. The format is unchanged.
 
 ## Alternatives

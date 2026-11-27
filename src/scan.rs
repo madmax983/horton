@@ -1286,6 +1286,11 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
     /// stream bytes ahead of it, which this lend checks; the output it
     /// copies from is the buffer's own. The image's flag must name the
     /// same stream. Answers as [`copy_rest`](Self::copy_rest).
+    ///
+    /// A backstop: every load that can find a partial inflate in its
+    /// buffer is a forward scan's, which goes on with it through
+    /// [`extend`](Self::extend) instead. This one completes it for any
+    /// other load, from the cache rather than the device.
     fn inflate_rest(
         &mut self,
         cache: &dyn CachePort<BLOCK>,
@@ -4920,6 +4925,27 @@ mod tests {
                 partial += holds::<1000>(seed, 0);
             }
             assert!(partial > 1000, "{partial} partial seeks");
+        }
+
+        /// The largest blocks that keep a decode: their positions fill
+        /// [`Resume`]'s 16 bits and their grains the 64-bit map (review
+        /// of ADR-0039). One past them inflates whole.
+        #[test]
+        fn a_partial_inflate_holds_at_the_16_bit_limit() {
+            let mut partial = 0;
+            for seed in 1..40 {
+                partial += holds::<65_536>(seed, 0);
+                partial += holds::<65_539>(seed, 0);
+                assert_eq!(
+                    holds::<65_540>(seed, 0),
+                    0,
+                    "a block over the limit kept a decode"
+                );
+            }
+            for seed in 1..10 {
+                holds::<65_536>(seed, 2);
+            }
+            assert!(partial > 100, "{partial} partial seeks");
         }
 
         /// A compressible block of `B` bytes with no long match.
