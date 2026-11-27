@@ -42,9 +42,18 @@
 //!    `NeedsCompaction`, the host calls [`Drainer::compact_step`] until
 //!    `Progress::Done`, then flushes again. No ticket is lost, and
 //!    `durable` does not move.
-//! 2. on all other errors, poisons itself. `sweep` returns the error.
+//! 2. on `BatchTooLarge` with more than one op, tries again with half
+//!    of the tickets. The other tickets stay pending (ADR-0038).
+//! 3. on all other errors, poisons itself. `sweep` returns the error.
 //!    Later sweeps return `Idle` and do nothing. The pending tickets
 //!    stay in the drainer.
+//!
+//! A sweep stops at the first ticket that the `Db` cannot hold (a
+//! payload that does not decode, or a key or value too large). It
+//! writes the tickets before it. The next sweep poisons the drainer, and
+//! [`Drainer::bad_ticket`] names the ticket. A [`Writer`] from
+//! [`Drainer::writer`] refuses such a payload before it claims a ticket
+//! (issue #48).
 //!
 //! After poison, the host does one of two things:
 //!
@@ -66,6 +75,7 @@ use crate::batch::WriteBatch;
 use crate::compact::{Compaction, Progress};
 use crate::db::Db;
 use crate::ring::{DrainPoll, FenceOutcome, Ring, TICKET_MASK};
+use crate::writer::Writer;
 use crate::{BlockDevice, Error};
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -102,7 +112,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 ///   applies as a no-op, mirroring `Db::delete_range`: the ticket
 ///   resolves without queueing an op or consuming a sequence number.
 pub mod payload {
+    use crate::Error;
+    use crate::batch::check_op;
     use crate::wal::Op;
+    use core::convert::Infallible;
 
     /// Operation byte for a put payload.
     pub const PUT: u8 = Op::Put as u8;
@@ -309,6 +322,29 @@ pub mod payload {
         }
     }
 
+    /// Checks that a `Db` with these `KEY_MAX` and `VAL_MAX` can take
+    /// `p`. The drainer refuses a ticket when this refuses its payload,
+    /// with the same error. An inverted range delete is a no-op, so it
+    /// passes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadPayload`] when `p` does not decode, else
+    /// [`Error::EmptyKey`], [`Error::KeyTooLarge`] or
+    /// [`Error::ValueTooLarge`].
+    pub fn check<const KEY_MAX: usize, const VAL_MAX: usize>(
+        p: &[u8; 32],
+    ) -> Result<(), Error<Infallible>> {
+        let (kind, key, val) = match decode(p).map_err(|_| Error::BadPayload)? {
+            Decoded::Put { key, val } => (Op::Put, key, val),
+            Decoded::Delete { key } => (Op::Delete, key, &[][..]),
+            Decoded::RangeDelete { start, end } if start < end => (Op::RangeDelete, start, end),
+            Decoded::RangeDelete { .. } => return Ok(()),
+            Decoded::PutTtl { key, val, .. } => (Op::PutTtl, key, val),
+        };
+        check_op::<KEY_MAX, VAL_MAX>(kind, key, val).map(|_| ())
+    }
+
     /// A malformed 32-byte ring payload.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum DecodeError {
@@ -363,12 +399,12 @@ pub fn drain_watermark(durable: &AtomicU32) -> u32 {
 /// Outcome of one [`Drainer::sweep`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepOutcome {
-    /// Drained and Db-acknowledged `tickets` tickets (one batch, one
-    /// flush). The `durable` watermark advanced past each of them.
+    /// Wrote `tickets` pending tickets (one batch, one flush). The
+    /// `durable` watermark advanced past each of them. Other tickets
+    /// can stay pending: the next sweep writes them first.
     Swept {
-        /// Number of tickets drained and made durable in this sweep
-        /// (including fenced/skipped tickets, which resolve without a
-        /// WAL record).
+        /// Number of tickets made durable in this sweep (including
+        /// fenced/skipped tickets, which resolve without a WAL record).
         tickets: usize,
     },
     /// The ring held no published tickets. The drainer may have fenced a
@@ -431,6 +467,9 @@ pub struct Drainer<
     /// drainer stops until [`Drainer::resume`]. [`Drainer::sweep`]
     /// returns the error itself.
     poisoned: bool,
+    /// The ticket that poisoned the drainer, when the error came from
+    /// that ticket. It is the first pending ticket.
+    bad_ticket: Option<u32>,
     /// Highest Db sequence number covered by the acknowledged ticket
     /// prefix (SPEC §13). Tickets and Db seqnums are independent counters;
     /// the Db assigns seqnums and the drainer learns the mapping from
@@ -500,6 +539,7 @@ impl<
             stall_budget: 1024,
             stall_polls: 0,
             poisoned: false,
+            bad_ticket: None,
             durable_seq: seq,
         }
     }
@@ -531,6 +571,29 @@ impl<
     /// same operations in the same order, so the result is the same.
     pub const fn resume(&mut self) {
         self.poisoned = false;
+        self.bad_ticket = None;
+    }
+
+    /// Returns the ticket that poisoned the drainer, when the error came
+    /// from that ticket: a payload that does not decode, or an op that
+    /// this `Db` cannot hold. It is the first pending ticket. Returns
+    /// `None` when the drainer is not poisoned, after other errors, and
+    /// after [`resume`](Drainer::resume).
+    ///
+    /// The drainer wrote the tickets before this ticket. No later ticket
+    /// completes. Fail this ticket's writer and all later writers.
+    #[must_use]
+    pub const fn bad_ticket(&self) -> Option<u32> {
+        self.bad_ticket
+    }
+
+    /// Returns a [`Writer`] for this drainer's ring and `durable`. It
+    /// refuses a payload that this `Db` cannot hold before it claims a
+    /// ticket, so one bad writer cannot stop the others. It does not
+    /// borrow the drainer: give a copy to each writer thread.
+    #[must_use]
+    pub const fn writer(&self) -> Writer<'r, N, KEY_MAX, VAL_MAX> {
+        Writer::new(self.ring, self.durable)
     }
 
     /// Returns the number of drained tickets that are not yet in the
@@ -653,35 +716,90 @@ impl<
             .compare_exchange(t, next, Ordering::Release, Ordering::Relaxed);
     }
 
-    /// Advance `durable` over all pending tickets, in order, then clear
-    /// the pending buffer. Called only after the `Db::write` for the
-    /// batch succeeded (or when the batch held no WAL-bearing payloads).
-    fn ack_pending(&mut self) {
-        for i in 0..self.pending_len {
+    /// Advances `durable` over the first `take` pending tickets, in
+    /// order, and moves the rest to the front. Call it only after the
+    /// `Db::write` of those tickets succeeded, or when they hold no op.
+    fn ack_prefix(&mut self, take: usize) {
+        for i in 0..take {
             self.advance_durable(self.pending_tickets[i]);
         }
-        self.pending_len = 0;
+        let len = self.pending_len;
+        self.pending_tickets.copy_within(take..len, 0);
+        self.pending_payloads.copy_within(take..len, 0);
+        self.pending_has_data.copy_within(take..len, 0);
+        self.pending_len = len - take;
+    }
+
+    /// Poisons the drainer on an error that comes from the first pending
+    /// ticket.
+    const fn poison_bad_ticket(&mut self) {
+        self.poisoned = true;
+        self.bad_ticket = self.pending_tickets.first().copied();
+    }
+
+    /// Queues the ops of the first `take` pending tickets in `batch`. It
+    /// stops at the first ticket that it cannot queue. Returns the
+    /// tickets queued, the ops queued, and the error of the ticket after
+    /// them, if any.
+    fn fill(
+        &self,
+        take: usize,
+        batch: &mut WriteBatch<KEY_MAX, VAL_MAX, MAX_WRITES>,
+    ) -> (usize, usize, Option<Error<Infallible>>) {
+        let mut n_ops = 0usize;
+        for i in 0..take {
+            if !self.pending_has_data[i] {
+                continue;
+            }
+            // A malformed payload is never written as some other op.
+            let queued = match payload::decode(&self.pending_payloads[i]) {
+                Ok(payload::Decoded::Put { key, val }) => batch.put(key, val).map(|()| true),
+                Ok(payload::Decoded::Delete { key }) => batch.delete(key).map(|()| true),
+                // An inverted range is a no-op, as in `Db::delete_range`:
+                // the ticket resolves and takes no sequence number.
+                Ok(payload::Decoded::RangeDelete { start, end }) if start >= end => Ok(false),
+                Ok(payload::Decoded::RangeDelete { start, end }) => {
+                    batch.range_delete(start, end).map(|()| true)
+                }
+                Ok(payload::Decoded::PutTtl {
+                    key,
+                    val,
+                    expire_at,
+                }) => batch.put_ttl(key, val, expire_at).map(|()| true),
+                Err(_) => Err(Error::BadPayload),
+            };
+            match queued {
+                Ok(true) => n_ops += 1,
+                Ok(false) => {}
+                // A ticket that the `Db` cannot hold. `BatchFull` cannot
+                // occur: `take <= MAX_WRITES`.
+                Err(e) => return (i, n_ops, Some(e)),
+            }
+        }
+        (take, n_ops, None)
     }
 
     /// One drain-batch-flush-advance cycle.
     ///
     /// Drains up to `MAX_WRITES` published tickets in ticket order into
-    /// the pending buffer. If an earlier sweep left pending tickets
-    /// (after `Stalled` or `resume`), this sweep writes them and drains
-    /// no new tickets. Builds a [`WriteBatch`]
-    /// from the WAL-bearing payloads and applies it via `Db::write` (one
-    /// WAL flush, memtable updated atomically), then advances `durable`
-    /// over the entire contiguous resolved prefix — WAL-bearing,
-    /// fenced, and skipped tickets alike. When the ring holds nothing
+    /// the pending buffer. If an earlier sweep left pending tickets,
+    /// this sweep writes them and drains no new tickets. Builds a
+    /// [`WriteBatch`] from the longest pending prefix that the `Db`
+    /// takes. Applies it with one `Db::write` (one WAL flush; the
+    /// memtable changes atomically). Then advances `durable` over that
+    /// prefix: WAL-bearing, fenced, and skipped tickets alike. The other
+    /// tickets stay pending (ADR-0038). When the ring holds nothing
     /// published, the stall budget counts up and the drainer fences the
     /// cursor; a fence that wins returns [`SweepOutcome::Idle`] so the
     /// host re-polls.
     ///
     /// # Errors
     ///
-    /// Returns the `Db` write error, or the error of a ticket
-    /// ([`Error::BadPayload`], a key or value that is too large). The
-    /// drainer then poisons itself. `durable` covers only the tickets
+    /// Returns the `Db` write error, or the error of the first pending
+    /// ticket ([`Error::BadPayload`], a key or value that is too large).
+    /// The drainer then poisons
+    /// itself, and [`bad_ticket`](Drainer::bad_ticket) names the
+    /// ticket. `durable` covers only the tickets
     /// acknowledged before, and the pending tickets stay (see
     /// [`resume`](Drainer::resume)). `TableFull`, `ArenaFull` and
     /// `WalFull` are not errors here: `sweep` returns
@@ -741,95 +859,57 @@ impl<
             return Ok(SweepOutcome::Idle);
         }
 
-        // --- Batch phase: pending payloads → WriteBatch.
-        let mut batch = WriteBatch::<KEY_MAX, VAL_MAX, MAX_WRITES>::new();
-        let mut n_ops = 0usize;
-        for i in 0..self.pending_len {
-            if !self.pending_has_data[i] {
-                continue;
+        // --- Batch phase: the longest pending prefix that the `Db` takes.
+        let mut take = self.pending_len;
+        loop {
+            let mut batch = WriteBatch::<KEY_MAX, VAL_MAX, MAX_WRITES>::new();
+            let (queued, n_ops, bad) = self.fill(take, &mut batch);
+            if let (Some(e), 0) = (bad, queued) {
+                // The first pending ticket is bad. The pipeline stops
+                // here; the tickets before it are written.
+                self.poison_bad_ticket();
+                return Err(e.widen());
             }
-            // Queue the decoded mutation. The borrow of the pending
-            // payload ends with this match — `bool` and
-            // `Error<Infallible>` own their data — so poisoning `self`
-            // below is borrowck-clean.
-            let queued: Result<bool, Error<Infallible>> =
-                match payload::decode(&self.pending_payloads[i]) {
-                    Ok(payload::Decoded::Put { key, val }) => batch.put(key, val).map(|()| true),
-                    Ok(payload::Decoded::Delete { key }) => batch.delete(key).map(|()| true),
-                    Ok(payload::Decoded::RangeDelete { start, end }) => {
-                        if start < end {
-                            batch.range_delete(start, end).map(|()| true)
-                        } else {
-                            // Inverted range: applied no-op (mirrors
-                            // `Db::delete_range`). The ticket resolves;
-                            // no op is queued and no sequence number is
-                            // consumed.
-                            Ok(false)
-                        }
-                    }
-                    Ok(payload::Decoded::PutTtl {
-                        key,
-                        val,
-                        expire_at,
-                    }) => batch.put_ttl(key, val, expire_at).map(|()| true),
-                    Err(_) => {
-                        // Malformed payload: never silently reinterpret
-                        // as a valid mutation. Poison — the host must
-                        // intervene.
-                        self.poisoned = true;
-                        return Err(Error::BadPayload);
-                    }
-                };
-            match queued {
-                Ok(true) => n_ops += 1,
-                Ok(false) => {}
-                Err(e) => {
-                    // Oversized for the Db's KEY_MAX/VAL_MAX, or a logic
-                    // bug (batch overfull — unreachable: at most
-                    // MAX_WRITES ops in a MAX_WRITES-capacity batch).
-                    // Configuration error, not a device error: poison —
-                    // the host must intervene. `widen` keeps whatever
-                    // variant the batch reported.
-                    self.poisoned = true;
-                    return Err(e.widen());
+            take = queued;
+
+            if n_ops == 0 {
+                // No ticket in the prefix holds an op (fenced, skipped or
+                // inverted ranges). Advance over them.
+                self.ack_prefix(take);
+                return Ok(SweepOutcome::Swept { tickets: take });
+            }
+
+            // --- Flush phase: one Db::write, one flush (SPEC §11).
+            match self.db.write(&batch).await {
+                Ok(base) => {
+                    // `Db::write` assigned `base .. base + n_ops` and
+                    // proved with checked arithmetic that the last fits.
+                    let span = u64::try_from(n_ops).map_err(|_| Error::CounterExhausted)?;
+                    let last = base.checked_add(span - 1).ok_or(Error::CounterExhausted)?;
+                    self.durable_seq = last;
+                    self.ack_prefix(take);
+                    return Ok(SweepOutcome::Swept { tickets: take });
                 }
-            }
-        }
-
-        if n_ops == 0 {
-            // All pending tickets were fenced/skipped: no WAL records
-            // needed. Advance the watermark over the resolved prefix.
-            let tickets = self.pending_len;
-            self.ack_pending();
-            return Ok(SweepOutcome::Swept { tickets });
-        }
-
-        // --- Flush phase: one Db::write, one flush (SPEC §11).
-        match self.db.write(&batch).await {
-            Ok(base) => {
-                let tickets = self.pending_len;
-                // `Db::write` assigned `base .. base + n_ops`; the batch's
-                // highest seqnum is now durable. `n_ops > 0` here (the
-                // all-skipped case returned above), and `Db::write`
-                // already proved `base + (n_ops - 1)` fits with checked
-                // arithmetic — `CounterExhausted` is unreachable.
-                let span = u64::try_from(n_ops).map_err(|_| Error::CounterExhausted)?;
-                let last = base.checked_add(span - 1).ok_or(Error::CounterExhausted)?;
-                self.durable_seq = last;
-                self.ack_pending();
-                Ok(SweepOutcome::Swept { tickets })
-            }
-            Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
-                // A flush answers these. `Db::write` refused the batch
-                // before any I/O, so keep the pending tickets: `durable`
-                // does not move and nothing is lost (issue #47).
-                Ok(SweepOutcome::Stalled)
-            }
-            Err(e) => {
-                // Poisoned. The pending tickets stay for `resume`.
-                // `durable` covers exactly the previously acked prefix.
-                self.poisoned = true;
-                Err(e)
+                Err(Error::TableFull | Error::ArenaFull | Error::WalFull) => {
+                    // A flush answers these. `Db::write` refused the batch
+                    // before any I/O, so keep the pending tickets: `durable`
+                    // does not move and nothing is lost (issue #47).
+                    return Ok(SweepOutcome::Stalled);
+                }
+                Err(Error::BatchTooLarge { .. }) if n_ops > 1 => {
+                    // Even an empty memtable cannot hold this many ops, or
+                    // the WAL group is too long. `Db::write` refused it
+                    // before any I/O. Write half (issue #48). `n_ops > 1`,
+                    // so `take >= 2` and the half is not empty. One ring
+                    // op always fits an empty memtable (ADR-0038).
+                    take /= 2;
+                }
+                Err(e) => {
+                    // Poisoned. The pending tickets stay for `resume`.
+                    // `durable` covers exactly the previously acked prefix.
+                    self.poisoned = true;
+                    return Err(e);
+                }
             }
         }
     }

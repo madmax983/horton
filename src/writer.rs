@@ -1,14 +1,17 @@
 //! Writer-side multiwriter put (SPEC §8).
 //!
-//! [`put`] claims a ring ticket, publishes the 32-byte payload, and
-//! returns a [`Put`] future that resolves when the drainer advances the
-//! `durable` watermark past the ticket. Dropping the future abandons
-//! *observation*, not the write — the entry was accepted and will be
-//! drained and made durable.
+//! [`Writer::put`] and [`put`] claim a ring ticket, publish the 32-byte
+//! payload, and return a [`Put`] future that resolves when the drainer
+//! advances the `durable` watermark past the ticket. If you drop the
+//! future, the drainer still writes the entry. Only the wait stops.
+//!
+//! Use [`Writer`] (from [`Drainer::writer`](crate::drainer::Drainer::writer)). It knows the `Db`'s key and
+//! value limits and refuses a payload that the `Db` cannot hold before it
+//! claims a ticket. A refused payload stops no other writer (issue #48).
 
 #![forbid(unsafe_code)]
 
-use crate::drainer::is_ticket_durable;
+use crate::drainer::{is_ticket_durable, payload};
 use crate::error::Error;
 use crate::ring::{PublishOutcome, Ring};
 use core::convert::Infallible;
@@ -51,8 +54,44 @@ impl<const N: usize> Future for Put<'_, N> {
     }
 }
 
+/// A writer's handle to one drainer's ring and `durable` watermark.
+///
+/// Get it from [`Drainer::writer`](crate::drainer::Drainer::writer). It is `Copy`: give one to each writer.
+/// `KEY_MAX` and `VAL_MAX` are the drainer's `Db` limits.
+#[derive(Clone, Copy)]
+pub struct Writer<'r, const N: usize, const KEY_MAX: usize, const VAL_MAX: usize> {
+    ring: &'r Ring<N>,
+    durable: &'r AtomicU32,
+}
+
+impl<'r, const N: usize, const KEY_MAX: usize, const VAL_MAX: usize>
+    Writer<'r, N, KEY_MAX, VAL_MAX>
+{
+    pub(crate) const fn new(ring: &'r Ring<N>, durable: &'r AtomicU32) -> Self {
+        Self { ring, durable }
+    }
+
+    /// Checks `payload` against the `Db`'s limits
+    /// ([`payload::check`]), then does what [`put`] does.
+    ///
+    /// # Errors
+    ///
+    /// The error of [`payload::check`]; then no ticket is claimed.
+    /// [`Error::RingFull`] when the ring is full at claim time.
+    pub fn put(&self, payload: &[u8; 32]) -> Result<Put<'r, N>, Error<Infallible>> {
+        payload::check::<KEY_MAX, VAL_MAX>(payload)?;
+        claim_and_publish(self.ring, self.durable, payload)
+    }
+}
+
 /// Claim a ticket, publish `payload`, and return a [`Put`] future.
 ///
+/// This does not know the `Db`'s limits. A payload that decodes but
+/// that the `Db` cannot hold poisons the drainer, and every later writer
+/// waits. Use [`Writer::put`] instead.
+///
+/// - A payload that does not decode → [`Error::BadPayload`]
+///   immediately: no ticket consumed.
 /// - Ring full at claim time → [`Error::RingFull`] immediately: no ticket
 ///   consumed, no sequence number consumed, safe to retry (SPEC §8).
 /// - `publish` returns `Fenced` → the ticket died while claimed (the
@@ -62,13 +101,24 @@ impl<const N: usize> Future for Put<'_, N> {
 /// - Otherwise returns the pending put; poll it to await durability.
 ///
 /// `payload` is the 32-byte ring payload — build it with one of the
-/// [`payload`](crate::drainer::payload) constructors: `encode_put`,
+/// [`payload`] constructors: `encode_put`,
 /// `encode_delete`, `encode_range_delete`, or `encode_put_ttl`.
 ///
 /// # Errors
 ///
+/// [`Error::BadPayload`] when `payload` does not decode.
 /// [`Error::RingFull`] when the ring is full at claim time.
 pub fn put<'r, const N: usize>(
+    ring: &'r Ring<N>,
+    durable: &'r AtomicU32,
+    payload: &[u8; 32],
+) -> Result<Put<'r, N>, Error<Infallible>> {
+    payload::decode(payload).map_err(|_| Error::BadPayload)?;
+    claim_and_publish(ring, durable, payload)
+}
+
+/// Claims a ticket and publishes `payload`. Re-claims when fenced.
+fn claim_and_publish<'r, const N: usize>(
     ring: &'r Ring<N>,
     durable: &'r AtomicU32,
     payload: &[u8; 32],
