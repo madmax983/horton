@@ -119,7 +119,8 @@ use crate::gate::{Gate, Pin, Slot};
 use crate::handoff::{Handoff, Next};
 use crate::{
     BLOCK, KEY_MAX, KvCompaction, KvDb, KvManifest, KvMemPage, KvProbe, KvReadScratch, KvRevScan,
-    KvScan, KvTables, LEVELS, MEMTABLE_ARENA, MEMTABLE_ENTRIES, VAL_MAX, block_on,
+    KvRevScanState, KvScan, KvScanState, KvTables, LEVELS, MEMTABLE_ARENA, MEMTABLE_ENTRIES,
+    VAL_MAX, block_on,
 };
 
 /// horton's error, with this store's device error.
@@ -603,6 +604,13 @@ thread_local! {
     /// Every thread that scans keeps its own block buffers to lend its
     /// scans (see [`SCAN_BLOCKS`]), built the first time it scans.
     static SCAN_POOL: RefCell<Vec<ScanBlock<BLOCK>>> = const { RefCell::new(Vec::new()) };
+
+    /// Every thread that scans keeps one forward and one reverse scan's
+    /// buffers and cursors (some 44 KiB each), built the first time it
+    /// scans that way, so that a page does not build and zero them: a
+    /// fifth of a cached seek did that (ADR-0037).
+    static SCAN_STATE: RefCell<Option<Box<KvScanState>>> = const { RefCell::new(None) };
+    static REV_SCAN_STATE: RefCell<Option<Box<KvRevScanState>>> = const { RefCell::new(None) };
 }
 
 /// Where a scan goes on from, between pages.
@@ -1134,26 +1142,31 @@ impl Shared {
         seq: u64,
         out: &mut Entries,
     ) -> Result<bool, StoreError> {
-        let mut scan = Box::new(KvScan::detached(
-            memtable,
-            tables,
-            &self.read_device,
-            Some(&self.cache),
-            node,
-        ));
-        scan.use_block_pool(pool);
-        block_on(scan.seek(from, stop, seq))?;
-        let mut key = [0u8; KEY_MAX];
-        READER.with(|reader| {
-            let val = &mut reader.borrow_mut().val;
-            while out.len() < limit {
-                match block_on(scan.next(&mut key, &mut val[..]))? {
-                    Some((kl, _)) if out.is_empty() && Some(&key[..kl]) == skip => {}
-                    Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
-                    None => return Ok(false),
+        SCAN_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let state = state.get_or_insert_with(|| Box::new(KvScanState::new()));
+            let mut scan = KvScan::detached_in(
+                state,
+                memtable,
+                tables,
+                &self.read_device,
+                Some(&self.cache),
+                node,
+            );
+            scan.use_block_pool(pool);
+            block_on(scan.seek(from, stop, seq))?;
+            let mut key = [0u8; KEY_MAX];
+            READER.with(|reader| {
+                let val = &mut reader.borrow_mut().val;
+                while out.len() < limit {
+                    match block_on(scan.next(&mut key, &mut val[..]))? {
+                        Some((kl, _)) if out.is_empty() && Some(&key[..kl]) == skip => {}
+                        Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
+                        None => return Ok(false),
+                    }
                 }
-            }
-            Ok(true)
+                Ok(true)
+            })
         })
     }
 
@@ -1174,27 +1187,32 @@ impl Shared {
         seq: u64,
         out: &mut Entries,
     ) -> Result<bool, StoreError> {
-        let mut scan = Box::new(KvRevScan::detached(
-            memtable,
-            tables,
-            &self.read_device,
-            Some(&self.cache),
-            node,
-        ));
-        scan.use_block_pool(pool);
-        block_on(scan.seek_prev(from, lower, seq))?;
-        let mut key = [0u8; KEY_MAX];
-        READER.with(|reader| {
-            let val = &mut reader.borrow_mut().val;
-            while out.len() < limit {
-                match block_on(scan.prev(&mut key, &mut val[..]))? {
-                    Some((kl, _)) if out.is_empty() && Some(&key[..kl]) == skip => {}
-                    Some((kl, _)) if &key[..kl] < start => return Ok(false),
-                    Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
-                    None => return Ok(false),
+        REV_SCAN_STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let state = state.get_or_insert_with(|| Box::new(KvRevScanState::new()));
+            let mut scan = KvRevScan::detached_in(
+                state,
+                memtable,
+                tables,
+                &self.read_device,
+                Some(&self.cache),
+                node,
+            );
+            scan.use_block_pool(pool);
+            block_on(scan.seek_prev(from, lower, seq))?;
+            let mut key = [0u8; KEY_MAX];
+            READER.with(|reader| {
+                let val = &mut reader.borrow_mut().val;
+                while out.len() < limit {
+                    match block_on(scan.prev(&mut key, &mut val[..]))? {
+                        Some((kl, _)) if out.is_empty() && Some(&key[..kl]) == skip => {}
+                        Some((kl, _)) if &key[..kl] < start => return Ok(false),
+                        Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
+                        None => return Ok(false),
+                    }
                 }
-            }
-            Ok(true)
+                Ok(true)
+            })
         })
     }
 
@@ -4425,6 +4443,143 @@ mod tests {
             );
         }
         assert_eq!(lock(&store.handle.shared.pages).len(), SCAN_PAGES);
+    }
+
+    /// A reader thread keeps one forward and one reverse scan state from
+    /// page to page (ADR-0037). Pages of every size, both ways, between
+    /// writes, flushes and compactions that replace the tables under
+    /// them, after a page whose seek failed part-way at a device read,
+    /// and after one refused at its bounds, each yield exactly what the
+    /// store holds; the states are built once.
+    #[test]
+    fn a_reader_thread_keeps_its_scan_state_from_page_to_page() {
+        let store = TempStore::new("kept-state");
+        let mut model = std::collections::BTreeMap::new();
+        let mut rng = 0x5EED_u64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            usize::try_from(rng % n as u64).expect("small")
+        };
+        let state_at = || {
+            let fwd = SCAN_STATE.with(|s| s.borrow().as_deref().map(core::ptr::from_ref));
+            let rev = REV_SCAN_STATE.with(|s| s.borrow().as_deref().map(core::ptr::from_ref));
+            (fwd, rev)
+        };
+        let mut kept = None;
+        let mut failed = 0;
+        for round in 0..12 {
+            for _ in 0..400 {
+                let k = key(next(2000));
+                if next(5) == 0 {
+                    store.delete(&k).expect("delete");
+                    model.remove(&k);
+                } else {
+                    let v = format!("r{round}-{}", next(1000)).into_bytes();
+                    store.put(&k, &v).expect("put");
+                    model.insert(k, v);
+                }
+            }
+            match round % 3 {
+                0 => store.flush().expect("flush"),
+                1 => store.compact().expect("compact"),
+                _ => {}
+            }
+            for _ in 0..30 {
+                let lo = key(next(2100));
+                let reverse = next(2) == 1;
+                let limit = [1usize, 2, 17, 1500][next(4)];
+                let got = store.scan(&lo, None, reverse, limit, None).expect("scan");
+                let want: Entries = if reverse {
+                    model
+                        .range(lo.clone()..)
+                        .rev()
+                        .take(limit)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                } else {
+                    model
+                        .range(lo.clone()..)
+                        .take(limit)
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                };
+                assert_eq!(got, want, "round {round} from {lo:?} reverse {reverse}");
+            }
+            // A page whose seek fails part-way, at its first, second or
+            // third read of a block from the device (the cache emptied,
+            // so that it reads them there), leaves the states fit for
+            // the next page.
+            for (n, reverse) in [(1, false), (2, true), (3, false), (2, false), (3, true)] {
+                let lo = key(next(2000));
+                store.handle.shared.cache.clear();
+                store.handle.shared.read_device.fail_read_in(n);
+                failed += usize::from(store.scan(&lo, None, reverse, 17, None).is_err());
+                store.handle.shared.read_device.fail_read_in(0);
+                let got = store.scan(&lo, None, reverse, 17, None).expect("scan");
+                let range: Vec<_> = if reverse {
+                    model.range(lo.clone()..).rev().take(17).collect()
+                } else {
+                    model.range(lo.clone()..).take(17).collect()
+                };
+                let want: Entries = range
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                assert_eq!(got, want, "after a failed read: round {round} from {lo:?}");
+            }
+            // So does a page refused at its bounds, before its seek
+            // touches anything.
+            let long = vec![b'k'; KEY_MAX + 1];
+            assert!(store.scan(&long, None, false, 3, None).is_err());
+            // A reverse page starts from its end bound.
+            assert!(store.scan(b"", Some(&long), true, 3, None).is_err());
+            let (fwd, rev) = state_at();
+            assert!(fwd.is_some() && rev.is_some(), "both directions scanned");
+            match kept {
+                None => kept = Some((fwd, rev)),
+                Some(k) => assert_eq!(k, (fwd, rev), "the states were built again"),
+            }
+        }
+        assert!(failed > 10, "only {failed} pages failed part-way");
+    }
+
+    /// A reader thread's kept scan state never answers from a block a
+    /// compaction freed: each round rewrites every key, and its tables
+    /// land in blocks earlier rounds' tables held, which this thread's
+    /// buffers last held, with other bytes. Every scan yields this round's
+    /// values (ADR-0037; found in review: the test above passes with every
+    /// block-forget guard removed, this one does not).
+    #[test]
+    fn a_kept_scan_state_reads_no_block_a_compaction_freed() {
+        let store = TempStore::new("kept-state-reuse");
+        let n = 600;
+        let value =
+            |round: usize, i: usize| format!("g{round}-{i}-{}", "x".repeat(40)).into_bytes();
+        for round in 0..60usize {
+            for i in 0..n {
+                store.put(&key(i), &value(round, i)).expect("put");
+            }
+            store.flush().expect("flush");
+            store.compact().expect("compact");
+            for start in [0usize, 97, 250, 401, 599] {
+                for reverse in [false, true] {
+                    let got = store
+                        .scan(&key(start), None, reverse, 3, None)
+                        .expect("scan");
+                    assert!(!got.is_empty());
+                    for (k, v) in &got {
+                        let i = (0..n).find(|&i| key(i) == *k).expect("a key written");
+                        assert_eq!(
+                            *v,
+                            value(round, i),
+                            "round {round} start {start} reverse {reverse}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Scanners on three threads, forward and in reverse, against two

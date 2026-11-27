@@ -41,7 +41,10 @@ and checks only what it reads, as a data block's does
 point reads 14% to 41% faster, seeks 19% to 75%. And a seek came to
 check and copy only the bytes of a data block it reads
 ([step 24](#then-a-seek-that-copies-only-what-it-checks)): 58% to 70%
-fewer instructions, and 49% to 86% faster at 1 M keys.
+fewer instructions, and 49% to 86% faster at 1 M keys. Then the host store
+came to keep its scans' buffers per reader thread
+([step 25](#then-a-scan-the-host-store-keeps)): 17% to 38% fewer
+instructions a seek, and 8% to 12% faster at 1 M keys.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1416,6 +1419,58 @@ What a seek's instructions are now, at 1 M keys on the hot range
 
 On the full key range a device read's CRC adds 19%.
 
+### Then: a scan the host store keeps
+
+Step 25 (ADR-0037). After step 24 a fifth of a cached seek at 1 M keys,
+and over a third at 300 K, was `memset`. The host store built a fresh
+scan for every page, and building one zeroes its buffers: 44,000 bytes
+at this shape. The library now lets a caller keep a scan's buffers and
+cursors (`ScanState`, `RevScanState`) and build each scan in them
+(`Scan::detached_in`). The host store keeps one forward and one
+reverse state per reader thread. Both builds read the same stores
+(format unchanged), the ones step 24 measured.
+
+Instructions per op (callgrind, one reader, a second pass over a warm
+cache; 20 K seeks, 100 K reads, scans read every key):
+
+| store, workload | before | after | |
+|---|---:|---:|---:|
+| 300 K keys, `seekrandom` hot | 103,278 | 63,801 | −38.2% |
+| 300 K keys, `seekrandom` full | 153,339 | 113,877 | −25.7% |
+| 1 M keys, `seekrandom` hot | 182,429 | 143,040 | −21.6% |
+| 1 M keys, `seekrandom` full | 238,229 | 198,841 | −16.5% |
+| 1 M keys, `readseq` | 7,172 | 7,151 | −0.3% |
+| 1 M keys, `readreverse` | 10,992 | 10,984 | −0.1% |
+| 1 M keys, `readrandom` hot | 38,724 | 38,723 | 0.0% |
+
+Every seek saves the same 39,400 instructions: the `memset` (37,300)
+and the move of the scan into its `Box`. Cache lookups, misses and
+device reads per op are identical.
+
+Wall clock at 1 M keys, ops/s, medians of interleaved pairs, each run
+from a fresh copy of the store; each run reads twice, and both passes
+are shown:
+
+| | before | after | |
+|---|---:|---:|---:|
+| `seekrandom` hot, 1 reader (6 pairs) | 91.6 K / 87.6 K | 92.2 K / 94.7 K | +1%, +8% |
+| `seekrandom` full, 1 reader (6 pairs) | 52.2 K / 51.2 K | 55.3 K / 57.1 K | +6%, +12% |
+| `seekrandom` hot, 4 readers (3 pairs, 800 K seeks) | 309 K | 327 K | +6% |
+| `readseq`, `readreverse` (8 pairs) | | | level |
+
+The wall clock gains less than the instructions say. A `memset` is
+cheap work per instruction next to the inflate and the CRC that remain.
+The first pass of each run also includes first touches of the
+thread's new states.
+
+What a cached seek's instructions are now, at 1 M keys on the hot range
+(143 K):
+- the cache checking chunks, 32%;
+- inflating the compressed block a seek reads in a deep level, 27%;
+- copies, parsing and comparing the rest.
+
+On the full key range a device read's CRC adds about 23%.
+
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
@@ -1516,13 +1571,9 @@ Measured or scoped while doing this, and left:
   and not summing a block's padding, would cheapen the deeper levels'.
   Packing a block by its compressed size would make compression save
   blocks at all (a format change).
-- **A scan the host store keeps.** Since step 24 a fifth of a cached
-  seek's instructions are `memset`: the host store builds a fresh scan
-  for every page, about 37 KiB of buffers zeroed, and lends it its
-  pool. A scan kept per reader thread and re-seeked would skip that.
 - **Inflating a seek's block only to the head.** A seek into a
-  compressed block (levels 2 and down) inflates it whole: 21% of a
-  cached seek at 1 M keys. A point read inflates only to its key
+  compressed block (levels 2 and down) inflates it whole: 27% of a
+  cached seek at 1 M keys since step 25. A point read inflates only to its key
   (step 17), and a seek could too, resuming the decoder as the scan
   reads on. That would be the first place a stream is used before it
   is checked whole.
@@ -1594,6 +1645,9 @@ Measured or scoped while doing this, and left:
   search find and check only the entries it reads.
 - **An index search that reads only what it needs.** Done in step 23
   (ADR-0034).
+- **A scan the host store keeps.** Done in step 25 (ADR-0037), as a
+  state the scan is built in rather than a scan kept whole: a scan
+  borrows its page.
 - **A seek that checks only the data bytes it reads.** Done in step 24
   (ADR-0035), as a map of the grains a scan's buffer has checked; a
   scan that reads on completes its block in one more lend.

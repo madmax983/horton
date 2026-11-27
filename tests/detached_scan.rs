@@ -757,3 +757,406 @@ fn a_seek_reads_only_the_tables_around_its_key() {
         "two tables of four were opened"
     );
 }
+
+type State = horton::ScanState<4096, 256, 1024, 7, 4>;
+type RevState = horton::RevScanState<4096, 256, 1024, 7, 4>;
+type TestCache = std::cell::RefCell<horton::BlockCache<4096, 16>>;
+
+/// One page of a detached scan over a kept state, forward or reverse,
+/// read to its end.
+#[allow(clippy::too_many_arguments)] // a page's inputs, as the host store passes them
+fn kept_page<R: BlockDevice>(
+    (state, rev_state): (&mut State, &mut RevState),
+    pool: &mut [horton::ScanBlock<4096>],
+    page: &Page<64, 4096>,
+    manifest: &TestManifest,
+    (device, cache): (&R, Option<&dyn horton::CachePort<4096>>),
+    node: u32,
+    reverse: bool,
+    (from, stop): (&[u8], Option<&[u8]>),
+    (seq, now): (u64, u64),
+) -> Entries
+where
+    R::Error: core::fmt::Debug,
+{
+    let (mut k, mut v) = ([0u8; 256], [0u8; 1024]);
+    let mut out = Vec::new();
+    if reverse {
+        let mut scan =
+            RevScanOver::<R, 64, 4096>::detached_in(rev_state, page, manifest, device, cache, node);
+        scan.use_block_pool(pool);
+        // Nothing before a seek, whatever the state held.
+        assert_eq!(block_on(scan.prev(&mut k, &mut v)).unwrap(), None);
+        block_on(scan.seek_prev_with_time(from, stop, seq, now)).unwrap();
+        while let Some((kl, vl)) = block_on(scan.prev(&mut k, &mut v)).unwrap() {
+            out.push((k[..kl].to_vec(), v[..vl].to_vec()));
+        }
+    } else {
+        let mut scan =
+            ScanOver::<R, 64, 4096>::detached_in(state, page, manifest, device, cache, node);
+        scan.use_block_pool(pool);
+        assert_eq!(block_on(scan.next(&mut k, &mut v)).unwrap(), None);
+        block_on(scan.seek_with_time(from, stop, seq, now)).unwrap();
+        while let Some((kl, vl)) = block_on(scan.next(&mut k, &mut v)).unwrap() {
+            out.push((k[..kl].to_vec(), v[..vl].to_vec()));
+        }
+    }
+    out
+}
+
+/// A scan state kept across scans (`Scan::detached_in`,
+/// `RevScan::detached_in`) changes nothing a scan yields: one pair of
+/// states and one pool serve every page of every range, in both
+/// directions, with and without a cache, across two generations of the
+/// store whose tables reuse blocks with other contents.
+#[test]
+fn a_kept_scan_state_yields_what_a_fresh_scan_yields() {
+    let mut state = Box::new(State::new());
+    let mut rev_state = Box::new(RevState::new());
+    let mut pool: Vec<horton::ScanBlock<4096>> = (0..3).map(|_| horton::ScanBlock::new()).collect();
+    let mut page = Box::new(Page::<64, 4096>::new());
+    let (mut db, marks) = populated();
+    let mut checked = 0;
+    for generation in 0..2 {
+        let manifest = *db.manifest();
+        let cache = TestCache::default();
+        for cached in [false, true] {
+            let cache: Option<&dyn horton::CachePort<4096>> = cached.then_some(&cache);
+            let src = (db.device(), cache);
+            for (start, end) in ranges() {
+                let end = end.as_deref();
+                for seq in [u64::MAX, marks[3], 1] {
+                    for now in [0u64, 85] {
+                        for max_keys in [1usize, 10_000] {
+                            // Forward, paged, every page on the kept state.
+                            let want = attached(&db, &start, end, seq, now);
+                            let mut got = Vec::new();
+                            let mut from = start.clone();
+                            loop {
+                                let horizon = db
+                                    .copy_memtable_range(&from, end, max_keys, &mut page)
+                                    .unwrap();
+                                let stop = horizon.as_ref().map(horton::KeyBound::as_slice).or(end);
+                                got.extend(kept_page(
+                                    (&mut state, &mut rev_state),
+                                    &mut pool,
+                                    &page,
+                                    &manifest,
+                                    src,
+                                    db.node_id(),
+                                    false,
+                                    (&from, stop),
+                                    (seq, now),
+                                ));
+                                match horizon {
+                                    Some(h) => from = h.as_slice().to_vec(),
+                                    None => break,
+                                }
+                            }
+                            assert_eq!(
+                                got, want,
+                                "gen {generation} cached {cached} {start:?}..{end:?} seq {seq} now {now}"
+                            );
+                            checked += want.len();
+                            // Reverse, from `end` (or the last key) down to `start`.
+                            let top = end.map_or_else(Vec::new, <[u8]>::to_vec);
+                            let lower = (!start.is_empty()).then_some(start.as_slice());
+                            let want = attached_rev(&db, &top, lower, seq, now);
+                            let mut got = Vec::new();
+                            let mut from = top.clone();
+                            loop {
+                                let horizon = db
+                                    .copy_memtable_range_rev(&from, lower, max_keys, &mut page)
+                                    .unwrap();
+                                let stop =
+                                    horizon.as_ref().map(horton::KeyBound::as_slice).or(lower);
+                                got.extend(kept_page(
+                                    (&mut state, &mut rev_state),
+                                    &mut pool,
+                                    &page,
+                                    &manifest,
+                                    src,
+                                    db.node_id(),
+                                    true,
+                                    (&from, stop),
+                                    (seq, now),
+                                ));
+                                match horizon {
+                                    Some(h) => from = h.as_slice().to_vec(),
+                                    None => break,
+                                }
+                            }
+                            assert_eq!(
+                                got, want,
+                                "rev gen {generation} cached {cached} {top:?}..{lower:?} seq {seq} now {now}"
+                            );
+                            checked += want.len();
+                        }
+                    }
+                }
+            }
+        }
+        // Rewrite the store: new tables over freed blocks, so block ids
+        // the kept state saw now hold other data.
+        for i in 0..150 {
+            let val = format!("gen-{generation}-{i}");
+            if let Err(Error::TableFull | Error::ArenaFull | Error::WalFull) =
+                block_on(db.put(&key(i), val.as_bytes()))
+            {
+                block_on(db.flush()).unwrap();
+                drain(&mut db);
+                block_on(db.put(&key(i), val.as_bytes())).unwrap();
+            }
+        }
+        block_on(db.flush()).unwrap();
+        drain(&mut db);
+    }
+    assert!(checked > 2000, "too little was compared: {checked}");
+}
+
+/// A store built by a fixed sequence of writes, whose values carry
+/// `tag`: two tags give two stores with the same tables in the same
+/// blocks, holding other bytes.
+fn twin(tag: u8) -> TestDb<MemDevice<4096>> {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    block_on(db.open()).unwrap();
+    for round in 0..4usize {
+        for i in (round..300).step_by(2) {
+            let val = vec![tag; 20 + (i % 7)];
+            if let Err(Error::TableFull | Error::ArenaFull | Error::WalFull) =
+                block_on(db.put(&key(i), &val))
+            {
+                block_on(db.flush()).unwrap();
+                drain(&mut db);
+                block_on(db.put(&key(i), &val)).unwrap();
+            }
+        }
+        block_on(db.flush()).unwrap();
+        drain(&mut db);
+    }
+    block_on(db.put(&key(5), &[tag; 9])).unwrap();
+    db
+}
+
+/// A kept state and pool, lent in turn to scans of two stores that
+/// have the same blocks with other bytes in them, each scan stopped
+/// after a few entries: a scan never answers from what the one before
+/// it left, buffers, grains, cursors or memtable head. Each store has
+/// its own cache, so a scan's buffers can hold grains a lend checked.
+#[test]
+fn a_kept_scan_state_carries_nothing_from_one_scan_to_the_next() {
+    let twins: Vec<_> = b"xy".iter().copied().map(twin).collect();
+    assert_eq!(twins[0].manifest().level(1), twins[1].manifest().level(1));
+    let caches: Vec<TestCache> = (0..2).map(|_| TestCache::default()).collect();
+    let mut state = Box::new(State::new());
+    let mut rev_state = Box::new(RevState::new());
+    let mut pool: Vec<horton::ScanBlock<4096>> = (0..2).map(|_| horton::ScanBlock::new()).collect();
+    let mut page = Box::new(Page::<64, 4096>::new());
+    let (mut k, mut v) = ([0u8; 256], [0u8; 1024]);
+    let mut rng = Lcg::new(7);
+    for n in 0..400 {
+        let db = &twins[n % 2];
+        let cache: Option<&dyn horton::CachePort<4096>> = (n % 5 != 0).then_some(&caches[n % 2]);
+        let manifest = *db.manifest();
+        let from = key(rng.next_bounded(320));
+        let take = 1 + rng.next_bounded(5);
+        if n % 3 == 2 {
+            let want: Entries = attached_rev(db, &from, None, u64::MAX, 0)
+                .into_iter()
+                .take(take)
+                .collect();
+            db.copy_memtable_range_rev(&from, None, 10_000, &mut page)
+                .unwrap();
+            let mut scan = RevScanOver::<_, 64, 4096>::detached_in(
+                &mut rev_state,
+                &page,
+                &manifest,
+                db.device(),
+                cache,
+                db.node_id(),
+            );
+            if n % 4 != 0 {
+                scan.use_block_pool(&mut pool);
+            }
+            assert_eq!(
+                block_on(scan.prev(&mut k, &mut v)).unwrap(),
+                None,
+                "a head before the seek"
+            );
+            block_on(scan.seek_prev(&from, None, u64::MAX)).unwrap();
+            let mut got = Vec::new();
+            while got.len() < take {
+                let Some((kl, vl)) = block_on(scan.prev(&mut k, &mut v)).unwrap() else {
+                    break;
+                };
+                got.push((k[..kl].to_vec(), v[..vl].to_vec()));
+            }
+            assert_eq!(got, want, "rev scan {n}");
+        } else {
+            let want: Entries = attached(db, &from, None, u64::MAX, 0)
+                .into_iter()
+                .take(take)
+                .collect();
+            db.copy_memtable_range(&from, None, 10_000, &mut page)
+                .unwrap();
+            let mut scan = ScanOver::<_, 64, 4096>::detached_in(
+                &mut state,
+                &page,
+                &manifest,
+                db.device(),
+                cache,
+                db.node_id(),
+            );
+            if n % 4 != 0 {
+                scan.use_block_pool(&mut pool);
+            }
+            assert_eq!(
+                block_on(scan.next(&mut k, &mut v)).unwrap(),
+                None,
+                "a head before the seek"
+            );
+            block_on(scan.seek(&from, None, u64::MAX)).unwrap();
+            let mut got = Vec::new();
+            while got.len() < take {
+                let Some((kl, vl)) = block_on(scan.next(&mut k, &mut v)).unwrap() else {
+                    break;
+                };
+                got.push((k[..kl].to_vec(), v[..vl].to_vec()));
+            }
+            assert_eq!(got, want, "scan {n}");
+        }
+    }
+}
+
+/// A device that fails reads of the blocks in `bad`.
+struct FailOn<'a> {
+    inner: &'a MemDevice<4096>,
+    bad: std::collections::HashSet<u64>,
+}
+
+impl BlockDevice for FailOn<'_> {
+    type Error = &'static str;
+    const BLOCK: usize = 4096;
+    fn poll_read_block(
+        &self,
+        cx: &mut core::task::Context<'_>,
+        id: u64,
+        buf: &mut [u8],
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        if self.bad.contains(&id) {
+            return core::task::Poll::Ready(Err("bad block"));
+        }
+        self.inner
+            .poll_read_block(cx, id, buf)
+            .map(|r| r.map_err(|e| match e {}))
+    }
+    fn poll_write_block(
+        &mut self,
+        _cx: &mut core::task::Context<'_>,
+        _id: u64,
+        _buf: &[u8],
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        core::task::Poll::Ready(Err("read only"))
+    }
+    fn poll_flush(
+        &mut self,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Result<(), Self::Error>> {
+        core::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// What a step after a failed seek gave: the entry, or that it failed.
+fn step_after<E: core::fmt::Debug>(
+    r: Result<Option<(usize, usize)>, Error<E>>,
+    (k, v): (&[u8], &[u8]),
+) -> Result<Option<Entries>, String> {
+    r.map(|o| o.map(|(kl, vl)| vec![(k[..kl].to_vec(), v[..vl].to_vec())]))
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A seek that fails part-way over a kept state, then a step without a
+/// new seek, does what it does on a fresh scan: no cursor an earlier
+/// scan left in the state is counted, so the step cannot yield that
+/// scan's head. Found in review of ADR-0037: a forward seek counted a
+/// table's cursor slot before reading it into place.
+#[test]
+fn a_failed_seek_over_a_kept_state_yields_what_a_fresh_one_does() {
+    let db = twin(b'x');
+    let manifest = *db.manifest();
+    let mut page = Box::new(Page::<64, 4096>::new());
+    let from = key(151);
+    let (mut k, mut v) = ([0u8; 256], [0u8; 1024]);
+    let good = FailOn {
+        inner: db.device(),
+        bad: std::collections::HashSet::new(),
+    };
+    let failing = FailOn {
+        inner: db.device(),
+        bad: (0..7)
+            .flat_map(|li| manifest.level(li).unwrap_or(&[]))
+            .map(|t| t.index_block().unwrap())
+            .collect(),
+    };
+    let empty = Box::new(Page::<64, 4096>::new());
+    let mut state = Box::new(State::new());
+    let mut rev_state = Box::new(RevState::new());
+    // Forward.
+    db.copy_memtable_range(&from, None, 10_000, &mut page)
+        .unwrap();
+    {
+        let mut scan =
+            ScanOver::<_, 64, 4096>::detached_in(&mut state, &page, &manifest, &good, None, 1);
+        block_on(scan.seek(&from, None, u64::MAX)).unwrap();
+        assert!(block_on(scan.next(&mut k, &mut v)).unwrap().is_some());
+    }
+    let kept = {
+        let mut scan =
+            ScanOver::<_, 64, 4096>::detached_in(&mut state, &empty, &manifest, &failing, None, 1);
+        assert!(block_on(scan.seek(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.next(&mut k, &mut v)), (&k, &v))
+    };
+    let fresh = {
+        let mut scan = Box::new(ScanOver::<_, 64, 4096>::detached(
+            &empty, &manifest, &failing, None, 1,
+        ));
+        assert!(block_on(scan.seek(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.next(&mut k, &mut v)), (&k, &v))
+    };
+    assert_eq!(kept, fresh, "forward");
+    // Reverse.
+    db.copy_memtable_range_rev(&from, None, 10_000, &mut page)
+        .unwrap();
+    {
+        let mut scan = RevScanOver::<_, 64, 4096>::detached_in(
+            &mut rev_state,
+            &page,
+            &manifest,
+            &good,
+            None,
+            1,
+        );
+        block_on(scan.seek_prev(&from, None, u64::MAX)).unwrap();
+        assert!(block_on(scan.prev(&mut k, &mut v)).unwrap().is_some());
+    }
+    let kept = {
+        let mut scan = RevScanOver::<_, 64, 4096>::detached_in(
+            &mut rev_state,
+            &empty,
+            &manifest,
+            &failing,
+            None,
+            1,
+        );
+        assert!(block_on(scan.seek_prev(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.prev(&mut k, &mut v)), (&k, &v))
+    };
+    let fresh = {
+        let mut scan = Box::new(RevScanOver::<_, 64, 4096>::detached(
+            &empty, &manifest, &failing, None, 1,
+        ));
+        assert!(block_on(scan.seek_prev(&from, None, u64::MAX)).is_err());
+        step_after(block_on(scan.prev(&mut k, &mut v)), (&k, &v))
+    };
+    assert_eq!(kept, fresh, "reverse");
+}

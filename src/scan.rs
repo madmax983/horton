@@ -178,6 +178,211 @@ impl<
     }
 }
 
+/// Part of a scan's state: its own, or kept by the caller in a
+/// [`ScanState`] and lent for the scan's life ([`Scan::detached_in`]).
+enum Held<'d, T> {
+    Own(T),
+    Lent(&'d mut T),
+}
+
+impl<T> core::ops::Deref for Held<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            Self::Own(t) => t,
+            Self::Lent(t) => t,
+        }
+    }
+}
+
+impl<T> core::ops::DerefMut for Held<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        match self {
+            Self::Own(t) => t,
+            Self::Lent(t) => t,
+        }
+    }
+}
+
+/// A scan's read scratch and its own block buffer.
+struct BlockBufs<const BLOCK: usize> {
+    /// A block as stored, before it is inflated into a buffer; also the
+    /// scratch for range-tombstone probes. Dead between block reads.
+    raw: [u8; BLOCK],
+    /// The scan's own buffer.
+    own: ScanBlock<BLOCK>,
+}
+
+impl<const BLOCK: usize> BlockBufs<BLOCK> {
+    const fn new() -> Self {
+        Self {
+            raw: [0u8; BLOCK],
+            own: ScanBlock::new(),
+        }
+    }
+}
+
+/// A forward scan's key buffers and cursors. Nothing in them is read
+/// before a seek has written it, so a scan over a kept set starts as a
+/// new one does.
+struct ScanKeys<
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> {
+    end: [u8; KEY_MAX],
+    mem_key: [u8; KEY_MAX],
+    mem_val: [u8; VAL_MAX],
+    cursors: [[ScanCursor<KEY_MAX>; TABLES]; LEVELS],
+}
+
+impl<const KEY_MAX: usize, const VAL_MAX: usize, const LEVELS: usize, const TABLES: usize>
+    ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>
+{
+    const fn new() -> Self {
+        Self {
+            end: [0u8; KEY_MAX],
+            mem_key: [0u8; KEY_MAX],
+            mem_val: [0u8; VAL_MAX],
+            cursors: [[ScanCursor::empty(); TABLES]; LEVELS],
+        }
+    }
+}
+
+/// The buffers and cursors of a [`Scan`], kept by the caller between
+/// scans ([`Scan::detached_in`]).
+///
+/// A caller that scans often, over a source that changes each time,
+/// builds and zeroes them once instead of for every scan: a block
+/// buffer and a read scratch of `BLOCK` bytes each, two key buffers, a
+/// value buffer and the cursors (43,872 bytes at the host store's shape
+/// of 16 KiB blocks, 128-byte keys and 4 KiB values).
+///
+/// A scan reads nothing of a state before it has written it. What
+/// decides whether it reads a byte (key lengths, cursor counts, the
+/// memtable head, which block a buffer holds and which of its grains
+/// were checked) lives in the scan and starts fresh with it, so a scan
+/// over a kept state starts as a new scan does (ADR-0037). A state, like
+/// a lent block pool, may serve scans of any store. A block cache may
+/// not: it keys a block by its table and block id, which another store
+/// reuses.
+pub struct ScanState<
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> {
+    blocks: BlockBufs<BLOCK>,
+    keys: ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+}
+
+impl<
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> ScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>
+{
+    /// An empty set. `const`, so it can be built in place.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            blocks: BlockBufs::new(),
+            keys: ScanKeys::new(),
+        }
+    }
+}
+
+impl<
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> Default for ScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A reverse scan's key buffers and cursors: as [`ScanKeys`].
+struct RevScanKeys<
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> {
+    ceil: [u8; KEY_MAX],
+    lower: [u8; KEY_MAX],
+    mem_key: [u8; KEY_MAX],
+    mem_val: [u8; VAL_MAX],
+    cursors: [[RevCursor<KEY_MAX>; TABLES]; LEVELS],
+}
+
+impl<const KEY_MAX: usize, const VAL_MAX: usize, const LEVELS: usize, const TABLES: usize>
+    RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>
+{
+    const fn new() -> Self {
+        Self {
+            ceil: [0u8; KEY_MAX],
+            lower: [0u8; KEY_MAX],
+            mem_key: [0u8; KEY_MAX],
+            mem_val: [0u8; VAL_MAX],
+            cursors: [[RevCursor::empty(); TABLES]; LEVELS],
+        }
+    }
+}
+
+/// The buffers and cursors of a [`RevScan`], kept apart from it, as
+/// [`ScanState`] is for a forward scan ([`RevScan::detached_in`]).
+pub struct RevScanState<
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> {
+    blocks: BlockBufs<BLOCK>,
+    keys: RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+}
+
+impl<
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> RevScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>
+{
+    /// An empty set. `const`, so it can be built in place.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            blocks: BlockBufs::new(),
+            keys: RevScanKeys::new(),
+        }
+    }
+}
+
+impl<
+    const BLOCK: usize,
+    const KEY_MAX: usize,
+    const VAL_MAX: usize,
+    const LEVELS: usize,
+    const TABLES: usize,
+> Default for RevScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A block buffer lent to a scan: see [`Scan::use_block_pool`]. `BLOCK`
 /// bytes and a tag.
 pub struct ScanBlock<const BLOCK: usize> {
@@ -203,6 +408,14 @@ impl<const BLOCK: usize> ScanBlock<BLOCK> {
             valid: 0,
             data: [0u8; BLOCK],
         }
+    }
+}
+
+impl<const BLOCK: usize> ScanBlock<BLOCK> {
+    /// Drops its tag: it holds no block.
+    const fn forget(&mut self) {
+        self.id = None;
+        self.valid = 0;
     }
 }
 
@@ -367,11 +580,9 @@ impl<const BLOCK: usize> CopyIn<'_, '_, BLOCK> {
 /// parser reads a buffer through a [`Gate`], so it never acts on a byte
 /// that was not checked.
 struct Blocks<'d, const BLOCK: usize> {
-    /// A block as stored, before it is inflated into a buffer; also the
-    /// scratch for range-tombstone probes. Dead between block reads.
-    raw: [u8; BLOCK],
-    /// The scan's own buffer.
-    own: ScanBlock<BLOCK>,
+    /// The read scratch and the scan's own buffer: the scan's, or kept
+    /// by the caller in a [`ScanState`].
+    bufs: Held<'d, BlockBufs<BLOCK>>,
     /// Buffers the caller lent.
     pool: &'d mut [ScanBlock<BLOCK>],
     /// The buffer the parsers read: 0 is `own`, `i + 1` is `pool[i]`.
@@ -390,10 +601,15 @@ enum Lend<R> {
 }
 
 impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
-    const fn new() -> Self {
+    /// Blocks over `bufs`, which may hold a block of an earlier scan:
+    /// it is forgotten.
+    const fn over(mut bufs: Held<'d, BlockBufs<BLOCK>>) -> Self {
+        match &mut bufs {
+            Held::Own(b) => b.own.forget(),
+            Held::Lent(b) => b.own.forget(),
+        }
         Self {
-            raw: [0u8; BLOCK],
-            own: ScanBlock::new(),
+            bufs,
             pool: &mut [],
             cur: 0,
             tick: 0,
@@ -406,28 +622,29 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         self.cur
             .checked_sub(1)
             .and_then(|i| self.pool.get(i))
-            .unwrap_or(&self.own)
+            .unwrap_or(&self.bufs.own)
     }
 
     fn slot_mut(&mut self, at: usize) -> &mut ScanBlock<BLOCK> {
         match at.checked_sub(1).and_then(|i| self.pool.get_mut(i)) {
             Some(lent) => lent,
-            None => &mut self.own,
+            None => &mut self.bufs.own,
         }
     }
 
     /// The read scratch and the current buffer, borrowed apart.
     fn split(&mut self) -> (&mut [u8; BLOCK], &mut ScanBlock<BLOCK>) {
+        let bufs = &mut *self.bufs;
         let block = match self.cur.checked_sub(1).and_then(|i| self.pool.get_mut(i)) {
             Some(lent) => lent,
-            None => &mut self.own,
+            None => &mut bufs.own,
         };
-        (&mut self.raw, block)
+        (&mut bufs.raw, block)
     }
 
     /// Makes the buffer holding block `id` current, if one does.
     fn find(&mut self, id: u64) -> bool {
-        let held = if self.own.id == Some(id) {
+        let held = if self.bufs.own.id == Some(id) {
             Some(0)
         } else {
             self.pool
@@ -452,7 +669,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
     fn victim(&mut self) -> (&mut [u8; BLOCK], &mut ScanBlock<BLOCK>) {
         let age = |b: &ScanBlock<BLOCK>| b.id.map_or(0, |_| b.used + 1);
         let mut at = 0;
-        let mut oldest = age(&self.own);
+        let mut oldest = age(&self.bufs.own);
         for (i, lent) in self.pool.iter().enumerate() {
             if age(lent) < oldest {
                 oldest = age(lent);
@@ -481,7 +698,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         // At most one buffer holds a block: a buffer is filled only when
         // `find` found none for it, or refilled in place (`complete`).
         debug_assert!(
-            core::iter::once(&self.own)
+            core::iter::once(&self.bufs.own)
                 .chain(self.pool.iter())
                 .enumerate()
                 .all(|(at, b)| at == self.cur || b.id != Some(id)),
@@ -495,8 +712,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
 
     /// Forgets every decoded block (a re-seek starts from scratch).
     fn forget(&mut self) {
-        self.own.id = None;
-        self.own.valid = 0;
+        self.bufs.own.forget();
         for lent in self.pool.iter_mut() {
             lent.id = None;
             lent.valid = 0;
@@ -1046,9 +1262,6 @@ pub struct Scan<
     const CACHE: usize,
 > {
     src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
-    start: [u8; KEY_MAX],
-    start_len: usize,
-    end: [u8; KEY_MAX],
     end_len: usize,
     has_end: bool,
     max_seq: u64,
@@ -1062,23 +1275,23 @@ pub struct Scan<
     blocks: Blocks<'d, BLOCK>,
     /// Memtable head: slot index plus cached entry bytes.
     mem_idx: usize,
-    mem_key: [u8; KEY_MAX],
     mem_key_len: usize,
-    mem_val: [u8; VAL_MAX],
     mem_val_len: usize,
     mem_seq: u64,
     mem_tombstone: bool,
     mem_live: bool,
     /// Absolute expiry tick of the memtable head; 0 = no expiry.
     mem_expire_at: u64,
-    /// One pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
+    /// The end bound's bytes, the memtable head's key and value, and one
+    /// pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
     /// capacity, used level-major: level `li`'s cursors are the
     /// `cursor_counts[li]` slots from `level_base[li]` of the flattened
     /// pool. A level below 0 may hold more than `TABLES` tables (they
     /// share the pool; F20), so rows per level would overflow. (Declared
     /// nested because stable Rust forbids const-generic products like
-    /// `LEVELS * TABLES` in array lengths.)
-    cursors: [[ScanCursor<KEY_MAX>; TABLES]; LEVELS],
+    /// `LEVELS * TABLES` in array lengths.) The scan's own, or kept by
+    /// the caller ([`Scan::detached_in`]).
+    k: Held<'d, ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>>,
     cursor_counts: [usize; LEVELS],
     /// Where each level's cursors start in the flattened pool.
     level_base: [usize; LEVELS],
@@ -1109,29 +1322,68 @@ impl<
 
     /// An unpositioned scan over `src`.
     const fn over(src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>) -> Self {
+        Self::over_in(src, Held::Own(BlockBufs::new()), Held::Own(ScanKeys::new()))
+    }
+
+    /// An unpositioned scan over `src`, in `bufs` and `k`.
+    const fn over_in(
+        src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
+        bufs: Held<'d, BlockBufs<BLOCK>>,
+        k: Held<'d, ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>>,
+    ) -> Self {
         Self {
             src,
-            start: [0u8; KEY_MAX],
-            start_len: 0,
-            end: [0u8; KEY_MAX],
             end_len: 0,
             has_end: false,
             max_seq: u64::MAX,
             now: 0,
-            blocks: Blocks::new(),
+            blocks: Blocks::over(bufs),
             mem_idx: 0,
-            mem_key: [0u8; KEY_MAX],
             mem_key_len: 0,
-            mem_val: [0u8; VAL_MAX],
             mem_val_len: 0,
             mem_seq: 0,
             mem_tombstone: false,
             mem_live: false,
             mem_expire_at: 0,
-            cursors: [[ScanCursor::empty(); TABLES]; LEVELS],
+            k,
             cursor_counts: [0; LEVELS],
             level_base: [0; LEVELS],
         }
+    }
+
+    /// [`detached`](Self::detached), in buffers the caller keeps:
+    /// `state` serves this scan for its life, and the next one after
+    /// it. A scan in a kept `state` starts as a new scan does and
+    /// yields the same entries, whatever an earlier scan in it saw or
+    /// how it ended; what it saves is building and zeroing its buffers
+    /// for every scan (see [`ScanState`]).
+    ///
+    /// The scan itself is still as large as one that owns its buffers
+    /// (`size_of::<Scan>()`): build it where it is used, not to move it.
+    /// Building one in a kept state writes a few words and zeroes
+    /// nothing. One state serves one scan at a time.
+    #[must_use]
+    pub const fn detached_in(
+        state: &'d mut ScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        memtable: &'d MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        manifest: &'d Manifest<LEVELS, TABLES, KEY_MAX>,
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        node_id: u32,
+    ) -> Self {
+        let ScanState { blocks, keys } = state;
+        Self::over_in(
+            Source {
+                memtable,
+                manifest,
+                device,
+                cache,
+                node_id,
+                open: true,
+            },
+            Held::Lent(blocks),
+            Held::Lent(keys),
+        )
     }
 
     /// Creates an unpositioned scan that does not borrow a `Db`: a
@@ -1250,7 +1502,7 @@ impl<
                 });
             }
             Some(e) => {
-                self.end[..e.len()].copy_from_slice(e);
+                self.k.end[..e.len()].copy_from_slice(e);
                 self.end_len = e.len();
                 self.has_end = true;
             }
@@ -1259,8 +1511,6 @@ impl<
                 self.end_len = 0;
             }
         }
-        self.start[..start.len()].copy_from_slice(start);
-        self.start_len = start.len();
         self.max_seq = max_seq;
         self.now = now;
         self.blocks.forget();
@@ -1284,7 +1534,7 @@ impl<
                 if tref.last_key.as_slice() < start {
                     continue;
                 }
-                if self.has_end && tref.first_key.as_slice() >= &self.end[..self.end_len] {
+                if self.has_end && tref.first_key.as_slice() >= &self.k.end[..self.end_len] {
                     continue;
                 }
                 // Entries below the table's live lower bound are dead (a
@@ -1315,9 +1565,11 @@ impl<
     /// own comparisons) never re-derive it through another `cursor_pos`
     /// lookup.
     fn min_src(&self, total: usize) -> Option<(usize, &[u8])> {
+        // Through the keys once, not once a source.
+        let keys = &*self.k;
         let mut best: Option<(usize, &[u8])> = None;
         for src in 0..=total {
-            let Some(k) = self.head_key(src) else {
+            let Some(k) = self.head_key(keys, src) else {
                 continue;
             };
             if best.is_none_or(|(_, m)| k < m) {
@@ -1325,6 +1577,17 @@ impl<
             }
         }
         best
+    }
+
+    /// The first table source still waiting at its lower bound with that
+    /// bound on `key`, if any (see [`ScanCursor::pending`]).
+    fn pending_on(&self, total: usize, key: &[u8]) -> Option<usize> {
+        let cursors = self.k.cursors.as_flattened();
+        (1..=total).find(|&src| {
+            let (li, ti) = self.cursor_pos(src);
+            let c = &cursors[self.level_base[li] + ti];
+            c.live && c.pending && &c.key[..c.key_len] == key
+        })
     }
 
     /// Yields the next entry: copies the key into `key_buf` and the value
@@ -1355,18 +1618,14 @@ impl<
                 return Ok(None);
             };
             // The end bound is exclusive: a head at/above it ends the scan.
-            if self.has_end && min_key >= &self.end[..self.end_len] {
+            if self.has_end && min_key >= &self.k.end[..self.end_len] {
                 return Ok(None);
             }
             // A cursor still waiting at its table's lower bound has
             // reached the front: position it for real, then look again.
             // Its first entry sorts at or after the bound, so nothing
             // already compared is disturbed.
-            if let Some(src) = (1..=total).find(|&src| {
-                let (li, ti) = self.cursor_pos(src);
-                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
-                c.live && c.pending && &c.key[..c.key_len] == min_key
-            }) {
+            if let Some(src) = self.pending_on(total, min_key) {
                 self.position_pending(src).await?;
                 continue;
             }
@@ -1384,14 +1643,15 @@ impl<
             let mut winner_key_len = min_key.len();
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
+            let keys = &*self.k;
             for src in 0..=total {
-                let Some((k, _seq, tomb, vlen, exp)) = self.head(src) else {
+                let Some((k, _seq, tomb, vlen, exp)) = self.head(keys, src) else {
                     continue;
                 };
                 if k != min_key {
                     continue;
                 }
-                let ver = self.head_version(src);
+                let ver = self.head_version(keys, src);
                 if version_gt(ver, winner_ver) {
                     winner_ver = ver;
                     winner_src = src;
@@ -1405,7 +1665,7 @@ impl<
                 (0u32, 0u64, 0usize, 0usize)
             } else {
                 let (wli, wti) = self.cursor_pos(winner_src);
-                let c = &self.cursors.as_flattened()[self.level_base[wli] + wti];
+                let c = &self.k.cursors.as_flattened()[self.level_base[wli] + wti];
                 (c.table_id, c.block_id, c.off, c.end)
             };
             // The winner key is materialized into a local buffer first, so a
@@ -1416,10 +1676,10 @@ impl<
             let mut wkey = [0u8; KEY_MAX];
             {
                 let wk: &[u8] = if winner_src == 0 {
-                    &self.mem_key[..winner_key_len]
+                    &self.k.mem_key[..winner_key_len]
                 } else {
                     let (wli, wti) = self.cursor_pos(winner_src);
-                    &self.cursors.as_flattened()[self.level_base[wli] + wti].key[..winner_key_len]
+                    &self.k.cursors.as_flattened()[self.level_base[wli] + wti].key[..winner_key_len]
                 };
                 wkey[..winner_key_len].copy_from_slice(wk);
             }
@@ -1430,7 +1690,7 @@ impl<
             // expired winner never falls through to an older version.
             let covered = self
                 .src
-                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.blocks.raw)
+                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.blocks.bufs.raw)
                 .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
@@ -1460,7 +1720,7 @@ impl<
             // Copy the winner's value while its cursor is still parked.
             // (A tombstone winner continued above, so this always copies.)
             if winner_src == 0 {
-                val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
+                val_buf[..winner_val_len].copy_from_slice(&self.k.mem_val[..winner_val_len]);
             } else {
                 let db = self.src;
                 let at = (winner_table, winner_bid, winner_off, winner_end);
@@ -1495,19 +1755,15 @@ impl<
         minkey: &[u8],
         total: usize,
     ) -> Result<(), Error<D::Error>> {
-        while self.mem_live && &self.mem_key[..self.mem_key_len] == minkey {
+        while self.mem_live && &self.k.mem_key[..self.mem_key_len] == minkey {
             self.mem_idx += 1;
             self.advance_mem();
         }
         for src in 1..=total {
             let (li, ti) = self.cursor_pos(src);
             loop {
-                if !self.cursors.as_flattened()[self.level_base[li] + ti].live {
-                    break;
-                }
-                let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
-                let tied = &c.key[..c.key_len] == minkey;
-                if !tied {
+                let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
+                if !c.live || &c.key[..c.key_len] != minkey {
                     break;
                 }
                 self.park_cursor(li, ti, None).await?;
@@ -1533,6 +1789,15 @@ impl<
             return Ok(());
         }
         let ti = self.cursor_counts[li];
+        // Emptied before it is counted: until `position_cursor` has read
+        // it into place, the slot holds no cursor, whatever an earlier
+        // seek, or an earlier scan in a kept state, left in it.
+        *self
+            .k
+            .cursors
+            .as_flattened_mut()
+            .get_mut(self.level_base[li] + ti)
+            .ok_or(Error::CorruptManifest)? = ScanCursor::empty();
         self.cursor_counts[li] += 1;
         self.position_cursor(tref, li, ti, start).await
     }
@@ -1550,6 +1815,7 @@ impl<
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
         let slot = self
+            .k
             .cursors
             .as_flattened_mut()
             .get_mut(self.level_base[li] + ti)
@@ -1571,7 +1837,7 @@ impl<
     /// table's first entry at or after the scan's start.
     async fn position_pending(&mut self, src: usize) -> Result<(), Error<D::Error>> {
         let (li, ti) = self.cursor_pos(src);
-        let table_id = self.cursors.as_flattened()[self.level_base[li] + ti].table_id;
+        let table_id = self.k.cursors.as_flattened()[self.level_base[li] + ti].table_id;
         // The scan's source does not change under it, so the table is
         // still in the manifest it was added from.
         let tref = *self
@@ -1614,7 +1880,7 @@ impl<
             db.cache,
             tref.id,
             index_id,
-            &mut self.blocks.raw,
+            &mut self.blocks.bufs.raw,
             |payload, check| sstable::index_lookup::<D::Error>(payload, start, index_id, check),
         )
         .await?;
@@ -1650,6 +1916,7 @@ impl<
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
         let slot = self
+            .k
             .cursors
             .as_flattened_mut()
             .get_mut(self.level_base[li] + ti)
@@ -1695,7 +1962,7 @@ impl<
     ) -> Result<(), Error<D::Error>> {
         let max_seq = self.max_seq;
         let (tid, mut bid, mut off, mut end, mut idx, first, nblocks) = {
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
             if !c.live {
                 return Ok(());
             }
@@ -1727,7 +1994,7 @@ impl<
                 }
             };
             if let Some(h) = parked {
-                let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
+                let c = &mut self.k.cursors.as_flattened_mut()[self.level_base[li] + ti];
                 c.block_id = bid;
                 c.block_idx = idx;
                 c.end = end;
@@ -1736,7 +2003,7 @@ impl<
             }
             // Block exhausted: move to the next data block, if any.
             if idx + 1 >= nblocks {
-                self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
+                self.k.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                 return Ok(());
             }
             let nid = first
@@ -1770,9 +2037,9 @@ impl<
                 && v.seq <= max_seq
                 && !v.range_del
             {
-                self.mem_key[..v.key.len()].copy_from_slice(v.key);
+                self.k.mem_key[..v.key.len()].copy_from_slice(v.key);
                 self.mem_key_len = v.key.len();
-                self.mem_val[..v.val.len()].copy_from_slice(v.val);
+                self.k.mem_val[..v.val.len()].copy_from_slice(v.val);
                 self.mem_val_len = v.val.len();
                 self.mem_seq = v.seq;
                 self.mem_tombstone = v.tombstone;
@@ -1810,16 +2077,20 @@ impl<
     /// Head key of a source: source 0 is the memtable, sources 1..=total
     /// are table cursors in level-major order. `None` when the source is
     /// exhausted.
-    fn head_key(&self, src: usize) -> Option<&[u8]> {
+    fn head_key<'a>(
+        &self,
+        keys: &'a ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<&'a [u8]> {
         if src == 0 {
             if self.mem_live {
-                Some(&self.mem_key[..self.mem_key_len])
+                Some(&keys.mem_key[..self.mem_key_len])
             } else {
                 None
             }
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             if c.live {
                 Some(&c.key[..c.key_len])
             } else {
@@ -1833,10 +2104,14 @@ impl<
     /// are table cursors in level-major order. One `cursor_pos` lookup
     /// instead of the two `head_key`/`head_meta` used to cost a caller
     /// needing both.
-    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize, u64)> {
+    fn head<'a>(
+        &self,
+        keys: &'a ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<(&'a [u8], u64, bool, usize, u64)> {
         if src == 0 {
             self.mem_live.then_some((
-                &self.mem_key[..self.mem_key_len],
+                &keys.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
@@ -1844,7 +2119,7 @@ impl<
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             c.live.then_some((
                 &c.key[..c.key_len],
                 c.seq,
@@ -1858,12 +2133,16 @@ impl<
     /// The head entry's version under the replica LWW merge rule: the
     /// memtable's versions are the node's own newest; table heads carry
     /// their table's origin.
-    fn head_version(&self, src: usize) -> Version {
+    fn head_version(
+        &self,
+        keys: &ScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Version {
         if src == 0 {
             Version::memtable(self.src.node_id, self.mem_seq)
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             Version::table(c.node_id, c.seal_wall, c.seq)
         }
     }
@@ -1995,13 +2274,12 @@ pub struct RevScan<
     const CACHE: usize,
 > {
     src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
-    /// Inclusive ceiling: entries qualify when `key <= ceil`. Set when
-    /// `seek_prev`'s `from` is non-empty; an empty `from` means no
-    /// ceiling — the scan starts at the last key.
-    ceil: [u8; KEY_MAX],
+    /// Inclusive ceiling, `k.ceil[..ceil_len]`: entries qualify when
+    /// `key <= ceil`. Set when `seek_prev`'s `from` is non-empty; an
+    /// empty `from` means no ceiling — the scan starts at the last key.
     ceil_len: usize,
-    /// Exclusive lower bound: a head at/below it ends the scan.
-    lower: [u8; KEY_MAX],
+    /// Exclusive lower bound, `k.lower[..lower_len]`: a head at/below it
+    /// ends the scan.
     lower_len: usize,
     has_lower: bool,
     max_seq: u64,
@@ -2016,23 +2294,19 @@ pub struct RevScan<
     /// Memtable head: slot index plus cached entry bytes. The walk moves
     /// downward from the last slot at/below the ceiling.
     mem_idx: usize,
-    mem_key: [u8; KEY_MAX],
     mem_key_len: usize,
-    mem_val: [u8; VAL_MAX],
     mem_val_len: usize,
     mem_seq: u64,
     mem_tombstone: bool,
     mem_live: bool,
     /// Absolute expiry tick of the memtable head; 0 = no expiry.
     mem_expire_at: u64,
-    /// One pool of `LEVELS × TABLES` cursors, the manifest's whole-tree
-    /// capacity, used level-major: level `li`'s cursors are the
-    /// `cursor_counts[li]` slots from `level_base[li]` of the flattened
-    /// pool. A level below 0 may hold more than `TABLES` tables (they
-    /// share the pool; F20), so rows per level would overflow. (Declared
-    /// nested because stable Rust forbids const-generic products like
-    /// `LEVELS * TABLES` in array lengths.)
-    cursors: [[RevCursor<KEY_MAX>; TABLES]; LEVELS],
+    /// The key buffers (`ceil`, `lower`, the memtable head's key and
+    /// value) and one pool of `LEVELS × TABLES` cursors, used
+    /// level-major: level `li`'s cursors are the `cursor_counts[li]`
+    /// slots from `level_base[li]` of the flattened pool. Its own, or
+    /// kept by the caller ([`RevScan::detached_in`]).
+    k: Held<'d, RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>>,
     cursor_counts: [usize; LEVELS],
     /// Where each level's cursors start in the flattened pool.
     level_base: [usize; LEVELS],
@@ -2084,29 +2358,64 @@ impl<
 
     /// An unpositioned scan over `src`.
     const fn over(src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>) -> Self {
+        Self::over_in(
+            src,
+            Held::Own(BlockBufs::new()),
+            Held::Own(RevScanKeys::new()),
+        )
+    }
+
+    /// An unpositioned scan over `src`, in `bufs` and `k`.
+    const fn over_in(
+        src: Source<'d, D, BLOCK, KEY_MAX, VAL_MAX, CAP, ARENA, LEVELS, TABLES>,
+        bufs: Held<'d, BlockBufs<BLOCK>>,
+        k: Held<'d, RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>>,
+    ) -> Self {
         Self {
             src,
-            ceil: [0u8; KEY_MAX],
             ceil_len: 0,
-            lower: [0u8; KEY_MAX],
             lower_len: 0,
             has_lower: false,
             max_seq: u64::MAX,
             now: 0,
-            blocks: Blocks::new(),
+            blocks: Blocks::over(bufs),
             mem_idx: 0,
-            mem_key: [0u8; KEY_MAX],
             mem_key_len: 0,
-            mem_val: [0u8; VAL_MAX],
             mem_val_len: 0,
             mem_seq: 0,
             mem_tombstone: false,
             mem_live: false,
             mem_expire_at: 0,
-            cursors: [[RevCursor::empty(); TABLES]; LEVELS],
+            k,
             cursor_counts: [0; LEVELS],
             level_base: [0; LEVELS],
         }
+    }
+
+    /// [`detached`](Self::detached), in buffers the caller keeps; see
+    /// [`Scan::detached_in`].
+    #[must_use]
+    pub const fn detached_in(
+        state: &'d mut RevScanState<BLOCK, KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        memtable: &'d MemTable<CAP, ARENA, KEY_MAX, VAL_MAX>,
+        manifest: &'d Manifest<LEVELS, TABLES, KEY_MAX>,
+        device: &'d D,
+        cache: Option<&'d dyn CachePort<BLOCK>>,
+        node_id: u32,
+    ) -> Self {
+        let RevScanState { blocks, keys } = state;
+        Self::over_in(
+            Source {
+                memtable,
+                manifest,
+                device,
+                cache,
+                node_id,
+                open: true,
+            },
+            Held::Lent(blocks),
+            Held::Lent(keys),
+        )
     }
 
     /// Lends the scan extra block buffers, for as long as it lives; see
@@ -2169,7 +2478,7 @@ impl<
                     max: KEY_MAX,
                 });
             }
-            self.lower[..l.len()].copy_from_slice(l);
+            self.k.lower[..l.len()].copy_from_slice(l);
             self.lower_len = l.len();
             self.has_lower = true;
         } else {
@@ -2181,11 +2490,13 @@ impl<
         if from.is_empty() {
             self.ceil_len = 0;
         } else {
-            self.ceil[..from.len()].copy_from_slice(from);
+            self.k.ceil[..from.len()].copy_from_slice(from);
             self.ceil_len = from.len();
         }
         self.max_seq = max_seq;
         self.now = now;
+        // A seek starts with no decoded block, as a forward one does.
+        self.blocks.forget();
         let db = self.src;
         // Memtable cursor: the last slot at/below `from` (or the last slot
         // when `from` is empty). When `from` is present that is the *end*
@@ -2220,10 +2531,10 @@ impl<
             let tables = db.manifest.level(li).unwrap_or(&[]);
             for tref in tables {
                 // Key-range prune: no I/O for tables outside the scan.
-                if !from.is_empty() && tref.first_key.as_slice() > &self.ceil[..self.ceil_len] {
+                if !from.is_empty() && tref.first_key.as_slice() > &self.k.ceil[..self.ceil_len] {
                     continue;
                 }
-                if self.has_lower && tref.last_key.as_slice() <= &self.lower[..self.lower_len] {
+                if self.has_lower && tref.last_key.as_slice() <= &self.k.lower[..self.lower_len] {
                     continue;
                 }
                 self.add_cursor_rev(tref, li, from).await?;
@@ -2261,7 +2572,7 @@ impl<
             };
             // The lower bound is exclusive: a head at/below it ends the
             // scan.
-            if self.has_lower && max_key <= &self.lower[..self.lower_len] {
+            if self.has_lower && max_key <= &self.k.lower[..self.lower_len] {
                 return Ok(None);
             }
             // Pass 2: among heads on the maximum key, the highest
@@ -2278,14 +2589,15 @@ impl<
             let mut winner_key_len = max_key.len();
             let mut winner_val_len = 0usize;
             let mut winner_expire_at = 0u64;
+            let keys = &*self.k;
             for src in 0..=total {
-                let Some((k, _seq, tomb, vlen, exp)) = self.head(src) else {
+                let Some((k, _seq, tomb, vlen, exp)) = self.head(keys, src) else {
                     continue;
                 };
                 if k != max_key {
                     continue;
                 }
-                let ver = self.head_version(src);
+                let ver = self.head_version(keys, src);
                 if version_gt(ver, winner_ver) {
                     winner_ver = ver;
                     winner_src = src;
@@ -2299,7 +2611,7 @@ impl<
                 (0u32, 0u64, 0usize, 0usize)
             } else {
                 let (wli, wti) = self.cursor_pos(winner_src);
-                let c = &self.cursors.as_flattened()[self.level_base[wli] + wti];
+                let c = &self.k.cursors.as_flattened()[self.level_base[wli] + wti];
                 (c.table_id, c.block_id, c.off, c.end)
             };
             // The winner key is materialized into a local buffer first, so a
@@ -2310,10 +2622,10 @@ impl<
             let mut wkey = [0u8; KEY_MAX];
             {
                 let wk: &[u8] = if winner_src == 0 {
-                    &self.mem_key[..winner_key_len]
+                    &self.k.mem_key[..winner_key_len]
                 } else {
                     let (wli, wti) = self.cursor_pos(winner_src);
-                    &self.cursors.as_flattened()[self.level_base[wli] + wti].key[..winner_key_len]
+                    &self.k.cursors.as_flattened()[self.level_base[wli] + wti].key[..winner_key_len]
                 };
                 wkey[..winner_key_len].copy_from_slice(wk);
             }
@@ -2324,7 +2636,7 @@ impl<
             // expired winner never falls through to an older version.
             let covered = self
                 .src
-                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.blocks.raw)
+                .rdel_hides(wkey, self.max_seq, winner_ver, &mut self.blocks.bufs.raw)
                 .await?;
             let expired =
                 !winner_tombstone && winner_expire_at != 0 && winner_expire_at <= self.now;
@@ -2354,7 +2666,7 @@ impl<
             // Copy the winner's value while its cursor is still parked.
             // (A tombstone winner continued above, so this always copies.)
             if winner_src == 0 {
-                val_buf[..winner_val_len].copy_from_slice(&self.mem_val[..winner_val_len]);
+                val_buf[..winner_val_len].copy_from_slice(&self.k.mem_val[..winner_val_len]);
             } else {
                 let db = self.src;
                 let at = (winner_table, winner_bid, winner_off, winner_end);
@@ -2388,9 +2700,11 @@ impl<
     /// own comparisons) never re-derive it through another `cursor_pos`
     /// lookup.
     fn max_src(&self, total: usize) -> Option<(usize, &[u8])> {
+        // Through the keys once, not once a source.
+        let keys = &*self.k;
         let mut best: Option<(usize, &[u8])> = None;
         for src in 0..=total {
-            let Some(k) = self.head_key(src) else {
+            let Some(k) = self.head_key(keys, src) else {
                 continue;
             };
             if best.is_none_or(|(_, m)| k > m) {
@@ -2410,7 +2724,7 @@ impl<
         maxkey: &[u8],
         total: usize,
     ) -> Result<(), Error<D::Error>> {
-        while self.mem_live && &self.mem_key[..self.mem_key_len] == maxkey {
+        while self.mem_live && &self.k.mem_key[..self.mem_key_len] == maxkey {
             if self.mem_idx == 0 {
                 self.mem_live = false;
                 break;
@@ -2427,7 +2741,7 @@ impl<
             let (li, ti) = self.cursor_pos(src);
             loop {
                 let tied = {
-                    let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+                    let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
                     c.live && &c.key[..c.key_len] == maxkey
                 };
                 if !tied {
@@ -2476,7 +2790,7 @@ impl<
                 db.cache,
                 tref.id,
                 index_id,
-                &mut self.blocks.raw,
+                &mut self.blocks.bufs.raw,
                 |payload, check| {
                     sstable::index_last_le_block::<D::Error>(payload, from, index_id, check)
                 },
@@ -2503,6 +2817,7 @@ impl<
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
         let slot = self
+            .k
             .cursors
             .as_flattened_mut()
             .get_mut(self.level_base[li] + ti)
@@ -2535,7 +2850,7 @@ impl<
             // is mutably borrowed for the park.
             let mut ck = [0u8; KEY_MAX];
             let clen = self.ceil_len;
-            ck[..clen].copy_from_slice(&self.ceil[..clen]);
+            ck[..clen].copy_from_slice(&self.k.ceil[..clen]);
             self.park_cursor_rev(li, ti, Some((&ck[..clen], true)))
                 .await?;
         }
@@ -2573,7 +2888,7 @@ impl<
         // a block it steps back into is taken whole (ADR-0035).
         let mut whole = false;
         let (tid, first, mut bid, mut idx) = {
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &self.k.cursors.as_flattened()[self.level_base[li] + ti];
             if !c.live {
                 return Ok(());
             }
@@ -2627,7 +2942,7 @@ impl<
                     } else {
                         (key, klen, seq, tomb, vlen, exp, off, bid, end, idx)
                     };
-                    let c = &mut self.cursors.as_flattened_mut()[self.level_base[li] + ti];
+                    let c = &mut self.k.cursors.as_flattened_mut()[self.level_base[li] + ti];
                     c.key = key;
                     c.key_len = klen;
                     c.seq = seq;
@@ -2642,7 +2957,7 @@ impl<
                     return Ok(());
                 }
                 RevFound::Dead => {
-                    self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
+                    self.k.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                     return Ok(());
                 }
                 RevFound::Nothing => {}
@@ -2650,7 +2965,7 @@ impl<
             // Block yielded nothing: step to the previous data block, if
             // any.
             if idx == 0 {
-                self.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
+                self.k.cursors.as_flattened_mut()[self.level_base[li] + ti].live = false;
                 return Ok(());
             }
             idx -= 1;
@@ -2770,9 +3085,9 @@ impl<
             }
             self.mem_idx = run_start;
             if let Some(v) = newest_visible.and_then(|b| mem.slot_view(b)) {
-                self.mem_key[..v.key.len()].copy_from_slice(v.key);
+                self.k.mem_key[..v.key.len()].copy_from_slice(v.key);
                 self.mem_key_len = v.key.len();
-                self.mem_val[..v.val.len()].copy_from_slice(v.val);
+                self.k.mem_val[..v.val.len()].copy_from_slice(v.val);
                 self.mem_val_len = v.val.len();
                 self.mem_seq = v.seq;
                 self.mem_tombstone = v.tombstone;
@@ -2814,16 +3129,20 @@ impl<
     /// Head key of a source: source 0 is the memtable, sources 1..=total
     /// are table cursors in level-major order. `None` when the source is
     /// exhausted.
-    fn head_key(&self, src: usize) -> Option<&[u8]> {
+    fn head_key<'a>(
+        &self,
+        keys: &'a RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<&'a [u8]> {
         if src == 0 {
             if self.mem_live {
-                Some(&self.mem_key[..self.mem_key_len])
+                Some(&keys.mem_key[..self.mem_key_len])
             } else {
                 None
             }
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             if c.live {
                 Some(&c.key[..c.key_len])
             } else {
@@ -2837,10 +3156,14 @@ impl<
     /// are table cursors in level-major order. One `cursor_pos` lookup
     /// instead of the two `head_key`/`head_meta` used to cost a caller
     /// needing both.
-    fn head(&self, src: usize) -> Option<(&[u8], u64, bool, usize, u64)> {
+    fn head<'a>(
+        &self,
+        keys: &'a RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Option<(&'a [u8], u64, bool, usize, u64)> {
         if src == 0 {
             self.mem_live.then_some((
-                &self.mem_key[..self.mem_key_len],
+                &keys.mem_key[..self.mem_key_len],
                 self.mem_seq,
                 self.mem_tombstone,
                 self.mem_val_len,
@@ -2848,7 +3171,7 @@ impl<
             ))
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             c.live.then_some((
                 &c.key[..c.key_len],
                 c.seq,
@@ -2862,12 +3185,16 @@ impl<
     /// The head entry's version under the replica LWW merge rule: the
     /// memtable's versions are the node's own newest; table heads carry
     /// their table's origin.
-    fn head_version(&self, src: usize) -> Version {
+    fn head_version(
+        &self,
+        keys: &RevScanKeys<KEY_MAX, VAL_MAX, LEVELS, TABLES>,
+        src: usize,
+    ) -> Version {
         if src == 0 {
             Version::memtable(self.src.node_id, self.mem_seq)
         } else {
             let (li, ti) = self.cursor_pos(src);
-            let c = &self.cursors.as_flattened()[self.level_base[li] + ti];
+            let c = &keys.cursors.as_flattened()[self.level_base[li] + ti];
             Version::table(c.node_id, c.seal_wall, c.seq)
         }
     }
@@ -3454,6 +3781,23 @@ mod tests {
         holds::<64>();
     }
 
+    /// Blocks over a kept set of buffers forget the block an earlier
+    /// scan left in them: a scan over a kept `ScanState` never answers
+    /// from it, whatever its tag and grains say (ADR-0037).
+    #[test]
+    fn blocks_over_kept_buffers_forget_what_they_held() {
+        use super::{BlockBufs, Blocks, Held};
+        const B: usize = 4096;
+        let mut bufs = BlockBufs::<B>::new();
+        bufs.own.id = Some(9);
+        bufs.own.valid = full::<B>();
+        let mut blocks = Blocks::<B>::over(Held::Lent(&mut bufs));
+        let mut any = |_: &[u8; B], _: &mut Gate<'_, '_, B>| -> R<()> { Ok(()) };
+        assert!(blocks.held(9, &mut any).is_none());
+        assert_eq!(blocks.current().id, None);
+        assert_eq!((bufs.own.id, bufs.own.valid), (None, 0));
+    }
+
     /// `held` answers from a buffer only what it can stand behind: a
     /// whole buffer's answer, error or not; a partial buffer's answer
     /// when its parse stayed inside the grains it holds and succeeded.
@@ -3464,11 +3808,11 @@ mod tests {
         use super::{Blocks, ScanBlock};
         const B: usize = 4096;
         let mut pool = [ScanBlock::<B>::new(), ScanBlock::<B>::new()];
-        let mut blocks = Blocks::<B>::new();
+        let mut blocks = Blocks::<B>::over(super::Held::Own(super::BlockBufs::new()));
         blocks.lend(&mut pool);
         // own: block 9, whole. pool[0]: block 7, grain 0 only.
-        blocks.own.id = Some(9);
-        blocks.own.valid = full::<B>();
+        blocks.bufs.own.id = Some(9);
+        blocks.bufs.own.valid = full::<B>();
         blocks.pool[0].id = Some(7);
         blocks.pool[0].valid = 1;
         let mut calls = 0;

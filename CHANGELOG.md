@@ -37,6 +37,12 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Added
 
+- **`ScanState`, `RevScanState`, `Scan::detached_in` and
+  `RevScan::detached_in`** (ADR-0037): a detached scan built in buffers
+  and cursors its caller keeps between scans, so that building one
+  zeroes nothing. A scan in a kept state yields what a new one yields.
+  `db_types!` takes `ScanState` and `RevScanState` alias kinds.
+  `Scan::new` and `Scan::detached` are unchanged.
 - **`CachePort::checks_ranges`** (ADR-0035): whether `with_checked`
   checks only the ranges it is asked about. A scan then takes from a
   lent block only what it reads, and otherwise takes each block whole
@@ -44,7 +50,7 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   slots) and the host store's cache answer `true`. It is advice: a wrong
   answer costs time, never a byte.
 - **`Drainer::writer`, `writer::Writer`, `payload::check` and
-  `Drainer::bad_ticket`** (`multiwriter`, ADR-0037, issue #48).
+  `Drainer::bad_ticket`** (`multiwriter`, ADR-0038, issue #48).
   `Writer::put` refuses a payload that the `Db` cannot hold
   (`payload::check`), before it claims a ticket. `bad_ticket` names
   the ticket that poisoned the drainer.
@@ -195,6 +201,17 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **The host store keeps a scan state per reader thread** (ADR-0037). A
+  page used to build a fresh scan, zeroing some 44 KiB; each thread now
+  keeps one forward and one reverse state and builds its pages' scans
+  in them. A seek takes 39,400 fewer instructions (−38% at 300 K keys,
+  −22% at 1 M), and one-thread seeks at 1 M keys are 8% to 12% faster
+  (docs/THROUGHPUT.md, step 25). Each scanning thread keeps about
+  86 KiB more.
+- **A reverse seek forgets its decoded blocks**, as a forward seek
+  does. Nothing it yields changes.
+- **`Scan` is a key buffer smaller**: the copy of the start key, which
+  nothing read, is gone (40 bytes on the ESP32-S3 profile).
 - **A scan copies from a cached data block only what it checks**
   (ADR-0035). It used to sum a block's RAM checksums whole, copy it
   twice, and walk it from its first entry to the seek key.
@@ -218,10 +235,10 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   largest WAL record is a TTL put, with an 8-byte expiry. A shape at the
   old limit no longer builds.
 - **`writer::put` refuses a payload that does not decode**
-  (`multiwriter`, ADR-0037). It returns `BadPayload` before it claims a
+  (`multiwriter`, ADR-0038). It returns `BadPayload` before it claims a
   ticket. Before, the drainer poisoned itself.
 - **`Swept { tickets }` can be less than the tickets drained**
-  (`multiwriter`, ADR-0037). The next sweep writes the rest first.
+  (`multiwriter`, ADR-0038). The next sweep writes the rest first.
 - **`SweepOutcome::Stalled` also means "WAL full"** (`multiwriter`,
   ADR-0036). The remedy is the same: `Drainer::flush`, then sweep
   again. A host that counts stalls as memtable flushes now also counts
@@ -427,6 +444,13 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Fixed
 
+- **A step after a failed seek yields no stale cursor.** A forward seek
+  counted a table's cursor slot before reading the cursor into place,
+  so a seek that failed there (a device error on the index block) left
+  an earlier seek's cursor counted, and a `next` without a new seek
+  could yield its head. The slot is now emptied first (found in the
+  review of ADR-0037, where a kept state made it reachable across
+  scans).
 - **A scan that retries after a failed device read gets the right
   value.** A forward cursor that crossed two blocks in one step (the
   first with nothing visible at the scan's snapshot) was moved to the
@@ -456,11 +480,11 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   `put_ttl` then failed with `BatchTooLarge` (found in the review of
   issue #48).
 - **A burst of valid writes no longer poisons the `multiwriter`
-  drainer** (ADR-0037, issue #48). With `MAX_WRITES` over `CAP`, or ops
+  drainer** (ADR-0038, issue #48). With `MAX_WRITES` over `CAP`, or ops
   over `ARENA` bytes, `Db::write` gave `BatchTooLarge`, and `resume`
   gave it again. The sweep now tries again with half of the tickets.
 - **A bad ticket no longer stops the good tickets before it**
-  (`multiwriter`, ADR-0037, issues #48 and #52). The sweep writes them,
+  (`multiwriter`, ADR-0038, issues #48 and #52). The sweep writes them,
   and poisons the drainer only when it gets to the bad ticket.
 - **The `multiwriter` drainer stalls on `WalFull`** (ADR-0036, issue
   #47). Each sweep of one write used one WAL block, and the drainer

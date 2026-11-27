@@ -43,7 +43,7 @@
 //!    `Progress::Done`, then flushes again. No ticket is lost, and
 //!    `durable` does not move.
 //! 2. on `BatchTooLarge` with more than one op, tries again with half
-//!    of the tickets. The other tickets stay pending (ADR-0037).
+//!    of the tickets. The other tickets stay pending (ADR-0038).
 //! 3. on all other errors, poisons itself. `sweep` returns the error.
 //!    Later sweeps return `Idle` and do nothing. The pending tickets
 //!    stay in the drainer.
@@ -788,7 +788,7 @@ impl<
     /// takes. Applies it with one `Db::write` (one WAL flush; the
     /// memtable changes atomically). Then advances `durable` over that
     /// prefix: WAL-bearing, fenced, and skipped tickets alike. The other
-    /// tickets stay pending (ADR-0037). When the ring holds nothing
+    /// tickets stay pending (ADR-0038). When the ring holds nothing
     /// published, the stall budget counts up and the drainer fences the
     /// cursor; a fence that wins returns [`SweepOutcome::Idle`] so the
     /// host re-polls.
@@ -901,7 +901,7 @@ impl<
                     // the WAL group is too long. `Db::write` refused it
                     // before any I/O. Write half (issue #48). `n_ops > 1`,
                     // so `take >= 2` and the half is not empty. One ring
-                    // op always fits an empty memtable (ADR-0037).
+                    // op always fits an empty memtable (ADR-0038).
                     take /= 2;
                 }
                 Err(e) => {

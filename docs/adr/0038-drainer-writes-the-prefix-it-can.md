@@ -1,4 +1,4 @@
-# ADR-0037: The drainer writes the longest prefix that the `Db` takes
+# ADR-0038: The drainer writes the longest prefix that the `Db` takes
 
 Status: Accepted (unreleased, 2026-11-26)
 

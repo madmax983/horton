@@ -199,7 +199,7 @@ unchanged.
 > stalling with retry, malformed-payload poisoning, the pending-flush
 > ordering regression, and the dropped-observer guarantee. Since
 > ADR-0036 it also covers WAL-full stalling, compaction through the
-> drainer, and `resume` after a device error. Since ADR-0037 it covers
+> drainer, and `resume` after a device error. Since ADR-0038 it covers
 > split bursts, bad tickets, `Writer` checks, and a model run
 > (`tests/drainer_model.rs`).
 >
@@ -226,7 +226,7 @@ unchanged.
   poison, and the next sweep writes them again. Do not rebuild the
   drainer on the same ring and `durable`: `into_db` drops the pending
   tickets, and `durable` stops at the first of them.
-- **A sweep writes the longest prefix that the `Db` takes** (ADR-0037,
+- **A sweep writes the longest prefix that the `Db` takes** (ADR-0038,
   issue #48). It stops at the first ticket that the `Db` cannot hold
   and writes the tickets before it. On `BatchTooLarge` with more than
   one op, it tries again with half of the tickets. The other tickets
@@ -288,7 +288,7 @@ unchanged.
   and `RingFull`'s is "let the drainer sweep, then retry". A payload the
   drainer cannot decode is `Error::BadPayload`. `writer::put` refuses
   it with no ticket; a published one poisons the drainer at its ticket.
-- **Limits before the claim** (ADR-0037). `Drainer::writer` gives a
+- **Limits before the claim** (ADR-0038). `Drainer::writer` gives a
   `Writer` with the `Db`'s `KEY_MAX` and `VAL_MAX`. `Writer::put`
   refuses a payload that `payload::check` refuses, before it claims a
   ticket. `writer::put` refuses only a payload that does not decode.
@@ -302,7 +302,7 @@ unchanged.
 > `Pending` post-acceptance only, per the rule above; dropping it
 > abandons observation, not the write. While the drainer is poisoned,
 > the watermark does not move. The host calls `Drainer::resume`, or
-> fails the abandoned puts. Since ADR-0037, `put` refuses a payload
+> fails the abandoned puts. Since ADR-0038, `put` refuses a payload
 > that does not decode, and `Writer::put` (from `Drainer::writer`) also
 > checks the `Db`'s `KEY_MAX` and `VAL_MAX`, both before the claim.
 
@@ -475,7 +475,7 @@ single-CAS).
     overlong lengths, or budget overflows yield `DecodeError` — never a
     panic, never a silent reinterpretation. A decode failure poisons the
     drainer (`Error::BadPayload`) when the sweep gets to that ticket;
-    the tickets before it are written (ADR-0037).
+    the tickets before it are written (ADR-0038).
 - Everything is `#[cfg(feature = "multiwriter")]`, const-generic,
   no_alloc, safe Rust. No new `Error` variants are added by the ring
   itself except surfacing `WriterFenced` at the `Db` integration layer

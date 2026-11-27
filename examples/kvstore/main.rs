@@ -97,6 +97,11 @@ horton::db_types! {
     pub type Db = KvDb;
     pub type Scan = KvScan;
     pub type RevScan = KvRevScan;
+    /// A forward scan's buffers and cursors, kept by a reader thread
+    /// from page to page.
+    pub type ScanState = KvScanState;
+    /// The same for a reverse scan.
+    pub type RevScanState = KvRevScanState;
     pub type Compaction = KvCompaction;
     /// The tables of the store, read without the `Db` (a detached read).
     pub type TableView = KvTables;

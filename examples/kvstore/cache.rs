@@ -634,6 +634,27 @@ impl CachePort<BLOCK> for SharedCache {
 
 #[cfg(test)]
 impl SharedCache {
+    /// Drops every entry, as [`CachePort::invalidate_table`] drops a
+    /// table's: the next read of any block goes to the device.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the epoch moves under the window's lock, with the entry"
+    )]
+    pub fn clear(&self) {
+        for (w, window) in self.windows.iter().enumerate() {
+            let mut window = lock(window);
+            for at in 0..WINDOW {
+                if window.tags.get(at).is_some_and(Option::is_some) {
+                    window.set(at, None);
+                    if let Some(epoch) = self.epochs.get(w * WINDOW + at) {
+                        epoch.fetch_add(1, Ordering::Release);
+                    }
+                    self.len.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// Caches `(table_id, block_id)` with an image that no longer
     /// matches its checksums at byte `at`, as a bit flipped in RAM would
     /// leave it.
