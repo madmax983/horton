@@ -17,6 +17,7 @@
 //! yields the same entry — never silent truncation, never a skipped entry.
 
 use crate::cache::CachePort;
+use crate::compress::Inflate;
 use crate::db::Db;
 use crate::device::BlockDevice;
 use crate::error::Error;
@@ -394,7 +395,49 @@ pub struct ScanBlock<const BLOCK: usize> {
     /// per [`grain`] (ADR-0035). [`full`] once the whole block is in.
     /// Meaningful only while `id` is `Some`.
     valid: u64,
+    /// For a compressed block inflated only part way, the decode to go
+    /// on with ([`Resume`], ADR-0039). Meaningful only while `id` is
+    /// `Some`, and cleared with `valid`.
+    resume: Resume,
     data: [u8; BLOCK],
+}
+
+/// A partial inflate a buffer holds (ADR-0039): where the decode stood
+/// once the prefix it made final was kept, and the length of the
+/// compressed stream, which names the stream. `clen` 0: none. The
+/// buffer's grains are then exactly those below `dp`
+/// ([`grains_below`]); the output below `dp` is the window the decode
+/// goes on from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Resume {
+    /// Stream bytes consumed: the next token starts here.
+    sp: u16,
+    /// Bytes of the logical block that are final.
+    dp: u16,
+    clen: u16,
+}
+
+impl Resume {
+    const NONE: Self = Self {
+        sp: 0,
+        dp: 0,
+        clen: 0,
+    };
+
+    /// The decode `inflate` of a stream of `clen` bytes; `None` when its
+    /// positions do not fit (a block over 64 KiB is inflated whole).
+    fn of(inflate: &Inflate, clen: usize) -> Option<Self> {
+        Some(Self {
+            sp: u16::try_from(inflate.consumed()).ok()?,
+            dp: u16::try_from(inflate.done()).ok()?,
+            clen: u16::try_from(clen).ok().filter(|&c| c != 0)?,
+        })
+    }
+
+    /// The decode to go on with.
+    fn inflate(self) -> Inflate {
+        Inflate::resumed(usize::from(self.sp), usize::from(self.dp))
+    }
 }
 
 impl<const BLOCK: usize> ScanBlock<BLOCK> {
@@ -406,6 +449,7 @@ impl<const BLOCK: usize> ScanBlock<BLOCK> {
             id: None,
             used: 0,
             valid: 0,
+            resume: Resume::NONE,
             data: [0u8; BLOCK],
         }
     }
@@ -416,6 +460,7 @@ impl<const BLOCK: usize> ScanBlock<BLOCK> {
     const fn forget(&mut self) {
         self.id = None;
         self.valid = 0;
+        self.resume = Resume::NONE;
     }
 }
 
@@ -474,29 +519,91 @@ enum Gate<'a, 'c, const BLOCK: usize> {
     Held(Gated<BLOCK>),
     /// A cache's lent image, taken into a buffer as it is checked.
     Lent(CopyIn<'a, 'c, BLOCK>),
+    /// A compressed block being inflated from its lent image, final as
+    /// far as [`Prefix::upto`]: a parse that reads further is run again
+    /// over more (ADR-0039).
+    Prefix(Prefix),
+}
+
+/// A gate over the part of a compressed block inflated so far, from
+/// stream bytes the lend checked ([`lend_prefix`], ADR-0039). A range
+/// holds when it lies below `upto`; one that does not is a miss, and the
+/// furthest byte a miss asked for is recorded, for the parse to be run
+/// again once the decode has gone past it.
+#[derive(Clone, Copy)]
+struct Prefix {
+    /// Bytes of the logical block that are final.
+    upto: usize,
+    /// Where a seek's walk had got to: every entry before it was passed
+    /// over, from final bytes, in an earlier run of the parse.
+    walked: usize,
+    /// The furthest byte a miss asked for.
+    want: usize,
+    missed: bool,
+}
+
+impl Prefix {
+    /// Whether bytes `from..to` are final; a miss is recorded.
+    const fn check(&mut self, from: usize, to: usize) -> bool {
+        if to <= from || to <= self.upto {
+            return true;
+        }
+        self.missed = true;
+        if to > self.want {
+            self.want = to;
+        }
+        false
+    }
 }
 
 impl<const BLOCK: usize> Gate<'_, '_, BLOCK> {
     /// Whether bytes `from..to` may be acted on.
-    #[inline]
+    #[allow(clippy::inline_always)] // a fourth variant stopped LLVM inlining it: measured
+    #[inline(always)]
     fn check(&mut self, from: usize, to: usize) -> bool {
         match self {
             Self::Open => to <= from || to <= BLOCK,
             Self::Held(g) => g.check(from, to),
             Self::Lent(c) => c.check(from, to),
+            Self::Prefix(p) => p.check(from, to),
+        }
+    }
+
+    /// For a block being inflated part way, where a seek walks from:
+    /// the block's restarts lie at its end, not yet inflated.
+    const fn linear_from(&self) -> Option<usize> {
+        match self {
+            Self::Prefix(p) => Some(p.walked),
+            _ => None,
+        }
+    }
+
+    /// A seek's walk has reached `off`, every entry before it passed
+    /// over.
+    const fn at(&mut self, off: usize) {
+        if let Self::Prefix(p) = self {
+            p.walked = off;
         }
     }
 
     /// Whether `ahead` does anything: only a lend takes bytes ahead.
     const fn takes_ahead(&self) -> bool {
-        matches!(self, Self::Lent(_))
+        matches!(self, Self::Lent(_) | Self::Prefix(_))
     }
 
     /// Bytes `from..to` the scan's next step will likely read.
     fn ahead(&mut self, from: usize, to: usize) {
-        if let Self::Lent(c) = self {
+        match self {
             // A failed check is sticky: the lend becomes a miss.
-            let _ = c.check(from, to);
+            Self::Lent(c) => {
+                let _ = c.check(from, to);
+            }
+            // A prefix short of it is inflated further, and the parse
+            // run again.
+            Self::Prefix(p) => {
+                let _ = p.check(from, to);
+            }
+            _ => {}
         }
     }
 
@@ -588,6 +695,30 @@ struct Blocks<'d, const BLOCK: usize> {
     /// The buffer the parsers read: 0 is `own`, `i + 1` is `pool[i]`.
     cur: usize,
     tick: u64,
+}
+
+/// How much of a block that no buffer holds a load takes (see
+/// [`Blocks::load_with`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Take {
+    /// What the parse reads, each range checked first, when the cache
+    /// checks ranges; a compressed block is inflated whole.
+    Ranged,
+    /// As [`Ranged`](Self::Ranged), but a compressed block is inflated
+    /// only as far as the parse reads, from as much of its stream as
+    /// that takes (ADR-0039). A forward scan's: a walk from the first
+    /// entry finds its head, where a reverse scan starts from the
+    /// restarts at the block's end.
+    Prefix,
+    /// The whole block, for a cursor about to read it through.
+    Whole,
+}
+
+impl Take {
+    /// [`Whole`](Self::Whole) when `whole`, else [`Ranged`](Self::Ranged).
+    const fn ranged_unless(whole: bool) -> Self {
+        if whole { Self::Whole } else { Self::Ranged }
+    }
 }
 
 /// What one lend of a block from the cache came to.
@@ -682,6 +813,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         // not leave the old tag on new bytes, nor its grains.
         block.id = None;
         block.valid = 0;
+        block.resume = Resume::NONE;
         // Debug builds fill it, so that a parser reading a byte no gate
         // let it read fails ordinary tests, not only the bit-flip ones.
         if cfg!(debug_assertions) {
@@ -708,14 +840,14 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         block.id = Some(id);
         block.used = tick;
         block.valid = valid;
+        block.resume = Resume::NONE;
     }
 
     /// Forgets every decoded block (a re-seek starts from scratch).
     fn forget(&mut self) {
         self.bufs.own.forget();
         for lent in self.pool.iter_mut() {
-            lent.id = None;
-            lent.valid = 0;
+            lent.forget();
         }
     }
 
@@ -752,7 +884,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         cache: Option<&dyn CachePort<BLOCK>>,
         table_id: u32,
         bid: u64,
-        whole: bool,
+        take: Take,
         f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<D::Error>>,
     ) -> Result<R, Error<D::Error>> {
         if let Some(answer) = self.held(bid, f) {
@@ -765,7 +897,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         }
         let mut missed = false;
         if let Some(c) = cache {
-            match self.lend_into(c, table_id, bid, whole, f) {
+            match self.lend_into(c, table_id, bid, take, f) {
                 Lend::Done(answer) => return answer,
                 Lend::Miss => missed = true,
                 Lend::Unlent => {}
@@ -827,9 +959,10 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         device: &D,
         cache: Option<&dyn CachePort<BLOCK>>,
         (table_id, bid, off, end): (u32, u64, usize, usize),
+        take: Take,
         out: &mut [u8],
     ) -> Result<usize, Error<D::Error>> {
-        self.load_with(device, cache, table_id, bid, false, &mut |b, g| {
+        self.load_with(device, cache, table_id, bid, take, &mut |b, g| {
             value_at(b, off, end, bid, g, out)
         })
         .await
@@ -850,14 +983,15 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         cache: &dyn CachePort<BLOCK>,
         table_id: u32,
         bid: u64,
-        whole: bool,
+        take: Take,
         f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
     ) -> Lend<Result<R, Error<E>>> {
-        let ranged = !whole && cache.checks_ranges();
+        let ranged = take != Take::Whole && cache.checks_ranges();
         let body_end = BLOCK - sstable::CRC_LEN;
         let (_, block) = self.victim();
         let data = &mut block.data;
         let mut valid = 0u64;
+        let mut resume = Resume::NONE;
         let mut answer = None;
         let lent = cache.with_checked(table_id, bid, &mut |image, check| {
             let (Ok(image), Some(at)) = (<&[u8; BLOCK]>::try_from(image), body_end.checked_sub(2))
@@ -868,6 +1002,15 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
                 return;
             }
             let flag = u16::from_le_bytes([image[at], image[at + 1]]);
+            if flag & 0x8000 != 0 && ranged && take == Take::Prefix {
+                let kept = lend_prefix(image, data, usize::from(flag & 0x7FFF), bid, check, f);
+                if let Some((parsed, grains, partial)) = kept {
+                    answer = Some(parsed);
+                    valid = grains;
+                    resume = partial;
+                }
+                return;
+            }
             if flag & 0x8000 != 0 {
                 let clen = usize::from(flag & 0x7FFF);
                 let inflated = clen < body_end
@@ -912,6 +1055,8 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             (Some(true), Some(answer)) => {
                 if valid != 0 {
                     self.loaded(bid, valid);
+                    let (_, block) = self.split();
+                    block.resume = resume;
                 }
                 Lend::Done(answer)
             }
@@ -919,11 +1064,14 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         }
     }
 
-    /// Takes the grains of block `bid` the current buffer (which holds
-    /// part of it) lacks: one lend that checks and copies each, kept only
-    /// if the lend held; otherwise the block is read from the device and
-    /// replaces the buffer whole. Nothing already in the buffer is
-    /// re-vouched by a check of the cache's image.
+    /// Takes the rest of block `bid`, of which the current buffer holds
+    /// part, in one lend: the grains it lacks, each checked and copied,
+    /// or, for a compressed block inflated part way, the rest of its
+    /// stream inflated ([`inflate_rest`](Self::inflate_rest)). What
+    /// that brings in is kept only if the lend held; otherwise the block
+    /// is read from the device and replaces the buffer whole. Nothing
+    /// already in the buffer is re-vouched by a check of the cache's
+    /// image.
     async fn complete<D: BlockDevice>(
         &mut self,
         device: &D,
@@ -931,41 +1079,120 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         table_id: u32,
         bid: u64,
     ) -> Result<(), Error<D::Error>> {
-        let missed = if let Some(c) = cache {
-            let (_, block) = self.split();
-            let mut valid = block.valid;
-            let data = &mut block.data;
-            let g = grain::<BLOCK>();
-            let lent = c.with_checked(table_id, bid, &mut |image, check| {
-                if image.len() != BLOCK {
-                    return;
-                }
-                for i in 0..grains::<BLOCK>() {
-                    if valid & (1u64 << i) == 0 {
-                        let (lo, hi) = (i * g, ((i + 1) * g).min(BLOCK));
-                        if !check(lo, hi) {
-                            return;
-                        }
-                        data[lo..hi].copy_from_slice(&image[lo..hi]);
-                        valid |= 1u64 << i;
-                    }
-                }
-            });
-            if lent == Some(true) && valid == full::<BLOCK>() {
-                block.valid = valid;
-                return Ok(());
-            }
-            lent.is_some()
-        } else {
-            false
+        let lent = match cache {
+            Some(c) if self.current().resume.clen != 0 => self.inflate_rest(c, table_id, bid),
+            Some(c) => self.copy_rest(c, table_id, bid),
+            None => None,
         };
+        if lent == Some(true) {
+            return Ok(());
+        }
         let (raw, block) = self.split();
-        block.id = None;
-        block.valid = 0;
-        sstable::read_data_block(device, cache, table_id, bid, raw, &mut block.data, missed)
-            .await?;
+        block.forget();
+        sstable::read_data_block(
+            device,
+            cache,
+            table_id,
+            bid,
+            raw,
+            &mut block.data,
+            lent.is_some(),
+        )
+        .await?;
         self.loaded(bid, full::<BLOCK>());
         Ok(())
+    }
+
+    /// [`complete`](Self::complete)'s lend for a raw block: copies in
+    /// each grain the current buffer lacks, checked first. `Some(true)`
+    /// when the buffer now holds the whole block; `Some(false)` when a
+    /// check failed, or the image is a compressed block's (whose grains
+    /// are not its logical block's); `None` when the cache lent nothing.
+    fn copy_rest(&mut self, cache: &dyn CachePort<BLOCK>, table_id: u32, bid: u64) -> Option<bool> {
+        let (_, block) = self.split();
+        let mut valid = block.valid;
+        let data = &mut block.data;
+        let g = grain::<BLOCK>();
+        let at = BLOCK - sstable::CRC_LEN - 2;
+        let lent = cache.with_checked(table_id, bid, &mut |image, check| {
+            if image.len() != BLOCK {
+                return;
+            }
+            // The flag, from the buffer when it holds the trailer's
+            // grain, else from the image, checked.
+            let flag = if valid & mask::<BLOCK>(at, at + 2) == mask::<BLOCK>(at, at + 2) {
+                &data[at..at + 2]
+            } else if check(at, at + 2) {
+                &image[at..at + 2]
+            } else {
+                return;
+            };
+            if flag[1] & 0x80 != 0 {
+                return;
+            }
+            for i in 0..grains::<BLOCK>() {
+                if valid & (1u64 << i) == 0 {
+                    let (lo, hi) = (i * g, ((i + 1) * g).min(BLOCK));
+                    if !check(lo, hi) {
+                        return;
+                    }
+                    data[lo..hi].copy_from_slice(&image[lo..hi]);
+                    valid |= 1u64 << i;
+                }
+            }
+        });
+        let done = lent == Some(true) && valid == full::<BLOCK>();
+        if done {
+            block.valid = valid;
+        }
+        lent.map(|_| done)
+    }
+
+    /// [`complete`](Self::complete)'s lend for a compressed block the
+    /// current buffer holds inflated part way (ADR-0039): the kept
+    /// decode ([`Resume`]) goes on to the end of the block, from the
+    /// stream bytes ahead of it, which this lend checks; the output it
+    /// copies from is the buffer's own. The image's flag must name the
+    /// same stream. Answers as [`copy_rest`](Self::copy_rest).
+    fn inflate_rest(
+        &mut self,
+        cache: &dyn CachePort<BLOCK>,
+        table_id: u32,
+        bid: u64,
+    ) -> Option<bool> {
+        let body_end = BLOCK - sstable::CRC_LEN;
+        let (_, block) = self.split();
+        let r = block.resume;
+        debug_assert_eq!(
+            block.valid,
+            grains_below::<BLOCK>(usize::from(r.dp)),
+            "a kept decode names the grains it made"
+        );
+        let mut st = Stream {
+            inflate: r.inflate(),
+            clen: usize::from(r.clen),
+            checked: usize::from(r.sp),
+        };
+        let data = &mut block.data;
+        let mut done = false;
+        let lent = cache.with_checked(table_id, bid, &mut |image, check| {
+            let Ok(image) = <&[u8; BLOCK]>::try_from(image) else {
+                return;
+            };
+            let at = body_end - 2;
+            if !check(at, body_end)
+                || u16::from_le_bytes([image[at], image[at + 1]]) != 0x8000 | r.clen
+            {
+                return;
+            }
+            done = st.grow(image, data, body_end, check) == Ok(true);
+        });
+        let done = lent == Some(true) && done;
+        if done {
+            block.valid = full::<BLOCK>();
+            block.resume = Resume::NONE;
+        }
+        lent.map(|_| done)
     }
 }
 
@@ -1060,6 +1287,25 @@ fn look_ahead<const BLOCK: usize>(
     if off >= end || !g.takes_ahead() {
         return;
     }
+    if let Gate::Prefix(p) = g {
+        // Bytes past the prefix are not final: take the header first,
+        // then the entry it gives; where the entries end, the whole
+        // block, so that the step past the head knows it is done.
+        let hdr = off + sstable::ENTRY_HEADER;
+        if hdr > p.upto {
+            let _ = p.check(off, hdr.min(BLOCK - sstable::CRC_LEN));
+            return;
+        }
+        match sstable::parse_data_entry::<(), BLOCK>(b, off, end, 0) {
+            Ok(n) => {
+                let _ = p.check(off, n.next);
+            }
+            Err(_) => {
+                let _ = p.check(0, BLOCK - sstable::CRC_LEN);
+            }
+        }
+        return;
+    }
     match sstable::parse_data_entry::<(), BLOCK>(b, off, end, 0) {
         Ok(n) => g.ahead(off, n.next),
         Err(_) if b.get(off..end).is_some_and(sstable::all_zero) => g.ahead(off, end),
@@ -1088,7 +1334,15 @@ fn park_in<E, const BLOCK: usize, const KEY_MAX: usize>(
             return Ok(None);
         }
         let Ok(e) = sstable::parse_data_entry::<E, BLOCK>(b, off, end, bid) else {
-            let padding = g.check(off, end) && b.get(off..end).is_some_and(sstable::all_zero);
+            // Past a partial inflate the entries end is not known yet:
+            // the block's trailer says it.
+            let end = if end == provisional_end::<BLOCK>() {
+                entries_end::<E, BLOCK>(b, bid, g)?
+            } else {
+                end
+            };
+            let padding =
+                off <= end && g.check(off, end) && b.get(off..end).is_some_and(sstable::all_zero);
             return if padding { Ok(None) } else { Err(corrupt()) };
         };
         if !g.check(off, e.next) {
@@ -1116,6 +1370,9 @@ fn seek_block<E, const BLOCK: usize, const KEY_MAX: usize>(
     g: &mut Gate<'_, '_, BLOCK>,
 ) -> Result<(usize, Option<Head<KEY_MAX>>), Error<E>> {
     let corrupt = || Error::CorruptBlock { id: bid };
+    if let Some(from) = g.linear_from() {
+        return seek_linear(b, from, start, max_seq, bid, g);
+    }
     let end = entries_end::<E, BLOCK>(b, bid, g)?;
     let body_end = BLOCK - sstable::CRC_LEN;
     if !g.check(end, body_end) {
@@ -1139,6 +1396,219 @@ fn seek_block<E, const BLOCK: usize, const KEY_MAX: usize>(
         None => 0,
     };
     Ok((end, park_in(b, from, end, Some(start), max_seq, bid, g)?))
+}
+
+/// The bound a cursor parses against in a block inflated only part way,
+/// whose entries end is not known: no block's entries reach past it (its
+/// trailer holds at least the count and restart 0).
+const fn provisional_end<const BLOCK: usize>() -> usize {
+    BLOCK - sstable::CRC_LEN - 4
+}
+
+/// [`seek_block`] over a compressed block being inflated (ADR-0039
+/// draft): a walk from the first entry, or from where an earlier run of
+/// it stopped short of the prefix, to the head. The entries end is
+/// [`provisional_end`]. What the walk cannot decide (the end of the
+/// entries, an entry that does not parse) it leaves to the whole block,
+/// by asking for all of it: the driver then runs [`seek_block`] over the
+/// whole block.
+fn seek_linear<E, const BLOCK: usize, const KEY_MAX: usize>(
+    b: &[u8; BLOCK],
+    mut off: usize,
+    start: &[u8],
+    max_seq: u64,
+    bid: u64,
+    g: &mut Gate<'_, '_, BLOCK>,
+) -> Result<(usize, Option<Head<KEY_MAX>>), Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: bid };
+    let body_end = BLOCK - sstable::CRC_LEN;
+    let end = provisional_end::<BLOCK>();
+    loop {
+        g.at(off);
+        let hdr = off + sstable::ENTRY_HEADER;
+        if hdr > end {
+            let _ = g.check(0, body_end);
+            return Err(corrupt());
+        }
+        // A header past the prefix may parse as anything; its entry's
+        // check then fails, since it ends past the header.
+        let Ok(e) = sstable::parse_data_entry::<E, BLOCK>(b, off, end, bid) else {
+            // Not an entry: a header not yet final is a miss; a final one
+            // ends the entries, which the whole block decides.
+            if g.check(off, hdr) {
+                let _ = g.check(0, body_end);
+            }
+            return Err(corrupt());
+        };
+        if !g.check(off, e.next) {
+            return Err(corrupt());
+        }
+        if e.seq <= max_seq && e.key >= start {
+            let head = Head::of(&e, off).ok_or_else(corrupt)?;
+            look_ahead(b, e.next, end, g);
+            return Ok((end, Some(head)));
+        }
+        off = e.next;
+    }
+}
+
+/// Output a partial inflate decodes past what a parse asked for, so that
+/// it is run again once per few entries rather than once per entry.
+const PREFIX_STEP: usize = 1024;
+
+/// What [`lend_prefix`] keeps: the parse's answer, the grains of the
+/// buffer it leaves valid, and the decode to go on with.
+type Kept<R, E> = (Result<R, Error<E>>, u64, Resume);
+
+/// The compressed branch of [`Blocks::lend_into`] for a forward scan
+/// over a cache that checks ranges (ADR-0039): block `bid`'s stream, of
+/// `clen` bytes at the front of `image`, is checked and inflated into
+/// `data` only as far as the parse `f` reads, and `f` runs over a
+/// [`Gate::Prefix`] that lets it act only on output already final.
+///
+/// - A parse that reaches past the prefix is run again over a longer
+///   one. The decoder reads only stream bytes this lend has checked.
+/// - A parse error is not believed from a prefix: the block is inflated
+///   whole and `f` runs over all of it, as the whole-block path does.
+///   A stream that does not decode is believed only once the whole
+///   image passes its checks.
+/// - The buffer keeps the whole grains below what the decode made
+///   final, and the decode is kept with them ([`Resume`]), for
+///   [`Blocks::complete`] to go on from.
+///
+/// `None`: a check failed, and the lend is a miss.
+fn lend_prefix<E, R, const BLOCK: usize>(
+    image: &[u8; BLOCK],
+    data: &mut [u8; BLOCK],
+    clen: usize,
+    bid: u64,
+    check: &mut (dyn FnMut(usize, usize) -> bool + '_),
+    f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
+) -> Option<Kept<R, E>> {
+    let body_end = BLOCK - sstable::CRC_LEN;
+    // Damage the image's checks let through, as the whole path says.
+    let corrupt = |check: &mut (dyn FnMut(usize, usize) -> bool + '_)| {
+        check(0, BLOCK).then_some((Err(Error::CorruptBlock { id: bid }), 0, Resume::NONE))
+    };
+    if clen >= body_end {
+        return corrupt(check);
+    }
+    let mut st = Stream {
+        inflate: Inflate::new(),
+        clen,
+        checked: 0,
+    };
+    let mut target = PREFIX_STEP;
+    // Where a seek's walk had got to: the entries before it were passed.
+    let mut walked = 0usize;
+    let parsed = loop {
+        match st.grow(image, data, target, check) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(()) => return corrupt(check),
+        }
+        let dp = st.inflate.done();
+        if dp >= body_end {
+            // The whole block: its parse, and its errors, stand.
+            return Some((f(data, &mut Gate::Open), full::<BLOCK>(), Resume::NONE));
+        }
+        let mut gate = Gate::Prefix(Prefix {
+            upto: dp,
+            walked,
+            want: 0,
+            missed: false,
+        });
+        let parsed = f(data, &mut gate);
+        // Fails closed: a gate that is no longer the prefix's answers
+        // nothing, and the lend is a miss.
+        let Gate::Prefix(p) = gate else {
+            return None;
+        };
+        if p.missed {
+            walked = p.walked;
+            target = p.want.max(dp + 1) + PREFIX_STEP;
+        } else if parsed.is_err() {
+            target = body_end;
+        } else {
+            break parsed;
+        }
+    };
+    // The buffer keeps whole grains: finish the last one begun, or, when
+    // the decode cannot be kept, the block.
+    let dp = st.inflate.done();
+    let up = if Resume::of(&st.inflate, clen).is_some() {
+        dp.next_multiple_of(grain::<BLOCK>())
+    } else {
+        body_end
+    };
+    match st.grow(image, data, up, check) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(()) => return corrupt(check),
+    }
+    let dp = st.inflate.done();
+    match Resume::of(&st.inflate, clen) {
+        Some(resume) if dp < body_end => Some((parsed, grains_below::<BLOCK>(dp), resume)),
+        _ => Some((parsed, full::<BLOCK>(), Resume::NONE)),
+    }
+}
+
+/// A partial inflate over a lent image whose stream is checked only as
+/// far as the decoder reads it (ADR-0039).
+struct Stream {
+    inflate: crate::compress::Inflate,
+    clen: usize,
+    /// Stream bytes checked in this lend: `[from_check..checked)`, where
+    /// `from_check` is where this lend's checks began.
+    checked: usize,
+}
+
+impl Stream {
+    /// Decodes until `until` bytes of the logical block are final,
+    /// checking stream bytes a few grains at a time just before the
+    /// decoder may read them. `Ok(false)`: a check failed (the lend is
+    /// a miss). `Err`: the stream does not decode.
+    fn grow<const BLOCK: usize>(
+        &mut self,
+        image: &[u8; BLOCK],
+        data: &mut [u8; BLOCK],
+        until: usize,
+        check: &mut (dyn FnMut(usize, usize) -> bool + '_),
+    ) -> Result<bool, ()> {
+        let body_end = BLOCK - sstable::CRC_LEN;
+        let until = until.min(body_end);
+        let g = grain::<BLOCK>();
+        while self.inflate.done() < until {
+            if self.checked < self.clen {
+                let guess = ((until - self.inflate.done()) / 2).max(2 * g);
+                let to = (self.checked + guess).next_multiple_of(g).min(self.clen);
+                if !check(self.checked, to) {
+                    return Ok(false);
+                }
+                self.checked = to;
+            }
+            let whole = self.checked >= self.clen;
+            let prefix = image.get(..self.checked).ok_or(())?;
+            let out = data.get_mut(..body_end).ok_or(())?;
+            self.inflate
+                .run_prefix(prefix, whole, out, until)
+                .map_err(|_| ())?;
+            if whole && self.inflate.done() < until {
+                return Err(());
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The grains wholly below byte `dp`.
+const fn grains_below<const BLOCK: usize>(dp: usize) -> u64 {
+    let n = dp / grain::<BLOCK>();
+    if n >= grains::<BLOCK>() {
+        full::<BLOCK>()
+    } else {
+        (1u64 << n) - 1
+    }
 }
 
 /// Copies the value of the entry at `off` in data block `b` (entries
@@ -1728,7 +2198,7 @@ impl<
                     Some(copied) => copied?,
                     None => {
                         self.blocks
-                            .value_into(db.device, db.cache, at, val_buf)
+                            .value_into(db.device, db.cache, at, Take::Prefix, val_buf)
                             .await?
                     }
                 };
@@ -1909,9 +2379,14 @@ impl<
         let max_seq = self.max_seq;
         let (end, head) = self
             .blocks
-            .load_with(db.device, db.cache, tref.id, bid, false, &mut |b, g| {
-                seek_block::<D::Error, BLOCK, KEY_MAX>(b, start, max_seq, bid, g)
-            })
+            .load_with(
+                db.device,
+                db.cache,
+                tref.id,
+                bid,
+                Take::Prefix,
+                &mut |b, g| seek_block::<D::Error, BLOCK, KEY_MAX>(b, start, max_seq, bid, g),
+            )
             .await?;
         // The manifest holds at most the pool's worth of tables, so this
         // never fails; if it did, the manifest is what is wrong.
@@ -1989,7 +2464,7 @@ impl<
                 Some(parked) => parked?,
                 None => {
                     self.blocks
-                        .load_with(db.device, db.cache, tid, bid, false, &mut park)
+                        .load_with(db.device, db.cache, tid, bid, Take::Prefix, &mut park)
                         .await?
                 }
             };
@@ -2013,7 +2488,7 @@ impl<
             // taken whole, in one lookup.
             end = self
                 .blocks
-                .load_with(db.device, db.cache, tid, nid, true, &mut |b, g| {
+                .load_with(db.device, db.cache, tid, nid, Take::Whole, &mut |b, g| {
                     entries_end::<D::Error, BLOCK>(b, nid, g)
                 })
                 .await?;
@@ -2674,7 +3149,7 @@ impl<
                     Some(copied) => copied?,
                     None => {
                         self.blocks
-                            .value_into(db.device, db.cache, at, val_buf)
+                            .value_into(db.device, db.cache, at, Take::Ranged, val_buf)
                             .await?
                     }
                 };
@@ -2924,7 +3399,14 @@ impl<
                 Some(found) => found?,
                 None => {
                     self.blocks
-                        .load_with(db.device, db.cache, tid, bid, whole, &mut search)
+                        .load_with(
+                            db.device,
+                            db.cache,
+                            tid,
+                            bid,
+                            Take::ranged_unless(whole),
+                            &mut search,
+                        )
                         .await?
                 }
             };
@@ -3010,23 +3492,30 @@ impl<
             // Each earlier block of the run is read through: whole.
             let found = self
                 .blocks
-                .load_with(db.device, db.cache, table_id, pbid, true, &mut |b, g| {
-                    let (pend, hit) = search_block_rev::<D::Error, BLOCK, KEY_MAX>(
-                        b,
-                        Some((kk, true)),
-                        max_seq,
-                        pbid,
-                        g,
-                    )?;
-                    match hit {
-                        Some(h) if h.0[..h.1] == *kk => {
-                            let at_first =
-                                entry_key_at::<D::Error, BLOCK>(b, 0, pend, pbid, g)? == kk;
-                            Ok(Some((h, pend, at_first)))
+                .load_with(
+                    db.device,
+                    db.cache,
+                    table_id,
+                    pbid,
+                    Take::Whole,
+                    &mut |b, g| {
+                        let (pend, hit) = search_block_rev::<D::Error, BLOCK, KEY_MAX>(
+                            b,
+                            Some((kk, true)),
+                            max_seq,
+                            pbid,
+                            g,
+                        )?;
+                        match hit {
+                            Some(h) if h.0[..h.1] == *kk => {
+                                let at_first =
+                                    entry_key_at::<D::Error, BLOCK>(b, 0, pend, pbid, g)? == kk;
+                                Ok(Some((h, pend, at_first)))
+                            }
+                            _ => Ok(None),
                         }
-                        _ => Ok(None),
-                    }
-                })
+                    },
+                )
                 .await?;
             let Some((hit, pend, at_first)) = found else {
                 break;
@@ -3842,5 +4331,297 @@ mod tests {
         };
         assert!(blocks.held(7, &mut past).is_none());
         assert_eq!(blocks.current().id, Some(7));
+    }
+
+    mod prefix {
+        //! A compressed block inflated only as far as a seek reads
+        //! (ADR-0039) answers as the whole block does.
+        use super::super::{BlockBufs, Blocks, Held, Lend, park_in, seek_block};
+        use super::{Entry, Gate, R, Rng, block, entries, key_of};
+        use crate::cache::{CachePort, CacheStats, CheckedRead};
+        use crate::compress::CompressScratch;
+        use crate::device::BlockDevice;
+        use crate::sstable::CRC_LEN;
+        use core::cell::Cell;
+        use core::future::Future;
+        use core::pin::pin;
+        use core::task::{Context, Poll, Waker};
+        extern crate std;
+        use std::boxed::Box;
+
+        /// Lends one image. Chunks of 1/64 block are "summed": a check
+        /// fails when it covers `bad` while `flips` lends remain flipped.
+        struct One<const B: usize> {
+            image: Box<[u8; B]>,
+            bad: usize,
+            flips: Cell<usize>,
+            lends: Cell<usize>,
+            summed: Cell<usize>,
+        }
+
+        impl<const B: usize> CachePort<B> for One<B> {
+            fn get_into(&self, _: u32, _: u64, _: &mut [u8; B]) -> bool {
+                false
+            }
+            fn get_range_into(&self, _: u32, _: u64, _: usize, _: &mut [u8]) -> bool {
+                false
+            }
+            fn with_checked(&self, _: u32, _: u64, read: &mut CheckedRead<'_>) -> Option<bool> {
+                self.lends.set(self.lends.get() + 1);
+                let flipped = self.flips.get() > 0;
+                if flipped {
+                    self.flips.set(self.flips.get() - 1);
+                }
+                let mut image = *self.image;
+                let g = super::grain::<B>();
+                if flipped {
+                    image[self.bad] ^= 0x10;
+                }
+                let mut ok = true;
+                read(&image, &mut |from, to| {
+                    if to <= from {
+                        return ok;
+                    }
+                    if to > B
+                        || (flipped && from / g <= self.bad / g && self.bad < to.div_ceil(g) * g)
+                    {
+                        ok = false;
+                    }
+                    self.summed
+                        .set(self.summed.get() + to.div_ceil(g) - from / g);
+                    ok
+                });
+                Some(ok)
+            }
+            fn checks_ranges(&self) -> bool {
+                true
+            }
+            fn put(&self, _: u32, _: u64, _: &[u8; B], _: bool) {}
+            fn invalidate_table(&self, _: u32) {}
+            fn stats(&self) -> CacheStats {
+                CacheStats::default()
+            }
+        }
+
+        /// A device every read of which fails: a test that reaches it
+        /// was a miss.
+        struct NoDevice;
+        impl BlockDevice for NoDevice {
+            type Error = ();
+            const BLOCK: usize = 0;
+            fn poll_read_block(
+                &self,
+                _: &mut Context<'_>,
+                _: u64,
+                _: &mut [u8],
+            ) -> Poll<Result<(), ()>> {
+                Poll::Ready(Err(()))
+            }
+            fn poll_write_block(
+                &mut self,
+                _: &mut Context<'_>,
+                _: u64,
+                _: &[u8],
+            ) -> Poll<Result<(), ()>> {
+                Poll::Ready(Err(()))
+            }
+            fn poll_flush(&mut self, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn block_on<F: Future>(f: F) -> F::Output {
+            let mut f = pin!(f);
+            let mut cx = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                    return v;
+                }
+            }
+        }
+
+        fn compressed<const B: usize>(logical: &[u8; B]) -> Option<Box<[u8; B]>> {
+            let body_end = B - CRC_LEN;
+            let mut cs = Box::new(CompressScratch::<B>::new());
+            let clen = cs.compress(&logical[..body_end])?;
+            let mut img = Box::new([0u8; B]);
+            img[..clen].copy_from_slice(&cs.compressed()[..clen]);
+            let flag = 0x8000u16 | u16::try_from(clen).unwrap();
+            img[body_end - 2..body_end].copy_from_slice(&flag.to_le_bytes());
+            Some(img)
+        }
+
+        #[allow(clippy::too_many_lines)] // one model run: seek, value, parks
+        fn holds<const B: usize>(seed: u64, flip_lends: usize) -> usize {
+            let mut rng = Rng(seed);
+            let every = 1 + rng.below(20);
+            let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+            let logical: [u8; B] = block::<B>(&es, every);
+            let Some(image) = compressed(&logical) else {
+                return 0;
+            };
+            let body_end = B - CRC_LEN;
+            let bad = rng.below(body_end);
+            let mut starts: std::vec::Vec<std::vec::Vec<u8>> =
+                es.iter().map(|e| e.0.clone()).collect();
+            starts.push(std::vec::Vec::new());
+            starts.push(b"zzzzzzzzzzzzzz".to_vec());
+            for k in es.iter().take(8) {
+                let mut k2 = k.0.clone();
+                k2.push(b'0');
+                starts.push(k2);
+            }
+            let mut partial = 0;
+            for start in &starts {
+                for max_seq in [u64::MAX, 60, 20, 2] {
+                    let cache = One {
+                        image: image.clone(),
+                        bad,
+                        flips: Cell::new(flip_lends),
+                        lends: Cell::new(0),
+                        summed: Cell::new(0),
+                    };
+                    let want: R<(usize, Option<super::Head<64>>)> =
+                        seek_block::<(), B, 64>(&logical, start, max_seq, 7, &mut Gate::Open);
+                    let (want_end, want_head) = want.unwrap();
+                    let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                    let got =
+                        blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                            seek_block::<(), B, 64>(b, start, max_seq, 7, g)
+                        });
+                    let (end, head) = match got {
+                        Lend::Done(r) => r.unwrap(),
+                        Lend::Miss => {
+                            assert!(flip_lends > 0, "a clean lend missed");
+                            continue;
+                        }
+                        Lend::Unlent => unreachable!(),
+                    };
+                    assert_eq!(
+                        head.as_ref()
+                            .map(|h| (key_of(h).to_vec(), h.seq, h.off, h.next)),
+                        want_head
+                            .as_ref()
+                            .map(|h| (key_of(h).to_vec(), h.seq, h.off, h.next)),
+                        "seed {seed} start {start:?} seq {max_seq}"
+                    );
+                    // A walk from the first entry does not know the
+                    // entries end: it parks against the provisional one,
+                    // even where its decode ran to the block's end.
+                    if blocks.current().valid == super::full::<B>() {
+                        assert!(end == want_end || end == super::super::provisional_end::<B>());
+                    } else {
+                        partial += 1;
+                        assert_eq!(end, super::super::provisional_end::<B>());
+                    }
+                    // The head's value, from a lend of its own (a cursor
+                    // whose buffer went to another table).
+                    if let Some(h) = head.as_ref().filter(|h| !h.tombstone) {
+                        let cache2 = One {
+                            image: image.clone(),
+                            bad,
+                            flips: Cell::new(flip_lends),
+                            lends: Cell::new(0),
+                            summed: Cell::new(0),
+                        };
+                        let mut other = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                        let mut out = [0u8; B];
+                        let mut want_out = [0u8; B];
+                        let wl = super::value_at::<(), B>(
+                            &logical,
+                            h.off,
+                            want_end,
+                            7,
+                            &mut Gate::Open,
+                            &mut want_out,
+                        )
+                        .unwrap();
+                        match other.lend_into(
+                            &cache2,
+                            1,
+                            7,
+                            super::super::Take::Prefix,
+                            &mut |b, g| super::value_at::<(), B>(b, h.off, end, 7, g, &mut out),
+                        ) {
+                            Lend::Done(r) => {
+                                let n = r.unwrap();
+                                assert_eq!(out[..n], want_out[..wl]);
+                            }
+                            Lend::Miss => assert!(flip_lends > 0),
+                            Lend::Unlent => unreachable!(),
+                        }
+                    }
+                    // The next 17 parks: from the buffer, or after a
+                    // resumed inflate in one more lend.
+                    let (mut off, mut woff) = match &head {
+                        Some(h) => (h.next, h.next),
+                        None => continue,
+                    };
+                    for _ in 0..17 {
+                        let want: Option<super::Head<64>> = park_in::<(), B, 64>(
+                            &logical,
+                            woff,
+                            want_end,
+                            None,
+                            max_seq,
+                            7,
+                            &mut Gate::Open,
+                        )
+                        .unwrap();
+                        let mut park = |b: &[u8; B], g: &mut Gate<'_, '_, B>| {
+                            park_in::<(), B, 64>(b, off, end, None, max_seq, 7, g)
+                        };
+                        let got = if let Some(r) = blocks.held(7, &mut park) {
+                            r.unwrap()
+                        } else {
+                            assert_eq!(blocks.current().id, Some(7));
+                            let done = block_on(blocks.complete(&NoDevice, Some(&cache), 1, 7));
+                            if done.is_err() {
+                                assert!(flip_lends > 0, "a clean completion missed");
+                                break;
+                            }
+                            assert_eq!(blocks.current().valid, super::full::<B>());
+                            assert_eq!(blocks.current().data[..body_end], logical[..body_end]);
+                            blocks.held(7, &mut park).unwrap().unwrap()
+                        };
+                        assert_eq!(
+                            got.as_ref()
+                                .map(|h| (key_of(h).to_vec(), h.seq, h.off, h.next)),
+                            want.as_ref()
+                                .map(|h| (key_of(h).to_vec(), h.seq, h.off, h.next)),
+                        );
+                        match got {
+                            Some(h) => {
+                                off = h.next;
+                                woff = h.next;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            partial
+        }
+
+        #[test]
+        fn a_partial_inflate_seeks_and_parks_as_the_whole_block() {
+            let mut partial = 0;
+            for seed in 1..200 {
+                partial += holds::<4096>(seed, 0);
+                partial += holds::<16384>(seed, 0);
+                partial += holds::<1000>(seed, 0);
+            }
+            assert!(partial > 1000, "{partial} partial seeks");
+        }
+
+        #[test]
+        fn a_flipped_stream_byte_is_a_miss_never_an_answer() {
+            for seed in 1..200 {
+                for lends in [1, 2, 9] {
+                    holds::<4096>(seed, lends);
+                    holds::<16384>(seed, lends);
+                }
+            }
+        }
     }
 }

@@ -10,7 +10,10 @@
 //! first lend (a bit that a refill, or the fault going away, clears).
 //! The second is the one a scan that copied a whole image and checked
 //! the rest later would get wrong: the later check passes over a clean
-//! image while its copy keeps the flipped byte.
+//! image while its copy keeps the flipped byte. A flip on every lend but
+//! the first hits what a later lend adds to a buffer the first one left
+//! part-filled: the rest of a raw block's grains, or the rest of a
+//! compressed block's inflate (ADR-0039).
 mod common;
 
 use common::{Lcg, MemDevice, TestDb, block_on, test_config};
@@ -61,6 +64,8 @@ enum Fault {
     Stuck,
     /// On the block's first lend only.
     Once,
+    /// On every lend of the block but its first.
+    Later,
 }
 
 /// A cache that checks ranges against a pristine copy, as a real one
@@ -79,6 +84,9 @@ struct FlipCache {
     lent_flipped: Cell<u64>,
     lookups: Cell<u64>,
     misses: Cell<u64>,
+    /// Lends of a compressed block that checked only part of its stream:
+    /// a seek's inflate that stopped short of the block's end.
+    partial: Cell<u64>,
     /// Checks answer `true` and the lend's result says whether they
     /// held: a cache that verifies its sums once the read is done, as
     /// the `CachePort::with_checked` contract allows (`Some(false)`:
@@ -111,17 +119,31 @@ impl CachePort<4096> for FlipCache {
         let mut lent = pristine;
         if let Some((at, mask, fault)) = self.flip.get()
             && self.targets.borrow().contains(&b)
-            && (fault == Fault::Stuck || self.flipped.borrow_mut().insert(b))
+            && match fault {
+                Fault::Stuck => true,
+                Fault::Once => self.flipped.borrow_mut().insert(b),
+                Fault::Later => !self.flipped.borrow_mut().insert(b),
+            }
         {
             lent[at] ^= mask;
             self.lent_flipped.set(self.lent_flipped.get() + 1);
         }
         let mut ok = true;
+        // The bytes checked, below the flag.
+        let mut covered = vec![false; 4092];
         read(&lent, &mut |from, to| {
             let good = ok && (to <= from || (to <= 4096 && lent[from..to] == pristine[from..to]));
             ok &= good;
+            for c in covered.iter_mut().take(to.min(4092)).skip(from) {
+                *c = true;
+            }
             good || self.defer.get()
         });
+        let flag = u16::from_le_bytes([pristine[4090], pristine[4091]]);
+        let clen = usize::from(flag & 0x7FFF);
+        if flag & 0x8000 != 0 && covered[4090] && covered[..clen].contains(&false) {
+            self.partial.set(self.partial.get() + 1);
+        }
         if !ok {
             self.images.borrow_mut().remove(&(t, b));
             self.rejected.set(self.rejected.get() + 1);
@@ -325,11 +347,14 @@ fn data_blocks(m: &Manifest) -> HashSet<u64> {
         .collect()
 }
 
-fn flip_every_byte(config: Config, fault: Fault) {
-    flip_every_byte_with(config, fault, false);
+fn flip_every_byte(config: Config, fault: Fault) -> u64 {
+    flip_every_byte_with(config, fault, false)
 }
 
-fn flip_every_byte_with(config: Config, fault: Fault, defer: bool) {
+/// Flips each byte of every cached data block in turn, for every run;
+/// returns how many lends of a compressed block checked only part of
+/// its stream.
+fn flip_every_byte_with(config: Config, fault: Fault, defer: bool) -> u64 {
     let db = build(config);
     let manifest = *db.manifest();
     let device = db.device().clone();
@@ -394,6 +419,7 @@ fn flip_every_byte_with(config: Config, fault: Fault, defer: bool) {
     }
     assert!(cache.lent_flipped.get() > 0);
     assert!(cache.rejected.get() > 0);
+    cache.partial.get()
 }
 
 #[test]
@@ -435,7 +461,34 @@ fn a_kept_scan_state_trusts_no_grain_an_earlier_scan_checked() {
 
 #[test]
 fn a_bit_flipped_in_a_compressed_data_block_never_changes_a_scan() {
-    flip_every_byte(test_config().with_compression_from_level(0), Fault::Stuck);
+    let partial = flip_every_byte(test_config().with_compression_from_level(0), Fault::Stuck);
+    assert!(partial > 0, "a seek inflated part of a block");
+}
+
+/// The seek's lend of a compressed block checks and inflates only the
+/// start of its stream; a flip there, on that lend only, is a miss, and a
+/// flip anywhere on a later lend (the one that goes on with the inflate)
+/// is a miss too: what the first lend left is never mixed with an
+/// unchecked byte (ADR-0039).
+#[test]
+fn a_bit_flipped_in_a_compressed_block_on_one_lend_never_changes_a_scan() {
+    let config = test_config().with_compression_from_level(0);
+    assert!(flip_every_byte(config, Fault::Once) > 0);
+    assert!(flip_every_byte(config, Fault::Later) > 0);
+    assert!(flip_every_byte_with(config, Fault::Stuck, true) > 0);
+}
+
+/// [`a_kept_scan_state_trusts_no_grain_an_earlier_scan_checked`] over
+/// compressed blocks: a kept state's buffer may hold a twin block's
+/// partial inflate under the same id, and none of it is gone on with.
+#[test]
+fn a_kept_scan_state_goes_on_with_no_inflate_an_earlier_scan_left() {
+    let config = test_config().with_compression_from_level(0);
+    KEPT.with(|k| *k.borrow_mut() = Some((Box::new(State::new()), Box::new(RevState::new()))));
+    TWIN.with(|t| *t.borrow_mut() = Some(build_with(config, true)));
+    assert!(flip_every_byte(config, Fault::Later) > 0);
+    TWIN.with(|t| t.borrow_mut().take());
+    assert!(KEPT.with(|k| k.borrow_mut().take()).is_some());
 }
 
 /// A limit-1 seek through an intact cache asks it once for the data
@@ -444,7 +497,19 @@ fn a_bit_flipped_in_a_compressed_data_block_never_changes_a_scan() {
 /// among them.
 #[test]
 fn a_short_seek_takes_one_lend_of_its_data_block() {
-    let db = build(test_config());
+    short_seek_lends(test_config());
+}
+
+/// [`a_short_seek_takes_one_lend_of_its_data_block`] over compressed
+/// blocks: the seek inflates the start of its block, past the entry after
+/// the head, in its one lend (ADR-0039).
+#[test]
+fn a_short_seek_takes_one_lend_of_its_compressed_data_block() {
+    short_seek_lends(test_config().with_compression_from_level(0));
+}
+
+fn short_seek_lends(config: Config) {
+    let db = build(config);
     let manifest = *db.manifest();
     let device = db.device().clone();
     let page = Box::new(Page::new());
@@ -592,7 +657,19 @@ fn a_seek_onto_a_blocks_last_entry_takes_its_padding() {
 /// on every step that went past what the buffer held.
 #[test]
 fn a_scan_takes_the_rest_of_its_seek_block_in_one_lend() {
-    let db = build(test_config());
+    rest_in_one_lend(test_config());
+}
+
+/// [`a_scan_takes_the_rest_of_its_seek_block_in_one_lend`] over
+/// compressed blocks: the step past a seek's partial inflate goes on
+/// with it in one lend (ADR-0039).
+#[test]
+fn a_scan_inflates_the_rest_of_its_seek_block_in_one_lend() {
+    rest_in_one_lend(test_config().with_compression_from_level(0));
+}
+
+fn rest_in_one_lend(config: Config) {
+    let db = build(config);
     let manifest = *db.manifest();
     let device = db.device().clone();
     let page = Box::new(Page::new());
