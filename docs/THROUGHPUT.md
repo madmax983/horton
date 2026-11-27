@@ -44,7 +44,10 @@ check and copy only the bytes of a data block it reads
 fewer instructions, and 49% to 86% faster at 1 M keys. Then the host store
 came to keep its scans' buffers per reader thread
 ([step 25](#then-a-scan-the-host-store-keeps)): 17% to 38% fewer
-instructions a seek, and 8% to 12% faster at 1 M keys.
+instructions a seek, and 8% to 12% faster at 1 M keys. And a seek came
+to inflate a compressed block only as far as it reads
+([step 26](#then-a-seek-that-inflates-only-what-it-reads)): 9% fewer
+instructions for a page of one, level at ten, 3% more at a hundred.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1471,6 +1474,54 @@ What a cached seek's instructions are now, at 1 M keys on the hot range
 
 On the full key range a device read's CRC adds about 23%.
 
+### Then: a seek that inflates only what it reads
+
+Step 26 (ADR-0039). After step 25, inflating the compressed block a
+seek reads in a deep level was 27% of a cached seek at 1 M keys, and
+checking that block's whole stream came on top. The restart offsets a
+seek searches sit at the end of the block, so it inflated all 16 KiB to
+read two entries.
+
+A forward seek now checks and inflates the stream only as far as it
+reads. It walks from the first entry by entry headers, comparing every
+16th key. The decode is kept in the scan's buffer, and a step past what
+the seek made goes on with it in one more lend: 2 KiB further the
+first time, the rest of the block the second. Every stream byte is
+checked in the lend that decodes it. Both builds read the same stores
+(format unchanged), the ones step 24 measured. The page limit is the
+host store's (`scan(.., limit)`); a page reads one entry past it.
+
+Instructions per op (callgrind, one reader, a second pass over a warm
+cache; 20 K seeks, 100 K reads, scans read every key):
+
+| store, workload | before | after | |
+|---|---:|---:|---:|
+| 1 M keys, `seekrandom` hot, a page of 1 | 143,876 | 130,278 | −9.5% |
+| 1 M keys, `seekrandom` hot, a page of 4 | 158,012 | 147,365 | −6.7% |
+| 1 M keys, `seekrandom` hot, a page of 10 | 188,760 | 185,449 | −1.8% |
+| 1 M keys, `seekrandom` hot, a page of 100 | 728,062 | 750,594 | +3.1% |
+| 1 M keys, `seekrandom` full, a page of 1 | 199,678 | 198,996 | −0.3% |
+| 1 M keys, `seekrandom` full, a page of 10 | 248,767 | 249,333 | +0.2% |
+| 300 K keys, `seekrandom` hot (raw blocks) | 64,630 | 65,039 | +0.6% |
+| 1 M keys, `readrandom` hot | 38,723 | 38,723 | 0.0% |
+| 1 M keys, `readseq` | 4,492 | 4,537 | +1.0% |
+| 1 M keys, `readreverse` | 6,942 | 6,944 | 0.0% |
+
+(The `readseq` and `readreverse` rows come from this step's harness and
+are not comparable with step 25's.)
+
+At a page of one, a seek's inflate falls from 38,400 instructions to
+22,900, and the cache's checks from 46,400 to 44,000. The walk from the
+block's first entry gives back 3,000 of that: the binary search over
+the restarts that it replaces read sixteen entries at most. On the full range most compressed blocks come from the
+device, and a device read still inflates whole. The cost of a long page
+is the steps past what the seek inflated. Each costs a lend, a re-check
+of the flag's chunk and of the chunk the decode stands in, and a re-run
+parse. A page that reads the block through pays those on top of the
+same inflate. Doubling each step instead measured the same at ten
+entries a page and 0.4% worse at a hundred. Taking the rest whole on the
+first step was +6.7% at ten.
+
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
@@ -1571,12 +1622,24 @@ Measured or scoped while doing this, and left:
   and not summing a block's padding, would cheapen the deeper levels'.
   Packing a block by its compressed size would make compression save
   blocks at all (a format change).
-- **Inflating a seek's block only to the head.** A seek into a
-  compressed block (levels 2 and down) inflates it whole: 27% of a
-  cached seek at 1 M keys since step 25. A point read inflates only to its key
-  (step 17), and a seek could too, resuming the decoder as the scan
-  reads on. That would be the first place a stream is used before it
-  is checked whole.
+- **Entry points in compressed blocks.** Pairs of stream and output
+  offsets, written in a compressed block's zero fill, would let a
+  decode start part way through it. A seek would no longer walk or
+  inflate from the block's first entry, and neither would a point read.
+  The design panel of step 26 measured a prototype at 1 M keys, hot
+  range: seeks −21% and point reads −26%. But a page of ten was +12%,
+  because its later steps decoded the whole block again. It is a
+  format and writer change, and a table the CRC vouches for that every
+  whole decode must agree with (ADR-0039).
+- **Point reads that check only the stream they inflate.** A point
+  read inflates only to its key (step 17), but checks the whole stream
+  of a cached compressed block first. It could check as it decodes, as
+  a seek does since step 26: up to 10,000 instructions on a 16 KiB block.
+- **Device misses inflated part way.** A seek whose block comes from
+  the device inflates all of it after the CRC. It could keep a partial
+  decode as a cache lend does. The step after would then go on through
+  the cache's copy, which may not hold the block. The design panel
+  measured −3.7% on the full range at a page of one.
 - **Device misses straight into the scan's buffer.** A block a scan
   misses is read into scratch, checked, and then copied or inflated
   into the buffer. Reading a raw block into the buffer directly would
@@ -1648,6 +1711,9 @@ Measured or scoped while doing this, and left:
 - **A scan the host store keeps.** Done in step 25 (ADR-0037), as a
   state the scan is built in rather than a scan kept whole: a scan
   borrows its page.
+- **Inflating a seek's block only to the head.** Done in step 26
+  (ADR-0039). A seek checks and inflates the stream as it reads, and
+  its later steps go on with the same decode.
 - **A seek that checks only the data bytes it reads.** Done in step 24
   (ADR-0035), as a map of the grains a scan's buffer has checked; a
   scan that reads on completes its block in one more lend.

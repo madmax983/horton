@@ -201,6 +201,21 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **A seek inflates a compressed block only as far as it reads**
+  (ADR-0039). Through a cache that checks ranges, a forward seek checks
+  and inflates a compressed data block's stream from its start only as
+  far as its head and the entry after, walking from the first entry. The
+  scan's buffer keeps the decode, and a step past it goes on with it in
+  one more lend, checking only the stream ahead. A bit flipped in the
+  cache's RAM is still a miss, and a parse error is believed only from
+  the whole block. In the host store at 1 M keys a cached seek takes
+  9.5% fewer instructions for a page of one, 1.8% fewer for ten and
+  3.1% more for a hundred (docs/THROUGHPUT.md, step 26). Reverse scans
+  and point reads are unchanged. `ScanBlock` grows by 8 bytes and the
+  scan futures by 24 on the ESP32-S3 profile, whose peak is 114,176
+  bytes. A partial seek no longer validates the restart trailer or the
+  unread stream of a block that passed its checksums, as a point read
+  does not (ADR-0027).
 - **The host store keeps a scan state per reader thread** (ADR-0037). A
   page used to build a fresh scan, zeroing some 44 KiB; each thread now
   keeps one forward and one reverse state and builds its pages' scans
