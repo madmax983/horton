@@ -417,9 +417,13 @@ impl Inflate {
     }
 
     /// Decodes whole tokens until at least `until` bytes of `dst` are
-    /// final (or `dst` is full). `src` and `dst` must be the ones of
-    /// every earlier call. The rules, and the errors, are
-    /// [`decompress`]'s. After an error the decode must not be resumed.
+    /// final (or `dst` is full). `src` and `dst` must hold the bytes of
+    /// every earlier call: the stream from [`consumed`](Self::consumed)
+    /// on, and the output below [`done`](Self::done), which later
+    /// matches copy from (the stream before `consumed` is not read
+    /// again). The rules, and the errors, are [`decompress`]'s. The
+    /// state moves only on `Ok`; after an error the decode must not be
+    /// resumed.
     ///
     /// # Errors
     ///
@@ -432,7 +436,53 @@ impl Inflate {
     ) -> Result<(), DecompressError> {
         let out_len = dst.len();
         let until = until.min(out_len);
-        let (sp, dp) = self.decode(src, dst, out_len, until)?;
+        let (sp, dp) = self.decode::<false>(src, dst, out_len, until)?;
+        self.sp = sp;
+        self.dp = dp;
+        Ok(())
+    }
+
+    /// Stream bytes consumed: the next token starts here.
+    pub(crate) const fn consumed(&self) -> usize {
+        self.sp
+    }
+
+    /// A decode that has consumed `sp` stream bytes and made `dp` bytes
+    /// of output final: one [`consumed`](Self::consumed) and
+    /// [`done`](Self::done) reported, kept to be gone on with later
+    /// (ADR-0039). The output below `dp` must still be that decode's.
+    pub(crate) const fn resumed(sp: usize, dp: usize) -> Self {
+        Self { sp, dp }
+    }
+
+    /// [`run`](Self::run) over `prefix`, the first bytes of the stream
+    /// (each call's a prefix of the next's, of the same stream). A token
+    /// that does not end inside `prefix` is not decoded: the decode
+    /// stops before it, with every byte it has made final as the whole
+    /// stream would have, and a later call with a longer prefix goes on
+    /// from there. Only the bytes of `prefix` are ever read, so a caller
+    /// that checks a stream as it goes hands the decoder only what it
+    /// has checked (ADR-0039). With `whole` (`prefix` is the whole
+    /// stream) this is `run`.
+    ///
+    /// # Errors
+    ///
+    /// As [`decompress`], for tokens wholly inside `prefix` (and, with
+    /// `whole`, a stream that ends mid-token). Only a token cut off by
+    /// the end of `prefix` stops the decode without an error.
+    pub(crate) fn run_prefix(
+        &mut self,
+        prefix: &[u8],
+        whole: bool,
+        dst: &mut [u8],
+        until: usize,
+    ) -> Result<(), DecompressError> {
+        if whole {
+            return self.run(prefix, dst, until);
+        }
+        let out_len = dst.len();
+        let until = until.min(out_len);
+        let (sp, dp) = self.decode::<true>(prefix, dst, out_len, until)?;
         self.sp = sp;
         self.dp = dp;
         Ok(())
@@ -440,7 +490,7 @@ impl Inflate {
 
     /// The decode loop: tokens from `self.sp` while the output is below
     /// `until`. Returns the new stream and output positions.
-    fn decode(
+    fn decode<const PREFIX: bool>(
         &self,
         src: &[u8],
         dst: &mut [u8],
@@ -449,12 +499,25 @@ impl Inflate {
     ) -> Result<(usize, usize), DecompressError> {
         let mut sp = self.sp; // stream position
         let mut dp = self.dp; // output position
+        // Where the token being decoded starts: over a prefix, a token
+        // cut off by its end leaves the decode here.
+        let mut tsp;
+        let mut tdp;
 
+        // The stream ended mid-token: over a prefix, stop before it.
+        macro_rules! truncated {
+            () => {{
+                if PREFIX {
+                    return Ok((tsp, tdp));
+                }
+                return Err(DecompressError::Truncated);
+            }};
+        }
         // Reads one stream byte.
         macro_rules! take {
             () => {{
                 if sp >= src.len() {
-                    return Err(DecompressError::Truncated);
+                    truncated!();
                 }
                 let b = src[sp];
                 sp += 1;
@@ -463,19 +526,25 @@ impl Inflate {
         }
 
         while dp < until {
+            tsp = sp;
+            tdp = dp;
             let tag = take!();
             let mut lit_len = usize::from(tag >> 4);
             let mut match_len = usize::from(tag & 0x0F);
 
             if lit_len == 15 {
-                lit_len += read_ext(src, &mut sp)?;
+                match read_ext(src, &mut sp) {
+                    Ok(n) => lit_len += n,
+                    Err(DecompressError::Truncated) => truncated!(),
+                    Err(e) => return Err(e),
+                }
             }
             // Copy literals.
             if lit_len > out_len - dp {
                 return Err(DecompressError::Invalid);
             }
             if sp + lit_len > src.len() {
-                return Err(DecompressError::Truncated);
+                truncated!();
             }
             copy_literals(dst, dp, src, sp, lit_len);
             sp += lit_len;
@@ -485,12 +554,16 @@ impl Inflate {
             }
 
             if match_len == 15 {
-                match_len += read_ext(src, &mut sp)?;
+                match read_ext(src, &mut sp) {
+                    Ok(n) => match_len += n,
+                    Err(DecompressError::Truncated) => truncated!(),
+                    Err(e) => return Err(e),
+                }
             }
             match_len += MIN_MATCH;
             // Offset: 2 bytes, little-endian, 1-based distance back.
             if sp + 2 > src.len() {
-                return Err(DecompressError::Truncated);
+                truncated!();
             }
             let offset = usize::from(src[sp]) | (usize::from(src[sp + 1]) << 8);
             sp += 2;
@@ -590,6 +663,231 @@ fn read_ext(src: &[u8], sp: &mut usize) -> Result<usize, DecompressError> {
         // check rejects the token.
         if total > (1 << 24) {
             return Ok(total);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`Inflate::run_prefix`] over growing prefixes of a stream decodes
+    //! exactly what [`decompress`] does over the whole (ADR-0039).
+    use super::{CompressScratch, DecompressError, Inflate, decompress};
+    extern crate std;
+    use std::boxed::Box;
+    use std::vec::Vec;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            usize::try_from(self.next() % u64::try_from(n).unwrap()).unwrap()
+        }
+    }
+
+    /// A block that compresses: runs of a few words, numbers, and noise.
+    fn compressible(rng: &mut Rng, len: usize) -> Vec<u8> {
+        let words: [&[u8]; 5] = [b"key-", b"value-", b"sensor/temp/", b"\0\0\0\0", b"zz"];
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            match rng.below(4) {
+                0 => out.extend_from_slice(words[rng.below(words.len())]),
+                1 => out.extend_from_slice(std::format!("{:05}", rng.below(99_999)).as_bytes()),
+                2 => out.extend((0..rng.below(24)).map(|_| u8::try_from(rng.below(256)).unwrap())),
+                _ => out.extend(core::iter::repeat_n(0u8, rng.below(300))),
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// Decodes `stream` into `len` bytes through prefixes that grow by
+    /// random steps, with random `until`s, checking after each call that
+    /// the final bytes are `want`'s and that only the prefix's end stops
+    /// a decode without an error. Returns the error the decode ended in.
+    fn by_prefixes(
+        rng: &mut Rng,
+        stream: &[u8],
+        len: usize,
+        want: &[u8],
+        want_err: Option<DecompressError>,
+    ) -> Option<DecompressError> {
+        let mut out = std::vec![0xA5u8; len];
+        let mut inflate = Inflate::new();
+        let mut have = 0usize;
+        loop {
+            have = (have + 1 + rng.below(64)).min(stream.len());
+            let whole = have == stream.len();
+            // Several calls over one prefix, each to a further `until`.
+            for _ in 0..=rng.below(3) {
+                let until = inflate.done() + rng.below(len + 1);
+                let before = inflate;
+                match inflate.run_prefix(&stream[..have], whole, &mut out, until) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Only a token wholly inside the prefix errs, and
+                        // so the whole stream errs the same way; only the
+                        // whole stream is ever cut short.
+                        assert_eq!(Some(e), want_err, "prefix {have} of {}", stream.len());
+                        assert!(whole || e == DecompressError::Invalid);
+                        // The state did not move.
+                        assert_eq!(
+                            (inflate.consumed(), inflate.done()),
+                            (before.consumed(), before.done())
+                        );
+                        return Some(e);
+                    }
+                }
+                assert!(inflate.done() >= before.done() && inflate.consumed() >= before.consumed());
+                assert!(inflate.consumed() <= have, "read past the prefix");
+                assert_eq!(
+                    out[..inflate.done()],
+                    want[..inflate.done()],
+                    "prefix {have}"
+                );
+                if !whole && inflate.done() < until.min(len) {
+                    // Stopped short of `until`: by the prefix's end, at
+                    // the start of a token it cuts off.
+                    assert!(inflate.consumed() < have || have == inflate.consumed());
+                }
+                if inflate.done() == len {
+                    assert_eq!(want_err, None);
+                    return None;
+                }
+            }
+            if whole {
+                // The whole stream, every `until` reached: nothing more.
+                let r = inflate.run_prefix(stream, true, &mut out, len);
+                assert_eq!(r.err(), want_err);
+                if r.is_ok() {
+                    assert_eq!(out[..], want[..]);
+                }
+                return r.err();
+            }
+        }
+    }
+
+    fn compressed<const B: usize>(block: &[u8]) -> Option<Vec<u8>> {
+        let mut cs = Box::new(CompressScratch::<B>::new());
+        let clen = cs.compress(block)?;
+        Some(cs.compressed()[..clen].to_vec())
+    }
+
+    #[test]
+    fn run_prefix_matches_decompress() {
+        let mut n = 0;
+        for seed in 1..400u64 {
+            let mut rng = Rng(seed * 0x9E37_79B9);
+            let len = [1000usize, 4092, 16380][rng.below(3)];
+            let block = compressible(&mut rng, len);
+            let stream = match len {
+                1000 => compressed::<1004>(&block),
+                4092 => compressed::<4096>(&block),
+                _ => compressed::<16384>(&block),
+            };
+            let Some(stream) = stream else { continue };
+            let mut want = std::vec![0u8; len];
+            assert_eq!(decompress(&stream, &mut want), Ok(len));
+            assert_eq!(want, block);
+            for _ in 0..8 {
+                assert_eq!(by_prefixes(&mut rng, &stream, len, &want, None), None);
+            }
+            n += 1;
+        }
+        assert!(n > 300, "{n} blocks compressed");
+    }
+
+    /// Streams that do not decode: a valid one cut short, or with bytes
+    /// changed (lengths, extension runs of 0xFF, offsets). A prefix decode
+    /// fails exactly where the whole decode does, with the same error,
+    /// and stops cleanly before every token its prefix cuts off.
+    #[test]
+    fn a_prefix_decode_fails_only_where_the_whole_does() {
+        let mut errs = [0usize; 2];
+        for seed in 1..600u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let block = compressible(&mut rng, 4092);
+            let Some(mut stream) = compressed::<4096>(&block) else {
+                continue;
+            };
+            match rng.below(4) {
+                0 => stream.truncate(rng.below(stream.len())),
+                1 => {
+                    let at = rng.below(stream.len());
+                    let run = 1 + rng.below(40);
+                    for b in stream.iter_mut().skip(at).take(run) {
+                        *b = 0xFF;
+                    }
+                }
+                _ => {
+                    for _ in 0..=rng.below(4) {
+                        let at = rng.below(stream.len());
+                        stream[at] = u8::try_from(rng.below(256)).unwrap();
+                    }
+                }
+            }
+            let mut want = std::vec![0xA5u8; 4092];
+            let want_err = decompress(&stream, &mut want).err();
+            match want_err {
+                Some(DecompressError::Truncated) => errs[0] += 1,
+                Some(DecompressError::Invalid) => errs[1] += 1,
+                None => {}
+            }
+            for _ in 0..4 {
+                assert_eq!(
+                    by_prefixes(&mut rng, &stream, 4092, &want, want_err),
+                    want_err
+                );
+            }
+            // The whole stream as a prefix: an invalid token lies wholly
+            // inside it, so it is an error, not a stop; only a stream cut
+            // mid-token stops short.
+            let mut out = std::vec![0u8; 4092];
+            let mut inflate = Inflate::new();
+            let r = inflate.run_prefix(&stream, false, &mut out, 4092);
+            match want_err {
+                Some(DecompressError::Invalid) => assert_eq!(r, Err(DecompressError::Invalid)),
+                Some(DecompressError::Truncated) => {
+                    assert_eq!(r, Ok(()));
+                    assert!(inflate.done() < 4092);
+                }
+                None => assert_eq!(inflate.done(), 4092),
+            }
+        }
+        assert!(errs[0] > 50 && errs[1] > 50, "{errs:?}");
+    }
+
+    /// A decode kept as `(consumed, done)` and resumed into the same
+    /// output over another copy of the stream from `consumed` on (the
+    /// bytes before it changed) makes the same block (ADR-0039).
+    #[test]
+    fn a_resumed_decode_reads_only_the_stream_ahead() {
+        for seed in 1..200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let block = compressible(&mut rng, 4092);
+            let Some(stream) = compressed::<4096>(&block) else {
+                continue;
+            };
+            let mut out = std::vec![0u8; 4092];
+            let mut inflate = Inflate::new();
+            let cut = rng.below(stream.len());
+            inflate
+                .run_prefix(&stream[..cut], false, &mut out, 4092)
+                .unwrap();
+            let kept = (inflate.consumed(), inflate.done());
+            let mut other = stream.clone();
+            for b in &mut other[..kept.0] {
+                *b = !*b;
+            }
+            let mut again = Inflate::resumed(kept.0, kept.1);
+            again.run_prefix(&other, true, &mut out, 4092).unwrap();
+            assert_eq!(out, block);
         }
     }
 }

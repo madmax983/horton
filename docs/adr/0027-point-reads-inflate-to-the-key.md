@@ -70,6 +70,9 @@ A raw block is searched in place, with no copy.
   rules decide that). A read of a key absent from a table usually
   stops at the bloom filter and never reaches a data block.
 
+A seek does the same since ADR-0039, and checks the stream as it
+decodes rather than whole first; its later steps go on with the decode.
+
 ## References
 
 - [ADR-0026](0026-hot-path-pass-crc-codec-cache-memtable.md) (where

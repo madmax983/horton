@@ -3,6 +3,11 @@
 //! what an unfailed scan yields from there, with no entry lost,
 //! repeated or given another entry's value.
 //!
+//! Over compressed tables a failed read can also be the one that would
+//! have gone on with a seek's partial inflate (ADR-0039): the buffer
+//! keeps what it had, and the retry goes on from there or reads the
+//! block again.
+//!
 //! A cursor is moved to the block it parks in only once the park has
 //! found its entry there. Before that fix a reverse cursor that stepped
 //! back to an earlier block was moved first, so a failed read of that
@@ -13,6 +18,7 @@
 mod common;
 
 use common::{Lcg, MemDevice, TestDb, block_on, test_config};
+use horton::Config;
 use horton::cache::BlockCache;
 use horton::{
     BlockDevice, CachePort, Compaction, Error, MemTable, Progress, RevScan, Scan, ScanBlock,
@@ -81,7 +87,12 @@ fn drain(db: &mut TestDb<MemDevice<4096>>) {
 
 /// Writes `keys` in order, each with a value of its own, and compacts.
 fn build(keys: impl Iterator<Item = usize>) -> TestDb<MemDevice<4096>> {
-    let mut db = TestDb::new(MemDevice::<4096>::new(), test_config());
+    build_with(test_config(), keys)
+}
+
+/// [`build`] under `config`.
+fn build_with(config: Config, keys: impl Iterator<Item = usize>) -> TestDb<MemDevice<4096>> {
+    let mut db = TestDb::new(MemDevice::<4096>::new(), config);
     block_on(db.open()).unwrap();
     for (n, i) in keys.enumerate() {
         let val = format!("value-{i:05}-{n:05}-").repeat(3).into_bytes();
@@ -227,5 +238,27 @@ fn a_failed_read_mid_scan_changes_nothing_a_retry_yields() {
 #[test]
 fn a_failed_read_while_crossing_invisible_blocks_changes_nothing() {
     let db = build(0..2400);
+    every_read_fails_once(&db, 1200);
+}
+
+/// [`a_failed_read_mid_scan_changes_nothing_a_retry_yields`] over
+/// compressed tables: each seek inflates the start of its block, and a
+/// read that fails while the scan goes on with that inflate, or reads the
+/// next block, leaves the scan as it was (ADR-0039).
+#[test]
+fn a_failed_read_mid_compressed_scan_changes_nothing_a_retry_yields() {
+    let mut rng = Lcg::new(0xC0DE_F11F);
+    let db = build_with(
+        test_config().with_compression_from_level(0),
+        (0..3000).map(|_| rng.next_bounded(3000)),
+    );
+    every_read_fails_once(&db, u64::MAX);
+}
+
+/// [`a_failed_read_while_crossing_invisible_blocks_changes_nothing`] over
+/// compressed tables.
+#[test]
+fn a_failed_read_while_crossing_invisible_compressed_blocks_changes_nothing() {
+    let db = build_with(test_config().with_compression_from_level(0), 0..2400);
     every_read_fails_once(&db, 1200);
 }

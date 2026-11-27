@@ -103,7 +103,9 @@ borrowed, or, in the host store, its tables pinned.
 - The reverse cursor's own block, and each re-park on it, is searched
   for what the search reads.
 - A compressed block is inflated whole, from a lend that checks its
-  flag and its stream (`0..clen`) rather than the whole image.
+  flag and its stream (`0..clen`) rather than the whole image. (Since
+  ADR-0039 a forward seek's lend checks and inflates only the start of
+  the stream, and keeps the decode for a later lend to go on with.)
 
 **`CachePort::checks_ranges` is new.** It says whether `with_checked`
 checks only the ranges it is asked about. The provided method answers

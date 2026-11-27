@@ -297,7 +297,7 @@ compacting.
 
 [`horton::profile`](src/profile.rs) is a measured ESP32-S3 shape: 4 KiB
 blocks, 32-byte keys, 64-byte values, a 16-entry memtable, 4 × 4 tables,
-a 2-block cache. It needs 114,168 bytes: 96,488 of structs, plus the
+a 2-block cache. It needs 114,176 bytes: 96,496 of structs, plus the
 largest future (`archive_commit`, 17,680 bytes). `tests/profile.rs`
 fails the test suite past 114,688 bytes (112 KiB). The breakdown, the futures
 and the history are in [`BUDGET.md`](BUDGET.md).
