@@ -2681,7 +2681,11 @@ fn lookup_image_checked<E, const BLOCK: usize>(
     // The table of entry points, if any (ADR-0040): checked, then a
     // search of its chunks that checks only the stream it inflates.
     let count = body_end - 4;
-    if clen < count && check(count, body_end - 2) && body[count..count + 2] != [0, 0] {
+    if points::has_points::<BLOCK>()
+        && clen < count
+        && check(count, body_end - 2)
+        && body[count..count + 2] != [0, 0]
+    {
         let n = usize::from(u16::from_le_bytes([body[count], body[count + 1]]));
         let table = count
             .checked_sub(n.min(MAX_POINTS + 1) * POINT_LEN)
@@ -2756,10 +2760,15 @@ impl ChunkDecode {
     }
 }
 
-/// Point reads that began past chunk 0 (tests: the path is reached).
+/// Point reads on this thread that began past chunk 0 (tests: the path
+/// is reached).
 #[cfg(test)]
-pub(crate) static ENTERED: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+mod entered {
+    extern crate std;
+    std::thread_local! {
+        pub(super) static ENTERED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+}
 
 /// Output a probe of a chunk head decodes: the head entry, most often.
 const PROBE_STEP: usize = 160;
@@ -2767,6 +2776,7 @@ const PROBE_STEP: usize = 160;
 /// The entry a decode has made final at `off`, if one parses there whole
 /// (`None`: not yet final, or the entries have ended: a zero key length).
 /// `Err`: its header is final and does not parse.
+#[inline]
 fn entry_ready(out: &[u8], done: usize, off: usize) -> Option<(ParsedEntry<'_>, usize)> {
     data_entry_parse(out.get(..done)?, off).ok()
 }
@@ -2854,7 +2864,7 @@ fn chunk_for_key(
         return Ok(Some((main, 0)));
     }
     #[cfg(test)]
-    ENTERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    entered::ENTERED.with(|e| e.set(e.get() + 1));
     let (s, t, head) = point_at(table, chunk - 1);
     let dec = match last {
         Some((at, dec)) if at == chunk => dec,
@@ -4408,12 +4418,14 @@ mod partial_inflate_tests {
     use std::vec::Vec;
 
     const BLOCK: usize = 4096;
+    /// Blocks that carry entry points (ADR-0040).
+    const BIG: usize = 16_384;
 
-    struct Ram(Vec<[u8; BLOCK]>);
+    struct Ram<const B: usize = BLOCK>(Vec<[u8; B]>);
 
-    impl BlockDevice for Ram {
+    impl<const B: usize> BlockDevice for Ram<B> {
         type Error = ();
-        const BLOCK: usize = BLOCK;
+        const BLOCK: usize = B;
         fn poll_read_block(
             &self,
             _: &mut Context<'_>,
@@ -4465,7 +4477,7 @@ mod partial_inflate_tests {
     /// A table of `keys` keys, each with 1 to 4 versions (newest first),
     /// some of them tombstones and some with an expiry; written with
     /// compression (`compressible`) or with every block raw.
-    fn table(keys: u32, compressible: bool) -> (Ram, u64) {
+    fn table<const B: usize>(keys: u32, compressible: bool) -> (Ram<B>, u64) {
         // Key, value, sequence number, tombstone, expiry.
         type Row = (Vec<u8>, Vec<u8>, u64, bool, u64);
         let mut entries: Vec<Row> = Vec::new();
@@ -4501,9 +4513,9 @@ mod partial_inflate_tests {
             }
             seq -= 10;
         }
-        let mut dev = Ram(std::vec![[0u8; BLOCK]; 512]);
-        let mut w = TableWriter::<BLOCK, 64, 32>::new(0, 3);
-        let mut cs = CompressScratch::<BLOCK>::new();
+        let mut dev = Ram(std::vec![[0u8; B]; 512]);
+        let mut w = TableWriter::<B, 64, 32>::new(0, 3);
+        let mut cs = CompressScratch::<B>::new();
         for (key, val, seq, tomb, expire) in &entries {
             let e = SstEntry {
                 key,
@@ -4532,7 +4544,7 @@ mod partial_inflate_tests {
 
         // `table` numbers versions down from 10,000, ten a key.
         let keys = 950u32;
-        let (dev, data_blocks) = table(keys, false);
+        let (dev, data_blocks) = table::<BLOCK>(keys, false);
         assert!(data_blocks > 3 * 16, "setup: {data_blocks} data blocks");
         // Base 0: data, bloom (one block), index, footer.
         let index_id = data_blocks + 1;
@@ -4616,41 +4628,51 @@ mod partial_inflate_tests {
     /// whole.
     #[test]
     fn a_flipped_bit_in_a_cached_data_block_never_changes_a_lookup() {
+        cached_flips::<BLOCK>(40, 1);
+    }
+
+    /// The same over blocks that carry entry points (ADR-0040): the
+    /// table, the count word and every chunk's stream are flipped, and a
+    /// lookup that begins at an entry point checks what it decodes.
+    #[test]
+    fn a_flipped_bit_in_a_cached_block_with_entry_points_never_changes_a_lookup() {
+        cached_flips::<BIG>(160, if cfg!(debug_assertions) { 13 } else { 3 });
+    }
+
+    fn cached_flips<const B: usize>(keys: u32, step: usize) {
         use crate::cache::BlockCache;
         use core::cell::RefCell;
 
         let table_id = 7;
         let mut val = std::vec![0u8; 4096];
         for compressible in [false, true] {
-            let (dev, blocks) = table(40, compressible);
-            let cache = RefCell::new(BlockCache::<BLOCK, 4>::new());
-            let (mut raw, mut logical) = ([0u8; BLOCK], [0u8; BLOCK]);
-            let mut answer = |cache: Option<&RefCell<BlockCache<BLOCK, 4>>>,
-                              b: u64,
-                              key: &[u8],
-                              max_seq: u64| {
-                let cache = cache.map(|c| c as &dyn CachePort<BLOCK>);
-                let r = block_on(lookup_data_block(
-                    &dev,
-                    cache,
-                    table_id,
-                    b,
-                    &mut raw,
-                    &mut logical,
-                    key,
-                    &mut val,
-                    max_seq,
-                ));
-                shape(&r, &val)
-            };
+            let (dev, blocks) = table::<B>(keys, compressible);
+            let cache = RefCell::new(BlockCache::<B, 4>::new());
+            let (mut raw, mut logical) = ([0u8; B], [0u8; B]);
+            let mut answer =
+                |cache: Option<&RefCell<BlockCache<B, 4>>>, b: u64, key: &[u8], max_seq: u64| {
+                    let cache = cache.map(|c| c as &dyn CachePort<B>);
+                    let r = block_on(lookup_data_block(
+                        &dev,
+                        cache,
+                        table_id,
+                        b,
+                        &mut raw,
+                        &mut logical,
+                        key,
+                        &mut val,
+                        max_seq,
+                    ));
+                    shape(&r, &val)
+                };
             let (mut unnoticed, mut caught) = (0u32, 0u32);
             for b in 0..blocks {
                 // The keys the block holds, and the absent ones around
                 // them; and what an uncached lookup answers for each.
-                let keys: Vec<Vec<u8>> = (0..40 * 3 + 2)
+                let names: Vec<Vec<u8>> = (0..keys * 3 + 2)
                     .map(|k| format!("key{k:05}").into_bytes())
                     .collect();
-                let held: Vec<bool> = keys
+                let held: Vec<bool> = names
                     .iter()
                     .map(|k| {
                         let a = answer(None, b, k, u64::MAX);
@@ -4658,8 +4680,8 @@ mod partial_inflate_tests {
                     })
                     .collect();
                 let mut probes = Vec::new();
-                for (i, key) in keys.iter().enumerate() {
-                    let near = held[i.saturating_sub(1)..(i + 2).min(keys.len())]
+                for (i, key) in names.iter().enumerate() {
+                    let near = held[i.saturating_sub(1)..(i + 2).min(names.len())]
                         .iter()
                         .any(|&h| h);
                     if near {
@@ -4670,7 +4692,7 @@ mod partial_inflate_tests {
                 }
                 assert!(probes.len() >= 8, "block {b}: {} probes", probes.len());
                 let image = dev.0[usize::try_from(b).unwrap()];
-                for at in 0..BLOCK {
+                for at in (0..B).step_by(step) {
                     let damaged = || {
                         cache.borrow_mut().put(table_id, b, &image, true);
                         assert!(cache.borrow_mut().damage(table_id, b, at, 1 << (at % 8)));
@@ -4688,7 +4710,7 @@ mod partial_inflate_tests {
                     // Every lookup of the block, over the same flip: at
                     // every byte in a release build, every third in a
                     // debug one (CI runs both).
-                    if cfg!(debug_assertions) && at % 3 != 0 {
+                    if cfg!(debug_assertions) && !(at / step).is_multiple_of(3) {
                         continue;
                     }
                     damaged();
@@ -4697,6 +4719,10 @@ mod partial_inflate_tests {
                         assert_eq!(&got, want, "block {b}, byte {at}, max_seq {s}");
                     }
                 }
+            }
+            if compressible && super::points::has_points::<B>() {
+                let entered = super::entered::ENTERED.with(core::cell::Cell::get);
+                assert!(entered > 100, "{entered} lookups began at an entry point");
             }
             assert!(caught > 0, "no flip was ever read");
             if !compressible {
@@ -4716,7 +4742,7 @@ mod partial_inflate_tests {
     #[test]
     fn a_checked_lookup_answers_alike_and_checks_what_it_reads() {
         for compressible in [true, false] {
-            let (dev, blocks) = table(700, compressible);
+            let (dev, blocks) = table::<BLOCK>(700, compressible);
             for b in 0..usize::try_from(blocks).unwrap() {
                 let image = dev.0[b];
                 let mut whole = [0u8; BLOCK];
@@ -4796,8 +4822,8 @@ mod partial_inflate_tests {
     #[test]
     fn a_wrong_table_is_corrupt_whole_and_never_reads_stale_bytes() {
         use super::{POINT_LEN, inflate_image};
-        let (dev, blocks) = table(700, true);
-        let body_end = BLOCK - CRC_LEN;
+        let (dev, blocks) = table::<BIG>(700, true);
+        let body_end = BIG - CRC_LEN;
         let (mut mutated, mut answered, mut failed, mut wrong) = (0u32, 0u32, 0u32, 0u32);
         for b in 0..usize::try_from(blocks).unwrap() {
             let image = dev.0[b];
@@ -4820,22 +4846,20 @@ mod partial_inflate_tests {
                         let Ok(v) = u16::try_from(v) else { continue };
                         bad[at..at + 2].copy_from_slice(&v.to_le_bytes());
                         mutated += 1;
-                        let mut out = [0u8; BLOCK];
+                        let mut out = [0u8; BIG];
                         assert!(
                             !inflate_image(&bad[..body_end], clen, &mut out[..body_end]),
                             "block {b}: point {i} field {field} {delta:+} passed a whole inflate"
                         );
-                        let mut whole = [0u8; BLOCK];
-                        assert!(
-                            inflate_data_block::<(), BLOCK>(&bad, &mut whole, b as u64).is_err()
-                        );
+                        let mut whole = [0u8; BIG];
+                        assert!(inflate_data_block::<(), BIG>(&bad, &mut whole, b as u64).is_err());
                         for k in (0..700 * 3).step_by(7) {
                             let key = format!("key{k:05}").into_bytes();
                             let mut v1 = std::vec![0u8; 4096];
                             let mut v2 = std::vec![0u8; 4096];
-                            let mut s1 = [0xEEu8; BLOCK];
-                            let mut s2 = [0x11u8; BLOCK];
-                            let r1 = lookup_image::<(), BLOCK>(
+                            let mut s1 = [0xEEu8; BIG];
+                            let mut s2 = [0x11u8; BIG];
+                            let r1 = lookup_image::<(), BIG>(
                                 &bad,
                                 &mut s1,
                                 &key,
@@ -4843,7 +4867,7 @@ mod partial_inflate_tests {
                                 b as u64,
                                 u64::MAX,
                             );
-                            let r2 = lookup_image::<(), BLOCK>(
+                            let r2 = lookup_image::<(), BIG>(
                                 &bad,
                                 &mut s2,
                                 &key,
@@ -4853,8 +4877,8 @@ mod partial_inflate_tests {
                             );
                             assert_eq!(shape(&r1, &v1), shape(&r2, &v2), "stale bytes read");
                             let mut v3 = std::vec![0u8; 4096];
-                            let mut s3 = [0u8; BLOCK];
-                            let good = lookup_image::<(), BLOCK>(
+                            let mut s3 = [0u8; BIG];
+                            let good = lookup_image::<(), BIG>(
                                 &image,
                                 &mut s3,
                                 &key,
@@ -4893,20 +4917,31 @@ mod partial_inflate_tests {
 
     #[test]
     fn partial_inflate_answers_as_the_whole_block_does() {
+        answers_alike::<BLOCK>();
+    }
+
+    /// The same over blocks that carry entry points (ADR-0040): point
+    /// reads search the chunk heads and decode from the chunk that holds
+    /// the key, and answer as the whole block does.
+    #[test]
+    fn a_read_from_an_entry_point_answers_as_the_whole_block_does() {
+        answers_alike::<BIG>();
+    }
+
+    fn answers_alike<const B: usize>() {
         for compressible in [true, false] {
-            let (dev, blocks) = table(700, compressible);
+            let (dev, blocks) = table::<B>(700, compressible);
             assert!(blocks > 4, "the table spans blocks");
             let mut compressed = 0;
             for b in 0..usize::try_from(blocks).unwrap() {
                 let image = dev.0[b];
-                let mut whole = [0u8; BLOCK];
-                let inflated =
-                    inflate_data_block::<(), BLOCK>(&image, &mut whole, b as u64).unwrap();
+                let mut whole = [0u8; B];
+                let inflated = inflate_data_block::<(), B>(&image, &mut whole, b as u64).unwrap();
                 compressed += usize::from(inflated);
                 let body: &[u8] = if inflated {
-                    &whole[..BLOCK - CRC_LEN]
+                    &whole[..B - CRC_LEN]
                 } else {
-                    &image[..BLOCK - CRC_LEN]
+                    &image[..B - CRC_LEN]
                 };
                 for k in 0..(700 * 3 + 5) {
                     let key = format!("key{k:05}").into_bytes();
@@ -4922,8 +4957,8 @@ mod partial_inflate_tests {
                                 &mut |_, _| true,
                             );
                             let mut got_val = std::vec![0u8; cap];
-                            let mut scratch = [0xEEu8; BLOCK];
-                            let got = lookup_image::<(), BLOCK>(
+                            let mut scratch = [0xEEu8; B];
+                            let got = lookup_image::<(), B>(
                                 &image,
                                 &mut scratch,
                                 &key,
@@ -4945,15 +4980,15 @@ mod partial_inflate_tests {
             // output buffer is as the caller left it.
             for b in 0..usize::try_from(blocks).unwrap() {
                 let image = dev.0[b];
-                let mut whole = [0u8; BLOCK];
-                if !inflate_data_block::<(), BLOCK>(&image, &mut whole, b as u64).unwrap() {
+                let mut whole = [0u8; B];
+                if !inflate_data_block::<(), B>(&image, &mut whole, b as u64).unwrap() {
                     continue;
                 }
                 let kl = usize::from(u16::from_le_bytes([whole[0], whole[1]]));
                 let first = whole[13..13 + kl].to_vec();
-                let mut scratch = [0xEEu8; BLOCK];
+                let mut scratch = [0xEEu8; B];
                 let mut val = [0u8; 4096];
-                let got = lookup_image::<(), BLOCK>(
+                let got = lookup_image::<(), B>(
                     &image,
                     &mut scratch,
                     &first,
@@ -4963,17 +4998,20 @@ mod partial_inflate_tests {
                 );
                 assert!(matches!(got, Ok(BlockOutcome::Hit(_))), "block {b}");
                 assert!(
-                    scratch[2048..BLOCK - CRC_LEN].iter().all(|&x| x == 0xEE),
+                    scratch[2048..B - CRC_LEN].iter().all(|&x| x == 0xEE),
                     "block {b}: a hit on the first key inflated the whole block"
                 );
             }
             if compressible {
-                let entered = super::ENTERED.load(core::sync::atomic::Ordering::Relaxed);
-                std::println!("point reads begun at an entry point: {entered}");
-                assert!(
-                    entered > 1000,
-                    "{entered} point reads began at an entry point"
-                );
+                let entered = super::entered::ENTERED.with(core::cell::Cell::get);
+                if super::points::has_points::<B>() {
+                    assert!(
+                        entered > 1000,
+                        "{entered} point reads began at an entry point"
+                    );
+                } else {
+                    assert_eq!(entered, 0, "a block that carries no table");
+                }
                 assert!(compressed > 4, "most blocks are compressed");
             } else {
                 assert_eq!(compressed, 0, "written without compression");

@@ -584,7 +584,7 @@ impl Inflate {
     ) -> Result<(), DecompressError> {
         let out_len = dst.len();
         let until = until.min(out_len);
-        let (sp, dp) = self.decode::<false>(src, dst, out_len, until)?;
+        let (sp, dp) = self.decode_with::<false>(src, dst, out_len, until)?;
         self.sp = sp;
         self.dp = dp;
         Ok(())
@@ -637,15 +637,33 @@ impl Inflate {
         }
         let out_len = dst.len();
         let until = until.min(out_len);
-        let (sp, dp) = self.decode::<true>(prefix, dst, out_len, until)?;
+        let (sp, dp) = self.decode_with::<true>(prefix, dst, out_len, until)?;
         self.sp = sp;
         self.dp = dp;
         Ok(())
     }
 
+    /// [`decode`](Self::decode) with its floor known at compile time to
+    /// be zero or not: a decode with no floor, the most of them, pays no
+    /// floor check on each match.
+    fn decode_with<const PREFIX: bool>(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        out_len: usize,
+        until: usize,
+    ) -> Result<(usize, usize), DecompressError> {
+        if self.floor == 0 {
+            self.decode::<PREFIX, false>(src, dst, out_len, until)
+        } else {
+            self.decode::<PREFIX, true>(src, dst, out_len, until)
+        }
+    }
+
     /// The decode loop: tokens from `self.sp` while the output is below
-    /// `until`. Returns the new stream and output positions.
-    fn decode<const PREFIX: bool>(
+    /// `until`. Returns the new stream and output positions. With
+    /// `FLOOR`, no match may reach below [`Inflate::floor`].
+    fn decode<const PREFIX: bool, const FLOOR: bool>(
         &self,
         src: &[u8],
         dst: &mut [u8],
@@ -722,7 +740,7 @@ impl Inflate {
             }
             let offset = usize::from(src[sp]) | (usize::from(src[sp + 1]) << 8);
             sp += 2;
-            if offset == 0 || offset > dp - self.floor {
+            if offset == 0 || offset > if FLOOR { dp - self.floor } else { dp } {
                 return Err(DecompressError::Invalid);
             }
             if match_len > out_len - dp {

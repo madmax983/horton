@@ -711,6 +711,7 @@ struct Gated<const BLOCK: usize> {
 }
 
 impl<const BLOCK: usize> Gated<BLOCK> {
+    #[inline]
     const fn holds(&self, from: usize, to: usize) -> bool {
         if to <= from {
             return true;
@@ -719,12 +720,18 @@ impl<const BLOCK: usize> Gated<BLOCK> {
             return false;
         }
         let m = mask::<BLOCK>(from, to);
-        if self.valid & m == m {
-            return true;
-        }
+        self.valid & m == m || (self.lo != 0 && self.holds_past_lo(from, m))
+    }
+
+    /// The rest of [`holds`](Self::holds), for a buffer whose decode
+    /// began at an entry point (ADR-0040): the grain `lo` lies in holds
+    /// from `lo` on once the grain after it does.
+    #[cold]
+    #[inline(never)]
+    const fn holds_past_lo(&self, from: usize, m: u64) -> bool {
         let g = grain::<BLOCK>();
         let first = self.lo / g;
-        if self.lo == 0 || from < self.lo || first + 1 >= 64 {
+        if from < self.lo || first + 1 >= 64 {
             return false;
         }
         // The decode began inside grain `first` and made the rest of it:
@@ -1738,6 +1745,7 @@ const PROBE_STEP: usize = 160;
 /// A decode kept from an earlier lend began at its chunk because that
 /// head sorted below an earlier seek's start; a seek that sorts at or
 /// below the head asks for the whole block.
+#[inline]
 fn chunk_head<const BLOCK: usize>(
     b: &[u8; BLOCK],
     from: usize,
@@ -1745,12 +1753,21 @@ fn chunk_head<const BLOCK: usize>(
     end: usize,
     g: &mut Gate<'_, '_, BLOCK>,
 ) -> Option<usize> {
-    let Gate::Prefix(p) = g else {
-        return Some(from);
-    };
-    if p.table.is_empty() {
-        return Some(from);
+    match g {
+        Gate::Prefix(p) if !p.table.is_empty() => search_heads(b, from, start, end, p),
+        _ => Some(from),
     }
+}
+
+/// [`chunk_head`] over a block that has a table.
+#[inline(never)]
+fn search_heads<const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    from: usize,
+    start: &[u8],
+    end: usize,
+    p: &mut Prefix<'_>,
+) -> Option<usize> {
     if start.is_empty() {
         p.sh = p.sl;
     }
@@ -1937,7 +1954,7 @@ type Kept<R, E> = (Result<R, Error<E>>, u64, Resume);
 ///   [`Blocks::extend`] or [`Blocks::complete`] to go on from.
 ///
 /// `None`: a check failed, and the lend is a miss.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn lend_prefix<E, R, const BLOCK: usize>(
     image: &[u8; BLOCK],
     data: &mut [u8; BLOCK],
@@ -1949,6 +1966,31 @@ fn lend_prefix<E, R, const BLOCK: usize>(
     check: &mut (dyn FnMut(usize, usize) -> bool + '_),
     f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
 ) -> Option<Kept<R, E>> {
+    // A block with no table, every block under 8 KiB among them, takes
+    // a build of this with the table's logic folded away: it costs what
+    // the decode cost before entry points (ADR-0040).
+    if table.is_empty() {
+        lend_prefix_in::<E, R, BLOCK, false>(image, data, start, clen, lends, table, bid, check, f)
+    } else {
+        lend_prefix_in::<E, R, BLOCK, true>(image, data, start, clen, lends, table, bid, check, f)
+    }
+}
+
+/// [`lend_prefix`], for a block with a table of entry points (`POINTS`)
+/// or with none.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn lend_prefix_in<E, R, const BLOCK: usize, const POINTS: bool>(
+    image: &[u8; BLOCK],
+    data: &mut [u8; BLOCK],
+    start: Option<(Stream, u8)>,
+    clen: usize,
+    lends: u8,
+    table: &[u8],
+    bid: u64,
+    check: &mut (dyn FnMut(usize, usize) -> bool + '_),
+    f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
+) -> Option<Kept<R, E>> {
+    let table: &[u8] = if POINTS { table } else { &[] };
     let body_end = BLOCK - sstable::CRC_LEN;
     let step = prefix_step(lends);
     // Damage the image's checks let through, as the whole path says.
@@ -2041,7 +2083,7 @@ fn lend_prefix<E, R, const BLOCK: usize>(
         p.missed = false;
         p.below = false;
         p.ask = Ask::Nothing;
-        if let Some((c, ps)) = &probe {
+        if POINTS && let Some((c, ps)) = &probe {
             p.probed = *c;
             p.plo = entry_floor(table, *c);
             p.phi = ps.inflate.done();
@@ -2054,6 +2096,18 @@ fn lend_prefix<E, R, const BLOCK: usize>(
             return None;
         };
         p = ran;
+        if !POINTS {
+            // No table: ADR-0039's loop, the decode from the block's
+            // start, run on past each miss.
+            if p.missed {
+                target = p.want.max(dp + 1) + step;
+            } else if parsed.is_err() {
+                target = body_end;
+            } else {
+                break parsed;
+            }
+            continue;
+        }
         let mut whole = false;
         let mut begin = None;
         match p.ask {
@@ -2258,6 +2312,8 @@ impl Stream {
     /// decode reaches it: a token must start there (ADR-0040).
     /// `Ok(false)`: a check failed (the lend is a miss). `Err`: the
     /// stream does not decode, or a point does not hold.
+    #[allow(clippy::inline_always)] // measured: not inlined, it cost every seek
+    #[inline(always)]
     fn grow<const BLOCK: usize>(
         &mut self,
         image: &[u8; BLOCK],
@@ -5467,20 +5523,23 @@ mod tests {
         /// go on through the chunks after it.
         #[test]
         fn a_chunked_inflate_seeks_and_parks_as_the_whole_block() {
+            // Block sizes that carry entry points (ADR-0040).
             let partial = chunked(|| {
                 let mut partial = 0;
                 for seed in 1..200 {
-                    partial += holds::<4096>(seed, 0);
+                    partial += holds::<8192>(seed, 0);
                     partial += holds::<16384>(seed, 0);
-                    partial += holds::<1000>(seed, 0);
+                    partial += holds::<32768>(seed, 0);
                 }
                 partial
             });
             assert!(partial > 1000, "{partial} partial seeks");
             let entered = ENTERED.with(Cell::get);
             std::println!("{partial} partial seeks, {entered} begun at an entry point");
+            // The entries a test block holds fill about 7 KB, so the
+            // larger blocks have few cuts among them.
             assert!(
-                entered > partial / 2,
+                entered > partial / 3,
                 "{entered} of {partial} seeks began at an entry point"
             );
         }
@@ -5492,7 +5551,7 @@ mod tests {
             chunked(|| {
                 for seed in 1..80 {
                     for flips in [1, 2, 9] {
-                        holds::<4096>(seed, flips);
+                        holds::<8192>(seed, flips);
                         holds::<16384>(seed, flips);
                     }
                 }

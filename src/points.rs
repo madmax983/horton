@@ -39,17 +39,24 @@ pub const MAX_POINTS: usize = 15;
 
 /// Least logical bytes from one chunk head to the next. Each cut costs
 /// the encoder its window, so cuts are kept a few kilobytes apart: a
-/// 4 KiB block has at most one, a 16 KiB block about seven (ADR-0040's
-/// measurements).
+/// 16 KiB block has about seven (ADR-0040's measurements).
 const fn chunk_min<const BLOCK: usize>() -> usize {
     let m = BLOCK / (MAX_POINTS + 1);
     if m < 2048 { 2048 } else { m }
 }
 
-/// Whether a `BLOCK`-byte block may carry entry points: its offsets fit
-/// 16 bits.
+/// Whether a `BLOCK`-byte block may carry entry points. Its offsets
+/// must fit 16 bits. And it must hold a few chunks: a block under 8 KiB
+/// could hold one cut, which measured a read no faster and a stream
+/// 1% to 10% longer (ADR-0040). Outside these sizes the fill is fill,
+/// to every reader.
 pub const fn has_points<const BLOCK: usize>() -> bool {
-    BLOCK - CRC_LEN <= u16::MAX as usize
+    carries_points(BLOCK - CRC_LEN)
+}
+
+/// [`has_points`] for a block whose body, up to its CRC, is `body` bytes.
+const fn carries_points(body: usize) -> bool {
+    body >= 8192 - CRC_LEN && body <= u16::MAX as usize
 }
 
 /// Entry point `i` of `table` (see [`point_table`]): `(s, t, b)`.
@@ -64,12 +71,16 @@ pub fn point_at(table: &[u8], i: usize) -> (usize, usize, usize) {
 }
 
 /// The entry points of the compressed data block image `body` (up to its
-/// CRC), whose stream is `clen` bytes: empty when it has none; `None`
-/// when its bytes cannot be a table. A table has at most [`MAX_POINTS`]
+/// CRC), whose stream is `clen` bytes: empty when it has none, or is of
+/// a size that carries none ([`has_points`]); `None` when its bytes
+/// cannot be a table. A table has at most [`MAX_POINTS`]
 /// points, lies wholly past the stream, and ascends: `s` and `t` never
 /// fall, `b` always rises, each `t` is at or below its `b`, each `s` is
 /// inside the stream, and each `b` lies before the trailer could begin.
 pub fn point_table(body: &[u8], clen: usize) -> Option<&[u8]> {
+    if !carries_points(body.len()) {
+        return Some(&[]);
+    }
     let at = body.len().checked_sub(4)?;
     let n = usize::from(u16::from_le_bytes([*body.get(at)?, *body.get(at + 1)?]));
     if n == 0 {
@@ -232,10 +243,13 @@ mod tests {
     extern crate std;
     use std::vec::Vec;
 
-    /// A 4 KiB body (up to its CRC) whose stream is `clen` bytes of 0xC3,
-    /// with `points` written as its table.
+    /// The body of a 16 KiB block, up to its CRC.
+    const BODY: usize = 16_380;
+
+    /// A 16 KiB body (up to its CRC) whose stream is `clen` bytes of
+    /// 0xC3, with `points` written as its table.
     fn body(clen: usize, points: &[(usize, usize, usize)]) -> Vec<u8> {
-        let mut b = std::vec![0u8; 4092];
+        let mut b = std::vec![0u8; BODY];
         b[..clen].fill(0xC3);
         let st: Vec<(usize, usize)> = points.iter().map(|p| (p.0, p.1)).collect();
         let heads: Vec<usize> = points.iter().map(|p| p.2).collect();
@@ -274,8 +288,8 @@ mod tests {
     #[test]
     fn a_table_over_the_stream_is_no_table() {
         // 3 points and the count take 20 bytes before the flag.
-        assert!(point_table(&body(4092 - 2 - 20, &GOOD), 4092 - 2 - 20).is_some());
-        assert!(point_table(&body(600, &GOOD), 4092 - 2 - 19).is_none());
+        assert!(point_table(&body(BODY - 2 - 20, &GOOD), BODY - 2 - 20).is_some());
+        assert!(point_table(&body(600, &GOOD), BODY - 2 - 19).is_none());
     }
 
     #[test]
@@ -317,7 +331,7 @@ mod tests {
     #[test]
     fn a_head_in_the_trailer_is_no_table() {
         let mut p = GOOD;
-        p[2] = (500, 4000, 4092 - 4);
+        p[2] = (500, 4000, BODY - 4);
         assert!(point_table(&body(600, &p), 600).is_none());
     }
 
@@ -348,8 +362,8 @@ mod tests {
     }
 
     /// The writer cuts at restarts a chunk's worth apart, at most
-    /// [`MAX_POINTS`] times, and never a block past 16-bit offsets: a
-    /// 4 KiB block once at most.
+    /// [`MAX_POINTS`] times, and never a block past 16-bit offsets or
+    /// under 8 KiB.
     #[test]
     fn bounds_are_restarts_a_chunk_apart() {
         let rs: Vec<u16> = (0..200).map(|i| i * 300).collect();
@@ -367,9 +381,14 @@ mod tests {
         // At most MAX_POINTS, however many restarts are a chunk apart.
         let dense: Vec<u16> = (0..1090).map(|i| i * 30).collect();
         assert_eq!(bounds_of::<32_768>(&dense, &mut out), MAX_POINTS);
+        // A block under 8 KiB is never cut, and its fill is fill.
         let rs4: Vec<u16> = (0..20).map(|i| i * 200).collect();
-        assert_eq!(bounds_of::<4096>(&rs4, &mut out), 1);
+        assert_eq!(bounds_of::<4096>(&rs4, &mut out), 0);
+        assert_eq!(bounds_of::<8192>(&rs4, &mut out), 1);
         assert_eq!(out[0], 2200, "the first restart 2 KiB in");
+        let mut small = std::vec![0u8; 4092];
+        small[4088..4090].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(point_table(&small, 100), Some(&[][..]));
         assert_eq!(bounds_of::<131_072>(&rs, &mut out), 0);
         let rs16: Vec<u16> = rs.iter().copied().filter(|&r| r < 16_380).collect();
         let n16 = bounds_of::<16_384>(&rs16, &mut out);
