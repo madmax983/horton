@@ -6005,6 +6005,188 @@ mod tests {
             (n > 0).then_some((logical, image))
         }
 
+        /// Every way a block can be read with `table` in place of its
+        /// own, under good sums: a seek from the start, one past every
+        /// key and one at a middle key, each followed by a completion.
+        /// A partial read over a wrong table is ADR-0027's class (a block
+        /// written wrong and checksummed) and may answer anything but
+        /// must end; a whole decode must refuse it. Returns how many
+        /// reads ended in `CorruptBlock`.
+        fn read_with_table<const B: usize>(
+            image: &[u8; B],
+            logical: &[u8; B],
+            table: &[u8],
+        ) -> usize {
+            let body_end = B - CRC_LEN;
+            let count = body_end - 4;
+            let mut wrong = *image;
+            let n = table.len() / 6;
+            wrong[count - table.len()..count].copy_from_slice(table);
+            wrong[count..count + 2].copy_from_slice(&u16::try_from(n).unwrap().to_le_bytes());
+            let mid = {
+                let mut off = 0;
+                let mut k = std::vec::Vec::new();
+                while off < body_end / 2 {
+                    let Ok(e) =
+                        crate::sstable::parse_data_entry::<(), B>(logical, off, body_end - 4, 7)
+                    else {
+                        break;
+                    };
+                    k = e.key.to_vec();
+                    off = e.next;
+                }
+                k
+            };
+            let mut corrupt = 0;
+            // Parks over fresh lends, at entries through the block: some
+            // decode from its start to its last grain and no further.
+            let mut off = 0;
+            while let Ok(e) =
+                crate::sstable::parse_data_entry::<(), B>(logical, off, body_end - 4, 7)
+            {
+                let at = off;
+                off = e.next;
+                let cache = one(&wrong);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let pend = super::super::provisional_end::<B>();
+                match blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                    park_in::<(), B, 64>(b, at, pend, None, u64::MAX, 7, g)
+                }) {
+                    Lend::Done(Err(crate::Error::CorruptBlock { id: 7 })) => corrupt += 1,
+                    Lend::Done(Ok(_)) => assert_ne!(
+                        blocks.current().valid,
+                        super::full::<B>(),
+                        "a park over a wrong table decoded the block whole and believed it"
+                    ),
+                    other => panic!("{:?}", matches!(other, Lend::Miss)),
+                }
+            }
+            for start in [&b""[..], b"zzzzzzzzzzzzzz", &mid] {
+                let cache = one(&wrong);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        seek_block::<(), B, 64>(b, start, u64::MAX, 7, g)
+                    });
+                match got {
+                    Lend::Done(Err(crate::Error::CorruptBlock { id: 7 })) => corrupt += 1,
+                    Lend::Done(Ok(_)) => assert_ne!(
+                        blocks.current().valid,
+                        super::full::<B>(),
+                        "a seek over a wrong table decoded the block whole and believed it"
+                    ),
+                    other => panic!("{:?}", matches!(other, Lend::Miss)),
+                }
+                if blocks.current().id == Some(7) {
+                    let done = block_on(blocks.complete(&NoDevice, Some(&cache), 1, 7));
+                    assert!(done.is_err(), "a completion believed a wrong table");
+                    corrupt += 1;
+                }
+            }
+            corrupt
+        }
+
+        /// A table moved off its block, under good sums, is never
+        /// believed by a whole decode, and a read over it ends. Each of
+        /// a point's three fields is moved over the offsets around it,
+        /// and a plain stream is given a table it never honoured, whose
+        /// later matches reach below its point. (Review of ADR-0040:
+        /// none of the whole decodes' checks of the table was tested
+        /// through a scan.)
+        #[test]
+        fn a_wrong_table_is_never_believed_whole() {
+            const B: usize = 16_384;
+            let mut corrupt = 0;
+            let mut tried = 0;
+            for seed in 1..25 {
+                let Some((logical, image)) = chunked_block::<B>(seed) else {
+                    continue;
+                };
+                let body_end = B - CRC_LEN;
+                let clen = usize::from(
+                    u16::from_le_bytes([image[body_end - 2], image[body_end - 1]]) & 0x7FFF,
+                );
+                let table = crate::points::point_table(&image[..body_end], clen)
+                    .unwrap()
+                    .to_vec();
+                for i in 0..table.len() / 6 {
+                    for field in 0..3 {
+                        for d in [-16i32, -7, -2, -1, 1, 2, 7, 16] {
+                            let mut t = table.clone();
+                            let at = 6 * i + 2 * field;
+                            let v = i32::from(u16::from_le_bytes([t[at], t[at + 1]])) + d;
+                            let Ok(v) = u16::try_from(v) else { continue };
+                            t[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                            if crate::points::point_table(
+                                &{
+                                    let mut w = image.clone();
+                                    let count = body_end - 4;
+                                    w[count - t.len()..count].copy_from_slice(&t);
+                                    w
+                                }[..body_end],
+                                clen,
+                            )
+                            .is_none()
+                            {
+                                continue;
+                            }
+                            tried += 1;
+                            corrupt += read_with_table(&image, &logical, &t);
+                        }
+                    }
+                }
+            }
+            assert!(tried > 400, "{tried} tables");
+            assert!(corrupt >= tried, "{corrupt} reads refused {tried} tables");
+            // A plain stream given one point at a token, whose head is a
+            // restart: only the floor tells it from a table it honours.
+            let mut floored = 0;
+            for seed in 1..25 {
+                let mut rng = Rng(seed);
+                let every = 1 + rng.below(4);
+                let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+                let logical: [u8; B] = block::<B>(&es, every);
+                let Some(image) = compressed::<B>(&logical) else {
+                    continue;
+                };
+                let body_end = B - CRC_LEN;
+                let clen = usize::from(
+                    u16::from_le_bytes([image[body_end - 2], image[body_end - 1]]) & 0x7FFF,
+                );
+                let rc = usize::from(u16::from_le_bytes([
+                    logical[body_end - 2],
+                    logical[body_end - 1],
+                ]));
+                let rstart = body_end - 2 - 2 * rc;
+                let mut out = std::vec![0u8; body_end];
+                let mut inf = crate::compress::Inflate::new();
+                let r = |i: usize| {
+                    usize::from(u16::from_le_bytes([
+                        logical[rstart + 2 * i],
+                        logical[rstart + 2 * i + 1],
+                    ]))
+                };
+                if rc < 4 {
+                    continue;
+                }
+                inf.run(&image[..clen], &mut out, r(rc / 2) - 1).unwrap();
+                let (s, t) = (inf.consumed(), inf.done());
+                let Some(b) = (0..rc).map(r).find(|&r| r >= t) else {
+                    continue;
+                };
+                let mut table = std::vec::Vec::new();
+                for v in [s, t, b] {
+                    table.extend_from_slice(&u16::try_from(v).unwrap().to_le_bytes());
+                }
+                if clen + table.len() + 4 >= body_end {
+                    continue;
+                }
+                floored += 1;
+                assert!(read_with_table(&image, &logical, &table) > 0, "seed {seed}");
+            }
+            assert!(floored > 10, "{floored}");
+        }
+
         /// A table whose last head lies within an entry header of the
         /// trailer, under a valid CRC: a seek past every head is
         /// `CorruptBlock`, as the whole block is, and ends. (Review of

@@ -206,25 +206,25 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
             // carries min(E, 15) and the extension the rest.
             let e = mlen - MIN_MATCH;
             if !self.emit_token(lit_len, e.min(15)) {
-                return self.overflow();
+                return None;
             }
             // Token order: literal extension, literals, match extension,
             // offset (the decoder reads them in this order, and stops
             // after the literals when the output is full — so the
             // trailing all-literal token needs no match part at all).
             if !self.emit_ext(lit_len) {
-                return self.overflow();
+                return None;
             }
             if !self.emit_literals(src, anchor, ip) {
-                return self.overflow();
+                return None;
             }
             if !self.emit_ext(e) {
-                return self.overflow();
+                return None;
             }
             // Offset: distance back from the current output position to
             // the match start.
             if !self.emit_u16(ip - cand) {
-                return self.overflow();
+                return None;
             }
             // Index some of the bytes the match skipped so later
             // positions can match into them. Not every one: a long match
@@ -242,13 +242,13 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         // Trailing literals.
         let lit_len = body - anchor;
         if !self.emit_token(lit_len, 0) {
-            return self.overflow();
+            return None;
         }
         if !self.emit_ext(lit_len) {
-            return self.overflow();
+            return None;
         }
         if !self.emit_literals(src, anchor, body) {
-            return self.overflow();
+            return None;
         }
 
         let clen = self.out_len;
@@ -262,21 +262,6 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         } else {
             None
         }
-    }
-
-    /// How long a stream the last [`compress_chunked`](Self::compress_chunked)
-    /// that returned `None` reached: its length when it missed the
-    /// saving threshold, `BLOCK` when it overflowed the staging buffer.
-    /// A writer that missed with entry points tries without them unless
-    /// this is the block's length or more (ADR-0040).
-    pub(crate) const fn reached(&self) -> usize {
-        self.out_len
-    }
-
-    /// The staging buffer is full: the stream does not fit the block.
-    const fn overflow(&mut self) -> Option<usize> {
-        self.out_len = BLOCK;
-        None
     }
 
     /// Hashes 4 bytes at `p` into a bucket.

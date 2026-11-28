@@ -810,13 +810,12 @@ fn compress_data_block<const BLOCK: usize>(
             "the encoder's entry points do not hold"
         );
         if !holds {
-            // A stream that missed the threshold is tried again without
-            // its cuts and table, unless it was no shorter than the block
-            // (review of ADR-0040: an incompressible block was encoded
-            // twice). One whose table does not hold is.
-            if clen.is_none() && cs.reached() >= body_end {
-                return;
-            }
+            // A stream that missed the threshold, or whose table does not
+            // hold, is tried again without cuts. The cuts can be what made
+            // it miss: a block whose repeats lie in other chunks saves
+            // nothing chunked and much plainly (review of ADR-0040). A
+            // block of random bytes overflows a plain encode early: the
+            // retry costs a fifth of the chunked one.
             clen = None;
             nb = 0;
         }
@@ -839,6 +838,15 @@ fn compress_data_block<const BLOCK: usize>(
     #[allow(clippy::cast_possible_truncation)]
     let flagged = 0x8000 | (clen as u16 & 0x7FFF);
     body[body_end - 2..body_end].copy_from_slice(&flagged.to_le_bytes());
+    // The table reads back as written: a reader trusts its heads as it
+    // trusts the restart offsets they were taken from (ADR-0040).
+    debug_assert!(
+        points::point_table(body, clen).is_some_and(|t| {
+            t.len() == nb * points::POINT_LEN
+                && (0..nb).all(|i| points::point_at(t, i) == (found[i].0, found[i].1, bounds[i]))
+        }),
+        "the table does not read back as written"
+    );
 }
 
 /// What [`TableWriter::push`] did with one entry.
@@ -2892,6 +2900,8 @@ fn chunk_for_key(
 ///
 /// The answers are [`data_lookup`]'s: the heads are restarts, and its
 /// binary search over restarts only picks where the same scan starts.
+/// The heads are trusted as that search trusts the restart offsets:
+/// only a whole decode checks them (ADR-0040, Trust).
 #[allow(clippy::too_many_arguments)]
 fn data_lookup_points<E, const BLOCK: usize>(
     body: &[u8],
@@ -4922,10 +4932,87 @@ mod partial_inflate_tests {
         );
     }
 
+    /// A probe that writes below what chunk 0's decode made sends that
+    /// decode back to the block's start. Point 0's `t` is moved down by
+    /// the length of some entries of chunk 1, so that its probe finds a
+    /// real entry at the head, larger than the key, having written over
+    /// chunk 0's first bytes: a read of a key in chunk 0 then answers as
+    /// the intact block does. (Review of ADR-0040: no test reached it; a
+    /// correct table never writes there.)
+    #[test]
+    fn a_probe_below_chunk_zeros_decode_restarts_it() {
+        use super::{POINT_LEN, inflate_data_block, parse_data_entry};
+        let (dev, blocks) = table::<BIG>(700, true);
+        let body_end = BIG - CRC_LEN;
+        let (mut tables, mut answered) = (0u32, 0u32);
+        for b in 0..usize::try_from(blocks).unwrap() {
+            let image = dev.0[b];
+            let flag = u16::from_le_bytes([image[body_end - 2], image[body_end - 1]]);
+            let n = usize::from(u16::from_le_bytes([
+                image[body_end - 4],
+                image[body_end - 3],
+            ]));
+            if flag & 0x8000 == 0 || n < 2 {
+                continue;
+            }
+            let mut logical = [0u8; BIG];
+            inflate_data_block::<(), BIG>(&image, &mut logical, b as u64).unwrap();
+            let from = body_end - 4 - n * POINT_LEN;
+            let field = |i: usize, f: usize| {
+                let at = from + i * POINT_LEN + 2 * f;
+                usize::from(u16::from_le_bytes([image[at], image[at + 1]]))
+            };
+            let (t0, b0, b1) = (field(0, 1), field(0, 2), field(1, 2));
+            // The keys of chunk 0, after its first.
+            let mut keys = std::vec::Vec::new();
+            let mut off = 0;
+            while off < b0 {
+                let e = parse_data_entry::<(), BIG>(&logical, off, b0, b as u64).unwrap();
+                if off > 0 {
+                    keys.push(e.key.to_vec());
+                }
+                off = e.next;
+            }
+            // Entry boundaries in chunk 1 that put t' within what chunk
+            // 0's first probe decodes.
+            let mut off = b0;
+            while off < b1 {
+                let e = parse_data_entry::<(), BIG>(&logical, off, b1, b as u64).unwrap();
+                off = e.next;
+                let Some(t) = t0.checked_sub(off - b0).filter(|&t| (1..160).contains(&t)) else {
+                    continue;
+                };
+                let mut bad = image;
+                let at = from + 2;
+                bad[at..at + 2].copy_from_slice(&u16::try_from(t).unwrap().to_le_bytes());
+                tables += 1;
+                for key in &keys {
+                    let mut v1 = std::vec![0u8; 4096];
+                    let mut s1 = [0u8; BIG];
+                    let before = super::entered::ENTERED.with(core::cell::Cell::get);
+                    let r =
+                        lookup_image::<(), BIG>(&bad, &mut s1, key, &mut v1, b as u64, u64::MAX);
+                    if super::entered::ENTERED.with(core::cell::Cell::get) != before || r.is_err() {
+                        continue;
+                    }
+                    answered += 1;
+                    let mut v2 = std::vec![0u8; 4096];
+                    let mut s2 = [0u8; BIG];
+                    let good =
+                        lookup_image::<(), BIG>(&image, &mut s2, key, &mut v2, b as u64, u64::MAX);
+                    assert_eq!(shape(&r, &v1), shape(&good, &v2), "block {b} t {t}");
+                }
+            }
+        }
+        assert!(
+            tables > 5 && answered > 50,
+            "{tables} tables, {answered} answers"
+        );
+    }
+
     /// The writer stores compressed every block that a plain stream
-    /// would, its cuts or not; random bytes overflow the chunked stream
-    /// and are not encoded again. (Review of ADR-0040: a rule meant to
-    /// spare incompressible blocks a second encode never applied.)
+    /// would, with its cuts and table where they still clear the
+    /// threshold and plainly where they do not.
     #[test]
     fn the_writer_compresses_what_a_plain_stream_would() {
         let body = BIG - CRC_LEN;
@@ -4992,26 +5079,64 @@ mod partial_inflate_tests {
         assert!(with_points > 50, "{with_points} blocks with points");
         assert!(plain_only > 0, "no block fell back to a plain stream");
         assert!(raw > 0, "{raw} raw blocks");
-        // Random bytes: the chunked stream overflows, and that is what
-        // spares the second encode.
-        let mut random = std::boxed::Box::new([0u8; BIG]);
-        for b in &mut random[..body] {
+    }
+
+    /// A block whose only repeats lie in other chunks: its chunked
+    /// stream overflows the block, its plain one saves three quarters of
+    /// it. It is compressed, plainly. (Review of ADR-0040: a rule that
+    /// skipped the plain retry after an overflow stored it raw.)
+    #[test]
+    fn a_block_whose_repeats_cross_its_cuts_is_compressed_plainly() {
+        let body = BIG - CRC_LEN;
+        let rs: Vec<u16> = (0..64u16).map(|i| i * 256).collect();
+        let mut cs = std::boxed::Box::new(CompressScratch::<BIG>::new());
+        let mut rng = 0x2545_F491_4F6C_DD1Du64;
+        let mut buf = std::boxed::Box::new([0u8; BIG]);
+        let mut pat = [0u8; 4096];
+        for b in &mut pat {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
             *b = rng.to_le_bytes()[5];
         }
+        for (i, b) in buf[..body].iter_mut().enumerate() {
+            *b = pat[i % 4096];
+        }
+        for cut in (2048..body).step_by(2048) {
+            buf[cut..cut + 8].copy_from_slice(b"abcdabcd");
+        }
+        let rstart = body - 2 - 2 * rs.len();
+        for (i, r) in rs.iter().enumerate() {
+            buf[rstart + 2 * i..rstart + 2 * i + 2].copy_from_slice(&r.to_le_bytes());
+        }
+        buf[body - 2..body].copy_from_slice(&64u16.to_le_bytes());
+        let logical = buf.clone();
         let mut bounds = [0usize; crate::points::MAX_POINTS];
         let nb = crate::points::bounds_of::<BIG>(&rs, &mut bounds);
         let mut found = [(0usize, 0usize); crate::points::MAX_POINTS];
-        let got = cs.compress_chunked(
-            &random[..body],
+        let chunked = cs.compress_chunked(
+            &logical[..body],
             &bounds[..nb],
             &mut found,
             crate::points::table_len(nb),
         );
-        assert!(got.is_none());
-        assert!(cs.reached() >= body);
+        assert!(chunked.is_none(), "the cuts are what make it miss");
+        let plain = cs.compress(&logical[..body]).unwrap();
+        assert!(plain < body / 2, "{plain}");
+        super::compress_data_block(&mut buf, &rs, &mut cs);
+        let flag = u16::from_le_bytes([buf[body - 2], buf[body - 1]]);
+        assert_eq!(
+            flag,
+            0x8000 | u16::try_from(plain).unwrap(),
+            "compressed plainly"
+        );
+        let mut out = std::boxed::Box::new([0u8; BIG]);
+        assert!(crate::points::inflate_image(
+            &buf[..body],
+            plain,
+            &mut out[..body]
+        ));
+        assert_eq!(out[..body], logical[..body]);
     }
 
     #[test]
