@@ -121,7 +121,10 @@ The design panel built three prototypes on the same store:
   a cached seek −17% for a page of one, −11% for ten, −1.5% for a
   hundred. A cached point read's inflate falls from 15,500 instructions
   to 4,100 and its checks of the cache's sums by half. `readreverse`
-  +1.1%: a whole decode checks the table as it passes it. [wall clock]
+  +1.1%: a whole decode checks the table as it passes it. In wall
+  clock, one reader: cached point reads 48% to 50% faster, a cached
+  seek of one entry 24% to 36%, of ten 7% to 11%; full-range seeks
+  level within the run-to-run noise (±15%).
 - **Compression.** The bench store's streams are 1.5% longer (the
   cuts) and its tables add about 44 bytes a block. Blocks stay `BLOCK`
   bytes on the device and in the cache, so this is not space: it is

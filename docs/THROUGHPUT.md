@@ -50,8 +50,8 @@ to inflate a compressed block only as far as it reads
 instructions for a page of one, level at ten, 3% more at a hundred.
 Last, a compressed block came to list points a decode may start at
 ([step 27](#then-compressed-blocks-a-read-can-enter-part-way)): a
-cached point read takes 38% fewer instructions, a cached seek 11% to
-17% fewer.
+cached point read takes 38% fewer instructions and is about 50%
+faster, a cached seek 11% to 17% fewer and 7% to 36% faster.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1576,7 +1576,21 @@ cache; 20 K seeks, 100 K reads, scans read every key):
 | 1 M keys with no tables, `seekrandom` hot, a page of 1 | 130,278 | 131,236 | +0.7% |
 | 1 M keys with no tables, `readrandom` hot | 38,723 | 38,889 | +0.4% |
 
-[wall clock]
+Wall clock at 1 M keys, one reader, ops/s, medians of 6 interleaved
+pairs, each run from a fresh copy of the store with tables; each run
+reads or seeks twice, and both passes are shown. Runs of one build
+spread ±15% on this session's machine.
+
+| | before | after | |
+|---|---:|---:|---:|
+| `readrandom` hot | 257 K / 266 K | 379 K / 399 K | +48%, +50% |
+| `readrandom` full | 119 K / 116 K | 128 K / 124 K | +8%, +7% |
+| `seekrandom` hot, a page of 1 | 80.1 K / 77.1 K | 99.7 K / 104.6 K | +24%, +36% |
+| `seekrandom` hot, a page of 10 | 59.4 K / 55.6 K | 63.4 K / 61.7 K | +7%, +11% |
+| `seekrandom` full, a page of 1 | 44.6 K / 42.4 K | 44.3 K / 47.8 K | −1%, +13% |
+
+The cached point read and the short cached seek gain beyond the noise;
+the full-range seek is level within it.
 
 A cached point read's inflate falls from 15,460 instructions to 4,130,
 and its checks of the cache's sums from 8,440 to 4,380: it checks only

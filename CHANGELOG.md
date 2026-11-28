@@ -213,8 +213,9 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
   not hold is `CorruptBlock`. The stream is one stream still: older
   builds read new images as before, ignoring the table, and blocks
   older builds wrote carry none. In the host store at 1 M keys a cached
-  point read takes 38% fewer instructions and a cached seek 11% to 17%
-  fewer (docs/THROUGHPUT.md, step 27); reverse scans 1.1% more, and
+  point read takes 38% fewer instructions (about 50% faster) and a
+  cached seek 11% to 17% fewer (7% to 36% faster; docs/THROUGHPUT.md,
+  step 27); reverse scans 1.1% more, and
   reads of blocks with no table 0.4% to 0.7% more. A point read over a
   table no longer checks the stream of the cached block past the chunk
   it decodes, as a seek does not (ADR-0039).
