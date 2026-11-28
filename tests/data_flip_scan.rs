@@ -87,6 +87,11 @@ struct FlipCache {
     /// Lends of a compressed block that checked only part of its stream:
     /// a seek's inflate that stopped short of the block's end.
     partial: Cell<u64>,
+    /// Lends of a compressed block that read its table of entry points,
+    /// and those whose decode began past the block's start, at one
+    /// (ADR-0040): the flips reach the chunked path.
+    tabled: Cell<u64>,
+    entered: Cell<u64>,
     /// Checks answer `true` and the lend's result says whether they
     /// held: a cache that verifies its sums once the read is done, as
     /// the `CachePort::with_checked` contract allows (`Some(false)`:
@@ -143,6 +148,13 @@ impl CachePort<4096> for FlipCache {
         let clen = usize::from(flag & 0x7FFF);
         if flag & 0x8000 != 0 && covered[4090] && covered[..clen].contains(&false) {
             self.partial.set(self.partial.get() + 1);
+            let n = usize::from(u16::from_le_bytes([pristine[4088], pristine[4089]]));
+            if n > 0 && covered[4088 - 6 * n..4090].iter().all(|&c| c) {
+                self.tabled.set(self.tabled.get() + 1);
+                if !covered[0] {
+                    self.entered.set(self.entered.get() + 1);
+                }
+            }
         }
         if !ok {
             self.images.borrow_mut().remove(&(t, b));
@@ -419,6 +431,16 @@ fn flip_every_byte_with(config: Config, fault: Fault, defer: bool) -> u64 {
     }
     assert!(cache.lent_flipped.get() > 0);
     assert!(cache.rejected.get() > 0);
+    if cache.partial.get() > 0 {
+        // Over compressed tables, the flips reach decodes begun at an
+        // entry point (ADR-0040).
+        assert!(
+            cache.tabled.get() > 0 && cache.entered.get() > 0,
+            "{} {}",
+            cache.tabled.get(),
+            cache.entered.get()
+        );
+    }
     cache.partial.get()
 }
 

@@ -53,11 +53,12 @@
 use core::future::poll_fn;
 
 use crate::cache::CachePort;
-use crate::compress::{CompressScratch, Inflate, decompress};
+use crate::compress::{CompressScratch, Inflate};
 use crate::crc::crc32;
 use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{KeyBound, TableRef};
+use crate::points::{self, MAX_POINTS, POINT_LEN, inflate_image, point_at, point_table};
 use crate::wal::Op;
 
 /// Footer magic: ASCII "hrtsst05" as stored on device.
@@ -762,19 +763,10 @@ async fn seal_block<D: BlockDevice, const BLOCK: usize>(
     // the flag: bit 15 set, low 15 bits the compressed length. The
     // original restart count already lives inside the compressed
     // payload, so the flag slot holds only the flag and length.
-    if restarts.is_some()
+    if let Some(rs) = restarts
         && let Some(cs) = compress.as_mut()
-        && let Some(clen) = cs.compress(&buf[..body_end])
     {
-        let (body, _) = buf.split_at_mut(body_end);
-        body[..clen].copy_from_slice(&cs.compressed()[..clen]);
-        body[clen..body_end].fill(0);
-        // `compress` guarantees `clen < 1 << 15`; the mask is
-        // belt-and-braces so the flag bit can never be clobbered,
-        // hence the narrowing cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let flagged = 0x8000 | (clen as u16 & 0x7FFF);
-        body[body_end - 2..body_end].copy_from_slice(&flagged.to_le_bytes());
+        compress_data_block(buf, rs, cs);
     }
 
     let crc = crc32(&buf[..body_end]);
@@ -783,6 +775,63 @@ async fn seal_block<D: BlockDevice, const BLOCK: usize>(
         .await
         .map_err(Error::Device)?;
     Ok(())
+}
+
+/// [`seal_block`]'s trial compression of a data block with restarts
+/// `rs`, with entry points at some of them (ADR-0040). Its own synchronous
+/// function, so that its arrays add nothing to the writer's futures.
+///
+/// The stream with entry points must clear [`COMPRESS_MIN_SAVING`] with
+/// its table counted; a block that does only without them is compressed
+/// plainly, with no table. Before a table is written, the writer checks
+/// it against the stream it describes ([`crate::compress::points_hold`]):
+/// a table the encoder got wrong would mislead a decode begun at one of
+/// its points, and is never written.
+///
+/// [`COMPRESS_MIN_SAVING`]: crate::compress::COMPRESS_MIN_SAVING
+fn compress_data_block<const BLOCK: usize>(
+    buf: &mut [u8; BLOCK],
+    rs: &[u16],
+    cs: &mut CompressScratch<BLOCK>,
+) {
+    let body_end = BLOCK - CRC_LEN;
+    let mut bounds = [0usize; points::MAX_POINTS];
+    let mut nb = points::bounds_of::<BLOCK>(rs, &mut bounds);
+    let mut found = [(0usize, 0usize); points::MAX_POINTS];
+    let mut clen = None;
+    if nb > 0 {
+        let reserve = points::table_len(nb);
+        clen = cs.compress_chunked(&buf[..body_end], &bounds[..nb], &mut found, reserve);
+        let holds = clen.is_some_and(|n| {
+            crate::compress::points_hold(&cs.compressed()[..n], body_end, &found[..nb])
+        });
+        debug_assert!(
+            clen.is_none() || holds,
+            "the encoder's entry points do not hold"
+        );
+        if !holds {
+            clen = None;
+            nb = 0;
+        }
+    }
+    if nb == 0 {
+        clen = cs.compress(&buf[..body_end]);
+    }
+    let Some(clen) = clen else {
+        return;
+    };
+    let (body, _) = buf.split_at_mut(body_end);
+    body[..clen].copy_from_slice(&cs.compressed()[..clen]);
+    body[clen..body_end].fill(0);
+    if nb > 0 {
+        points::write_table(&mut body[..body_end - 2], &found[..nb], &bounds[..nb]);
+    }
+    // `compress` guarantees `clen < 1 << 15`; the mask is belt-and-braces
+    // so the flag bit can never be clobbered, hence the narrowing cast is
+    // exact.
+    #[allow(clippy::cast_possible_truncation)]
+    let flagged = 0x8000 | (clen as u16 & 0x7FFF);
+    body[body_end - 2..body_end].copy_from_slice(&flagged.to_le_bytes());
 }
 
 /// What [`TableWriter::push`] did with one entry.
@@ -1717,10 +1766,9 @@ pub(crate) fn inflate_data_block<E, const BLOCK: usize>(
         return Ok(false);
     }
     let clen = usize::from(trailer & 0x7FFF);
-    if clen >= body_end {
+    if clen >= body_end || !inflate_image(&raw[..body_end], clen, &mut decomp[..body_end]) {
         return Err(corrupt());
     }
-    decompress(&raw[..clen], &mut decomp[..body_end]).map_err(|_| corrupt())?;
     Ok(true)
 }
 
@@ -2630,11 +2678,265 @@ fn lookup_image_checked<E, const BLOCK: usize>(
         return data_lookup(body, key, val_buf, block_id, max_seq, check);
     }
     let clen = usize::from(flag & 0x7FFF);
+    // The table of entry points, if any (ADR-0040): checked, then a
+    // search of its chunks that checks only the stream it inflates.
+    let count = body_end - 4;
+    if clen < count && check(count, body_end - 2) && body[count..count + 2] != [0, 0] {
+        let n = usize::from(u16::from_le_bytes([body[count], body[count + 1]]));
+        let table = count
+            .checked_sub(n.min(MAX_POINTS + 1) * POINT_LEN)
+            .filter(|&from| check(from, count))
+            .and_then(|_| point_table(body, clen))
+            .ok_or_else(corrupt)?;
+        return data_lookup_points(
+            body, clen, table, logical, key, val_buf, block_id, max_seq, check,
+        );
+    }
     let stream = body
         .get(..clen)
         .filter(|_| clen < body_end && check(0, clen))
         .ok_or_else(corrupt)?;
     data_lookup_inflating(stream, logical, key, val_buf, block_id, max_seq)
+}
+
+/// A decode of part of a compressed block begun at an entry point
+/// (ADR-0040), checking the stream as it goes: no stream byte reaches the
+/// decoder before `check` held over it.
+struct ChunkDecode {
+    inflate: Inflate,
+    /// Stream bytes checked, from where the decode began.
+    checked: usize,
+}
+
+impl ChunkDecode {
+    /// A decode at entry point `(s, t)`.
+    const fn at(s: usize, t: usize) -> Self {
+        Self {
+            inflate: Inflate::at(s, t),
+            checked: s,
+        }
+    }
+
+    /// Decodes until at least `need` bytes are final (past it by `step`),
+    /// checking stream bytes just before the decoder may read them.
+    /// `Ok(false)`: the block holds fewer. `Err`: a check failed, or the
+    /// stream does not decode.
+    fn ready(
+        &mut self,
+        body: &[u8],
+        clen: usize,
+        out: &mut [u8],
+        need: usize,
+        step: usize,
+        check: &mut impl FnMut(usize, usize) -> bool,
+    ) -> Result<bool, ()> {
+        if need > out.len() {
+            return Ok(false);
+        }
+        let until = need.max(self.inflate.done() + step).min(out.len());
+        while self.inflate.done() < need {
+            if self.checked < clen {
+                let guess = ((until - self.inflate.done()) / 2).max(256);
+                let to = (self.checked + guess).min(clen);
+                if !check(self.checked, to) {
+                    return Err(());
+                }
+                self.checked = to;
+            }
+            let whole = self.checked >= clen;
+            let prefix = body.get(..self.checked).ok_or(())?;
+            self.inflate
+                .run_prefix(prefix, whole, out, until)
+                .map_err(|_| ())?;
+            if whole && self.inflate.done() < need {
+                return Err(());
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Point reads that began past chunk 0 (tests: the path is reached).
+#[cfg(test)]
+pub(crate) static ENTERED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Output a probe of a chunk head decodes: the head entry, most often.
+const PROBE_STEP: usize = 160;
+
+/// The entry a decode has made final at `off`, if one parses there whole
+/// (`None`: not yet final, or the entries have ended: a zero key length).
+/// `Err`: its header is final and does not parse.
+fn entry_ready(out: &[u8], done: usize, off: usize) -> Option<(ParsedEntry<'_>, usize)> {
+    data_entry_parse(out.get(..done)?, off).ok()
+}
+
+/// Decodes with `dec` until the entry at `head` is final, and returns
+/// its key's length; `None`: it does not parse there (the whole block
+/// decides). `Err`: a check failed or the stream does not decode.
+fn probe_head(
+    dec: &mut ChunkDecode,
+    body: &[u8],
+    clen: usize,
+    out: &mut [u8],
+    head: usize,
+    check: &mut impl FnMut(usize, usize) -> bool,
+) -> Result<Option<usize>, ()> {
+    if !dec.ready(body, clen, out, head + ENTRY_HEADER, PROBE_STEP, check)? {
+        return Ok(None);
+    }
+    let h = &out[head..head + ENTRY_HEADER];
+    let kl = usize::from(u16::from_le_bytes([h[0], h[1]]));
+    let vl = usize::from(u16::from_le_bytes([h[2], h[3]]));
+    let ttl = if h[12] == Op::PutTtl.to_u8() { 8 } else { 0 };
+    if kl == 0
+        || !dec.ready(
+            body,
+            clen,
+            out,
+            head + ENTRY_HEADER + kl + vl + ttl,
+            0,
+            check,
+        )?
+    {
+        return Ok(None);
+    }
+    Ok(entry_ready(out, dec.inflate.done(), head).map(|(e, _)| e.key.len()))
+}
+
+/// [`data_lookup_points`]'s search for the chunk that holds `key`: the
+/// decode to scan with and the offset to scan from. The head of chunk 0
+/// (the block's first entry) is decoded first: a key at or before it is
+/// in chunk 0. Otherwise a binary search over the other heads, each
+/// decoded by a probe of its own chunk, finds the last that sorts below
+/// the key. `None`: a head does not parse, and the whole block decides.
+fn chunk_for_key(
+    body: &[u8],
+    clen: usize,
+    table: &[u8],
+    out: &mut [u8],
+    key: &[u8],
+    check: &mut impl FnMut(usize, usize) -> bool,
+) -> Result<Option<(ChunkDecode, usize)>, ()> {
+    let n = table.len() / POINT_LEN;
+    let mut main = ChunkDecode::at(0, 0);
+    match probe_head(&mut main, body, clen, out, 0, check)? {
+        None => return Ok(None),
+        Some(kl) if &out[ENTRY_HEADER..ENTRY_HEADER + kl] >= key => return Ok(Some((main, 0))),
+        Some(_) => {}
+    }
+    // The first head at or above the key, of chunks 1..=n.
+    let (mut lo, mut hi) = (1usize, n + 1);
+    let mut last: Option<(usize, ChunkDecode)> = None;
+    // The lowest output a probe wrote: chunk 0's decode below it is intact.
+    let mut lowest = usize::MAX;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (s, t, head) = point_at(table, mid - 1);
+        lowest = lowest.min(t);
+        let mut dec = ChunkDecode::at(s, t);
+        let Some(kl) = probe_head(&mut dec, body, clen, out, head, check)? else {
+            return Ok(None);
+        };
+        if &out[head + ENTRY_HEADER..head + ENTRY_HEADER + kl] < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+        last = Some((mid, dec));
+    }
+    let chunk = lo - 1;
+    if chunk == 0 {
+        // A probe may have written over what chunk 0's decode made.
+        if lowest < main.inflate.done() {
+            main = ChunkDecode::at(0, 0);
+        }
+        return Ok(Some((main, 0)));
+    }
+    #[cfg(test)]
+    ENTERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let (s, t, head) = point_at(table, chunk - 1);
+    let dec = match last {
+        Some((at, dec)) if at == chunk => dec,
+        _ => ChunkDecode::at(s, t),
+    };
+    Ok(Some((dec, head)))
+}
+
+/// [`data_lookup`] over a compressed data block with entry points
+/// (ADR-0040), inflating only the chunks it reads and checking only the
+/// stream it inflates. The head of chunk 0 (the block's first entry) is
+/// read first: a key at or before it is in chunk 0. Otherwise a binary
+/// search over the other chunk heads finds the last that sorts below the
+/// key, and the scan of [`data_lookup_inflating`] runs from there, the
+/// decode going on through the chunks after it as one stream. What the
+/// scan does not decide is the whole block's, inflated whole and its
+/// entry points checked ([`inflate_image`]), as there.
+///
+/// The answers are [`data_lookup`]'s: the heads are restarts, and its
+/// binary search over restarts only picks where the same scan starts.
+#[allow(clippy::too_many_arguments)]
+fn data_lookup_points<E, const BLOCK: usize>(
+    body: &[u8],
+    clen: usize,
+    table: &[u8],
+    logical: &mut [u8; BLOCK],
+    key: &[u8],
+    val_buf: &mut [u8],
+    block_id: u64,
+    max_seq: u64,
+    check: &mut impl FnMut(usize, usize) -> bool,
+) -> Result<BlockOutcome, Error<E>> {
+    let corrupt = || Error::CorruptBlock { id: block_id };
+    let body_end = BLOCK.checked_sub(CRC_LEN).ok_or_else(corrupt)?;
+    let out = &mut logical[..body_end];
+    let found = chunk_for_key(body, clen, table, out, key, check).map_err(|()| corrupt())?;
+    let whole = found.is_none();
+    let (mut main, start) = found.unwrap_or((ChunkDecode::at(0, 0), 0));
+    if !whole {
+        let mut off = start;
+        loop {
+            match main.ready(body, clen, out, off + ENTRY_HEADER, INFLATE_STEP, check) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(()) => return Err(corrupt()),
+            }
+            let head = &out[off..off + ENTRY_HEADER];
+            let kl = usize::from(u16::from_le_bytes([head[0], head[1]]));
+            let vl = usize::from(u16::from_le_bytes([head[2], head[3]]));
+            if kl == 0 {
+                break;
+            }
+            let ttl = if head[12] == Op::PutTtl.to_u8() { 8 } else { 0 };
+            match main.ready(
+                body,
+                clen,
+                out,
+                off + ENTRY_HEADER + kl + vl + ttl,
+                INFLATE_STEP,
+                check,
+            ) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(()) => return Err(corrupt()),
+            }
+            let Some((entry, next)) = entry_ready(out, main.inflate.done(), off) else {
+                break;
+            };
+            match entry.key.cmp(key) {
+                core::cmp::Ordering::Greater => return Ok(BlockOutcome::Absent),
+                core::cmp::Ordering::Equal if entry.seq <= max_seq => {
+                    return data_hit(&entry, val_buf);
+                }
+                core::cmp::Ordering::Less | core::cmp::Ordering::Equal => off = next,
+            }
+        }
+    }
+    // Not decided by the scan: the whole block, its points checked.
+    if !check(0, clen) || !inflate_image(body, clen, out) {
+        return Err(corrupt());
+    }
+    data_lookup(out, key, val_buf, block_id, max_seq, &mut |_, _| true)
 }
 
 /// One data block of a point lookup: [`data_lookup`]'s answer for block
@@ -4485,6 +4787,110 @@ mod partial_inflate_tests {
         }
     }
 
+    /// A table of entry points that a writer bug got wrong under a valid
+    /// CRC (ADR-0040): every whole inflate rejects it, so the block is
+    /// `CorruptBlock` wherever it is read whole; a point read over it never
+    /// acts on a byte its own decode did not make (the answer does not
+    /// depend on what the output buffer held), and it answers as the
+    /// intact block does, or fails.
+    #[test]
+    fn a_wrong_table_is_corrupt_whole_and_never_reads_stale_bytes() {
+        use super::{POINT_LEN, inflate_image};
+        let (dev, blocks) = table(700, true);
+        let body_end = BLOCK - CRC_LEN;
+        let (mut mutated, mut answered, mut failed, mut wrong) = (0u32, 0u32, 0u32, 0u32);
+        for b in 0..usize::try_from(blocks).unwrap() {
+            let image = dev.0[b];
+            let flag = u16::from_le_bytes([image[body_end - 2], image[body_end - 1]]);
+            if flag & 0x8000 == 0 {
+                continue;
+            }
+            let clen = usize::from(flag & 0x7FFF);
+            let n = usize::from(u16::from_le_bytes([
+                image[body_end - 4],
+                image[body_end - 3],
+            ]));
+            let from = body_end - 4 - n * POINT_LEN;
+            for i in 0..n {
+                for field in 0..3 {
+                    for delta in [-1i32, 1, 7, -16] {
+                        let mut bad = image;
+                        let at = from + i * POINT_LEN + field * 2;
+                        let v = i32::from(u16::from_le_bytes([bad[at], bad[at + 1]])) + delta;
+                        let Ok(v) = u16::try_from(v) else { continue };
+                        bad[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                        mutated += 1;
+                        let mut out = [0u8; BLOCK];
+                        assert!(
+                            !inflate_image(&bad[..body_end], clen, &mut out[..body_end]),
+                            "block {b}: point {i} field {field} {delta:+} passed a whole inflate"
+                        );
+                        let mut whole = [0u8; BLOCK];
+                        assert!(
+                            inflate_data_block::<(), BLOCK>(&bad, &mut whole, b as u64).is_err()
+                        );
+                        for k in (0..700 * 3).step_by(7) {
+                            let key = format!("key{k:05}").into_bytes();
+                            let mut v1 = std::vec![0u8; 4096];
+                            let mut v2 = std::vec![0u8; 4096];
+                            let mut s1 = [0xEEu8; BLOCK];
+                            let mut s2 = [0x11u8; BLOCK];
+                            let r1 = lookup_image::<(), BLOCK>(
+                                &bad,
+                                &mut s1,
+                                &key,
+                                &mut v1,
+                                b as u64,
+                                u64::MAX,
+                            );
+                            let r2 = lookup_image::<(), BLOCK>(
+                                &bad,
+                                &mut s2,
+                                &key,
+                                &mut v2,
+                                b as u64,
+                                u64::MAX,
+                            );
+                            assert_eq!(shape(&r1, &v1), shape(&r2, &v2), "stale bytes read");
+                            let mut v3 = std::vec![0u8; 4096];
+                            let mut s3 = [0u8; BLOCK];
+                            let good = lookup_image::<(), BLOCK>(
+                                &image,
+                                &mut s3,
+                                &key,
+                                &mut v3,
+                                b as u64,
+                                u64::MAX,
+                            );
+                            if r1.is_ok() {
+                                answered += 1;
+                                if shape(&r1, &v1) != shape(&good, &v3) {
+                                    wrong += 1;
+                                }
+                            } else {
+                                failed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::println!(
+            "wrong tables: {mutated}; point reads over them answered {answered}, failed {failed}"
+        );
+        assert!(mutated > 100);
+        assert!(
+            answered > 1000 && failed > 1000,
+            "both outcomes are reached"
+        );
+        // Measured, and kept: a point read over a table one field off
+        // answers as the intact block does, or fails (ADR-0040).
+        assert_eq!(
+            wrong, 0,
+            "a point read over a wrong table answered differently"
+        );
+    }
+
     #[test]
     fn partial_inflate_answers_as_the_whole_block_does() {
         for compressible in [true, false] {
@@ -4562,10 +4968,223 @@ mod partial_inflate_tests {
                 );
             }
             if compressible {
+                let entered = super::ENTERED.load(core::sync::atomic::Ordering::Relaxed);
+                std::println!("point reads begun at an entry point: {entered}");
+                assert!(
+                    entered > 1000,
+                    "{entered} point reads began at an entry point"
+                );
                 assert!(compressed > 4, "most blocks are compressed");
             } else {
                 assert_eq!(compressed, 0, "written without compression");
             }
         }
+    }
+}
+
+/// The cost of entry points in compression (ADR-0040): the compressed
+/// bytes of tables of firmware-like entries with entry points, against
+/// the same logical blocks compressed whole. A measurement, printed:
+/// `cargo test --release --lib ratio_cost -- --ignored --nocapture`.
+#[cfg(test)]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)] // printed ratios
+mod ratio_cost {
+    extern crate std;
+    use super::{CRC_LEN, POINT_LEN, SstEntry, TableWriter, inflate_data_block};
+    use crate::compress::CompressScratch;
+    use crate::device::BlockDevice;
+    use core::future::Future;
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use std::vec::Vec;
+
+    struct Ram<const B: usize>(Vec<[u8; B]>);
+    impl<const B: usize> BlockDevice for Ram<B> {
+        type Error = ();
+        const BLOCK: usize = B;
+        fn poll_read_block(
+            &self,
+            _: &mut Context<'_>,
+            id: u64,
+            buf: &mut [u8],
+        ) -> Poll<Result<(), ()>> {
+            buf.copy_from_slice(&self.0[usize::try_from(id).unwrap()]);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_write_block(
+            &mut self,
+            _: &mut Context<'_>,
+            id: u64,
+            buf: &[u8],
+        ) -> Poll<Result<(), ()>> {
+            self.0[usize::try_from(id).unwrap()].copy_from_slice(buf);
+            Poll::Ready(Ok(()))
+        }
+        fn poll_flush(&mut self, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    fn block_on<F: Future>(f: F) -> F::Output {
+        let mut f = pin!(f);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    fn measure<const B: usize>(name: &str, entries: &[(Vec<u8>, Vec<u8>)]) {
+        let mut dev = Ram::<B>(std::vec![[0u8; B]; 4096]);
+        let mut w = TableWriter::<B, 64, 64>::new(0, 3);
+        let mut cs = CompressScratch::<B>::new();
+        for (i, (k, v)) in entries.iter().enumerate() {
+            let e = SstEntry {
+                key: k,
+                val: v,
+                seq: 1_000_000 - i as u64,
+                tombstone: false,
+                expire_at: 0,
+            };
+            block_on(w.push(&mut dev, e, Some(&mut cs))).unwrap();
+        }
+        let done = block_on(w.finish(&mut dev, Some(&mut cs))).unwrap();
+        let body = B - CRC_LEN;
+        let (
+            mut chunked,
+            mut plain,
+            mut raw,
+            mut tables,
+            mut nblocks,
+            mut comp_chunked,
+            mut comp_plain,
+        ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for b in 0..usize::try_from(done.data_blocks).unwrap() {
+            let image = dev.0[b];
+            let mut logical = [0u8; B];
+            let compressed = inflate_data_block::<(), B>(&image, &mut logical, b as u64).unwrap();
+            if !compressed {
+                logical = image;
+            }
+            nblocks += 1;
+            raw += body;
+            // As stored: stream plus table, or raw.
+            let stored = if compressed {
+                let flag = u16::from_le_bytes([image[body - 2], image[body - 1]]);
+                let clen = usize::from(flag & 0x7FFF);
+                let n = usize::from(u16::from_le_bytes([image[body - 4], image[body - 3]]));
+                tables += if n > 0 { 2 + n * POINT_LEN } else { 0 };
+                clen + if n > 0 { 2 + n * POINT_LEN } else { 0 }
+            } else {
+                body
+            };
+            chunked += stored;
+            let p = cs.compress(&logical[..body]).unwrap_or(body);
+            plain += p;
+            if compressed {
+                comp_chunked += stored;
+            }
+            if p < body {
+                comp_plain += p;
+            }
+        }
+        std::println!(
+            "{name}: {nblocks} blocks of {B}; logical {raw}; whole-stream {plain} ({:.2}%); chunked {chunked} ({:.2}%) of which tables {tables}; cost {:+.2}% (compressed blocks only: {comp_plain} -> {comp_chunked})",
+            plain as f64 * 100.0 / raw as f64,
+            chunked as f64 * 100.0 / raw as f64,
+            (chunked as f64 - plain as f64) * 100.0 / plain as f64,
+        );
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement"]
+    fn ratio_cost() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        // 1. Firmware telemetry: 32-byte keys "dev/<node>/<sensor>/<ts>",
+        //    64-byte values of a few varying fields and constant padding.
+        let mut es = Vec::new();
+        for i in 0..2_400u64 {
+            let mut k = std::format!(
+                "site07/node{:03}/s{:02}/{:010}",
+                (i / 40) % 200,
+                i % 8,
+                1_700_000_000 + i
+            )
+            .into_bytes();
+            k.resize(32, b'_');
+            let mut v = Vec::with_capacity(64);
+            let r = rng.next();
+            v.extend_from_slice(&(i * 37).to_le_bytes());
+            v.extend_from_slice(&((r % 4000) as u16).to_le_bytes());
+            v.extend_from_slice(&((r >> 16) as u16 % 100).to_le_bytes());
+            v.extend_from_slice(b"status=OK;fw=1.4.2;unit=degC;");
+            while v.len() < 64 {
+                v.push(0);
+            }
+            es.push((k, v));
+        }
+        es.sort();
+        measure::<4096>("firmware telemetry 32B keys / 64B values", &es);
+        // 2. 32-byte keys, 64-byte values that compress to about half
+        //    (db_bench's generator: 32 random bytes, repeated).
+        let mut es = Vec::new();
+        for i in 0..2_400u64 {
+            let mut k = std::format!("{:016}", i * 7919 % 1_000_003).into_bytes();
+            k.resize(32, b'0');
+            let mut half = [0u8; 32];
+            for b in &mut half {
+                *b = b' ' + (rng.next() % 95) as u8;
+            }
+            let mut v = half.to_vec();
+            v.extend_from_slice(&half);
+            es.push((k, v));
+        }
+        es.sort();
+        measure::<4096>("32B keys / 64B half-compressible values", &es);
+        // 3. 32-byte keys, 64-byte random values (barely compressible).
+        let mut es = Vec::new();
+        for i in 0..2_400u64 {
+            let mut k = std::format!("key/{i:012}").into_bytes();
+            k.resize(32, b'.');
+            let v: Vec<u8> = (0..8).flat_map(|_| rng.next().to_le_bytes()).collect();
+            es.push((k, v));
+        }
+        measure::<4096>("32B keys / 64B random values", &es);
+        // 4. The flight recorder's entries: 10-byte keys, 8-byte values.
+        let mut es = Vec::new();
+        for t in 0..4_000u64 {
+            for id in 0..4u8 {
+                let mut k = std::vec![0u8; 10];
+                k[..8].copy_from_slice(&t.to_be_bytes());
+                k[8] = b'r';
+                k[9] = id;
+                let v = rng.next().to_le_bytes().to_vec();
+                es.push((k, v));
+            }
+        }
+        measure::<4096>("flight recorder 10B keys / 8B values", &es);
+        // 5. db_bench shape on 16 KiB blocks: 16-byte keys, 100-byte values.
+        let mut es = Vec::new();
+        for i in 0..40_000u64 {
+            let k = std::format!("{:016}", i * 25).into_bytes();
+            let mut half = [0u8; 50];
+            for b in &mut half {
+                *b = b' ' + (rng.next() % 95) as u8;
+            }
+            let mut v = half.to_vec();
+            v.extend_from_slice(&half);
+            es.push((k, v));
+        }
+        measure::<16384>("db_bench-like 16B keys / 100B values", &es);
     }
 }
