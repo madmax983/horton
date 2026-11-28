@@ -48,6 +48,10 @@ instructions a seek, and 8% to 12% faster at 1 M keys. And a seek came
 to inflate a compressed block only as far as it reads
 ([step 26](#then-a-seek-that-inflates-only-what-it-reads)): 9% fewer
 instructions for a page of one, level at ten, 3% more at a hundred.
+Last, a compressed block came to list points a decode may start at
+([step 27](#then-compressed-blocks-a-read-can-enter-part-way)): a
+cached point read takes 38% fewer instructions and is about 50%
+faster, a cached seek 11% to 17% fewer and 7% to 36% faster.
 
 The table was measured again after step 20, with RocksDB run beside it
 on the same machine; it is the first of two runs.
@@ -1535,6 +1539,70 @@ same inflate. Doubling each step instead measured the same at ten
 entries a page and 0.4% worse at a hundred. Taking the rest whole on the
 first step was +6.7% at ten.
 
+### Then: compressed blocks a read can enter part way
+
+Step 27 (ADR-0040). After step 26, inflating a compressed block from its
+first byte was still a sixth of a cached seek at 1 M keys and a third of
+a cached point read: a 16 KiB block decodes as one stream, and the
+entry a read wants is, on average, half way through it.
+
+The writer now cuts a compressed block's stream at a restart every
+2 KiB or so, forgets its window there, and lists the cuts in the
+block's zero fill: about seven a block, 6 bytes each. A point read
+decodes the first entry of the block's first chunk, binary-searches the
+other chunks' first entries by decoding each, and scans the one that
+holds its key. A forward seek does the same inside its lend, and its
+later steps go on with that decode. A block with no table (an old
+image, and every block under 8 KiB, the firmware's) reads as before.
+The format is otherwise unchanged and the magic is not bumped: both
+builds read the same store, written by this step's writer, and the
+build before it reads the table as fill. A second store, written before
+this step, has no tables.
+
+Instructions per op (callgrind, one reader, a second pass over a warm
+cache; 20 K seeks, 100 K reads, scans read every key):
+
+| store, workload | before | after | |
+|---|---:|---:|---:|
+| 1 M keys, `seekrandom` hot, a page of 1 | 131,031 | 108,716 | −17.0% |
+| 1 M keys, `seekrandom` hot, a page of 4 | 148,213 | 126,946 | −14.3% |
+| 1 M keys, `seekrandom` hot, a page of 10 | 186,639 | 166,664 | −10.7% |
+| 1 M keys, `seekrandom` hot, a page of 100 | 754,484 | 742,916 | −1.5% |
+| 1 M keys, `seekrandom` full, a page of 1 | 200,105 | 199,764 | −0.2% |
+| 1 M keys, `readrandom` hot | 39,086 | 24,159 | −38.2% |
+| 1 M keys, `readrandom` full | 69,320 | 62,502 | −9.8% |
+| 1 M keys, `readseq` | 4,554 | 4,570 | +0.4% |
+| 1 M keys, `readreverse` | 6,946 | 7,022 | +1.1% |
+| 1 M keys with no tables, `seekrandom` hot, a page of 1 | 130,278 | 131,236 | +0.7% |
+| 1 M keys with no tables, `readrandom` hot | 38,723 | 38,889 | +0.4% |
+
+Wall clock at 1 M keys, one reader, ops/s, medians of 6 interleaved
+pairs, each run from a fresh copy of the store with tables; each run
+reads or seeks twice, and both passes are shown. Runs of one build
+spread ±15% on this session's machine.
+
+| | before | after | |
+|---|---:|---:|---:|
+| `readrandom` hot | 257 K / 266 K | 379 K / 399 K | +48%, +50% |
+| `readrandom` full | 119 K / 116 K | 128 K / 124 K | +8%, +7% |
+| `seekrandom` hot, a page of 1 | 80.1 K / 77.1 K | 99.7 K / 104.6 K | +24%, +36% |
+| `seekrandom` hot, a page of 10 | 59.4 K / 55.6 K | 63.4 K / 61.7 K | +7%, +11% |
+| `seekrandom` full, a page of 1 | 44.6 K / 42.4 K | 44.3 K / 47.8 K | −1%, +13% |
+
+The cached point read and the short cached seek gain beyond the noise;
+the full-range seek is level within it.
+
+A cached point read's inflate falls from 15,460 instructions to 4,130,
+and its checks of the cache's sums from 8,440 to 4,380: it checks only
+the stream it decodes, a lever earlier steps left. A probe of
+a chunk's first entry costs about 300. A one-entry seek's inflate falls
+from 23,400 to 7,700 and its copies by 2,900; its search over the heads
+costs 1,400 more in the lend. On the full range most blocks come from
+the device, which inflates whole. Reverse scans and compaction decode
+whole and check the table as they go: +1.1% on `readreverse`. A store
+with no tables pays for the larger lend state and the lower bound its
+gate keeps.
+
 ## What the remaining gap is made of
 
 Ratios from the two runs of step 20 ([Results](#results)), in a
@@ -1635,24 +1703,17 @@ Measured or scoped while doing this, and left:
   and not summing a block's padding, would cheapen the deeper levels'.
   Packing a block by its compressed size would make compression save
   blocks at all (a format change).
-- **Entry points in compressed blocks.** Pairs of stream and output
-  offsets, written in a compressed block's zero fill, would let a
-  decode start part way through it. A seek would no longer walk or
-  inflate from the block's first entry, and neither would a point read.
-  The design panel of step 26 measured a prototype at 1 M keys, hot
-  range: seeks −21% and point reads −26%. But a page of ten was +12%,
-  because its later steps decoded the whole block again. It is a
-  format and writer change, and a table the CRC vouches for that every
-  whole decode must agree with (ADR-0039).
-- **Point reads that check only the stream they inflate.** A point
-  read inflates only to its key (step 17), but checks the whole stream
-  of a cached compressed block first. It could check as it decodes, as
-  a seek does since step 26: up to 10,000 instructions on a 16 KiB block.
-- **Device misses inflated part way.** A seek whose block comes from
-  the device inflates all of it after the CRC. It could keep a partial
-  decode as a cache lend does. The step after would then go on through
-  the cache's copy, which may not hold the block. The design panel
-  measured −3.7% on the full range at a page of one.
+- **Entry points in 4 KiB blocks.** A block under 8 KiB holds one cut
+  at most, and with one a point read measured 1.9% slower, not faster
+  (ADR-0040). The firmware's blocks carry no table.
+- **Device misses inflated part way.** A block read from the device
+  is inflated whole after its CRC, and its table checked against the
+  decode. A point read could inflate only its key's chunk, and a seek
+  keep a partial decode, as a cache lend does since step 27. A seek's
+  step after would then go on through the cache's copy, which may not
+  hold the block. The full-range rows of step 27 are where it shows:
+  there most blocks come from the device. Step 26's design panel
+  measured −3.7% for seeks on the full range at a page of one.
 - **Device misses straight into the scan's buffer.** A block a scan
   misses is read into scratch, checked, and then copied or inflated
   into the buffer. Reading a raw block into the buffer directly would

@@ -68,6 +68,11 @@ impl<const BLOCK: usize> MemDevice<BLOCK> {
     pub fn blocks_mut(&mut self) -> &mut Vec<[u8; BLOCK]> {
         &mut self.blocks
     }
+
+    /// Test-only: the blocks written, as [`blocks_mut`](Self::blocks_mut).
+    pub fn blocks(&self) -> &[[u8; BLOCK]] {
+        &self.blocks
+    }
 }
 
 impl<const BLOCK: usize> Default for MemDevice<BLOCK> {

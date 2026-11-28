@@ -129,8 +129,28 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
     /// then available via [`compressed`](Self::compressed). Returns
     /// `None` when the block should be stored raw. Never panics.
     pub fn compress(&mut self, src: &[u8]) -> Option<usize> {
+        self.compress_chunked(src, &[], &mut [], 0)
+    }
+
+    /// [`compress`](Self::compress) in chunks (entry points, ADR-0040):
+    /// at each of `bounds` (ascending logical offsets) the encoder forgets
+    /// its window. No match crosses a bound, and none after it reaches
+    /// below the token that the bound falls in, so a decode can start at
+    /// that token with no output before it. That token is recorded in
+    /// `points` as `(stream offset, logical offset)`: its literals may
+    /// begin a little before the bound. The stream is one stream still,
+    /// which [`decompress`] decodes whole as before. `reserve` bytes more
+    /// must fit beside the stream (the table of points) for the block to
+    /// be worth compressing.
+    pub fn compress_chunked(
+        &mut self,
+        src: &[u8],
+        bounds: &[usize],
+        points: &mut [(usize, usize)],
+        reserve: usize,
+    ) -> Option<usize> {
         let body = BLOCK.checked_sub(4)?;
-        if src.len() != body {
+        if src.len() != body || points.len() < bounds.len() {
             return None;
         }
         self.head = [u32::MAX; HASH_SIZE];
@@ -143,13 +163,31 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         // more than one byte at a time (LZ4's acceleration): a block of
         // random bytes costs a fraction of the hashing it would.
         let mut misses = 0usize;
-        while ip + MIN_MATCH <= body {
+        // No match reaches below `floor`, nor past `limit`, the next bound.
+        let mut floor = 0usize;
+        let mut next = 0usize;
+        let mut limit = bounds.first().map_or(body, |&b| b.min(body));
+        loop {
+            if ip + MIN_MATCH > limit {
+                if limit >= body {
+                    break;
+                }
+                // A bound: the next token, whose literals start at
+                // `anchor`, is where a decode may begin.
+                points[next] = (self.out_len, anchor);
+                floor = anchor;
+                ip = limit;
+                misses = 0;
+                next += 1;
+                limit = bounds.get(next).map_or(body, |&b| b.max(ip).min(body));
+                continue;
+            }
             let word = load_u32(src, ip);
             let h = hash(word);
             let cand = self.head[h] as usize;
             self.insert_at(h, ip);
             // `u32::MAX` (an empty bucket) is never below `ip`.
-            if cand >= ip || ip - cand > 32768 || load_u32(src, cand) != word {
+            if cand >= ip || cand < floor || ip - cand > 32768 || load_u32(src, cand) != word {
                 ip += 1 + (misses >> SKIP_TRIGGER);
                 misses += 1;
                 continue;
@@ -157,7 +195,7 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
             misses = 0;
             // Four bytes match; count the rest, capped so one token pair
             // stays sane.
-            let cap = (body - ip).min(MAX_MATCH);
+            let cap = (limit - ip).min(MAX_MATCH);
             let mlen = MIN_MATCH
                 + common_prefix(
                     &src[cand + MIN_MATCH..cand + cap],
@@ -216,11 +254,12 @@ impl<const BLOCK: usize> CompressScratch<BLOCK> {
         let clen = self.out_len;
         // Worth it? Must clear the saving threshold and fit the
         // 15-bit trailer length field.
-        if body.saturating_sub(clen) >= COMPRESS_MIN_SAVING && clen < (1 << 15) {
+        if body.saturating_sub(clen.saturating_add(reserve)) >= COMPRESS_MIN_SAVING
+            && clen < (1 << 15)
+        {
             self.out_len = clen;
             Some(clen)
         } else {
-            self.out_len = 0;
             None
         }
     }
@@ -388,6 +427,92 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
     Ok(dst.len())
 }
 
+/// [`decompress`] of a stream with entry points (ADR-0040), checking
+/// them as it goes: each of `points` (`(stream, logical)` offsets,
+/// ascending) must be where a token starts, and no match after it may
+/// reach below it. A table that does not hold is
+/// [`Invalid`](DecompressError::Invalid): a decode begun at a point then
+/// makes what the whole decode makes there, or this one fails.
+///
+/// # Errors
+///
+/// As [`decompress`], and `Invalid` for a point that does not hold.
+pub(crate) fn decompress_points(
+    src: &[u8],
+    dst: &mut [u8],
+    points: impl Iterator<Item = (usize, usize)>,
+) -> Result<usize, DecompressError> {
+    let mut inflate = Inflate::new();
+    for (s, t) in points {
+        inflate.run(src, dst, t)?;
+        if inflate.dp != t || inflate.sp != s {
+            return Err(DecompressError::Invalid);
+        }
+        inflate.enter();
+    }
+    inflate.run(src, dst, dst.len())?;
+    Ok(dst.len())
+}
+
+/// Whether `points` (`(stream, logical)` offsets, ascending) hold for
+/// the whole stream `src`, which decodes to `len` bytes, by its token
+/// headers alone, decoding nothing: each is where a token starts, and no
+/// match after it reaches below it. These are [`decompress_points`]'s
+/// checks; a writer makes them on the table it is about to write
+/// (ADR-0040), where no buffer is free to decode into.
+pub(crate) fn points_hold(src: &[u8], len: usize, points: &[(usize, usize)]) -> bool {
+    let (mut sp, mut dp, mut floor, mut next) = (0usize, 0usize, 0usize, 0usize);
+    while dp < len {
+        if let Some(&(s, t)) = points.get(next)
+            && dp >= t
+        {
+            if dp != t || sp != s {
+                return false;
+            }
+            floor = t;
+            next += 1;
+            continue;
+        }
+        let Some(&tag) = src.get(sp) else {
+            return false;
+        };
+        sp += 1;
+        let mut lit = usize::from(tag >> 4);
+        if lit == 15 {
+            let Ok(n) = read_ext(src, &mut sp) else {
+                return false;
+            };
+            lit = lit.saturating_add(n);
+        }
+        if lit > len - dp || sp.saturating_add(lit) > src.len() {
+            return false;
+        }
+        sp += lit;
+        dp += lit;
+        if dp == len {
+            break;
+        }
+        let mut m = usize::from(tag & 0x0F);
+        if m == 15 {
+            let Ok(n) = read_ext(src, &mut sp) else {
+                return false;
+            };
+            m = m.saturating_add(n);
+        }
+        let m = m.saturating_add(MIN_MATCH);
+        let (Some(&lo), Some(&hi)) = (src.get(sp), src.get(sp + 1)) else {
+            return false;
+        };
+        sp += 2;
+        let offset = usize::from(lo) | (usize::from(hi) << 8);
+        if offset == 0 || offset > dp - floor || m > len - dp {
+            return false;
+        }
+        dp += m;
+    }
+    next == points.len() && dp == len
+}
+
 /// A decode that can stop part way and go on later: [`decompress`] in
 /// steps. A point lookup inflates a data block only as far as the entry
 /// that answers it (ADR-0027); [`run`](Self::run) is called again, with
@@ -401,14 +526,36 @@ pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, DecompressError> 
 pub(crate) struct Inflate {
     /// Stream position: the next token starts here.
     sp: usize,
-    /// Output position: `dst[..dp]` is final.
+    /// Output position: `dst[floor..dp]` is final.
     dp: usize,
+    /// No match may reach below this: the decode began here, at an entry
+    /// point (ADR-0040), and has made nothing before it.
+    floor: usize,
 }
 
 impl Inflate {
     /// A decode at the start of the stream.
     pub(crate) const fn new() -> Self {
-        Self { sp: 0, dp: 0 }
+        Self {
+            sp: 0,
+            dp: 0,
+            floor: 0,
+        }
+    }
+
+    /// A decode begun at an entry point (ADR-0040): the token at stream
+    /// offset `sp` writes logical offset `dp` on. Nothing below `dp` is
+    /// made, and a match that reaches below it is
+    /// [`Invalid`](DecompressError::Invalid).
+    pub(crate) const fn at(sp: usize, dp: usize) -> Self {
+        Self { sp, dp, floor: dp }
+    }
+
+    /// Raises the floor to the output position, which must be an entry
+    /// point the decode has just reached (ADR-0040): no later match may
+    /// reach below it, as no match of a decode begun there could.
+    pub(crate) const fn enter(&mut self) {
+        self.floor = self.dp;
     }
 
     /// Bytes of output that are final.
@@ -436,7 +583,7 @@ impl Inflate {
     ) -> Result<(), DecompressError> {
         let out_len = dst.len();
         let until = until.min(out_len);
-        let (sp, dp) = self.decode::<false>(src, dst, out_len, until)?;
+        let (sp, dp) = self.decode_with::<false>(src, dst, out_len, until)?;
         self.sp = sp;
         self.dp = dp;
         Ok(())
@@ -451,8 +598,15 @@ impl Inflate {
     /// of output final: one [`consumed`](Self::consumed) and
     /// [`done`](Self::done) reported, kept to be gone on with later
     /// (ADR-0039). The output below `dp` must still be that decode's.
+    #[cfg(test)]
     pub(crate) const fn resumed(sp: usize, dp: usize) -> Self {
-        Self { sp, dp }
+        Self { sp, dp, floor: 0 }
+    }
+
+    /// [`resumed`](Self::resumed) for a decode begun at an entry point
+    /// `floor` ([`at`](Self::at)).
+    pub(crate) const fn resumed_at(sp: usize, dp: usize, floor: usize) -> Self {
+        Self { sp, dp, floor }
     }
 
     /// [`run`](Self::run) over `prefix`, the first bytes of the stream
@@ -482,15 +636,33 @@ impl Inflate {
         }
         let out_len = dst.len();
         let until = until.min(out_len);
-        let (sp, dp) = self.decode::<true>(prefix, dst, out_len, until)?;
+        let (sp, dp) = self.decode_with::<true>(prefix, dst, out_len, until)?;
         self.sp = sp;
         self.dp = dp;
         Ok(())
     }
 
+    /// [`decode`](Self::decode) with its floor known at compile time to
+    /// be zero or not: a decode with no floor, the most of them, pays no
+    /// floor check on each match.
+    fn decode_with<const PREFIX: bool>(
+        &self,
+        src: &[u8],
+        dst: &mut [u8],
+        out_len: usize,
+        until: usize,
+    ) -> Result<(usize, usize), DecompressError> {
+        if self.floor == 0 {
+            self.decode::<PREFIX, false>(src, dst, out_len, until)
+        } else {
+            self.decode::<PREFIX, true>(src, dst, out_len, until)
+        }
+    }
+
     /// The decode loop: tokens from `self.sp` while the output is below
-    /// `until`. Returns the new stream and output positions.
-    fn decode<const PREFIX: bool>(
+    /// `until`. Returns the new stream and output positions. With
+    /// `FLOOR`, no match may reach below [`Inflate::floor`].
+    fn decode<const PREFIX: bool, const FLOOR: bool>(
         &self,
         src: &[u8],
         dst: &mut [u8],
@@ -567,7 +739,7 @@ impl Inflate {
             }
             let offset = usize::from(src[sp]) | (usize::from(src[sp + 1]) << 8);
             sp += 2;
-            if offset == 0 || offset > dp {
+            if offset == 0 || offset > if FLOOR { dp - self.floor } else { dp } {
                 return Err(DecompressError::Invalid);
             }
             if match_len > out_len - dp {
@@ -671,7 +843,9 @@ fn read_ext(src: &[u8], sp: &mut usize) -> Result<usize, DecompressError> {
 mod tests {
     //! [`Inflate::run_prefix`] over growing prefixes of a stream decodes
     //! exactly what [`decompress`] does over the whole (ADR-0039).
-    use super::{CompressScratch, DecompressError, Inflate, decompress};
+    use super::{
+        CompressScratch, DecompressError, Inflate, decompress, decompress_points, points_hold,
+    };
     extern crate std;
     use std::boxed::Box;
     use std::vec::Vec;
@@ -888,6 +1062,273 @@ mod tests {
             let mut again = Inflate::resumed(kept.0, kept.1);
             again.run_prefix(&other, true, &mut out, 4092).unwrap();
             assert_eq!(out, block);
+        }
+    }
+
+    /// One token of a stream, as an independent parser reads it: where it
+    /// starts in the stream and the output, and the lowest output byte
+    /// its match copies from (`None`: no match).
+    struct Token {
+        sp: usize,
+        dp: usize,
+        reach: Option<usize>,
+    }
+
+    /// The tokens of a whole valid stream decoding to `len` bytes, read by
+    /// hand (not by [`Inflate`]), for tests of what [`Inflate`] accepts.
+    fn tokens(src: &[u8], len: usize) -> Vec<Token> {
+        let ext = |sp: &mut usize| {
+            let mut n = 0usize;
+            loop {
+                let b = src[*sp];
+                *sp += 1;
+                n += usize::from(b);
+                if b != 0xFF {
+                    return n;
+                }
+            }
+        };
+        let (mut sp, mut dp, mut out) = (0usize, 0usize, Vec::new());
+        while dp < len {
+            let start = (sp, dp);
+            let tag = src[sp];
+            sp += 1;
+            let mut lit = usize::from(tag >> 4);
+            if lit == 15 {
+                lit += ext(&mut sp);
+            }
+            sp += lit;
+            dp += lit;
+            if dp == len {
+                out.push(Token {
+                    sp: start.0,
+                    dp: start.1,
+                    reach: None,
+                });
+                break;
+            }
+            let mut m = usize::from(tag & 0x0F);
+            if m == 15 {
+                m += ext(&mut sp);
+            }
+            let offset = usize::from(src[sp]) | (usize::from(src[sp + 1]) << 8);
+            sp += 2;
+            out.push(Token {
+                sp: start.0,
+                dp: start.1,
+                reach: Some(dp - offset),
+            });
+            dp += m + super::MIN_MATCH;
+        }
+        out
+    }
+
+    /// Restart-like bounds about `every` bytes apart, as a writer picks
+    /// them (ADR-0040).
+    fn bounds_every(len: usize, every: usize) -> Vec<usize> {
+        (1..len / every).map(|i| i * every).take(15).collect()
+    }
+
+    /// With no bounds, a chunked compress is the plain one, byte for
+    /// byte; with bounds, its stream still decompresses to the block, and
+    /// each point it records is a token start no later match reaches
+    /// below, so a decode begun there makes the rest of the block.
+    #[test]
+    fn a_chunked_stream_is_one_stream_with_points_a_decode_can_begin_at() {
+        let mut chunked_blocks = 0;
+        for seed in 1..300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let block = compressible(&mut rng, 4092);
+            let mut cs = Box::new(CompressScratch::<4096>::new());
+            let plain = cs.compress(&block).map(|n| cs.compressed()[..n].to_vec());
+            let same = cs
+                .compress_chunked(&block, &[], &mut [], 0)
+                .map(|n| cs.compressed()[..n].to_vec());
+            assert_eq!(plain, same, "no bounds is the plain compress");
+            let bounds = bounds_every(4092, 200 + rng.below(900));
+            let mut points = std::vec![(0usize, 0usize); bounds.len()];
+            let Some(n) = cs.compress_chunked(&block, &bounds, &mut points, 0) else {
+                continue;
+            };
+            chunked_blocks += 1;
+            let stream = cs.compressed()[..n].to_vec();
+            let mut out = std::vec![0u8; 4092];
+            assert_eq!(decompress(&stream, &mut out), Ok(4092));
+            assert_eq!(out, block);
+            let toks = tokens(&stream, 4092);
+            for (&(s, t), &b) in points.iter().zip(&bounds) {
+                assert!(t <= b, "a point past its bound");
+                assert!(
+                    toks.iter().any(|k| k.sp == s && k.dp == t),
+                    "a point not at a token"
+                );
+                assert!(
+                    toks.iter()
+                        .filter(|k| k.dp >= t)
+                        .all(|k| k.reach.is_none_or(|r| r >= t)),
+                    "a match after a point reaches below it"
+                );
+                // A decode begun there, over growing prefixes.
+                let mut part = std::vec![0xA5u8; 4092];
+                let mut inflate = Inflate::at(s, t);
+                let mut have = s;
+                while inflate.done() < 4092 {
+                    have = (have + 1 + rng.below(300)).min(stream.len());
+                    inflate
+                        .run_prefix(&stream[..have], have == stream.len(), &mut part, 4092)
+                        .unwrap();
+                }
+                assert_eq!(part[t..], block[t..]);
+            }
+            let mut whole = std::vec![0u8; 4092];
+            assert_eq!(
+                decompress_points(&stream, &mut whole, points.iter().copied()),
+                Ok(4092)
+            );
+            assert_eq!(whole, block);
+            assert!(
+                points_hold(&stream, 4092, &points),
+                "the writer's check of its own table"
+            );
+        }
+        assert!(chunked_blocks > 250, "{chunked_blocks} blocks");
+    }
+
+    /// The floor: a decode begun, or entered, at a token that a later
+    /// match reaches below is `Invalid`, exactly when one does. Taken at
+    /// every token of plain streams, whose matches cross freely. (Review
+    /// of ADR-0040's panel: dropping the floor check passed every other
+    /// test.)
+    #[test]
+    fn a_match_below_the_floor_is_invalid() {
+        let (mut crossed, mut clean) = (0usize, 0usize);
+        for seed in 1..80u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let block = compressible(&mut rng, 4092);
+            // Plain streams, and chunked ones, whose points are clean.
+            let mut cs = Box::new(CompressScratch::<4096>::new());
+            let bounds = if seed % 2 == 0 {
+                bounds_every(4092, 300)
+            } else {
+                Vec::new()
+            };
+            let mut points = std::vec![(0usize, 0usize); bounds.len()];
+            let Some(n) = cs.compress_chunked(&block, &bounds, &mut points, 0) else {
+                continue;
+            };
+            let stream = cs.compressed()[..n].to_vec();
+            let toks = tokens(&stream, 4092);
+            for k in toks.iter().skip(1).step_by(3) {
+                let reaches_below = toks
+                    .iter()
+                    .filter(|j| j.dp >= k.dp)
+                    .any(|j| j.reach.is_some_and(|r| r < k.dp));
+                let mut out = std::vec![0u8; 4092];
+                let mut at = Inflate::at(k.sp, k.dp);
+                let begun = at.run(&stream, &mut out, 4092);
+                let mut whole = std::vec![0u8; 4092];
+                let entered = decompress_points(&stream, &mut whole, [(k.sp, k.dp)].into_iter());
+                // The writer's check, by headers alone, agrees.
+                assert_eq!(points_hold(&stream, 4092, &[(k.sp, k.dp)]), entered.is_ok());
+                if reaches_below {
+                    crossed += 1;
+                    assert_eq!(
+                        begun,
+                        Err(DecompressError::Invalid),
+                        "begun at {} {}",
+                        k.sp,
+                        k.dp
+                    );
+                    assert_eq!(entered, Err(DecompressError::Invalid));
+                } else {
+                    clean += 1;
+                    assert_eq!(begun, Ok(()));
+                    assert_eq!(out[k.dp..], block[k.dp..]);
+                    assert_eq!(entered, Ok(4092));
+                }
+            }
+        }
+        assert!(
+            crossed > 300 && clean > 100,
+            "{crossed} crossed, {clean} clean"
+        );
+    }
+
+    /// A table whose points are not where the stream's tokens start, by
+    /// any amount, is `Invalid` to a whole decode that checks them.
+    #[test]
+    fn a_point_off_a_token_is_invalid() {
+        let mut tried = 0;
+        for seed in 1..120u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D));
+            let block = compressible(&mut rng, 4092);
+            let mut cs = Box::new(CompressScratch::<4096>::new());
+            let bounds = bounds_every(4092, 700);
+            let mut points = std::vec![(0usize, 0usize); bounds.len()];
+            let Some(n) = cs.compress_chunked(&block, &bounds, &mut points, 0) else {
+                continue;
+            };
+            let stream = cs.compressed()[..n].to_vec();
+            let toks = tokens(&stream, 4092);
+            for i in 0..points.len() {
+                for (ds, dt) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1), (3, 5), (0, 64)] {
+                    let (s, t) = points[i];
+                    let (Some(s2), Some(t2)) = (s.checked_add_signed(ds), t.checked_add_signed(dt))
+                    else {
+                        continue;
+                    };
+                    if toks.iter().any(|k| k.sp == s2 && k.dp == t2) {
+                        continue;
+                    }
+                    let mut bad = points.clone();
+                    bad[i] = (s2, t2);
+                    let mut out = std::vec![0u8; 4092];
+                    assert_eq!(
+                        decompress_points(&stream, &mut out, bad.iter().copied()),
+                        Err(DecompressError::Invalid),
+                        "point {i} moved by {ds},{dt}"
+                    );
+                    assert!(
+                        !points_hold(&stream, 4092, &bad),
+                        "the writer's check let it by"
+                    );
+                    tried += 1;
+                }
+            }
+        }
+        assert!(tried > 300, "{tried}");
+    }
+
+    /// The writer's check reads only token headers, and is total: over
+    /// streams that do not decode, and points anywhere, it never panics,
+    /// and it holds only where a checked whole decode succeeds.
+    #[test]
+    fn the_writers_check_agrees_with_the_decoder_on_any_bytes() {
+        for seed in 1..600u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xA076_1D64_78BD_642F));
+            let block = compressible(&mut rng, 4092);
+            let mut cs = Box::new(CompressScratch::<4096>::new());
+            let bounds = bounds_every(4092, 400 + rng.below(800));
+            let mut points = std::vec![(0usize, 0usize); bounds.len()];
+            let Some(n) = cs.compress_chunked(&block, &bounds, &mut points, 0) else {
+                continue;
+            };
+            let mut stream = cs.compressed()[..n].to_vec();
+            for _ in 0..rng.below(3) {
+                let at = rng.below(stream.len());
+                stream[at] = u8::try_from(rng.below(256)).unwrap();
+            }
+            if rng.below(3) == 0 && !points.is_empty() {
+                let i = rng.below(points.len());
+                points[i].0 = points[i].0.wrapping_add(rng.below(5)).wrapping_sub(2);
+            }
+            let mut out = std::vec![0u8; 4092];
+            let whole = decompress_points(&stream, &mut out, points.iter().copied());
+            assert_eq!(
+                points_hold(&stream, 4092, &points),
+                whole.is_ok(),
+                "seed {seed}"
+            );
         }
     }
 }

@@ -1,6 +1,6 @@
 # ADR-0039: A seek inflates a compressed block only as far as it reads
 
-Status: Accepted (unreleased, 2026-11-27)
+Status: Accepted (unreleased, 2026-11-27; over a block with entry points, from its chunk: ADR-0040)
 
 ## Context
 

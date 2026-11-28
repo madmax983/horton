@@ -227,6 +227,22 @@ Every block is `BLOCK` bytes ending in a CRC32 of its payload.
   compaction outputs) store their data blocks raw (ADR-0030); a table
   moved down whole, or ingested, keeps its blocks as they are. A block
   says which it is, so the setting is not part of the format.
+- **Compressed data block:** `stream | zero fill | n × (s u16 | t u16 |
+  b u16) | n u16 | flag u16`, where the flag is bit 15 and the stream's
+  length `clen`. The stream is one LZ77 stream of the logical block
+  above. The writer may cut it into chunks at restarts (at least 2 KiB,
+  or a sixteenth of the block, apart; at most 15 cuts). At a cut the
+  encoder forgets its window, so no match crosses it, and the block
+  lists the cut as an entry point (ADR-0040): `s` is the stream offset
+  of the token a decode may begin at, `t` the logical offset it writes
+  from, and `b` the chunk's head, a restart at or past `t`. `n` is 0 for
+  a block with one chunk (and for every block written before entry
+  points). A table must lie past the stream and ascend (`s` and `t`
+  never fall, `b` always rises, `t ≤ b`); every whole decode also checks
+  that each point is where a token starts, that no later match reaches
+  below it, and that each head is a restart, and a block that fails is
+  `CorruptBlock`. A reader that ignores the table decodes the stream as
+  before; blocks over 64 KiB carry none.
 - **Rdel block:** range tombstones `start_len u16 | end_len u16 | seq u64
   | start | end`, sorted by start, then a `u16` count. Never compressed.
 - **Bloom blocks:** a bit array in 64-byte buckets. A key hashes to one

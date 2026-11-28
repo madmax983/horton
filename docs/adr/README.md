@@ -51,6 +51,7 @@ history keeps it); its §9 milestone log now lives in
 | [0037](0037-scans-over-a-kept-state.md) | A scan can be built in buffers its caller keeps (`ScanState`, `RevScanState`, `Scan::detached_in`): everything that decides whether a byte of them is read stays in the scan and starts fresh; the host store keeps one forward and one reverse state per reader thread, so a page zeroes nothing |
 | [0038](0038-drainer-writes-the-prefix-it-can.md) | The `multiwriter` drainer writes the longest pending prefix that the `Db` takes: a burst over `CAP` or `ARENA` splits, the tickets before a bad ticket complete, `Drainer::bad_ticket` names it, and `Writer::put` checks the `Db`'s limits before the claim |
 | [0039](0039-seeks-inflate-only-what-they-read.md) | A forward seek checks and inflates a compressed block's stream only as far as it reads, walking from the first entry; the buffer keeps the whole grains made and the decode, and a step past them goes on with it in one more lend, checking only the stream ahead; a parse error is believed only from the whole block |
+| [0040](0040-entry-points-in-compressed-blocks.md) | A compressed data block of 8 to 64 KiB lists points its stream may be decoded from, cut at restarts about 2 KiB apart; a cached point read or seek decodes only the chunk it needs; every whole decode checks the table; no magic bump |
 
 ## Adding a record
 

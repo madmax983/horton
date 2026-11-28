@@ -23,6 +23,7 @@ use crate::device::BlockDevice;
 use crate::error::Error;
 use crate::manifest::{Manifest, TableRef};
 use crate::memtable::MemTable;
+use crate::points::{POINT_LEN, point_at, table_of};
 use crate::sstable;
 use crate::version::{Version, version_gt};
 
@@ -414,11 +415,14 @@ struct Resume {
     sp: u16,
     /// Bytes of the logical block that are final.
     dp: u16,
+    /// The stream's length; bit 15 set once two lends or more have gone
+    /// on with the decode (each decodes further past what its parse
+    /// reads than the one before, [`prefix_step`]).
     clen: u16,
-    /// Lends that have gone on with the decode since it began: each
-    /// decodes further past what its parse reads than the one before
-    /// ([`prefix_step`]).
-    lends: u8,
+    /// Where the decode began (ADR-0040): 0, the block's start; else the
+    /// token of an entry point, below which the buffer holds nothing of
+    /// the block. Bytes from here to the end of its grain are final too.
+    lo: u16,
 }
 
 impl Resume {
@@ -426,24 +430,30 @@ impl Resume {
         sp: 0,
         dp: 0,
         clen: 0,
-        lends: 0,
+        lo: 0,
     };
 
-    /// The decode `inflate` of a stream of `clen` bytes, kept by its
-    /// `lends`th lend; `None` when its positions do not fit (a block
-    /// over 64 KiB is inflated whole).
-    fn of(inflate: &Inflate, clen: usize, lends: u8) -> Option<Self> {
+    /// The decode `inflate` of a stream of `clen` bytes, begun at `lo`
+    /// and kept by its `lends`th lend (1 or more); `None` when its
+    /// positions do not fit (a block over 64 KiB is inflated whole).
+    fn of(inflate: &Inflate, clen: usize, lends: u8, lo: usize) -> Option<Self> {
+        let len = u16::try_from(clen).ok().filter(|&c| c != 0 && c < 0x8000)?;
         Some(Self {
             sp: u16::try_from(inflate.consumed()).ok()?,
             dp: u16::try_from(inflate.done()).ok()?,
-            clen: u16::try_from(clen).ok().filter(|&c| c != 0)?,
-            lends,
+            clen: if lends >= 2 { len | 0x8000 } else { len },
+            lo: u16::try_from(lo).ok()?,
         })
     }
 
-    /// The decode to go on with.
-    fn inflate(self) -> Inflate {
-        Inflate::resumed(usize::from(self.sp), usize::from(self.dp))
+    /// The compressed stream's length.
+    const fn stream_len(self) -> u16 {
+        self.clen & 0x7FFF
+    }
+
+    /// Lends that have gone on with the decode: 1, or 2 for more.
+    const fn lends(self) -> u8 {
+        if self.clen & 0x8000 != 0 { 2 } else { 1 }
     }
 }
 
@@ -529,7 +539,7 @@ enum Gate<'a, 'c, const BLOCK: usize> {
     /// A compressed block being inflated from its lent image, final as
     /// far as [`Prefix::upto`]: a parse that reads further is run again
     /// over more (ADR-0039).
-    Prefix(Prefix),
+    Prefix(Prefix<'a>),
 }
 
 /// A gate over the part of a compressed block inflated so far, from
@@ -538,28 +548,80 @@ enum Gate<'a, 'c, const BLOCK: usize> {
 /// furthest byte a miss asked for is recorded, for the parse to be run
 /// again once the decode has gone past it.
 #[derive(Clone, Copy)]
-struct Prefix {
-    /// Bytes of the logical block that are final.
+struct Prefix<'a> {
+    /// Bytes `lo..upto` of the logical block are final: the decode
+    /// began at `lo`, the block's start or an entry point (ADR-0040).
+    lo: usize,
     upto: usize,
     /// Where a seek's walk had got to: every entry before it was passed
     /// over, from final bytes, in an earlier run of the parse.
     walked: usize,
-    /// The furthest byte a miss asked for.
+    /// The furthest byte a miss asked for, and the lowest.
     want: usize,
+    low: usize,
     missed: bool,
+    /// A miss asked for bytes below `lo`, which the decode cannot make.
+    below: bool,
+    /// The block's entry points, checked (ADR-0040); empty: none.
+    table: &'a [u8],
+    /// A seek's binary search over the chunk heads `1..=n`: the first
+    /// whose key sorts at or above its start lies in `sl..sh`.
+    sl: u8,
+    sh: u8,
+    /// The chunk the decode began at, [`NO_CHUNK`] while there is none.
+    main: u8,
+    /// The chunk a probe decoded, and the bytes of it final.
+    probed: u8,
+    plo: usize,
+    phi: usize,
+    /// What the parse asks the lend to decode before it runs again.
+    ask: Ask,
 }
 
-impl Prefix {
+/// No chunk: see [`Prefix::main`].
+const NO_CHUNK: u8 = u8::MAX;
+
+/// What a parse over a [`Prefix`] asks for, besides bytes past the
+/// decode's end (ADR-0040).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ask {
+    Nothing,
+    /// The head of chunk `.0`, final up to `.1`: a probe of the search.
+    Probe(u8, usize),
+    /// The decode, begun at chunk `.0`.
+    Main(u8),
+    /// The whole block, from its start.
+    Whole,
+}
+
+impl Prefix<'_> {
     /// Whether bytes `from..to` are final; a miss is recorded.
     const fn check(&mut self, from: usize, to: usize) -> bool {
-        if to <= from || to <= self.upto {
+        if to <= from || (from >= self.lo && to <= self.upto) {
             return true;
         }
         self.missed = true;
+        if from < self.lo {
+            self.below = true;
+        }
         if to > self.want {
             self.want = to;
         }
+        if from < self.low {
+            self.low = from;
+        }
         false
+    }
+
+    /// Whether a probe has made bytes `from..to` of chunk `c` final.
+    const fn probed(&self, c: u8, from: usize, to: usize) -> bool {
+        self.probed == c && from >= self.plo && to <= self.phi
+    }
+
+    /// Asks for `ask`, a miss.
+    const fn ask(&mut self, ask: Ask) {
+        self.ask = ask;
+        self.missed = true;
     }
 }
 
@@ -602,11 +664,9 @@ impl<const BLOCK: usize> Gate<'_, '_, BLOCK> {
         }
         match self {
             Self::Open => to <= BLOCK,
-            Self::Held(g) => {
-                to <= BLOCK && g.valid & mask::<BLOCK>(from, to) == mask::<BLOCK>(from, to)
-            }
+            Self::Held(g) => g.holds(from, to),
             Self::Lent(_) => false,
-            Self::Prefix(p) => to <= p.upto,
+            Self::Prefix(p) => from >= p.lo && to <= p.upto,
         }
     }
 
@@ -644,20 +704,44 @@ impl<const BLOCK: usize> Gate<'_, '_, BLOCK> {
 /// driver takes the rest of the block and parses again.
 struct Gated<const BLOCK: usize> {
     valid: u64,
+    /// Where a kept decode began ([`Resume::lo`]): bytes from it to the
+    /// end of its grain hold too, when the grain after it does.
+    lo: usize,
     missed: bool,
 }
 
 impl<const BLOCK: usize> Gated<BLOCK> {
-    const fn check(&mut self, from: usize, to: usize) -> bool {
+    #[inline]
+    const fn holds(&self, from: usize, to: usize) -> bool {
         if to <= from {
             return true;
         }
-        let m = if to > BLOCK {
-            0
-        } else {
-            mask::<BLOCK>(from, to)
-        };
-        let held = to <= BLOCK && self.valid & m == m;
+        if to > BLOCK {
+            return false;
+        }
+        let m = mask::<BLOCK>(from, to);
+        self.valid & m == m || (self.lo != 0 && self.holds_past_lo(from, m))
+    }
+
+    /// The rest of [`holds`](Self::holds), for a buffer whose decode
+    /// began at an entry point (ADR-0040): the grain `lo` lies in holds
+    /// from `lo` on once the grain after it does.
+    #[cold]
+    #[inline(never)]
+    const fn holds_past_lo(&self, from: usize, m: u64) -> bool {
+        let g = grain::<BLOCK>();
+        let first = self.lo / g;
+        if from < self.lo || first + 1 >= 64 {
+            return false;
+        }
+        // The decode began inside grain `first` and made the rest of it:
+        // the grain after it is whole.
+        let partial = 1u64 << first;
+        self.valid & (partial << 1) != 0 && (self.valid | partial) & m == m
+    }
+
+    const fn check(&mut self, from: usize, to: usize) -> bool {
+        let held = self.holds(from, to);
         self.missed |= !held;
         held
     }
@@ -958,6 +1042,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         }
         let mut gate = Gate::Held(Gated::<BLOCK> {
             valid: block.valid,
+            lo: usize::from(block.resume.lo),
             missed: false,
         });
         let answer = f(&block.data, &mut gate);
@@ -1063,12 +1148,18 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             }
             let flag = u16::from_le_bytes([image[at], image[at + 1]]);
             if flag & 0x8000 != 0 && ranged && take == Take::Prefix && keeps_decode::<BLOCK>() {
-                let st = Stream {
-                    inflate: Inflate::new(),
-                    clen: usize::from(flag & 0x7FFF),
-                    checked: 0,
+                let clen = usize::from(flag & 0x7FFF);
+                let table = match table_of(image, clen, check) {
+                    Ok(table) => table,
+                    Err(true) => return,
+                    Err(false) => {
+                        if check(0, BLOCK) {
+                            answer = Some(Err(Error::CorruptBlock { id: bid }));
+                        }
+                        return;
+                    }
                 };
-                let kept = lend_prefix(image, data, st, 0, bid, check, f);
+                let kept = lend_prefix(image, data, None, clen, 0, table, bid, check, f);
                 if let Some((parsed, grains, partial)) = kept {
                     answer = Some(parsed);
                     valid = grains;
@@ -1080,7 +1171,12 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
                 let clen = usize::from(flag & 0x7FFF);
                 let inflated = clen < body_end
                     && check(0, clen)
-                    && crate::compress::decompress(&image[..clen], &mut data[..body_end]).is_ok();
+                    && table_of(image, clen, check).is_ok()
+                    && crate::points::inflate_image(
+                        &image[..body_end],
+                        clen,
+                        &mut data[..body_end],
+                    );
                 if inflated {
                     valid = full::<BLOCK>();
                     answer = Some(f(data, &mut Gate::Open));
@@ -1181,11 +1277,7 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         let body_end = BLOCK - sstable::CRC_LEN;
         let (_, block) = self.split();
         let r = block.resume;
-        debug_assert_eq!(
-            block.valid,
-            grains_below::<BLOCK>(usize::from(r.dp)),
-            "a kept decode names the grains it made"
-        );
+        let held = block.valid;
         let data = &mut block.data;
         let mut kept = None;
         let lent = cache.with_checked(table_id, bid, &mut |image, check| {
@@ -1194,16 +1286,34 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             };
             let at = body_end - 2;
             if !check(at, body_end)
-                || u16::from_le_bytes([image[at], image[at + 1]]) != 0x8000 | r.clen
+                || u16::from_le_bytes([image[at], image[at + 1]]) != 0x8000 | r.stream_len()
             {
                 return;
             }
-            let st = Stream {
-                inflate: r.inflate(),
-                clen: usize::from(r.clen),
-                checked: usize::from(r.sp),
+            let clen = usize::from(r.stream_len());
+            let Ok(table) = table_of(image, clen, check) else {
+                return;
             };
-            kept = lend_prefix(image, data, st, r.lends, bid, check, f);
+            let st = Stream::resumed(r, table);
+            let Some(entry) = chunk_at(table, r.lo) else {
+                return;
+            };
+            debug_assert_eq!(
+                held,
+                grains_in::<BLOCK>(usize::from(r.lo), usize::from(r.dp)),
+                "a kept decode names the grains it made"
+            );
+            kept = lend_prefix(
+                image,
+                data,
+                Some((st, entry)),
+                clen,
+                r.lends(),
+                table,
+                bid,
+                check,
+                f,
+            );
         });
         match (lent, kept) {
             (None, _) => Lend::Unlent,
@@ -1300,16 +1410,6 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
         let body_end = BLOCK - sstable::CRC_LEN;
         let (_, block) = self.split();
         let r = block.resume;
-        debug_assert_eq!(
-            block.valid,
-            grains_below::<BLOCK>(usize::from(r.dp)),
-            "a kept decode names the grains it made"
-        );
-        let mut st = Stream {
-            inflate: r.inflate(),
-            clen: usize::from(r.clen),
-            checked: usize::from(r.sp),
-        };
         let data = &mut block.data;
         let mut done = false;
         let lent = cache.with_checked(table_id, bid, &mut |image, check| {
@@ -1318,11 +1418,24 @@ impl<'d, const BLOCK: usize> Blocks<'d, BLOCK> {
             };
             let at = body_end - 2;
             if !check(at, body_end)
-                || u16::from_le_bytes([image[at], image[at + 1]]) != 0x8000 | r.clen
+                || u16::from_le_bytes([image[at], image[at + 1]]) != 0x8000 | r.stream_len()
             {
                 return;
             }
-            done = st.grow(image, data, body_end, check) == Ok(true);
+            let clen = usize::from(r.stream_len());
+            let Ok(table) = table_of(image, clen, check) else {
+                return;
+            };
+            // A decode begun at an entry point made nothing below it: the
+            // block is inflated from its start instead (ADR-0040).
+            let mut st = if r.lo == 0 {
+                Stream::resumed(r, table)
+            } else {
+                Stream::fresh(clen)
+            };
+            done = st.grow(image, data, body_end, table, check) == Ok(true)
+                && (table.is_empty()
+                    || crate::points::points_are_restarts(&data[..body_end], table));
         });
         let done = lent == Some(true) && done;
         if done {
@@ -1369,6 +1482,7 @@ impl<const KEY_MAX: usize> Head<KEY_MAX> {
 
 /// The entries end of data block `b` (see [`sstable::data_entries_end`]),
 /// with its count word checked first. A block always holds an entry.
+#[inline]
 fn entries_end<E, const BLOCK: usize>(
     b: &[u8; BLOCK],
     bid: u64,
@@ -1438,7 +1552,9 @@ fn look_ahead<const BLOCK: usize>(
                 let _ = p.check(off, n.next);
             }
             Err(_) => {
-                let _ = p.check(0, BLOCK - sstable::CRC_LEN);
+                // The rest of the block: a decode begun at an entry point
+                // has all a park past here reads (ADR-0040).
+                let _ = p.check(off, BLOCK - sstable::CRC_LEN);
             }
         }
         return;
@@ -1579,6 +1695,9 @@ fn seek_linear<E, const BLOCK: usize, const KEY_MAX: usize>(
     let corrupt = || Error::CorruptBlock { id: bid };
     let body_end = BLOCK - sstable::CRC_LEN;
     let end = provisional_end::<BLOCK>();
+    let Some(from) = chunk_head(b, from, start, end, g) else {
+        return Err(corrupt());
+    };
     let mut off = skip_below(b, from, start, end, g);
     loop {
         g.at(off);
@@ -1607,6 +1726,116 @@ fn seek_linear<E, const BLOCK: usize, const KEY_MAX: usize>(
         }
         off = e.next;
     }
+}
+
+/// Output a probe of a chunk head asks for past the head: its entry,
+/// most often (ADR-0040).
+const PROBE_STEP: usize = 160;
+
+/// The first part of [`seek_linear`] over a block with entry points
+/// (ADR-0040): where its walk may begin. A binary search over the chunk
+/// heads finds the last whose key sorts below `start`, each head decoded
+/// by a probe of its own chunk, and the decode then begins at that
+/// chunk; the walk begins at its head, or at `from` past it. The search
+/// is kept in the gate across runs of the parse, so each run goes on
+/// where the last stopped. `None`: the parse asked for a probe, the
+/// decode, or the whole block (a head that does not parse), and runs
+/// again. Over a gate with no table, `from`.
+///
+/// A decode kept from an earlier lend began at its chunk because that
+/// head sorted below an earlier seek's start; a seek that sorts at or
+/// below the head asks for the whole block.
+#[inline]
+fn chunk_head<const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    from: usize,
+    start: &[u8],
+    end: usize,
+    g: &mut Gate<'_, '_, BLOCK>,
+) -> Option<usize> {
+    match g {
+        Gate::Prefix(p) if !p.table.is_empty() => search_heads(b, from, start, end, p),
+        _ => Some(from),
+    }
+}
+
+/// [`chunk_head`] over a block that has a table.
+#[inline(never)]
+fn search_heads<const BLOCK: usize>(
+    b: &[u8; BLOCK],
+    from: usize,
+    start: &[u8],
+    end: usize,
+    p: &mut Prefix<'_>,
+) -> Option<usize> {
+    if start.is_empty() {
+        p.sh = p.sl;
+    }
+    // The key of the entry at `head`, by the bytes `final_` lets through.
+    while p.sl < p.sh {
+        let mid = p.sl + (p.sh - p.sl) / 2;
+        let head = point_at(p.table, usize::from(mid) - 1).2;
+        let hdr = head + sstable::ENTRY_HEADER;
+        if !p.probed(mid, head, hdr) {
+            p.ask(Ask::Probe(mid, hdr + PROBE_STEP));
+            return None;
+        }
+        let (kl, next) = header_span(b, head);
+        if kl == 0 || next > end {
+            p.ask(Ask::Whole);
+            return None;
+        }
+        if !p.probed(mid, head, next) {
+            p.ask(Ask::Probe(mid, next));
+            return None;
+        }
+        if &b[hdr..hdr + kl] < start {
+            p.sl = mid + 1;
+        } else {
+            p.sh = mid;
+        }
+    }
+    let chunk = p.sl - 1;
+    if p.main != chunk {
+        p.ask(Ask::Main(chunk));
+        return None;
+    }
+    if chunk == 0 {
+        return Some(from);
+    }
+    let head = point_at(p.table, usize::from(chunk) - 1).2;
+    let hdr = head + sstable::ENTRY_HEADER;
+    if !p.check(head, hdr) {
+        return None;
+    }
+    let (kl, next) = header_span(b, head);
+    if kl == 0 || next > end {
+        p.ask(Ask::Whole);
+        return None;
+    }
+    if !p.check(head, next) {
+        return None;
+    }
+    if &b[hdr..hdr + kl] >= start {
+        p.ask(Ask::Whole);
+        return None;
+    }
+    Some(from.max(head))
+}
+
+/// The key length and the end of the entry whose header lies at `off`
+/// in `b`, read from the header alone (the caller has checked it is
+/// final). The end counts a TTL entry's expiry.
+fn header_span<const BLOCK: usize>(b: &[u8; BLOCK], off: usize) -> (usize, usize) {
+    let h = &b[off..off + sstable::ENTRY_HEADER];
+    let kl = usize::from(u16::from_le_bytes([h[0], h[1]]));
+    let vl = usize::from(u16::from_le_bytes([h[2], h[3]]));
+    let ttl = if h[12] == crate::wal::Op::PutTtl.to_u8() {
+        8
+    } else {
+        0
+    };
+    (kl, off + sstable::ENTRY_HEADER + kl + vl + ttl)
 }
 
 /// How many entries [`seek_linear`] steps over by their headers between
@@ -1725,17 +1954,44 @@ type Kept<R, E> = (Result<R, Error<E>>, u64, Resume);
 ///   [`Blocks::extend`] or [`Blocks::complete`] to go on from.
 ///
 /// `None`: a check failed, and the lend is a miss.
+#[allow(clippy::too_many_arguments)]
 fn lend_prefix<E, R, const BLOCK: usize>(
     image: &[u8; BLOCK],
     data: &mut [u8; BLOCK],
-    mut st: Stream,
+    start: Option<(Stream, u8)>,
+    clen: usize,
     lends: u8,
+    table: &[u8],
     bid: u64,
     check: &mut (dyn FnMut(usize, usize) -> bool + '_),
     f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
 ) -> Option<Kept<R, E>> {
+    // A block with no table, every block under 8 KiB among them, takes
+    // a build of this with the table's logic folded away: it costs what
+    // the decode cost before entry points (ADR-0040).
+    if table.is_empty() {
+        lend_prefix_in::<E, R, BLOCK, false>(image, data, start, clen, lends, table, bid, check, f)
+    } else {
+        lend_prefix_in::<E, R, BLOCK, true>(image, data, start, clen, lends, table, bid, check, f)
+    }
+}
+
+/// [`lend_prefix`], for a block with a table of entry points (`POINTS`)
+/// or with none.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn lend_prefix_in<E, R, const BLOCK: usize, const POINTS: bool>(
+    image: &[u8; BLOCK],
+    data: &mut [u8; BLOCK],
+    start: Option<(Stream, u8)>,
+    clen: usize,
+    lends: u8,
+    table: &[u8],
+    bid: u64,
+    check: &mut (dyn FnMut(usize, usize) -> bool + '_),
+    f: &mut impl FnMut(&[u8; BLOCK], &mut Gate<'_, '_, BLOCK>) -> Result<R, Error<E>>,
+) -> Option<Kept<R, E>> {
+    let table: &[u8] = if POINTS { table } else { &[] };
     let body_end = BLOCK - sstable::CRC_LEN;
-    let clen = st.clen;
     let step = prefix_step(lends);
     // Damage the image's checks let through, as the whole path says.
     let corrupt = |check: &mut (dyn FnMut(usize, usize) -> bool + '_)| {
@@ -1744,64 +2000,262 @@ fn lend_prefix<E, R, const BLOCK: usize>(
     if clen >= body_end {
         return corrupt(check);
     }
-    let mut target = st.inflate.done() + step;
-    // Where a seek's walk had got to: the entries before it were passed.
-    let mut walked = 0usize;
+    let n = table.len() / POINT_LEN;
+    // The decode the parse reads, and the chunk it began at. A fresh lend
+    // over a block with entry points has none until a seek's search has
+    // chosen its chunk (ADR-0040).
+    let searching = start.is_none() && n > 0;
+    let (mut main, entry) = match start {
+        Some((st, e)) => (Some(st), e),
+        None if n == 0 => (Some(Stream::fresh(clen)), 0),
+        None => (None, 0),
+    };
+    let mut lo = entry_floor(table, entry);
+    let mut target = main.as_ref().map_or(0, |d| d.inflate.done() + step);
+    let mut probe: Option<(u8, Stream)> = None;
+    #[allow(clippy::cast_possible_truncation)] // at most MAX_POINTS + 1
+    let top = (n + 1) as u8;
+    let mut p = Prefix {
+        lo,
+        upto: lo,
+        walked: entry_head(table, entry),
+        want: 0,
+        low: usize::MAX,
+        missed: false,
+        below: false,
+        table,
+        sl: if searching {
+            1
+        } else {
+            entry.saturating_add(1)
+        },
+        sh: if searching {
+            top
+        } else {
+            entry.saturating_add(1)
+        },
+        main: if main.is_some() { entry } else { NO_CHUNK },
+        probed: NO_CHUNK,
+        plo: 0,
+        phi: 0,
+        ask: Ask::Nothing,
+    };
+    #[cfg(test)]
+    let mut spins = 0u32;
     let parsed = loop {
-        match st.grow(image, data, target, check) {
-            Ok(true) => {}
-            Ok(false) => return None,
-            Err(()) => return corrupt(check),
+        #[cfg(test)]
+        {
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "lend_prefix spins: ask {:?} missed {} below {} lo {} upto {} want {} low {} main {} sl {} sh {} target {target} n {n}",
+                p.ask,
+                p.missed,
+                p.below,
+                p.lo,
+                p.upto,
+                p.want,
+                p.low,
+                p.main,
+                p.sl,
+                p.sh
+            );
         }
-        let dp = st.inflate.done();
-        if dp >= body_end {
-            // The whole block: its parse, and its errors, stand.
+        if let Some(decode) = main.as_mut() {
+            match decode.grow(image, data, target, table, check) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(()) => return corrupt(check),
+            }
+        }
+        let dp = main.as_ref().map_or(lo, |d| d.inflate.done());
+        if lo == 0 && dp >= body_end {
+            // The whole block, its entry points checked: its parse, and
+            // its errors, stand.
+            if n > 0 && !crate::points::points_are_restarts(&data[..body_end], table) {
+                return corrupt(check);
+            }
             return Some((f(data, &mut Gate::Open), full::<BLOCK>(), Resume::NONE));
         }
-        let mut gate = Gate::Prefix(Prefix {
-            upto: dp,
-            walked,
-            want: 0,
-            missed: false,
-        });
+        p.upto = dp;
+        p.want = 0;
+        p.low = usize::MAX;
+        p.missed = false;
+        p.below = false;
+        p.ask = Ask::Nothing;
+        if POINTS && let Some((c, ps)) = &probe {
+            p.probed = *c;
+            p.plo = entry_floor(table, *c);
+            p.phi = ps.inflate.done();
+        }
+        let mut gate = Gate::Prefix(p);
         let parsed = f(data, &mut gate);
         // Fails closed: a gate that is no longer the prefix's answers
         // nothing, and the lend is a miss.
-        let Gate::Prefix(p) = gate else {
+        let Gate::Prefix(ran) = gate else {
             return None;
         };
-        if p.missed {
-            walked = p.walked;
-            target = p.want.max(dp + 1) + step;
-        } else if parsed.is_err() {
-            target = body_end;
-        } else {
-            break parsed;
+        p = ran;
+        if !POINTS {
+            // No table: ADR-0039's loop, the decode from the block's
+            // start, run on past each miss.
+            if p.missed {
+                target = p.want.max(dp + 1) + step;
+            } else if parsed.is_err() {
+                target = body_end;
+            } else {
+                break parsed;
+            }
+            continue;
         }
+        let mut whole = false;
+        let mut begin = None;
+        match p.ask {
+            Ask::Probe(c, want) => {
+                if probe.as_ref().is_none_or(|(pc, _)| *pc != c) {
+                    probe = Some((c, Stream::at(table, c, clen)?));
+                }
+                if let Some((_, ps)) = probe.as_mut() {
+                    match ps.grow(image, data, want, table, check) {
+                        Ok(true) => {}
+                        Ok(false) => return None,
+                        Err(()) => return corrupt(check),
+                    }
+                    // A probe the block cannot satisfy (it asked past the
+                    // block's end) is the whole block's to decide, never
+                    // asked again (review of ADR-0040: it looped).
+                    whole = ps.inflate.done() < want;
+                }
+                if !whole {
+                    continue;
+                }
+            }
+            Ask::Main(c) => begin = Some(c),
+            Ask::Whole => whole = true,
+            Ask::Nothing if !p.missed => {}
+            Ask::Nothing if p.below => whole = true,
+            Ask::Nothing if main.is_none() => {
+                // A parse other than a seek's, over a fresh lend: the
+                // decode begins at the chunk that holds the lowest byte
+                // it asked for. A parse of the buffer's stale bytes fails
+                // and asks for the trailer first; that names no chunk,
+                // and the decode begins at the block's start (review of
+                // ADR-0040: it began at the last chunk, then whole).
+                let mut c = 0usize;
+                if p.low < provisional_end::<BLOCK>() {
+                    while c < n && point_at(table, c).1 <= p.low {
+                        c += 1;
+                    }
+                } else {
+                    // Nor is the trailer a target: the decode runs a step
+                    // from the chunk's head, and the parse, over real
+                    // bytes, asks again.
+                    p.want = 0;
+                }
+                #[allow(clippy::cast_possible_truncation)] // at most MAX_POINTS
+                let c = c as u8;
+                begin = Some(c);
+            }
+            Ask::Nothing => {
+                target = p.want.max(dp + 1) + step;
+                continue;
+            }
+        }
+        if let Some(c) = begin {
+            main = match probe.take() {
+                Some((pc, ps)) if pc == c => Some(ps),
+                _ if c == 0 => Some(Stream::fresh(clen)),
+                _ => Some(Stream::at(table, c, clen)?),
+            };
+            lo = entry_floor(table, c);
+            p.lo = lo;
+            p.main = c;
+            p.walked = entry_head(table, c);
+            target = p.walked.max(p.want) + step;
+            continue;
+        }
+        if whole || (parsed.is_err() && (lo > 0 || main.is_none())) {
+            // Not decided over the chunk: the whole block, from its start.
+            main = Some(Stream::fresh(clen));
+            probe = None;
+            lo = 0;
+            p.lo = 0;
+            p.main = 0;
+            p.sl = 1;
+            p.sh = 1;
+            p.walked = 0;
+            target = body_end;
+            continue;
+        }
+        if parsed.is_err() {
+            target = body_end;
+            continue;
+        }
+        break parsed;
+    };
+    let Some(mut kept) = main else {
+        // The parse read nothing: nothing to keep.
+        return Some((parsed, 0, Resume::NONE));
     };
     // The buffer keeps whole grains: finish the last one begun, or, when
     // the decode cannot be kept, the block.
-    let dp = st.inflate.done();
+    let dp = kept.inflate.done();
     let next = lends.saturating_add(1);
-    match st.grow(image, data, dp.next_multiple_of(grain::<BLOCK>()), check) {
+    match kept.grow(
+        image,
+        data,
+        dp.next_multiple_of(grain::<BLOCK>()),
+        table,
+        check,
+    ) {
         Ok(true) => {}
         Ok(false) => return None,
         Err(()) => return corrupt(check),
     }
-    let dp = st.inflate.done();
-    if dp < body_end
-        && let Some(resume) = Resume::of(&st.inflate, clen, next)
+    let dp = kept.inflate.done();
+    if (dp < body_end || lo > 0)
+        && let Some(resume) = Resume::of(&kept.inflate, clen, next, lo)
     {
-        return Some((parsed, grains_below::<BLOCK>(dp), resume));
+        return Some((parsed, grains_in::<BLOCK>(lo, dp), resume));
     }
     // The decode cannot be kept: the buffer is marked whole only once it
     // is (review of ADR-0039: a block over 64 KiB was marked whole with
     // its end not inflated).
-    match st.grow(image, data, body_end, check) {
-        Ok(true) => Some((parsed, full::<BLOCK>(), Resume::NONE)),
-        Ok(false) => None,
-        Err(()) => corrupt(check),
+    if lo > 0 {
+        return None;
     }
+    match kept.grow(image, data, body_end, table, check) {
+        Ok(true) if n == 0 || crate::points::points_are_restarts(&data[..body_end], table) => {
+            Some((parsed, full::<BLOCK>(), Resume::NONE))
+        }
+        Ok(true) | Err(()) => corrupt(check),
+        Ok(false) => None,
+    }
+}
+
+/// The token offset of chunk `c`'s entry point: where a decode begun
+/// there begins (0 for chunk 0).
+fn entry_floor(table: &[u8], c: u8) -> usize {
+    usize::from(c)
+        .checked_sub(1)
+        .map_or(0, |i| point_at(table, i).1)
+}
+
+/// The first chunk whose entry point's token is `lo` (chunk 0 for 0):
+/// where a kept decode began. `None`: no such chunk.
+fn chunk_at(table: &[u8], lo: u16) -> Option<u8> {
+    if lo == 0 {
+        return Some(0);
+    }
+    let i = (0..table.len() / POINT_LEN).find(|&i| point_at(table, i).1 == usize::from(lo))?;
+    u8::try_from(i + 1).ok()
+}
+
+/// The head of chunk `c`: its first entry (0 for chunk 0).
+fn entry_head(table: &[u8], c: u8) -> usize {
+    usize::from(c)
+        .checked_sub(1)
+        .map_or(0, |i| point_at(table, i).2)
 }
 
 /// Whether a buffer can keep a partial inflate of a `BLOCK`-byte block:
@@ -1812,33 +2266,106 @@ const fn keeps_decode<const BLOCK: usize>() -> bool {
 }
 
 /// A partial inflate over a lent image whose stream is checked only as
-/// far as the decoder reads it (ADR-0039).
+/// far as the decoder reads it (ADR-0039), from the block's start or an
+/// entry point (ADR-0040).
 struct Stream {
     inflate: crate::compress::Inflate,
     clen: usize,
     /// Stream bytes checked in this lend: `[from_check..checked)`, where
     /// `from_check` is where this lend's checks began.
     checked: usize,
+    /// The next entry point the decode must reach at a token's start,
+    /// as an index into the table.
+    next: usize,
 }
 
 impl Stream {
+    /// A decode from the stream's start.
+    const fn fresh(clen: usize) -> Self {
+        Self {
+            inflate: Inflate::new(),
+            clen,
+            checked: 0,
+            next: 0,
+        }
+    }
+
+    /// A decode begun at the entry point of chunk `c` (`1..=n`).
+    fn at(table: &[u8], c: u8, clen: usize) -> Option<Self> {
+        let i = usize::from(c).checked_sub(1)?;
+        if i >= table.len() / POINT_LEN {
+            return None;
+        }
+        let (s, t, _) = point_at(table, i);
+        Some(Self {
+            inflate: Inflate::at(s, t),
+            clen,
+            checked: s,
+            next: i,
+        })
+    }
+
+    /// The decode a buffer kept, to go on with: its floor is the last
+    /// entry point it has passed, each of which it checked.
+    fn resumed(r: Resume, table: &[u8]) -> Self {
+        let n = table.len() / POINT_LEN;
+        let dp = usize::from(r.dp);
+        let (mut next, mut floor) = (0usize, 0usize);
+        while next < n && point_at(table, next).1 <= dp {
+            floor = point_at(table, next).1;
+            next += 1;
+        }
+        Self {
+            inflate: Inflate::resumed_at(usize::from(r.sp), dp, floor),
+            clen: usize::from(r.stream_len()),
+            checked: usize::from(r.sp),
+            next,
+        }
+    }
+
     /// Decodes until `until` bytes of the logical block are final,
     /// checking stream bytes a few grains at a time just before the
-    /// decoder may read them. `Ok(false)`: a check failed (the lend is
-    /// a miss). `Err`: the stream does not decode.
+    /// decoder may read them, and each entry point of `table` as the
+    /// decode reaches it: a token must start there (ADR-0040).
+    /// `Ok(false)`: a check failed (the lend is a miss). `Err`: the
+    /// stream does not decode, or a point does not hold.
+    #[allow(clippy::inline_always)] // measured: not inlined, it cost every seek
+    #[inline(always)]
     fn grow<const BLOCK: usize>(
         &mut self,
         image: &[u8; BLOCK],
         data: &mut [u8; BLOCK],
         until: usize,
+        table: &[u8],
         check: &mut (dyn FnMut(usize, usize) -> bool + '_),
     ) -> Result<bool, ()> {
         let body_end = BLOCK - sstable::CRC_LEN;
         let until = until.min(body_end);
         let g = grain::<BLOCK>();
-        while self.inflate.done() < until {
+        let n = table.len() / POINT_LEN;
+        loop {
+            while self.next < n {
+                let (s, t, _) = point_at(table, self.next);
+                if self.inflate.done() < t {
+                    break;
+                }
+                if self.inflate.done() != t || self.inflate.consumed() != s {
+                    return Err(());
+                }
+                self.inflate.enter();
+                self.next += 1;
+            }
+            let done = self.inflate.done();
+            if done >= until {
+                return Ok(true);
+            }
+            let stop = if self.next < n {
+                until.min(point_at(table, self.next).1)
+            } else {
+                until
+            };
             if self.checked < self.clen {
-                let guess = ((until - self.inflate.done()) / 2).max(2 * g);
+                let guess = ((until - done) / 2).max(2 * g);
                 let to = (self.checked + guess).next_multiple_of(g).min(self.clen);
                 if !check(self.checked, to) {
                     return Ok(false);
@@ -1849,13 +2376,28 @@ impl Stream {
             let prefix = image.get(..self.checked).ok_or(())?;
             let out = data.get_mut(..body_end).ok_or(())?;
             self.inflate
-                .run_prefix(prefix, whole, out, until)
+                .run_prefix(prefix, whole, out, stop)
                 .map_err(|_| ())?;
-            if whole && self.inflate.done() < until {
+            if whole && self.inflate.done() < stop {
                 return Err(());
             }
         }
-        Ok(true)
+    }
+}
+
+/// The grains wholly inside bytes `lo..dp` (`dp` at the block's end
+/// counts as `BLOCK`: the trailer's grain is in).
+const fn grains_in<const BLOCK: usize>(lo: usize, dp: usize) -> u64 {
+    let first = lo.div_ceil(grain::<BLOCK>());
+    let below = if dp >= BLOCK - sstable::CRC_LEN {
+        full::<BLOCK>()
+    } else {
+        grains_below::<BLOCK>(dp)
+    };
+    if first >= 64 {
+        0
+    } else {
+        below & !((1u64 << first) - 1)
     }
 }
 
@@ -4337,6 +4879,7 @@ mod tests {
                 assert_eq!(head.as_ref().map(key_of), want.1.as_ref().map(key_of));
                 // The same seek over the buffer finds all it reads there.
                 let mut gate = Gate::Held(Gated::<B> {
+                    lo: 0,
                     valid,
                     missed: false,
                 });
@@ -4350,6 +4893,7 @@ mod tests {
                 // The head's value and the step past it come from the
                 // buffer, through its grains: no miss, the same answers.
                 let mut gate = Gate::Held(Gated::<B> {
+                    lo: 0,
                     valid,
                     missed: false,
                 });
@@ -4368,6 +4912,7 @@ mod tests {
                 }
                 // Further on, the buffer either answers truly or misses.
                 let mut gate = Gate::Held(Gated::<B> {
+                    lo: 0,
                     valid,
                     missed: false,
                 });
@@ -4435,6 +4980,7 @@ mod tests {
                 assert_eq!(got.1.as_ref().map(rev_key), want.1.as_ref().map(rev_key));
                 // The same search over the buffer needs nothing more.
                 let mut gate = Gate::Held(Gated::<B> {
+                    lo: 0,
                     valid,
                     missed: false,
                 });
@@ -4446,6 +4992,7 @@ mod tests {
                 let Some(h) = got.1 else { continue };
                 let below = Some((&h.0[..h.1], false));
                 let mut gate = Gate::Held(Gated::<B> {
+                    lo: 0,
                     valid,
                     missed: false,
                 });
@@ -4491,6 +5038,7 @@ mod tests {
         let mut data = image;
         data[end - 1] = 0;
         let mut gate = Gate::Held(Gated::<4096> {
+            lo: 0,
             valid: mask::<4096>(0, tail),
             missed: false,
         });
@@ -4508,6 +5056,7 @@ mod tests {
             assert_eq!(mask::<B>(B - 1, B), 1 << (grains::<B>() - 1));
             assert_eq!(mask::<B>(g - 1, g + 1), 0b11);
             let mut gate = Gate::Held(Gated::<B> {
+                lo: 0,
                 valid: mask::<B>(g, 2 * g),
                 missed: false,
             });
@@ -4515,6 +5064,7 @@ mod tests {
             assert!(!gate.check(g - 1, g + 1) && gate.missed());
             assert!(
                 !Gated::<B> {
+                    lo: 0,
                     valid: full::<B>(),
                     missed: false
                 }
@@ -4698,12 +5248,65 @@ mod tests {
             }
         }
 
+        std::thread_local! {
+            /// Whether [`compressed`] writes entry points (ADR-0040).
+            static CHUNKED: Cell<bool> = const { Cell::new(false) };
+            /// Seeks whose decode began past the block's start.
+            static ENTERED: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// Runs `f` with [`compressed`] writing entry points.
+        fn chunked<T>(f: impl FnOnce() -> T) -> T {
+            CHUNKED.with(|c| c.set(true));
+            let r = f();
+            CHUNKED.with(|c| c.set(false));
+            r
+        }
+
         fn compressed<const B: usize>(logical: &[u8; B]) -> Option<Box<[u8; B]>> {
             let body_end = B - CRC_LEN;
             let mut cs = Box::new(CompressScratch::<B>::new());
-            let clen = cs.compress(&logical[..body_end])?;
+            // Entry points at restarts a ninth of the block apart, as
+            // the writer chooses them (ADR-0040).
+            let mut bounds = std::vec::Vec::new();
+            if CHUNKED.with(Cell::get) && u16::try_from(body_end).is_ok() {
+                let rc = usize::from(u16::from_le_bytes([
+                    logical[body_end - 2],
+                    logical[body_end - 1],
+                ]));
+                let rstart = body_end - 2 - 2 * rc;
+                let mut last = 0;
+                for i in 1..rc {
+                    let r = usize::from(u16::from_le_bytes([
+                        logical[rstart + 2 * i],
+                        logical[rstart + 2 * i + 1],
+                    ]));
+                    if bounds.len() < crate::points::MAX_POINTS && r >= last + (B / 9).max(64) {
+                        bounds.push(r);
+                        last = r;
+                    }
+                }
+            }
+            let mut points = std::vec![(0usize, 0usize); bounds.len()];
+            let reserve = if bounds.is_empty() {
+                0
+            } else {
+                2 + 6 * bounds.len()
+            };
+            let clen = cs.compress_chunked(&logical[..body_end], &bounds, &mut points, reserve)?;
             let mut img = Box::new([0u8; B]);
             img[..clen].copy_from_slice(&cs.compressed()[..clen]);
+            if !bounds.is_empty() {
+                let mut at = body_end - 4 - 6 * bounds.len();
+                for (&(sp, tp), &b) in points.iter().zip(&bounds) {
+                    for v in [sp, tp, b] {
+                        img[at..at + 2].copy_from_slice(&u16::try_from(v).unwrap().to_le_bytes());
+                        at += 2;
+                    }
+                }
+                img[at..at + 2]
+                    .copy_from_slice(&u16::try_from(bounds.len()).unwrap().to_le_bytes());
+            }
             let flag = 0x8000u16 | u16::try_from(clen).unwrap();
             img[body_end - 2..body_end].copy_from_slice(&flag.to_le_bytes());
             Some(img)
@@ -4756,6 +5359,9 @@ mod tests {
                         Lend::Unlent => unreachable!(),
                     };
                     grains_hold(blocks.current(), &logical);
+                    if blocks.current().resume.lo > 0 {
+                        ENTERED.with(|e| e.set(e.get() + 1));
+                    }
                     assert_eq!(
                         head.as_ref()
                             .map(|h| (key_of(h).to_vec(), h.seq, h.off, h.next)),
@@ -4838,7 +5444,10 @@ mod tests {
                                 || step > 0
                                 || max_seq != u64::MAX
                                 || flip_lends > 0,
-                            "seed {seed}: the step past the head lent the block again"
+                            "seed {seed}: the step past the head lent the block again: resume {:?} valid {:x} off {off} start {start:?} want {:?}",
+                            blocks.current().resume,
+                            blocks.current().valid,
+                            want.as_ref().map(|h| (h.off, h.next))
                         );
                         let got = if let Some(r) = in_buffer {
                             r.unwrap()
@@ -4899,13 +5508,12 @@ mod tests {
                 }
             }
             if block.resume.clen != 0 {
-                assert_eq!(
-                    block.valid,
-                    super::super::grains_below::<B>(usize::from(block.resume.dp))
-                );
+                // The decode began at its entry chunk's token (ADR-0040).
+                let lo = usize::from(block.resume.lo);
                 let dp = usize::from(block.resume.dp);
-                assert!(dp < body_end, "a decode kept at the block's end");
-                assert_eq!(block.data[..dp], logical[..dp], "the decode's window");
+                assert_eq!(block.valid, super::super::grains_in::<B>(lo, dp));
+                assert!(dp < body_end || lo > 0, "a decode kept at the block's end");
+                assert_eq!(block.data[lo..dp], logical[lo..dp], "the decode's window");
             } else if block.id.is_some() {
                 assert_eq!(
                     block.valid,
@@ -4925,6 +5533,46 @@ mod tests {
                 partial += holds::<1000>(seed, 0);
             }
             assert!(partial > 1000, "{partial} partial seeks");
+        }
+
+        /// The same over blocks with entry points (ADR-0040): a seek
+        /// searches the chunk heads and decodes from one, and its parks
+        /// go on through the chunks after it.
+        #[test]
+        fn a_chunked_inflate_seeks_and_parks_as_the_whole_block() {
+            // Block sizes that carry entry points (ADR-0040).
+            let partial = chunked(|| {
+                let mut partial = 0;
+                for seed in 1..200 {
+                    partial += holds::<8192>(seed, 0);
+                    partial += holds::<16384>(seed, 0);
+                    partial += holds::<32768>(seed, 0);
+                }
+                partial
+            });
+            assert!(partial > 1000, "{partial} partial seeks");
+            let entered = ENTERED.with(Cell::get);
+            std::println!("{partial} partial seeks, {entered} begun at an entry point");
+            // The entries a test block holds fill about 7 KB, so the
+            // larger blocks have few cuts among them.
+            assert!(
+                entered > partial / 3,
+                "{entered} of {partial} seeks began at an entry point"
+            );
+        }
+
+        /// A flip on the first, second or ninth lend over blocks with
+        /// entry points is a miss, never a wrong answer.
+        #[test]
+        fn a_chunked_inflate_misses_on_a_flip() {
+            chunked(|| {
+                for seed in 1..80 {
+                    for flips in [1, 2, 9] {
+                        holds::<8192>(seed, flips);
+                        holds::<16384>(seed, flips);
+                    }
+                }
+            });
         }
 
         /// The largest blocks that keep a decode: their positions fill
@@ -5003,16 +5651,13 @@ mod tests {
             let mut data: Box<[u8; B]> =
                 std::vec![0xA5u8; B].into_boxed_slice().try_into().unwrap();
             let flag = u16::from_le_bytes([image[B - CRC_LEN - 2], image[B - CRC_LEN - 1]]);
-            let st = super::super::Stream {
-                inflate: crate::compress::Inflate::new(),
-                clen: usize::from(flag & 0x7FFF),
-                checked: 0,
-            };
             let kept = super::super::lend_prefix(
                 &image,
                 &mut data,
-                st,
+                None,
+                usize::from(flag & 0x7FFF),
                 0,
+                &[],
                 7,
                 &mut |_, _| true,
                 &mut early,
@@ -5344,6 +5989,290 @@ mod tests {
             assert_eq!(blocks.copy_rest(&one(&image), 1, 7), Some(false));
             assert!(block_on(blocks.complete(&NoDevice, Some(&one(&image)), 1, 7)).is_err());
             assert_eq!(blocks.current().id, None);
+        }
+
+        /// A chunked block of random entries at `B` bytes, and its image.
+        fn chunked_block<const B: usize>(seed: u64) -> Option<([u8; B], Box<[u8; B]>)> {
+            let mut rng = Rng(seed);
+            let every = 1 + rng.below(4);
+            let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+            let logical: [u8; B] = block::<B>(&es, every);
+            let image = chunked(|| compressed::<B>(&logical))?;
+            let n = usize::from(u16::from_le_bytes([
+                image[B - CRC_LEN - 4],
+                image[B - CRC_LEN - 3],
+            ]));
+            (n > 0).then_some((logical, image))
+        }
+
+        /// Every way a block can be read with `table` in place of its
+        /// own, under good sums: a seek from the start, one past every
+        /// key and one at a middle key, each followed by a completion.
+        /// A partial read over a wrong table is ADR-0027's class (a block
+        /// written wrong and checksummed) and may answer anything but
+        /// must end; a whole decode must refuse it. Returns how many
+        /// reads ended in `CorruptBlock`.
+        fn read_with_table<const B: usize>(
+            image: &[u8; B],
+            logical: &[u8; B],
+            table: &[u8],
+        ) -> usize {
+            let body_end = B - CRC_LEN;
+            let count = body_end - 4;
+            let mut wrong = *image;
+            let n = table.len() / 6;
+            wrong[count - table.len()..count].copy_from_slice(table);
+            wrong[count..count + 2].copy_from_slice(&u16::try_from(n).unwrap().to_le_bytes());
+            let mid = {
+                let mut off = 0;
+                let mut k = std::vec::Vec::new();
+                while off < body_end / 2 {
+                    let Ok(e) =
+                        crate::sstable::parse_data_entry::<(), B>(logical, off, body_end - 4, 7)
+                    else {
+                        break;
+                    };
+                    k = e.key.to_vec();
+                    off = e.next;
+                }
+                k
+            };
+            let mut corrupt = 0;
+            // Parks over fresh lends, at entries through the block: some
+            // decode from its start to its last grain and no further.
+            let mut off = 0;
+            while let Ok(e) =
+                crate::sstable::parse_data_entry::<(), B>(logical, off, body_end - 4, 7)
+            {
+                let at = off;
+                off = e.next;
+                let cache = one(&wrong);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let pend = super::super::provisional_end::<B>();
+                match blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                    park_in::<(), B, 64>(b, at, pend, None, u64::MAX, 7, g)
+                }) {
+                    Lend::Done(Err(crate::Error::CorruptBlock { id: 7 })) => corrupt += 1,
+                    Lend::Done(Ok(_)) => assert_ne!(
+                        blocks.current().valid,
+                        super::full::<B>(),
+                        "a park over a wrong table decoded the block whole and believed it"
+                    ),
+                    other => panic!("{:?}", matches!(other, Lend::Miss)),
+                }
+            }
+            for start in [&b""[..], b"zzzzzzzzzzzzzz", &mid] {
+                let cache = one(&wrong);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        seek_block::<(), B, 64>(b, start, u64::MAX, 7, g)
+                    });
+                match got {
+                    Lend::Done(Err(crate::Error::CorruptBlock { id: 7 })) => corrupt += 1,
+                    Lend::Done(Ok(_)) => assert_ne!(
+                        blocks.current().valid,
+                        super::full::<B>(),
+                        "a seek over a wrong table decoded the block whole and believed it"
+                    ),
+                    other => panic!("{:?}", matches!(other, Lend::Miss)),
+                }
+                if blocks.current().id == Some(7) {
+                    let done = block_on(blocks.complete(&NoDevice, Some(&cache), 1, 7));
+                    assert!(done.is_err(), "a completion believed a wrong table");
+                    corrupt += 1;
+                }
+            }
+            corrupt
+        }
+
+        /// A table moved off its block, under good sums, is never
+        /// believed by a whole decode, and a read over it ends. Each of
+        /// a point's three fields is moved over the offsets around it,
+        /// and a plain stream is given a table it never honoured, whose
+        /// later matches reach below its point. (Review of ADR-0040:
+        /// none of the whole decodes' checks of the table was tested
+        /// through a scan.)
+        #[test]
+        fn a_wrong_table_is_never_believed_whole() {
+            const B: usize = 16_384;
+            let mut corrupt = 0;
+            let mut tried = 0;
+            for seed in 1..25 {
+                let Some((logical, image)) = chunked_block::<B>(seed) else {
+                    continue;
+                };
+                let body_end = B - CRC_LEN;
+                let clen = usize::from(
+                    u16::from_le_bytes([image[body_end - 2], image[body_end - 1]]) & 0x7FFF,
+                );
+                let table = crate::points::point_table(&image[..body_end], clen)
+                    .unwrap()
+                    .to_vec();
+                for i in 0..table.len() / 6 {
+                    for field in 0..3 {
+                        for d in [-16i32, -7, -2, -1, 1, 2, 7, 16] {
+                            let mut t = table.clone();
+                            let at = 6 * i + 2 * field;
+                            let v = i32::from(u16::from_le_bytes([t[at], t[at + 1]])) + d;
+                            let Ok(v) = u16::try_from(v) else { continue };
+                            t[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                            if crate::points::point_table(
+                                &{
+                                    let mut w = image.clone();
+                                    let count = body_end - 4;
+                                    w[count - t.len()..count].copy_from_slice(&t);
+                                    w
+                                }[..body_end],
+                                clen,
+                            )
+                            .is_none()
+                            {
+                                continue;
+                            }
+                            tried += 1;
+                            corrupt += read_with_table(&image, &logical, &t);
+                        }
+                    }
+                }
+            }
+            assert!(tried > 400, "{tried} tables");
+            assert!(corrupt >= tried, "{corrupt} reads refused {tried} tables");
+            // A plain stream given one point at a token, whose head is a
+            // restart: only the floor tells it from a table it honours.
+            let mut floored = 0;
+            for seed in 1..25 {
+                let mut rng = Rng(seed);
+                let every = 1 + rng.below(4);
+                let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+                let logical: [u8; B] = block::<B>(&es, every);
+                let Some(image) = compressed::<B>(&logical) else {
+                    continue;
+                };
+                let body_end = B - CRC_LEN;
+                let clen = usize::from(
+                    u16::from_le_bytes([image[body_end - 2], image[body_end - 1]]) & 0x7FFF,
+                );
+                let rc = usize::from(u16::from_le_bytes([
+                    logical[body_end - 2],
+                    logical[body_end - 1],
+                ]));
+                let rstart = body_end - 2 - 2 * rc;
+                let mut out = std::vec![0u8; body_end];
+                let mut inf = crate::compress::Inflate::new();
+                let r = |i: usize| {
+                    usize::from(u16::from_le_bytes([
+                        logical[rstart + 2 * i],
+                        logical[rstart + 2 * i + 1],
+                    ]))
+                };
+                if rc < 4 {
+                    continue;
+                }
+                inf.run(&image[..clen], &mut out, r(rc / 2) - 1).unwrap();
+                let (s, t) = (inf.consumed(), inf.done());
+                let Some(b) = (0..rc).map(r).find(|&r| r >= t) else {
+                    continue;
+                };
+                let mut table = std::vec::Vec::new();
+                for v in [s, t, b] {
+                    table.extend_from_slice(&u16::try_from(v).unwrap().to_le_bytes());
+                }
+                if clen + table.len() + 4 >= body_end {
+                    continue;
+                }
+                floored += 1;
+                assert!(read_with_table(&image, &logical, &table) > 0, "seed {seed}");
+            }
+            assert!(floored > 10, "{floored}");
+        }
+
+        /// A table whose last head lies within an entry header of the
+        /// trailer, under a valid CRC: a seek past every head is
+        /// `CorruptBlock`, as the whole block is, and ends. (Review of
+        /// ADR-0040: the seek asked for a probe of that head's header,
+        /// which the block cannot hold, on every run of its parse.)
+        #[test]
+        fn a_seek_over_a_head_against_the_trailer_ends() {
+            const B: usize = 16_384;
+            let mut tried = 0;
+            for seed in 1..60 {
+                let Some((_, mut image)) = chunked_block::<B>(seed) else {
+                    continue;
+                };
+                let count = B - CRC_LEN - 4;
+                let n = usize::from(u16::from_le_bytes([image[count], image[count + 1]]));
+                let last = count - 2;
+                let near = u16::try_from(count - 10).unwrap();
+                image[last..last + 2].copy_from_slice(&near.to_le_bytes());
+                let cache = one(&image);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        seek_block::<(), B, 64>(b, b"zzzzzzzzzzzz", u64::MAX, 7, g)
+                    });
+                assert!(
+                    matches!(got, Lend::Done(Err(crate::Error::CorruptBlock { id: 7 }))),
+                    "seed {seed}, {n} points"
+                );
+                tried += 1;
+            }
+            assert!(tried > 10, "{tried}");
+        }
+
+        /// A park over a fresh lend of a block with a table, from an
+        /// entry near the block's start, decodes from the start and stops
+        /// soon after it, not the whole block. (Review of ADR-0040: the
+        /// parse of the buffer's stale bytes asked for the trailer first,
+        /// and the decode began at the last chunk, then went whole.)
+        #[test]
+        fn a_park_over_a_fresh_lend_decodes_from_its_chunk() {
+            const B: usize = 16_384;
+            let mut partial = 0;
+            for seed in 1..60 {
+                let Some((logical, image)) = chunked_block::<B>(seed) else {
+                    continue;
+                };
+                let end = super::super::entries_end::<(), B>(&logical, 7, &mut Gate::Open).unwrap();
+                let first =
+                    park_in::<(), B, 64>(&logical, 0, end, None, u64::MAX, 7, &mut Gate::Open)
+                        .unwrap()
+                        .unwrap();
+                let want = park_in::<(), B, 64>(
+                    &logical,
+                    first.next,
+                    end,
+                    None,
+                    u64::MAX,
+                    7,
+                    &mut Gate::Open,
+                )
+                .unwrap();
+                let cache = one(&image);
+                let mut bufs = Box::new(BlockBufs::<B>::new());
+                bufs.own.data.fill(0x5A);
+                let mut blocks = Blocks::<B>::over(Held::Lent(&mut bufs));
+                // A cursor a partial inflate positioned parks against the
+                // provisional end, as the seek left it.
+                let pend = super::super::provisional_end::<B>();
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        park_in::<(), B, 64>(b, first.next, pend, None, u64::MAX, 7, g)
+                    });
+                let Lend::Done(Ok(got)) = got else {
+                    panic!("seed {seed}: a clean lend missed");
+                };
+                assert_eq!(got.map(|h| (h.off, h.next)), want.map(|h| (h.off, h.next)));
+                grains_hold(blocks.current(), &logical);
+                if blocks.current().valid != super::full::<B>() {
+                    partial += 1;
+                    assert_eq!(blocks.current().resume.lo, 0, "seed {seed}");
+                }
+            }
+            assert!(
+                partial > 10,
+                "{partial} parks stopped short of the whole block"
+            );
         }
 
         #[test]

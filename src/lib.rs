@@ -70,6 +70,7 @@ pub mod memtable;
 // differential tests, not part of the storage API.
 #[doc(hidden)]
 pub mod model;
+pub(crate) mod points;
 pub mod profile;
 #[cfg(feature = "multiwriter")]
 pub mod ring;
