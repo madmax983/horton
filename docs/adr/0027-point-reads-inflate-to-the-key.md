@@ -1,6 +1,6 @@
 # ADR-0027: A point read inflates a data block only as far as its key
 
-Status: Accepted (unreleased, 2026-11-23)
+Status: Accepted (unreleased, 2026-11-23; over a block with entry points, from its key's chunk: ADR-0040)
 
 ## Context
 

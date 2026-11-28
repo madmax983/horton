@@ -201,6 +201,23 @@ writes 1.7 to 2.6 times as fast as RocksDB given the same memory.
 
 ### Changed
 
+- **Compressed data blocks carry entry points** (ADR-0040). The writer
+  cuts a compressed block's stream at a restart about every 2 KiB,
+  forgets its window there, and lists the cuts in the block's zero
+  fill (SPEC §4.4): at most 15, 6 bytes each. Only blocks of 8 to
+  64 KiB carry them, so the firmware's 4 KiB blocks do not change. A
+  cached point read decodes only the chunk that holds its key, and a
+  cached forward seek only the chunk it starts in and what it reads
+  after. Every whole decode, compaction's among them, checks the table
+  against the stream and the block's restarts, and a table that does
+  not hold is `CorruptBlock`. The stream is one stream still: older
+  builds read new images as before, ignoring the table, and blocks
+  older builds wrote carry none. In the host store at 1 M keys a cached
+  point read takes 38% fewer instructions and a cached seek 11% to 17%
+  fewer (docs/THROUGHPUT.md, step 27); reverse scans 1.1% more, and
+  reads of blocks with no table 0.4% to 0.7% more. A point read over a
+  table no longer checks the stream of the cached block past the chunk
+  it decodes, as a seek does not (ADR-0039).
 - **A seek inflates a compressed block only as far as it reads**
   (ADR-0039). Through a cache that checks ranges, a forward seek checks
   and inflates a compressed data block's stream from its start only as
