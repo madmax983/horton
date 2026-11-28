@@ -28,7 +28,7 @@
 //! block is read whole.
 
 use crate::compress::decompress_points;
-use crate::sstable::CRC_LEN;
+use crate::sstable::{CRC_LEN, ENTRY_HEADER};
 
 /// Bytes of one entry point: three `u16` offsets.
 pub const POINT_LEN: usize = 6;
@@ -76,12 +76,19 @@ pub fn point_at(table: &[u8], i: usize) -> (usize, usize, usize) {
 /// cannot be a table. A table has at most [`MAX_POINTS`]
 /// points, lies wholly past the stream, and ascends: `s` and `t` never
 /// fall, `b` always rises, each `t` is at or below its `b`, each `s` is
-/// inside the stream, and each `b` lies before the trailer could begin.
+/// inside the stream, and each head's entry header ends before the
+/// trailer could begin. A stream that reaches the count word leaves no
+/// room for a table.
 pub fn point_table(body: &[u8], clen: usize) -> Option<&[u8]> {
     if !carries_points(body.len()) {
         return Some(&[]);
     }
     let at = body.len().checked_sub(4)?;
+    if clen >= at {
+        // The stream covers the count word: the block has no fill, and so
+        // no table, as every reader takes it (review of ADR-0040).
+        return Some(&[]);
+    }
     let n = usize::from(u16::from_le_bytes([*body.get(at)?, *body.get(at + 1)?]));
     if n == 0 {
         return Some(&[]);
@@ -97,7 +104,10 @@ pub fn point_table(body: &[u8], clen: usize) -> Option<&[u8]> {
     let (mut ps, mut pt, mut pb) = (0, 0, 0);
     for i in 0..n {
         let (s, t, b) = point_at(table, i);
-        if s < ps || s >= clen || t < pt || t > b || b <= pb || b >= at {
+        // A head's entry header must end before the trailer could begin
+        // (review of ADR-0040: a head in the last bytes before the count
+        // word left a seek probing for a header the block cannot hold).
+        if s < ps || s >= clen || t < pt || t > b || b <= pb || b + ENTRY_HEADER > at {
             return None;
         }
         (ps, pt, pb) = (s, t, b);
@@ -393,5 +403,31 @@ mod tests {
         let rs16: Vec<u16> = rs.iter().copied().filter(|&r| r < 16_380).collect();
         let n16 = bounds_of::<16_384>(&rs16, &mut out);
         assert!((5..=7).contains(&n16), "{n16}");
+    }
+
+    /// A stream that reaches the count word leaves no room for a table:
+    /// every reader takes the block as having none, the whole decode too
+    /// (review of ADR-0040: the partial paths said none, the whole one
+    /// read a table out of the stream's last bytes).
+    #[test]
+    fn a_stream_over_the_count_word_has_no_table() {
+        let mut b = std::vec![0u8; BODY];
+        b[BODY - 4..BODY - 2].copy_from_slice(&5u16.to_le_bytes());
+        for clen in [BODY - 4, BODY - 3, BODY - 2] {
+            assert_eq!(point_table(&b, clen), Some(&[][..]), "clen {clen}");
+        }
+    }
+
+    /// A head whose entry header would run into the trailer is no table
+    /// (review of ADR-0040: a seek probed for that header forever).
+    #[test]
+    fn a_head_too_near_the_trailer_is_no_table() {
+        let at = BODY - 4;
+        for near in [at - 12, at - 6, at - 1] {
+            let p = [(100, 990, 1000), (300, 1995, near)];
+            assert!(point_table(&body(600, &p), 600).is_none(), "head {near}");
+        }
+        let p = [(100, 990, 1000), (300, 1995, at - 13)];
+        assert!(point_table(&body(600, &p), 600).is_some());
     }
 }

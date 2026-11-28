@@ -810,6 +810,13 @@ fn compress_data_block<const BLOCK: usize>(
             "the encoder's entry points do not hold"
         );
         if !holds {
+            // A stream that missed the threshold is tried again without
+            // its cuts and table, unless it was no shorter than the block
+            // (review of ADR-0040: an incompressible block was encoded
+            // twice). One whose table does not hold is.
+            if clen.is_none() && cs.reached() >= body_end {
+                return;
+            }
             clen = None;
             nb = 0;
         }
@@ -4913,6 +4920,98 @@ mod partial_inflate_tests {
             wrong, 0,
             "a point read over a wrong table answered differently"
         );
+    }
+
+    /// The writer stores compressed every block that a plain stream
+    /// would, its cuts or not; random bytes overflow the chunked stream
+    /// and are not encoded again. (Review of ADR-0040: a rule meant to
+    /// spare incompressible blocks a second encode never applied.)
+    #[test]
+    fn the_writer_compresses_what_a_plain_stream_would() {
+        let body = BIG - CRC_LEN;
+        let rs: Vec<u16> = (0..64u16).map(|i| i * 256).collect();
+        let pattern: [u8; 16] = *b"sensor/00042=ok;";
+        let mut cs = std::boxed::Box::new(CompressScratch::<BIG>::new());
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut plain_only, mut with_points, mut raw) = (0, 0, 0);
+        for pct in 0..=100u64 {
+            for _ in 0..3 {
+                let mut buf = std::boxed::Box::new([0u8; BIG]);
+                for seg in buf[..body - 2].chunks_mut(16) {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    if rng % 100 < pct {
+                        for b in seg.iter_mut() {
+                            rng ^= rng << 13;
+                            rng ^= rng >> 7;
+                            rng ^= rng << 17;
+                            *b = rng.to_le_bytes()[3];
+                        }
+                    } else {
+                        seg.copy_from_slice(&pattern[..seg.len()]);
+                    }
+                }
+                // The trailer a reader checks the heads against.
+                let rstart = body - 2 - 2 * rs.len();
+                for (i, r) in rs.iter().enumerate() {
+                    buf[rstart + 2 * i..rstart + 2 * i + 2].copy_from_slice(&r.to_le_bytes());
+                }
+                buf[body - 2..body].copy_from_slice(&64u16.to_le_bytes());
+                let logical = buf.clone();
+                let plain = cs.compress(&logical[..body]).is_some();
+                super::compress_data_block(&mut buf, &rs, &mut cs);
+                let flag = u16::from_le_bytes([buf[body - 2], buf[body - 1]]);
+                let compressed = flag & 0x8000 != 0;
+                assert_eq!(compressed, plain, "{pct}% random bytes");
+                if !compressed {
+                    raw += 1;
+                    assert_eq!(buf, logical, "a raw block is the logical block");
+                    continue;
+                }
+                let clen = usize::from(flag & 0x7FFF);
+                let count = body - 4;
+                let n = usize::from(u16::from_le_bytes([buf[count], buf[count + 1]]));
+                if n > 0 {
+                    with_points += 1;
+                    assert!(
+                        crate::points::point_table(&buf[..body], clen)
+                            .is_some_and(|t| t.len() == 6 * n)
+                    );
+                } else {
+                    plain_only += 1;
+                }
+                let mut out = std::boxed::Box::new([0u8; BIG]);
+                assert!(
+                    crate::points::inflate_image(&buf[..body], clen, &mut out[..body]),
+                    "{pct}% random bytes: the block does not inflate whole"
+                );
+                assert_eq!(out[..body], logical[..body]);
+            }
+        }
+        assert!(with_points > 50, "{with_points} blocks with points");
+        assert!(plain_only > 0, "no block fell back to a plain stream");
+        assert!(raw > 0, "{raw} raw blocks");
+        // Random bytes: the chunked stream overflows, and that is what
+        // spares the second encode.
+        let mut random = std::boxed::Box::new([0u8; BIG]);
+        for b in &mut random[..body] {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            *b = rng.to_le_bytes()[5];
+        }
+        let mut bounds = [0usize; crate::points::MAX_POINTS];
+        let nb = crate::points::bounds_of::<BIG>(&rs, &mut bounds);
+        let mut found = [(0usize, 0usize); crate::points::MAX_POINTS];
+        let got = cs.compress_chunked(
+            &random[..body],
+            &bounds[..nb],
+            &mut found,
+            crate::points::table_len(nb),
+        );
+        assert!(got.is_none());
+        assert!(cs.reached() >= body);
     }
 
     #[test]

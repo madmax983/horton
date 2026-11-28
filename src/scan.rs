@@ -2121,8 +2121,14 @@ fn lend_prefix_in<E, R, const BLOCK: usize, const POINTS: bool>(
                         Ok(false) => return None,
                         Err(()) => return corrupt(check),
                     }
+                    // A probe the block cannot satisfy (it asked past the
+                    // block's end) is the whole block's to decide, never
+                    // asked again (review of ADR-0040: it looped).
+                    whole = ps.inflate.done() < want;
                 }
-                continue;
+                if !whole {
+                    continue;
+                }
             }
             Ask::Main(c) => begin = Some(c),
             Ask::Whole => whole = true,
@@ -2130,10 +2136,21 @@ fn lend_prefix_in<E, R, const BLOCK: usize, const POINTS: bool>(
             Ask::Nothing if p.below => whole = true,
             Ask::Nothing if main.is_none() => {
                 // A parse other than a seek's, over a fresh lend: the
-                // decode begins at the chunk that holds what it read.
+                // decode begins at the chunk that holds the lowest byte
+                // it asked for. A parse of the buffer's stale bytes fails
+                // and asks for the trailer first; that names no chunk,
+                // and the decode begins at the block's start (review of
+                // ADR-0040: it began at the last chunk, then whole).
                 let mut c = 0usize;
-                while c < n && point_at(table, c).1 <= p.low {
-                    c += 1;
+                if p.low < provisional_end::<BLOCK>() {
+                    while c < n && point_at(table, c).1 <= p.low {
+                        c += 1;
+                    }
+                } else {
+                    // Nor is the trailer a target: the decode runs a step
+                    // from the chunk's head, and the parse, over real
+                    // bytes, asks again.
+                    p.want = 0;
                 }
                 #[allow(clippy::cast_possible_truncation)] // at most MAX_POINTS
                 let c = c as u8;
@@ -5972,6 +5989,108 @@ mod tests {
             assert_eq!(blocks.copy_rest(&one(&image), 1, 7), Some(false));
             assert!(block_on(blocks.complete(&NoDevice, Some(&one(&image)), 1, 7)).is_err());
             assert_eq!(blocks.current().id, None);
+        }
+
+        /// A chunked block of random entries at `B` bytes, and its image.
+        fn chunked_block<const B: usize>(seed: u64) -> Option<([u8; B], Box<[u8; B]>)> {
+            let mut rng = Rng(seed);
+            let every = 1 + rng.below(4);
+            let es: std::vec::Vec<Entry> = entries::<B>(&mut rng, every);
+            let logical: [u8; B] = block::<B>(&es, every);
+            let image = chunked(|| compressed::<B>(&logical))?;
+            let n = usize::from(u16::from_le_bytes([
+                image[B - CRC_LEN - 4],
+                image[B - CRC_LEN - 3],
+            ]));
+            (n > 0).then_some((logical, image))
+        }
+
+        /// A table whose last head lies within an entry header of the
+        /// trailer, under a valid CRC: a seek past every head is
+        /// `CorruptBlock`, as the whole block is, and ends. (Review of
+        /// ADR-0040: the seek asked for a probe of that head's header,
+        /// which the block cannot hold, on every run of its parse.)
+        #[test]
+        fn a_seek_over_a_head_against_the_trailer_ends() {
+            const B: usize = 16_384;
+            let mut tried = 0;
+            for seed in 1..60 {
+                let Some((_, mut image)) = chunked_block::<B>(seed) else {
+                    continue;
+                };
+                let count = B - CRC_LEN - 4;
+                let n = usize::from(u16::from_le_bytes([image[count], image[count + 1]]));
+                let last = count - 2;
+                let near = u16::try_from(count - 10).unwrap();
+                image[last..last + 2].copy_from_slice(&near.to_le_bytes());
+                let cache = one(&image);
+                let mut blocks = Blocks::<B>::over(Held::Own(BlockBufs::new()));
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        seek_block::<(), B, 64>(b, b"zzzzzzzzzzzz", u64::MAX, 7, g)
+                    });
+                assert!(
+                    matches!(got, Lend::Done(Err(crate::Error::CorruptBlock { id: 7 }))),
+                    "seed {seed}, {n} points"
+                );
+                tried += 1;
+            }
+            assert!(tried > 10, "{tried}");
+        }
+
+        /// A park over a fresh lend of a block with a table, from an
+        /// entry near the block's start, decodes from the start and stops
+        /// soon after it, not the whole block. (Review of ADR-0040: the
+        /// parse of the buffer's stale bytes asked for the trailer first,
+        /// and the decode began at the last chunk, then went whole.)
+        #[test]
+        fn a_park_over_a_fresh_lend_decodes_from_its_chunk() {
+            const B: usize = 16_384;
+            let mut partial = 0;
+            for seed in 1..60 {
+                let Some((logical, image)) = chunked_block::<B>(seed) else {
+                    continue;
+                };
+                let end = super::super::entries_end::<(), B>(&logical, 7, &mut Gate::Open).unwrap();
+                let first =
+                    park_in::<(), B, 64>(&logical, 0, end, None, u64::MAX, 7, &mut Gate::Open)
+                        .unwrap()
+                        .unwrap();
+                let want = park_in::<(), B, 64>(
+                    &logical,
+                    first.next,
+                    end,
+                    None,
+                    u64::MAX,
+                    7,
+                    &mut Gate::Open,
+                )
+                .unwrap();
+                let cache = one(&image);
+                let mut bufs = Box::new(BlockBufs::<B>::new());
+                bufs.own.data.fill(0x5A);
+                let mut blocks = Blocks::<B>::over(Held::Lent(&mut bufs));
+                // A cursor a partial inflate positioned parks against the
+                // provisional end, as the seek left it.
+                let pend = super::super::provisional_end::<B>();
+                let got =
+                    blocks.lend_into(&cache, 1, 7, super::super::Take::Prefix, &mut |b, g| {
+                        park_in::<(), B, 64>(b, first.next, pend, None, u64::MAX, 7, g)
+                    });
+                let Lend::Done(Ok(got)) = got else {
+                    panic!("seed {seed}: a clean lend missed");
+                };
+                assert_eq!(got.map(|h| (h.off, h.next)), want.map(|h| (h.off, h.next)));
+                grains_hold(blocks.current(), &logical);
+                if blocks.current().valid != super::full::<B>() {
+                    partial += 1;
+                    assert_eq!(blocks.current().resume.lo, 0, "seed {seed}");
+                }
+            }
+            assert!(
+                partial > 10,
+                "{partial} parks stopped short of the whole block"
+            );
         }
 
         #[test]
